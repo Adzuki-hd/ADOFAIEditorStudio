@@ -1,0 +1,32 @@
+# 构建产物
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# 本地源码快照。Backups/ 里是每次动工前存的副本，
+# 只对本机有意义，而且会随时间堆到几十 MB。
+Backups/
+
+# 旧的本地分发包副本。正式分发走清单仓库
+# （Adzuki-hd/ADOFAIEditorStudio-manifest），这里不需要留。
+dist/
+
+# 调试与安装过程留下的日志
+*.log
+install-result.log
+
+# 隔离的帧缓存实验有自己的构建产物
+FrameCacheSpike/bin/
+FrameCacheSpike/obj/
+
+# 谱面工程文件，属于用户数据不属于源码
+*.adofaiprj
+*.adofaiprj.bak
+*.adofai
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store
