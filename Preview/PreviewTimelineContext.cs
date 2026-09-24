@@ -289,6 +289,11 @@ namespace ADOFAIEditorStudio.Preview
             return levelEvent != null && levelEvent.HasPropertyKey(key);
         }
 
+        internal Vector2 GetVector2WithNaN(PreviewEventSnapshot levelEvent, string key, Vector2 fallback)
+        {
+            return levelEvent == null ? fallback : levelEvent.GetVector2WithNaN(key, fallback);
+        }
+
         internal T GetValue<T>(PreviewEventSnapshot levelEvent, string key, T fallback)
         {
             return levelEvent == null ? fallback : levelEvent.GetValue(key, fallback);

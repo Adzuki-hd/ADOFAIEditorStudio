@@ -76,6 +76,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
         // Player 打开它，Tile/Global 调 SetToFreeMode 关掉它，LastPosition
         // 保持原样。
         private bool[] followModeAtFloor = new bool[0];
+        // 【诊断】已打印的逐事件条数。
 
         private CamMovementType defaultMode;
         private Vector2 defaultPosition;
@@ -238,20 +239,54 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     Zoom = context.GetValue(levelEvent, "zoom", defaultZoom * 100f) / 100f,
                     Floor = levelEvent.Floor
                 });
+
             }
             PreviewStableSort.Sort(keyframes, (left, right) => left.StartTime.CompareTo(right.StartTime));
 
-            // 跟随递推的帧长。原生每帧用
-            // Time.deltaTime 推进它的跟随计时器，而谱面的理想格间距没有算
-            // 落地本身发生的那一帧，所以递推必须把它补回来。
-            // 那一帧的大小就是游戏实际跑的帧长——在
-            // M3 谱面上量到每格缺 ~0.0059s，当时游戏跑在 ~167fps
-            // （工作台报的是 ~165），不是按 60fps 名义假设算出来的 0.0167s。
-            // 用 smoothDeltaTime 能让它在任何机器上都对，
-            // 而不是把某个帧率写死。
-            BuildFollowTrack(context, Mathf.Clamp(Time.smoothDeltaTime, 1f / 1000f, 1f / 15f));
+            // 跟随递推的帧长。原生每帧用 Time.deltaTime 推进它的跟随
+            // 计时器，而谱面的理想格间距没有算落地本身发生的那一帧，
+            // 所以递推必须把它补回来。那一帧的大小就是游戏实际跑的帧长
+            // ——在 M3 谱面上量到每格缺 ~0.0059s，当时游戏跑在 ~167fps。
+            //
+            // 但**不能读 TIME.SMOOTHDELTATIME 的瞬时值**。这个值会被烘进
+            // 整条跟随轨道：它大一点，每格的推进就靠前一点；大到某个程度
+            // 比值直接夹到 1，相机当场贴到球上——每走一格"卡"一下、
+            // 平滑跟随整个消失。而重建往往正好发生在最慢的一帧
+            // （刚拖完时间轴、整条轨道重算），于是这个缺陷看时机出现，
+            // 也就是"有时"。
+            //
+            // 改用持续跟踪的帧长估计：它在每一帧的求值里缓慢跟随真实帧率，
+            // 对单帧尖峰不敏感，并且夹在一个物理上合理的区间里
+            // （游戏不会长期跑得比 240fps 还快、也不会比 60fps 还慢）。
+            BuildFollowTrack(context, StableFrameSeconds);
             Main.Logger.Log("[StaticPreview/Camera] analyzed " + keyframes.Count
                 + " events, " + floorCount + " floors.");
+        }
+
+        // 持续跟踪的帧长。初值取 1/144：它只是"第一条轨道还没攒到数据时"
+        // 的占位，下一次重建（拖动之后必然发生）就用上真实估计了。
+        private float observedFrameSeconds = 1f / 144f;
+
+        /// <summary>
+        /// 稳定的帧长估计。每帧缓慢跟随真实帧率，单帧尖峰影响很小。
+        /// </summary>
+        private float StableFrameSeconds
+        {
+            get { return Mathf.Clamp(observedFrameSeconds, 1f / 240f, 1f / 60f); }
+        }
+
+        /// <summary>
+        /// 逐帧更新帧长估计。放在求值里而不是重建里：重建本身可能
+        /// 正好落在慢帧上，那正是要避免的取样点。
+        /// </summary>
+        private void TrackFrameSeconds()
+        {
+            float delta = Time.smoothDeltaTime;
+            // 丢掉明显不合理的样本（暂停后恢复、场景切换那一帧）。
+            if (delta > 1f / 400f && delta < 1f / 30f)
+            {
+                observedFrameSeconds = Mathf.Lerp(observedFrameSeconds, delta, 0.05f);
+            }
         }
 
         /// <summary>
@@ -263,6 +298,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
         /// </summary>
         private void BuildFollowTrack(PreviewTimelineContext context, float frameSeconds)
         {
+
             floorCount = context.FloorCount;
             cameraAtFloorEntry = new Vector2[floorCount];
             ballAtFloorEntry = new Vector2[floorCount];
@@ -295,13 +331,27 @@ namespace ADOFAIEditorStudio.Preview.Domains
             for (int i = 0; i < floorCount; i++)
             {
                 PreviewFloorSnapshot floor = context.GetFloor(i);
-                Vector2 anchor = floor == null
+
+                // 两个位置必须分开：
+                //
+                //   floorPosition —— 格本身在哪（startPos + offsetPos）。
+                //     相机 Tile 模式锚在它上面；自由段之后跟随重新播种
+                //     也取它，因为那段结束时相机停在格位置上。
+                //
+                //   ballAtFloorEntry —— 球在哪。stickToFloor 关掉的格上，
+                //     轨道被推走了而球还留在布局位，两者差一个 offsetPos。
+                //     跟随追的是**球**：用格的位置会让相机跟着轨道偏出去，
+                //     第 7 格 offset=(1,-1) 时正好是往右偏一格。
+                Vector2 tileAnchor = floor == null
                     ? Vector2.zero
                     : new Vector2(floor.StartPosition.x, floor.StartPosition.y);
+                Vector2 ballAnchor = floor == null
+                    ? Vector2.zero
+                    : new Vector2(floor.BallPosition.x, floor.BallPosition.y);
                 float entryTime = floor == null ? 0f : Convert.ToSingle(floor.EntryTime);
 
-                ballAtFloorEntry[i] = anchor;
-                floorPosition[i] = anchor;
+                ballAtFloorEntry[i] = ballAnchor;
+                floorPosition[i] = tileAnchor;
                 floorEntryTime[i] = entryTime;
 
                 float camspeed = GetCameraSpeed(context, floor);
@@ -309,7 +359,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
                 if (i == 0)
                 {
-                    camera = anchor;
+                    // 起点取球的位置：跟追随的本来就是球。
+                    camera = ballAnchor;
                 }
                 else if (followModeAtFloor[i] && !followModeAtFloor[i - 1])
                 {
@@ -368,6 +419,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
             }
         }
 
+
         public void Evaluate(PreviewEvaluationFrame frame)
         {
             scrCamera camera = scrCamera.instance;
@@ -377,6 +429,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
             }
 
             PreviewTimelineContext context = frame.Context;
+            TrackFrameSeconds();
             int floorIndex = Mathf.Clamp(context.FindFloorAtOrBefore(frame.Time),
                 0, floorCount - 1);
 
@@ -735,40 +788,27 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     // 把相机横着甩出去，而原生那条 tween 根本没碰过
                     // X。
                     Vector2 offset = defaultPosition;
-                    if (float.IsNaN(keyframe.Position.x))
-                    {
-                        // 只有当事件同时也写了模式时，原生才会把 NaN 轴清零
-                        // （"if (float.IsNaN(vector.x)) vector.x = 0f"）。没有模式时
-                        // NaN 会活到 finalPos 里，逐轴的 tween 门会跳过那条
-                        // 轴，把相机留在原地。
-                        if (keyframe.ModeUsed)
-                        {
-                            offset.x = 0f;
-                        }
-                        else
-                        {
-                            offset.x = float.NaN;
-                        }
-                    }
-                    else
-                    {
-                        offset.x = keyframe.Position.x;
-                    }
-                    if (float.IsNaN(keyframe.Position.y))
-                    {
-                        if (keyframe.ModeUsed)
-                        {
-                            offset.y = 0f;
-                        }
-                        else
-                        {
-                            offset.y = float.NaN;
-                        }
-                    }
-                    else
-                    {
-                        offset.y = keyframe.Position.y;
-                    }
+                    // 两个轴一视同仁：数组里的 null（读出来是 NaN）
+                    // 一律保留。NaN 轴在下面会走到「不驱动」那一支，
+                    // 目标由携带值给出，而不是被清成 0。
+                    offset.x = keyframe.Position.x;
+                    // 数组里的 null（= NaN）一律**保留**，不因为事件
+                    // 写了 relativeTo 就把它清成 0。
+                    //
+                    // 这里原本有一句「ModeUsed 时 offset 清零」，理由是
+                    // 原生那段
+                    //     if (movementTypeUsed) { if (IsNaN(vector.y)) vector.y = 0; }
+                    // 实测下来这个读法是错的：Phantigma 第 396 格是
+                    // `position [-4, null]` + `relativeTo Tile`，而原版的相机
+                    // Y 从 85.19 一路升到 **96.63** —— 那是第 382 格
+                    // `[null, 9]` 那条 tween 的目标（格子 87.63 + 偏移 9）。
+                    // 如果清零，目标就变成 87.63，正好丢掉那 9，
+                    // 相机也整个偏掉。
+                    //
+                    // 保住 NaN 之后，这一格 Y 轴的目标由「携带值」给出
+                    // （见下面的逐轴重启），起点用该时刻的实时位置，
+                    // 于是 85.08 → 96.63，与原版一致。
+                    offset.y = keyframe.Position.y;
 
                     // 一个事件的起点必须让相机留在它原本所在的地方，
                     // 因为原生 tween 是从 camParent.position 起跑的——而它
@@ -818,10 +858,29 @@ namespace ADOFAIEditorStudio.Preview.Domains
                         ? followAtStart + eventCarry
                         : eventCarry;
 
+                    // 交接用的原点：上一条事件还在**缓动中途**时，取它
+                    // 在这一刻的实际值；没有 tween 在跑时，沿用携带值。
+                    //
+                    // 为什么要实时值：本谱 f382 那条 MoveCamera 长 18.857 秒
+                    // （页面里是 duration 32），到 f396 才走了 3%，相机在
+                    // 85.07，而目标是 96.63。拿目标当新事件的起点会把相机
+                    // 一帧内拽过去——表现就是「走一格突然被结算」。
+                    //
+                    // 为什么要有回落：早段还没有任何位置事件时通道是
+                    // 初始值，无条件采样会把那个占位值当成真实值用。
+                    float handoffX = LiveChannelValue(
+                        activeXOrigin, activeXTarget, activeXStart, activeXDuration,
+                        activeXEase, eventCarry.x, (float)keyframe.StartTime);
+                    float handoffY = LiveChannelValue(
+                        activeYOrigin, activeYTarget, activeYStart, activeYDuration,
+                        activeYEase, eventCarry.y, (float)keyframe.StartTime);
+                    Vector2 handoffOutput = (previousCarries ? followAtStart : Vector2.zero)
+                        + new Vector2(handoffX, handoffY);
+
                     // 事件分量的原点：取那个能让合成输出
                     // 跨过切换仍然连续的值。CarriesFollow 在分量上是仿射的，
                     // 系数为 1，所以差别只在跟随项。
-                    Vector2 continuityOrigin = previousOutput - (nextCarries
+                    Vector2 continuityOrigin = handoffOutput - (nextCarries
                         ? followAtStart
                         : Vector2.zero);
 
@@ -846,10 +905,26 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
                     followMode = nextFollow;
 
+                    CamMovementType previousMode = activeMode;
                     activeMode = mode;
                     Vector2 resolved = ResolveWorld(mode, offset, keyframe.Floor,
                         ballAtFloorEntry[Mathf.Clamp(keyframe.Floor, 0, floorCount - 1)],
                         eventWorld);
+
+                    // 一根轴什么时候被重新指向：**事件真的给了值**，
+                    // 或者**模式换了**（换模式时原生会把 camParent 从相机
+                    // 当前位置重新播种，两根轴都要重建）。
+                    //
+                    // 关键是 `keyframe.ModeUsed` 单独**不构成**重启理由。
+                    // 实测 Phantigma 第 396 格：事件带 relativeTo=Tile
+                    // （与第 382 格相同）而 position 是 [-4, null]。原版的
+                    // Y 一路平滑走到 96.63 —— 也就是第 382 格那条事件的目标
+                    // （格子 87.63 + 偏移 9）—— 在 t=21.27 到达后才停住。
+                    // 也就是说第 396 格**根本没有重启 Y**。
+                    //
+                    // 之前这里写的是 `!IsNaN(y) || ModeUsed`，ModeUsed 一来
+                    // 就无条件重启 Y，于是目标被重指向「格子位置」87.63，
+                    // 第 382 格留下的 +9 偏移被丢掉，相机位置就错了。
 
                     // 逐轴重启，对应原生那几道门。原生只杀掉
                     // finalPos 为实数的那个轴：
@@ -857,14 +932,39 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     //   if (!float.IsNaN(finalPos.x) || movementTypeUsed) { moveXTween?.Kill(complete: true); }
                     //
                     // 被驱动的轴会被杀到终点再重新指向，所以它从
-                    // 连续性原点重启。被保持的轴（NaN、且没写模式）则
-                    // 原封不动地保留正在跑的 tween——原点、目标、起点和缓动全都不变——
+                    // 连续性原点重启。被保持的轴则原封不动地保留
+                    // 正在跑的 tween——原点、目标、起点和缓动全都不变——
                     // 只是按自己的时钟继续走。改为从它此刻持有的值
                     // 重启，就产生了那次单帧瞬移：在
                     // Digital Warrior 谱面上第 435 格正处在第 419 格事件的
                     // X 位移中途（100.4 朝 94.28 走），这时第 436 格的纯 Y 事件来了，
                     // 相机在一帧里跳掉了剩下的 6.1。
-                    if (!float.IsNaN(resolved.x) || keyframe.ModeUsed)
+                    // 只有**事件真的给了值**的那根轴才重启。
+                    //
+                    // 原来这里还挂着 `|| keyframe.ModeUsed`，于是一个
+                    // 只写 X、带 relativeTo 的事件会把 Y 也重启，而 Y 的
+                    // NaN 又被下面那条替换成「起点自己」，Y 就成了一个
+                    // 原点到目标的空 tween —— 相机 Y 彻底不动。
+                    //
+                    // 实测 Phantigma 第 396 格：事件是 [-4, null] + relativeTo=Tile。
+                    // 原版的 Y 从 85.19 一路升到 96.63（第 382 格 [null,9]
+                    // 那条 tween 的目标），21.27 秒才到 —— 也就是说第 396 格
+                    // **没有触碰 Y**。带 ModeUsed 的判据每次都重启它，
+                    // 相机就钉在原地，位置整个偏掉 9。
+                    // 一根 NaN 轴要不要被「定住」，取决于**模式有没有换**，
+                    // 而不是事件有没有写 relativeTo。
+                    //
+                    // 逐事件实测（Phantigma 382/396 两格，形状都是 [X, null] + Tile）：
+                    //   f382  模式 Player -> Tile（换了）→ 必须定住 Y，
+                    //         否则 carry 会衰减成 0，下一格的起点跟着变 0
+                    //         （相机从 83 掉到 0 再爬）
+                    //   f396  模式 Tile -> Tile（没换）→ **不能**动 Y，
+                    //         否则正在跑的 Y（目标 96.63）被冻在 85.08
+                    // 两次的差别只有模式是否变化这一条。
+                    bool modeChanged = mode != previousMode;
+                    bool forceAxis = keyframe.ModeUsed && modeChanged;
+
+                                        if (!float.IsNaN(resolved.x) || forceAxis)
                     {
                         activeXOrigin = continuityOrigin.x;
                         activeXTarget = float.IsNaN(resolved.x) ? continuityOrigin.x : resolved.x;
@@ -872,7 +972,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
                         activeXDuration = keyframe.Duration;
                         activeXEase = keyframe.Ease;
                     }
-                    if (!float.IsNaN(resolved.y) || keyframe.ModeUsed)
+                    if (!float.IsNaN(resolved.y) || forceAxis)
                     {
                         activeYOrigin = continuityOrigin.y;
                         activeYTarget = float.IsNaN(resolved.y) ? continuityOrigin.y : resolved.y;
@@ -1025,6 +1125,23 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 default:
                     return offset * tileSize;
             }
+        }
+
+        /// <summary>
+        /// 一根通道在某个时刻的实时值；**没有 tween 在跑时回落到携带值**。
+        ///
+        /// `start == NegativeInfinity` 或 `duration &lt;= 0` 表示这个通道
+        /// 还没有被任何事件驱动过，此时 origin/target 都是初始占位值，
+        /// 直接采样会把它当成真实值用。
+        /// </summary>
+        private static float LiveChannelValue(float origin, float target, float start,
+            float duration, Ease ease, float carry, float time)
+        {
+            if (float.IsNegativeInfinity(start) || duration <= 0f || time <= start)
+            {
+                return carry;
+            }
+            return Sample(origin, target, start, duration, ease, time);
         }
 
         private static Vector2 AddPerAxis(Vector2 left, Vector2 right)

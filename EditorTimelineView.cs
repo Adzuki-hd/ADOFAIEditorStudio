@@ -58,6 +58,8 @@ namespace ADOFAIEditorStudio
             // 尺寸由 BindMarker 按当前行高写——ALT+滚轮改行高后
             // 下一帧就跟上。
             internal Image Outline;
+            // 拖动交互。挂在块上，随池复用，所以创建一次就够。
+            internal TimelineBlockDrag Drag;
             internal TimelineItem Item;
         }
 
@@ -66,6 +68,240 @@ namespace ADOFAIEditorStudio
             internal float StartTime;
             internal float EndTime;
             internal TimelineItem Item;
+        }
+
+        /// <summary>
+        /// 事件块的直接操作：左键拖块身改开始时间，瞄准左右边缘拖拽改时长。
+        ///
+        /// 做成 EditorTimelineView 的嵌套类，是为了能直接用
+        /// TimelineMarker / TimelineItem —— 两者都是这个类的私有嵌套类型，
+        /// 放到外面就得把可见性放宽，为了一个交互细节不值得。
+        ///
+        /// **只实现拖动相关的接口，不实现 IPointerDownHandler。**
+        /// marker 身上已经有一个 Button，它的 OnPointerDown 会 eventData.Use()。
+        /// Unity 派发 pointerDown 时，即使父级有处理器也会照常执行
+        /// （ExecuteHierarchy 会在第一个命中对象上把该接口的所有组件跑完），
+        /// 所以加一个自己的 IPointerDownHandler 并不能拦住
+        /// EditorTimelineView.OnPointerDown，只会多一处要协调的状态。
+        /// 而 IBeginDragHandler 是沿父链查找的：marker 自己实现了，
+        /// 视图的 OnBeginDrag 就不会被调用，这正是我们要的切入点。
+        /// </summary>
+        private sealed class TimelineBlockDrag : MonoBehaviour,
+            IPointerMoveHandler, IPointerExitHandler,
+            IBeginDragHandler, IDragHandler, IEndDragHandler
+        {
+            private enum Mode
+            {
+                None,
+                Move,
+                ResizeLeft,
+                ResizeRight
+            }
+
+            /// <summary>边缘多宽算「贴边」，够宽才好瞄准。</summary>
+            private const float EdgeZone = 6f;
+            /// <summary>拖出这个像素数才算拖动，避免点击时手抖被当成拖动。</summary>
+            private const float DragThreshold = 3f;
+
+            private EditorTimelineView view;
+            private TimelineMarker marker;
+
+            private Mode mode = Mode.None;
+            private bool dragging;
+            private Vector2 pressScreen;
+            private float anchorScreenX;
+            private float originalStartTime;
+            private float originalDuration;
+
+            internal void Initialize(EditorTimelineView owner, TimelineMarker target)
+            {
+                view = owner;
+                marker = target;
+            }
+
+            // ---------------------------------------------------------- 指针形状
+
+            public void OnPointerMove(PointerEventData eventData)
+            {
+                if (view == null || marker == null || marker.Item == null || dragging)
+                {
+                    return;
+                }
+
+                bool onLeftEdge;
+                bool onRightEdge;
+                DetectEdges(eventData.position, out onLeftEdge, out onRightEdge);
+                view.ApplyBlockDragCursor(onLeftEdge, onRightEdge);
+            }
+
+            public void OnPointerExit(PointerEventData eventData)
+            {
+                if (!dragging)
+                {
+                    view.RestoreCursor();
+                }
+            }
+
+            // ---------------------------------------------------------- 拖动
+
+            public void OnBeginDrag(PointerEventData eventData)
+            {
+                mode = Mode.None;
+                dragging = false;
+                if (view == null || marker == null || marker.Item == null
+                    || eventData.button != PointerEventData.InputButton.Left)
+                {
+                    return;
+                }
+
+                TimelineItem item = marker.Item;
+                if (item.Event == null)
+                {
+                    return;
+                }
+
+                // 用 pressPosition 判边缘，不用 position：OnPointerMove 不保证
+                // 在 OnBeginDrag 之前跑过，而 pressPosition 一定是按下的那一点。
+                bool onLeftEdge;
+                bool onRightEdge;
+                DetectEdges(eventData.pressPosition, out onLeftEdge, out onRightEdge);
+
+                // 没有时长的事件不给拉长——它只有一个时间点，没有长度可改。
+                if (!view.CanResizeItem(item))
+                {
+                    onLeftEdge = false;
+                    onRightEdge = false;
+                }
+
+                if (onLeftEdge)
+                {
+                    mode = Mode.ResizeLeft;
+                }
+                else if (onRightEdge)
+                {
+                    mode = Mode.ResizeRight;
+                }
+                else
+                {
+                    mode = Mode.Move;
+                }
+
+                pressScreen = eventData.pressPosition;
+                anchorScreenX = eventData.pressPosition.x;
+                originalStartTime = item.StartTime;
+                originalDuration = item.Duration;
+
+                dragging = true;
+                view.BeginBlockDrag(marker, mode != Mode.Move);
+                eventData.Use();
+            }
+
+            public void OnDrag(PointerEventData eventData)
+            {
+                if (!dragging || view == null || marker == null)
+                {
+                    return;
+                }
+
+                // 块可能已经被池回收给别人了（RefreshData 重建了 TimelineItem）。
+                // 这时手上这个 item 是孤儿，继续改它没有意义。
+                if (marker.Item == null)
+                {
+                    Cancel();
+                    return;
+                }
+
+                float deltaX = eventData.position.x - anchorScreenX;
+                if (mode == Mode.Move && Mathf.Abs(deltaX) < DragThreshold)
+                {
+                    return;
+                }
+
+                float deltaTime = deltaX / Mathf.Max(1f, view.pixelsPerSecond);
+
+                switch (mode)
+                {
+                    case Mode.Move:
+                    {
+                        // 拖块身：起点吸附到格边界，时长不变。
+                        float start = view.SnapBlockTime(originalStartTime + deltaTime);
+                        view.PreviewBlockDrag(marker, start, originalDuration);
+                        break;
+                    }
+                    case Mode.ResizeRight:
+                    {
+                        // 右边缘：**不吸附**。吸附是"落到哪一格"这件事，
+                        // 对拉长没有意义——把终点吸到最近的格边界，会让
+                        // 一个短事件的终点吸回它自己起点所在的那条边界，
+                        // 时长恒为 0，块当场塌成最小宽度，看起来就是
+                        // 「拉不动」。长度要的是自由伸缩。
+                        float end = originalStartTime + originalDuration + deltaTime;
+                        view.PreviewBlockDrag(marker, originalStartTime, Mathf.Max(0f, end - originalStartTime));
+                        break;
+                    }
+                    case Mode.ResizeLeft:
+                    {
+                        // 左边缘：同样不吸附。**右端钉住不动**，起点动多少，
+                        // 时长就反向变多少。
+                        float end = originalStartTime + originalDuration;
+                        float start = Mathf.Min(originalStartTime + deltaTime, end);
+                        view.PreviewBlockDrag(marker, start, end - start);
+                        break;
+                    }
+                }
+            }
+
+            public void OnEndDrag(PointerEventData eventData)
+            {
+                if (!dragging)
+                {
+                    return;
+                }
+
+                dragging = false;
+                view.EndBlockDrag(marker, originalStartTime, originalDuration);
+                view.RestoreCursor();
+                eventData.Use();
+            }
+
+            private void Cancel()
+            {
+                dragging = false;
+                mode = Mode.None;
+                if (view != null)
+                {
+                    view.CancelBlockDrag();
+                    view.RestoreCursor();
+                }
+            }
+
+            /// <summary>
+            /// 按按下点落在块内的位置判定是不是瞄准了边缘。
+            /// 用的是「相对块左边缘的像素」，所以块被裁剪（左端滑出视口）时
+            /// 判定依然对——裁剪会一并改掉 rect 的宽度，两边同步偏移。
+            /// </summary>
+            private void DetectEdges(Vector2 screenPosition, out bool onLeftEdge, out bool onRightEdge)
+            {
+                onLeftEdge = false;
+                onRightEdge = false;
+
+                if (marker == null || marker.Rect == null)
+                {
+                    return;
+                }
+
+                Vector2 local;
+                if (!RectTransformUtility.ScreenPointToLocalPointInRectangle(
+                        marker.Rect, screenPosition, null, out local))
+                {
+                    return;
+                }
+
+                float width = marker.Rect.rect.width;
+                float x = local.x + width * marker.Rect.pivot.x;
+                onLeftEdge = x <= EdgeZone;
+                onRightEdge = x >= width - EdgeZone;
+            }
         }
 
         /// <summary>
@@ -277,6 +513,13 @@ namespace ADOFAIEditorStudio
         private RectTransform badgeLayer;
         private RectTransform rulerBackdrop;
         private RectTransform playhead;
+        // 播放头的三个可见子节点。必须自己存着——它们的高度是按
+        // 构建时的 bodyHeight 定死的，而那一帧 root 的尺寸往往还是
+        // 占位值。只改父节点的高度是没用的：父节点自己没有像素，
+        // 线看上去永远停在最初那个偏矮的高度上（表现就是"被切了一半"）。
+        private Image playheadGlow;
+        private Image playheadCore;
+        private Image playheadHandle;
         private TextMeshProUGUI summaryText;
         private TextMeshProUGUI timeText;
         private TextMeshProUGUI zoomText;
@@ -293,9 +536,11 @@ namespace ADOFAIEditorStudio
         private Button layoutModeButton;
         private Button followModeButton;
         private Button selectionFollowButton;
+        private Button snapDragButton;
         private Sprite layoutModeSprite;
         private Sprite followModeSprite;
         private Sprite selectionFollowSprite;
+        private Sprite snapDragSprite;
         private Sprite viewLockSprite;
         // 筛选改成多选：每个车道一个可见标志，而不是一个单选值。
         // 按钮挂在预览面板的工具栏上（见 EditorStudioOverlay.BuildPreview），
@@ -488,6 +733,17 @@ namespace ADOFAIEditorStudio
             if (outlineTexture != null)
             {
                 Destroy(outlineTexture);
+            }
+
+            // 拖动指针交给 Cursor 之后，Unity 不持有它；不在这里销毁
+            // 就是每次重建工作台泄漏一张纹理。它挂在静态字段上，
+            // 所以销毁后要把引用也清掉，否则下次会去用一个已销毁的对象。
+            if (resizeCursorTexture != null)
+            {
+                Cursor.SetCursor(null, Vector2.zero, CursorMode.Auto);
+                Destroy(resizeCursorTexture);
+                resizeCursorTexture = null;
+                cursorIsResize = false;
             }
         }
 
@@ -1141,6 +1397,13 @@ namespace ADOFAIEditorStudio
                 delegate { ToggleSelectionFollow(); ApplySelectionFollowIcon(); });
             ApplySelectionFollowIcon();
 
+            // 拖动事件块时是否吸附到格边界。放在一排开关的最后，
+            // 和上面三个一样是"模式开关"的性质。
+            snapDragButton = CreateButton(
+                "SnapDrag", root, 208f, 7f, 32f, 29f, string.Empty,
+                delegate { ToggleSnapDrag(); });
+            ApplySnapDragIcon();
+
             BuildEventPalette(root);
 
             float controlsX = rootWidth - 76f;
@@ -1295,20 +1558,21 @@ namespace ADOFAIEditorStudio
             //
             // 辉光层是 playhead 的子节点，拖动时整体一起走，不必另外同步位置。
             playhead = CreateRect("Playhead", viewport, 0f, 0f, PlayheadCoreWidth, bodyHeight);
-            Image playheadGlow = CreateImage("PlayheadGlow", playhead,
+            playheadGlow = CreateImage("PlayheadGlow", playhead,
                 -(PlayheadGlowWidth - PlayheadCoreWidth) * 0.5f, 0f,
                 PlayheadGlowWidth, bodyHeight, Color.white);
             playheadGlow.sprite = GetPlayheadGlowSprite();
             playheadGlow.type = Image.Type.Simple;
             playheadGlow.color = PlayheadColor;
             playheadGlow.raycastTarget = false;
-            Image playheadImage = CreateImage("PlayheadCore", playhead,
+            playheadCore = CreateImage("PlayheadCore", playhead,
                 0f, 0f, PlayheadCoreWidth, bodyHeight, PlayheadColor);
-            playheadImage.raycastTarget = false;
+            playheadCore.raycastTarget = false;
             // 顶部的手柄也跟着发光色走。
-            CreateRoundedImage("PlayheadHandle", playhead,
+            playheadHandle = CreateRoundedImage("PlayheadHandle", playhead,
                 -(PlayheadHandleWidth - PlayheadCoreWidth) * 0.5f, 0f,
-                PlayheadHandleWidth, 9f, PlayheadColor).raycastTarget = false;
+                PlayheadHandleWidth, 9f, PlayheadColor);
+            playheadHandle.raycastTarget = false;
 
             Image resizeHandleImage = CreateImage(
                 "ResizeHandle",
@@ -1543,12 +1807,31 @@ namespace ADOFAIEditorStudio
                 Outline = outline
             };
             button.onClick.AddListener(delegate { ActivateMarker(marker); });
+
+            // 拖动交互挂在块自己身上。它不实现 IPointerDownHandler，
+            // 所以不会和上面这个 Button 抢事件，也不会挡住父级视图——
+            // 细节见 TimelineBlockDrag 的注释。
+            marker.Drag = markerObject.AddComponent<TimelineBlockDrag>();
+            marker.Drag.Initialize(this, marker);
+
             markerObject.SetActive(false);
             markerPool.Add(marker);
         }
 
         private void RefreshData(bool force)
         {
+            // 拖动期间绝不能重建 TimelineItem。
+            //
+            // 拖动中的操作对象是 marker.Item，而这个方法会把所有 item
+            // 换成新造的一批，手上的引用当场变成孤儿——后续 OnDrag 改的是
+            // 一个已经不在任何行里的对象，表现为「拖到一半块就不动了」。
+            // 松手提交后 dataFingerprint 会变，紧接着的那次轮询
+            // 自然会重建，所以这里直接跳过不会漏掉刷新。
+            if (blockDragActive && !force)
+            {
+                return;
+            }
+
             scnEditor editor = scnEditor.instance;
             int fingerprint = ComputeDataFingerprint(editor);
             if (!force && dataFingerprintValid && fingerprint == dataFingerprint)
@@ -3054,6 +3337,542 @@ namespace ADOFAIEditorStudio
         }
 
 
+        // ---------------------------------------------------------------- 块拖动
+        //
+        // 拖动分两段：拖的时候只改内存里的 TimelineItem（视觉上块跟着橡皮筋
+        // 走），松手时才算一次真实编辑——写回 angleOffset / duration / floor，
+        // 记一步撤销，并重排布局。
+        //
+        // 为什么拖动中不写数据：RefreshData 每 0.5 秒轮询一次，而它的指纹
+        // 已经把 angleOffset 和 duration 算进去了。拖动中一旦写数据，
+        // 下一次轮询就会重建 TimelineItem，把手上这个 marker.Item 变成孤儿，
+        // 后续 OnDrag 改的就是一个没人看的对象。
+        //
+        // 为什么拖动中不置 layoutDirty：RebuildDynamicRows 是贪心装箱，
+        // 途中重排会让块在手指底下跳行。只让它在原行内伸缩，松手再整理。
+
+        private bool blockDragActive;
+
+        // 拖动开始时的原始值，松手时用来做「有没有真的改动」的判断
+        // 和撤销的 old 值。
+        private int blockDragOriginalFloor;
+        private float blockDragOriginalAngleOffset;
+        private float blockDragOriginalDuration;
+        private bool blockDragHadDuration;
+
+        /// <summary>没有时长的事件不给拉长：它只有一个时间点，没有长度可改。</summary>
+        private bool CanResizeItem(TimelineItem item)
+        {
+            if (item == null || item.Event == null || item.Event.info == null)
+            {
+                return false;
+            }
+
+            // 事件必须声明了 duration 这个属性。往未声明的键上写值，
+            // 游戏的解析器可能直接忽略，用户会看到「拖了但没反应」。
+            Dictionary<string, ADOFAI.PropertyInfo> properties = item.Event.info.propertiesInfo;
+            return properties != null && properties.ContainsKey("duration");
+        }
+
+        private void BeginBlockDrag(TimelineMarker marker, bool resizing)
+        {
+            TimelineItem item = marker == null ? null : marker.Item;
+            if (item == null || item.Event == null)
+            {
+                return;
+            }
+
+            blockDragActive = true;
+            blockDragOriginalFloor = item.FloorId;
+            blockDragOriginalAngleOffset = GetEnabledFloat(item.Event, "angleOffset");
+            blockDragOriginalDuration = GetEnabledFloat(item.Event, "duration");
+            blockDragHadDuration = CanResizeItem(item);
+
+            // 拖动期间必须让 RefreshData 站住：它会重建 TimelineItem，
+            // 而重建之后手上这个引用就指着孤儿了。
+            if (Main.Settings != null && Main.Settings.VerboseDiagnostics)
+            {
+                Main.Logger.Log("[TimelineDrag] begin " + item.Name
+                    + " mode=" + (resizing ? "resize" : "move")
+                    + " floor=" + item.FloorId
+                    + " start=" + item.StartTime.ToString("0.000")
+                    + " dur=" + item.Duration.ToString("0.000"));
+            }
+        }
+
+        /// <summary>
+        /// 拖动中的视觉预览。只改内存里的 TimelineItem，不碰谱面数据。
+        /// </summary>
+        private void PreviewBlockDrag(TimelineMarker marker, float startTime, float duration)
+        {
+            TimelineItem item = marker == null ? null : marker.Item;
+            if (item == null)
+            {
+                return;
+            }
+
+            float newStart = Mathf.Max(0f, startTime);
+            float newDuration = Mathf.Max(0f, duration);
+
+            item.StartTime = newStart;
+            item.Duration = newDuration;
+
+            // visualsDirty 会在下一帧走 RefreshGeometry 重新摆这一块，
+            // 但不碰 layoutRows，所以它留在原来的行里。
+            visualsDirty = true;
+            UpdateSummary();
+        }
+
+        /// <summary>
+        /// 松手：把拖动结果转换成一次真实编辑并提交。
+        /// </summary>
+        private void EndBlockDrag(TimelineMarker marker, float originalStart, float originalDuration)
+        {
+            if (!blockDragActive)
+            {
+                return;
+            }
+            blockDragActive = false;
+
+            TimelineItem item = marker == null ? null : marker.Item;
+            scnEditor editor = scnEditor.instance;
+            if (item == null || item.Event == null || editor == null
+                || editor.floors == null || editor.floors.Count == 0)
+            {
+                visualsDirty = true;
+                return;
+            }
+
+            float finalStart = item.StartTime;
+            float finalDuration = blockDragHadDuration
+                ? Mathf.Max(0f, item.Duration)
+                : blockDragOriginalDuration;
+
+            // 先还原成原值：下面的 CommitBlockDrag 要用真实的 old 值
+            // 和它比较来决定记不记这一步撤销，而 item 上现在挂着的
+            // 还是拖动中的中间值。最终值已经存在 finalStart / finalDuration 里。
+            item.StartTime = originalStart;
+            item.Duration = originalDuration;
+
+            CommitBlockDrag(editor, item, finalStart, finalDuration);
+        }
+
+        /// <summary>拖动被中断（块被回收等），丢弃这次操作。</summary>
+        private void CancelBlockDrag()
+        {
+            blockDragActive = false;
+            visualsDirty = true;
+        }
+
+        private void CommitBlockDrag(
+            scnEditor editor,
+            TimelineItem item,
+            float finalStart,
+            float finalDuration)
+        {
+            LevelEvent levelEvent = item.Event;
+            if (levelEvent == null || !IsEventStillLive(editor, levelEvent))
+            {
+                visualsDirty = true;
+                return;
+            }
+
+            // 反解出新的 floor 与 angleOffset。
+            int newFloor;
+            float newAngleOffset;
+            ResolveFloorAndAngleOffset(editor, levelEvent, finalStart, out newFloor, out newAngleOffset);
+
+            int oldFloor = blockDragOriginalFloor;
+            float oldAngleOffset = blockDragOriginalAngleOffset;
+
+            bool floorChanged = newFloor != oldFloor;
+            bool angleChanged = !Mathf.Approximately(newAngleOffset, oldAngleOffset);
+
+            float newDurationValue = blockDragHadDuration
+                ? ConvertDurationToData(editor, newFloor, finalDuration)
+                : blockDragOriginalDuration;
+            bool durationChanged = blockDragHadDuration
+                && !Mathf.Approximately(newDurationValue, blockDragOriginalDuration);
+
+            if (!floorChanged && !angleChanged && !durationChanged)
+            {
+                // 原地按下去又原样放开，不占一步撤销。
+                visualsDirty = true;
+                layoutDirty = true;
+                return;
+            }
+
+            var keys = new List<string>(3);
+            var oldValues = new List<object>(3);
+            var newValues = new List<object>(3);
+            var oldDisabled = new List<bool>(3);
+            var newDisabled = new List<bool>(3);
+
+            AddKey(levelEvent, "floor", keys, oldValues, newValues, oldDisabled, newDisabled,
+                oldFloor, newFloor, floorChanged);
+            AddKey(levelEvent, "angleOffset", keys, oldValues, newValues, oldDisabled, newDisabled,
+                oldAngleOffset, newAngleOffset, angleChanged);
+
+            if (blockDragHadDuration)
+            {
+                AddKey(levelEvent, "duration", keys, oldValues, newValues, oldDisabled, newDisabled,
+                    blockDragOriginalDuration, newDurationValue, durationChanged);
+            }
+
+            for (int i = 0; i < keys.Count; i++)
+            {
+                string key = keys[i];
+                if (string.Equals(key, "floor", StringComparison.Ordinal))
+                {
+                    levelEvent.floor = Convert.ToInt32(newValues[i]);
+                }
+                else
+                {
+                    levelEvent[key] = newValues[i];
+                }
+
+                // 属性被 disable 时读取一律按 0 算（GetEnabledFloat）。
+                // 不清掉的话，刚写进去的值会被当成没写，块瞬间跳回格首。
+                if (levelEvent.disabled != null && levelEvent.disabled.ContainsKey(key))
+                {
+                    levelEvent.disabled[key] = false;
+                    newDisabled[i] = false;
+                }
+            }
+
+            if (levelEvent.info != null && levelEvent.info.isDecoration)
+            {
+                editor.UpdateDecorationObject(levelEvent);
+            }
+
+            // 写完之后才把 item 同步到**落点**的等价时间。
+            //
+            // 不能直接沿用 finalStart：它和写进 floor/angleOffset 再读回来的
+            // 时间会差一点点（角度有 360 度取整）。用读数回填，块和参数栏
+            // 的数值就严丝合缝，不会出现"块在这个位置、参数栏写另一个值"。
+            //
+            // 这一步必须在置 layoutDirty 之前：重排是拿 item.StartTime
+            // 装箱的，用还原后的旧值排，块会先跳回旧位置待半秒，
+            // 等下一轮轮询才纠正。
+            item.FloorId = newFloor;
+            item.StartTime = GetEventStartTime(editor, levelEvent);
+            item.Duration = GetEventDuration(editor, levelEvent);
+
+            EditorPlaybackBridge.RequestEvaluatorRebuild("timeline-drag");
+            EditorCommandHistory.RecordBlockDrag(
+                editor,
+                levelEvent,
+                keys.ToArray(),
+                oldValues.ToArray(),
+                newValues.ToArray(),
+                oldDisabled.ToArray(),
+                newDisabled.ToArray());
+
+            // 松手才重排：拖动中不排，否则块会在手指底下跳行。
+            layoutDirty = true;
+            visualsDirty = true;
+            UpdateSummary();
+
+            if (Main.Settings != null && Main.Settings.VerboseDiagnostics)
+            {
+                Main.Logger.Log("[TimelineDrag] commit " + item.Name
+                    + " floor " + oldFloor + "->" + newFloor
+                    + " angle " + oldAngleOffset.ToString("0.###") + "->" + newAngleOffset.ToString("0.###")
+                    + (blockDragHadDuration
+                        ? " dur " + blockDragOriginalDuration.ToString("0.###") + "->" + newDurationValue.ToString("0.###")
+                        : ""));
+            }
+        }
+
+        private static void AddKey(
+            LevelEvent levelEvent,
+            string key,
+            List<string> keys,
+            List<object> oldValues,
+            List<object> newValues,
+            List<bool> oldDisabled,
+            List<bool> newDisabled,
+            object oldValue,
+            object newValue,
+            bool changed)
+        {
+            if (!changed)
+            {
+                return;
+            }
+
+            keys.Add(key);
+            oldValues.Add(oldValue);
+            newValues.Add(newValue);
+            oldDisabled.Add(IsDisabledKey(levelEvent, key));
+            // 这里写 false 是有意的：提交时会把 disabled 清掉，
+            // 所以重做之后它也应该是不禁用的状态。
+            newDisabled.Add(false);
+        }
+
+        private static bool IsDisabledKey(LevelEvent levelEvent, string key)
+        {
+            bool disabled;
+            return levelEvent.disabled != null
+                && levelEvent.disabled.TryGetValue(key, out disabled)
+                && disabled;
+        }
+
+        /// <summary>
+        /// 把一个绝对时间反解成「哪一格 + 格内角度偏移」。
+        ///
+        /// 这是 <see cref="GetEventStartTime"/> 的逆运算，必须和它保持
+        /// 同一套公式（同一份 bpm、同一套 entryTime），否则拖完松手
+        /// 块会轻微跳一下——反解出来的值再正着算一遍对不上原时间。
+        ///
+        /// 跨格是允许的：目标时间落到哪一格，事件就挂到哪一格上，
+        /// 这也是「拖到另一格」这个操作的实现方式。
+        /// </summary>
+        private static void ResolveFloorAndAngleOffset(
+            scnEditor editor, LevelEvent levelEvent, float time, out int floorId, out float angleOffset)
+        {
+            int last = editor.floors.Count - 1;
+            floorId = Mathf.Clamp(levelEvent.floor, 0, last);
+
+            // 先确定落在哪一格：格的进入时间单调递增，二分即可。
+            int low = 0;
+            int high = editor.floors.Count;
+            while (low < high)
+            {
+                int middle = low + (high - low) / 2;
+                if (Convert.ToSingle(editor.floors[middle].entryTime) <= time)
+                {
+                    low = middle + 1;
+                }
+                else
+                {
+                    high = middle;
+                }
+            }
+            floorId = Mathf.Clamp(low - 1, 0, last);
+
+            scrFloor floor = editor.floors[floorId];
+            float bpm = Mathf.Max(0.001f, editor.levelData.bpm * floor.speed);
+            float secondsIntoFloor = time - Convert.ToSingle(floor.entryTime);
+            angleOffset = secondsIntoFloor * bpm * 180f / 60f;
+
+            // 角度是周期量：一格最多转 360 度。夹进 [0, 360) 免得写出
+            // 一个越界的值（游戏能读，但和原生编辑器里显示的对不上）。
+            angleOffset = Mathf.Repeat(angleOffset, 360f);
+        }
+
+        /// <summary>把一个时长（秒）反解成 duration 字段的值（拍）。</summary>
+        private static float ConvertDurationToData(scnEditor editor, int floorId, float seconds)
+        {
+            if (seconds <= 0f)
+            {
+                return 0f;
+            }
+            int clamped = Mathf.Clamp(floorId, 0, editor.floors.Count - 1);
+            scrFloor floor = editor.floors[clamped];
+            float bpm = Mathf.Max(0.001f, editor.levelData.bpm * floor.speed);
+            return Mathf.Max(0f, seconds * bpm / 60f);
+        }
+
+        /// <summary>
+        /// 吸附：把时间对到**最近的格的边界**上。
+        ///
+        /// 不是对"以 t=0 为原点的拍网格"取整。这两者只有在每格都是
+        /// 180 度、且中途没有变速时才恰好重合——360 度的格、SetSpeed
+        /// 都会让拍网格和真实格边界错开。用户看的是时间轴上那些
+        /// 格子线和格号刻度，所以吸附必须对着它们来。
+        ///
+        /// 做法：二分找出前后相邻的两格，看目标时间离哪一格的进入
+        /// 时刻更近。这与 PACL2 的 GetFloorNumberTimeSec 是同一思路
+        /// （它对 FloorsTime 做二分取格号），区别只是我们同时看
+        /// 左右两边，好判断"更近的是哪边"。
+        /// </summary>
+        private float SnapBlockTime(float time)
+        {
+            if (!SnapDragEnabled)
+            {
+                return Mathf.Max(0f, time);
+            }
+
+            scnEditor editor = scnEditor.instance;
+            if (editor == null || editor.floors == null || editor.floors.Count == 0)
+            {
+                return Mathf.Max(0f, time);
+            }
+
+            List<scrFloor> floors = editor.floors;
+            int index = LowerBoundFloors(floors, time);
+            if (index <= 0)
+            {
+                return 0f;
+            }
+            if (index >= floors.Count)
+            {
+                // 拖到末格之后：吸附到最后一个格边界，不让事件掉出谱面。
+                return Convert.ToSingle(floors[floors.Count - 1].entryTime);
+            }
+
+            float before = Convert.ToSingle(floors[index - 1].entryTime);
+            float after = Convert.ToSingle(floors[index].entryTime);
+            return (time - before) <= (after - time) ? before : after;
+        }
+
+        /// <summary>吸附开关：设置项，拖的时候按住 Alt 临时反转。</summary>
+        private bool SnapDragEnabled
+        {
+            get
+            {
+                bool snap = Main.Settings == null || Main.Settings.SnapTimelineDrag;
+                if (IsAltHeld())
+                {
+                    return !snap;
+                }
+                return snap;
+            }
+        }
+
+        private static bool IsAltHeld()
+        {
+            return Input.GetKey(KeyCode.LeftAlt) || Input.GetKey(KeyCode.RightAlt);
+        }
+
+        // ---------------------------------------------------------- 拖动指针
+
+        private static Texture2D resizeCursorTexture;
+
+        /// <summary>
+        /// 左右箭头指针。Unity 没有内置的 resize 指针，
+        /// 而 Cursor.SetCursor 只吃自定义 Texture2D，所以自己画一张。
+        ///
+        /// 画成左右两个三角 + 中间一根横杠，边缘做一像素羽化——
+        /// 硬边的斜线在大屏上锯齿很明显。
+        /// </summary>
+        internal static Texture2D GetResizeCursorTexture()
+        {
+            if (resizeCursorTexture != null)
+            {
+                return resizeCursorTexture;
+            }
+
+            const int size = 24;
+            const float halfStroke = 1.6f;
+            var pixels = new Color32[size * size];
+            var clear = new Color32(0, 0, 0, 0);
+
+            float mid = size * 0.5f;
+            for (int y = 0; y < size; y++)
+            {
+                for (int x = 0; x < size; x++)
+                {
+                    float px = x + 0.5f;
+                    float py = y + 0.5f;
+
+                    // 中间那根横杠。
+                    float bar = Mathf.Max(
+                        Mathf.Abs(py - mid) - 1.1f,
+                        Mathf.Abs(px - mid) - (size * 0.22f));
+                    float barAlpha = Mathf.Clamp01(0.5f - bar);
+
+                    // 左右两个箭头（三角形），用「点到三段线段的距离」描边，
+                    // 这样和项目里其它自绘图标是同一套画法。
+                    float left = DistanceToSegment(px, py, 2.5f, mid, 8f, mid - 5.5f);
+                    left = Mathf.Min(left, DistanceToSegment(px, py, 2.5f, mid, 8f, mid + 5.5f));
+                    left = Mathf.Min(left, DistanceToSegment(px, py, 2.5f, mid, 8f, mid));
+
+                    float right = DistanceToSegment(px, py, size - 2.5f, mid, size - 8f, mid - 5.5f);
+                    right = Mathf.Min(right, DistanceToSegment(px, py, size - 2.5f, mid, size - 8f, mid + 5.5f));
+                    right = Mathf.Min(right, DistanceToSegment(px, py, size - 2.5f, mid, size - 8f, mid));
+
+                    float alpha = Mathf.Max(barAlpha, Mathf.Clamp01(halfStroke - Mathf.Min(left, right) + 0.5f));
+                    if (alpha <= 0f)
+                    {
+                        pixels[y * size + x] = clear;
+                        continue;
+                    }
+
+                    // 深色描边 + 白色主体：指针会落在浅色的事件块上，
+                    // 纯白的箭头在白块上会看不见。
+                    pixels[y * size + x] = new Color32(255, 255, 255, (byte)Mathf.RoundToInt(alpha * 255f));
+                }
+            }
+
+            resizeCursorTexture = new Texture2D(size, size, TextureFormat.RGBA32, false)
+            {
+                filterMode = FilterMode.Bilinear,
+                wrapMode = TextureWrapMode.Clamp,
+                hideFlags = HideFlags.HideAndDontSave
+            };
+            resizeCursorTexture.SetPixels32(pixels);
+            resizeCursorTexture.Apply(false, true);
+            return resizeCursorTexture;
+        }
+
+        private bool cursorIsResize;
+
+        /// <summary>鼠标悬停在块的左/右边缘时切换成左右箭头。</summary>
+        private void ApplyBlockDragCursor(bool onLeftEdge, bool onRightEdge)
+        {
+            bool wantResize = onLeftEdge || onRightEdge;
+            if (wantResize == cursorIsResize)
+            {
+                return;
+            }
+            if (wantResize)
+            {
+                Texture2D texture = GetResizeCursorTexture();
+                if (texture != null)
+                {
+                    Cursor.SetCursor(texture, new Vector2(texture.width * 0.5f, texture.height * 0.5f),
+                        CursorMode.Auto);
+                    cursorIsResize = true;
+                }
+            }
+            else
+            {
+                RestoreCursor();
+            }
+        }
+
+        private void RestoreCursor()
+        {
+            if (!cursorIsResize)
+            {
+                return;
+            }
+            cursorIsResize = false;
+            Cursor.SetCursor(null, Vector2.zero, CursorMode.Auto);
+        }
+
+        /// <summary>事件还在编辑器的事件表里。原生撤销会整体换掉数据，旧引用会失效。</summary>
+        private static bool IsEventStillLive(scnEditor editor, LevelEvent levelEvent)
+        {
+            if (editor == null || levelEvent == null)
+            {
+                return false;
+            }
+            if (editor.events != null)
+            {
+                for (int i = 0; i < editor.events.Count; i++)
+                {
+                    if (ReferenceEquals(editor.events[i], levelEvent))
+                    {
+                        return true;
+                    }
+                }
+            }
+            if (editor.decorations != null)
+            {
+                for (int i = 0; i < editor.decorations.Count; i++)
+                {
+                    if (ReferenceEquals(editor.decorations[i], levelEvent))
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
         private float GetItemPixelWidth(TimelineItem item)
         {
             float durationWidth = item.Duration > 0.001f
@@ -3186,6 +4005,42 @@ namespace ADOFAIEditorStudio
         }
 
 
+        /// <summary>
+        /// 把播放头的三个可见子节点拉满当前的内容高度。
+        ///
+        /// 它们是构建时按当时的 bodyHeight 建的，而那一帧 root 的尺寸
+        /// 往往还不是最终值（面板刚建出来），所以启动后线会一直停在
+        /// 那个偏矮的高度上，看着像被切掉一截。父节点每帧都在改尺寸，
+        /// 但父节点自己没有像素——真正要改的是这三层。
+        ///
+        /// 横向偏移和纵向起点都沿用构建时的取值（起点 0，也就是从
+        /// 视口最顶端、标尺之上开始），这里只更新高度。
+        /// </summary>
+        private void SyncPlayheadHeight()
+        {
+            if (playhead == null)
+            {
+                return;
+            }
+
+            if (playheadGlow != null)
+            {
+                SetTopLeft(playheadGlow.rectTransform,
+                    -(PlayheadGlowWidth - PlayheadCoreWidth) * 0.5f, 0f,
+                    PlayheadGlowWidth, bodyHeight);
+            }
+            if (playheadCore != null)
+            {
+                SetTopLeft(playheadCore.rectTransform, 0f, 0f, PlayheadCoreWidth, bodyHeight);
+            }
+            if (playheadHandle != null)
+            {
+                SetTopLeft(playheadHandle.rectTransform,
+                    -(PlayheadHandleWidth - PlayheadCoreWidth) * 0.5f, 0f,
+                    PlayheadHandleWidth, 9f);
+            }
+        }
+
         private void UpdatePlayhead(EditorPlaybackSnapshot snapshot)
         {
             float current = Mathf.Max(0f, snapshot.CurrentTime);
@@ -3195,6 +4050,7 @@ namespace ADOFAIEditorStudio
             if (inside)
             {
                 SetTopLeft(playhead, x, 0f, 2f, bodyHeight);
+                SyncPlayheadHeight();
             }
             timeText.text = FormatTime(current) + " / " + FormatTime(Mathf.Max(totalDuration, snapshot.Duration, current));
         }
@@ -4401,6 +5257,152 @@ namespace ADOFAIEditorStudio
 
             Main.Settings.FollowSelectionOnClick = !Main.Settings.FollowSelectionOnClick;
             Main.SaveSettings();
+        }
+
+        /// <summary>
+        /// 吸附开关的图标：两块一样大的圆角方块中间夹一条对齐线。
+        ///
+        /// 开：两块**吸在一起**，中间那条线正好落在它们的接缝上，方块染强调色。
+        /// 关：两块**分开**，中间留出明显的缝。
+        /// 两态的差别是"缝的有无"，比换个符号更容易一眼认出来。
+        /// </summary>
+        private static Sprite CreateSnapDragSprite(bool on)
+        {
+            const int w = 32;
+            const int h = 28;
+            var tex = new Texture2D(w, h, TextureFormat.RGBA32, false, true);
+            var px = new Color32[w * h];
+
+            const float cx = 16f;
+            const float cy = 14f;
+
+            void FillRoundedRect(float left, float top, float right, float bottom, float radius)
+            {
+                for (int y = 0; y < h; y++)
+                {
+                    for (int x = 0; x < w; x++)
+                    {
+                        float pxc = x + 0.5f;
+                        float pyc = y + 0.5f;
+                        // 到圆角矩形边界的距离：把采样点夹进"核心矩形"
+                        // 之后剩下的偏移，就是到最近圆角中心的距离。
+                        float qx = Mathf.Clamp(pxc, left + radius, right - radius);
+                        float qy = Mathf.Clamp(pyc, top + radius, bottom - radius);
+                        float dx = pxc - qx;
+                        float dy = pyc - qy;
+                        float a = Mathf.Clamp01(radius + 0.5f - Mathf.Sqrt(dx * dx + dy * dy));
+                        if (a <= 0f)
+                        {
+                            continue;
+                        }
+                        int o = y * w + x;
+                        byte v = (byte)Mathf.RoundToInt(a * 255f);
+                        if (v > px[o].a)
+                        {
+                            px[o] = new Color32(255, 255, 255, v);
+                        }
+                    }
+                }
+            }
+
+            void FillDisc(float cx0, float cy0, float radius)
+            {
+                for (int y = 0; y < h; y++)
+                {
+                    for (int x = 0; x < w; x++)
+                    {
+                        float dx = x + 0.5f - cx0;
+                        float dy = y + 0.5f - cy0;
+                        float a = Mathf.Clamp01(radius + 0.5f - Mathf.Sqrt(dx * dx + dy * dy));
+                        if (a <= 0f)
+                        {
+                            continue;
+                        }
+                        int o = y * w + x;
+                        byte v = (byte)Mathf.RoundToInt(a * 255f);
+                        if (v > px[o].a)
+                        {
+                            px[o] = new Color32(255, 255, 255, v);
+                        }
+                    }
+                }
+            }
+
+            // 两块方块。开态两块贴在一起（缝隙 1px，视觉上就是一条接缝线），
+            // 关态拉开 7px。方块本身够大够圆，缩到 18px 显示时不会糊成一坨。
+            const float gapOpen = 1.5f;
+            const float gapClosed = 7f;
+            float gap = on ? gapOpen : gapClosed;
+            const float boxW = 8.5f;
+            const float boxH = 15f;
+
+            FillRoundedRect(cx - gap - boxW, cy - boxH * 0.5f, cx - gap, cy + boxH * 0.5f, 2.6f);
+            FillRoundedRect(cx + gap, cy - boxH * 0.5f, cx + gap + boxW, cy + boxH * 0.5f, 2.6f);
+
+            // 对齐线。开态它落在接缝上（就是那条缝本身），关态则穿在两块
+            // 中间的空隙里——两种情况下它都在"本该吸合的位置"，所以
+            // 用户看的是方块有没有贴上去。
+            FillDisc(cx, cy, 1.7f);
+            FillRoundedRect(cx - 0.9f, 2f, cx + 0.9f, cy - 3f, 0.9f);
+            FillRoundedRect(cx - 0.9f, cy + 3f, cx + 0.9f, h - 2f, 0.9f);
+
+            tex.SetPixels32(px);
+            tex.Apply(false, true);
+            Sprite sprite = Sprite.Create(
+                tex,
+                new Rect(0f, 0f, w, h),
+                new Vector2(0.5f, 0.5f),
+                100f,
+                0,
+                SpriteMeshType.FullRect);
+            sprite.hideFlags = HideFlags.HideAndDontSave;
+            return sprite;
+        }
+
+        private void ApplySnapDragIcon()
+        {
+            if (snapDragButton == null)
+            {
+                return;
+            }
+            TextMeshProUGUI label = snapDragButton.GetComponentInChildren<TextMeshProUGUI>();
+            if (label != null)
+            {
+                label.text = string.Empty;
+            }
+            Transform existing = snapDragButton.transform.Find("SnapDragIcon");
+            if (existing != null)
+            {
+                UnityEngine.Object.Destroy(existing.gameObject);
+            }
+            if (snapDragSprite != null)
+            {
+                UnityEngine.Object.Destroy(snapDragSprite);
+            }
+
+            bool on = Main.Settings == null || Main.Settings.SnapTimelineDrag;
+            snapDragSprite = CreateSnapDragSprite(on);
+            Image icon = CreateImage("SnapDragIcon", snapDragButton.GetComponent<RectTransform>(),
+                5f, 6f, 18f, 16f, on ? Palette.Accent : TextMuted);
+            icon.sprite = snapDragSprite;
+            icon.raycastTarget = false;
+        }
+
+        private void ToggleSnapDrag()
+        {
+            if (Main.Settings == null)
+            {
+                return;
+            }
+            Main.Settings.SnapTimelineDrag = !Main.Settings.SnapTimelineDrag;
+            ApplySnapDragIcon();
+            // 时间轴自己没有状态栏，摘要列每秒都会被 UpdateSummary 覆写，
+            // 所以借工作台页眉那行读数报一下开关状态。
+            if (owner != null)
+            {
+                owner.SetSceneSelectionStatus(
+                    Main.Settings.SnapTimelineDrag ? "拖动吸附：开" : "拖动吸附：关");
+            }
         }
 
         private void ApplySelectionFollowIcon()

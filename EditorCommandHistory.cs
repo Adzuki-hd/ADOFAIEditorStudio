@@ -246,8 +246,93 @@ namespace ADOFAIEditorStudio
             }
         }
 
-        // ---------------------------------------------------------------- 栈
+        /// <summary>
+        /// 一次改动同时写多个键。
+        ///
+        /// 时间轴上拖一个事件块会同时动两样东西：把块往前挪会改 `floor`
+        /// 和 `angleOffset`（时间由这两者共同决定），拉长会改 `duration`。
+        /// 这些必须算**一步**撤销——否则用户按一次 Ctrl+Z 只退回一半，
+        /// 块落到一个从没出现过的中间状态上。
+        /// </summary>
+        private sealed class MultiPropertyEditCommand : ICommand
+        {
+            internal scnEditor Editor;
+            internal LevelEvent Target;
+            internal string[] Keys;
+            internal object[] OldValues;
+            internal object[] NewValues;
+            internal bool[] OldDisabled;
+            internal bool[] NewDisabled;
 
+            public string Description
+            {
+                get { return Keys == null || Keys.Length == 0 ? "修改事件" : "修改 " + string.Join(" / ", Keys); }
+            }
+
+            public bool Undo()
+            {
+                return Apply(OldValues, OldDisabled);
+            }
+
+            public bool Redo()
+            {
+                return Apply(NewValues, NewDisabled);
+            }
+
+            private bool Apply(object[] values, bool[] disabled)
+            {
+                if (Editor == null || Target == null || Keys == null
+                    || values == null || Keys.Length != values.Length)
+                {
+                    return false;
+                }
+
+                try
+                {
+                    for (int i = 0; i < Keys.Length; i++)
+                    {
+                        string key = Keys[i];
+                        if (string.IsNullOrEmpty(key))
+                        {
+                            continue;
+                        }
+
+                        // floor 不是 data 字典里的键，它是 LevelEvent 的字段
+                        // （见 EditorPropertyPanel.BuildFloor）。走索引器写它
+                        // 会往 data 里塞一个没人读的副本，格子其实没动。
+                        if (string.Equals(key, "floor", StringComparison.Ordinal))
+                        {
+                            Target.floor = Convert.ToInt32(values[i]);
+                            continue;
+                        }
+
+                        Target[key] = values[i];
+                        if (disabled != null && i < disabled.Length
+                            && Target.disabled != null && Target.disabled.ContainsKey(key))
+                        {
+                            Target.disabled[key] = disabled[i];
+                        }
+                    }
+
+                    // 与面板编辑后执行的刷新相同：重跑 Setup，让实时
+                    // 装饰物读到该值，再重建，让预览据此重新播种基线。
+                    if (Target.info != null && Target.info.isDecoration)
+                    {
+                        Editor.UpdateDecorationObject(Target);
+                    }
+                    EditorPlaybackBridge.RequestEvaluatorRebuild("command-history");
+                }
+                catch (Exception exception)
+                {
+                    ReportFailure("apply", Description, exception);
+                    return false;
+                }
+
+                return true;
+            }
+        }
+
+        // ---------------------------------------------------------------- 栈
         private static readonly List<ICommand> undoStack = new List<ICommand>();
         private static readonly List<ICommand> redoStack = new List<ICommand>();
 
@@ -334,6 +419,59 @@ namespace ADOFAIEditorStudio
                 Key = key,
                 OldValue = oldValue,
                 NewValue = newValue,
+                OldDisabled = oldDisabled,
+                NewDisabled = newDisabled
+            });
+        }
+
+        /// <summary>
+        /// 记录一次时间轴拖动。新旧值全部相同时不记录——用户按下去
+        /// 又原样放开，不该占一步撤销。
+        /// </summary>
+        internal static void RecordBlockDrag(
+            scnEditor editor,
+            LevelEvent target,
+            string[] keys,
+            object[] oldValues,
+            object[] newValues,
+            bool[] oldDisabled,
+            bool[] newDisabled)
+        {
+            if (target == null || keys == null || keys.Length == 0
+                || oldValues == null || newValues == null
+                || oldValues.Length != keys.Length || newValues.Length != keys.Length)
+            {
+                return;
+            }
+
+            bool changed = false;
+            for (int i = 0; i < keys.Length; i++)
+            {
+                if (!Equals(oldValues[i], newValues[i]))
+                {
+                    changed = true;
+                    break;
+                }
+                if (oldDisabled != null && newDisabled != null
+                    && i < oldDisabled.Length && i < newDisabled.Length
+                    && oldDisabled[i] != newDisabled[i])
+                {
+                    changed = true;
+                    break;
+                }
+            }
+            if (!changed)
+            {
+                return;
+            }
+
+            Record(new MultiPropertyEditCommand
+            {
+                Editor = editor,
+                Target = target,
+                Keys = keys,
+                OldValues = oldValues,
+                NewValues = newValues,
                 OldDisabled = oldDisabled,
                 NewDisabled = newDisabled
             });

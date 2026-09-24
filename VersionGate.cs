@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Collections.Generic;
 using System.Net;
 using System.Text;
 using System.Threading;
@@ -13,8 +14,21 @@ namespace ADOFAIEditorStudio
     /// <summary>
     /// 启动时的版本闸门与自动更新。
     ///
-    /// 流程：查清单 → 低于 min 就下载新版 zip → 覆盖 mod 目录 → 重启游戏。
-    /// 用户全程不用做任何事，重启后就是新版。
+    /// 流程：查清单 → 低于 min 就下载新版 zip → 覆盖 mod 目录 →
+    /// **提示用户关闭并重新打开游戏**。
+    ///
+    /// **为什么最后一步不自动重启。** 试过五种重启方式，全都在真实场景
+    /// 里失败：`Application.OpenURL("steam://...")` 会阻塞十几秒；
+    /// `cmd /c timeout &amp; start` 里的 `timeout` 遇到重定向 stdin 直接报错
+    /// 退出（延迟等于没有）；`steam://launch` 起的实例会卡在 shader warmup；
+    /// 直接 `Process.Start` 则旧实例还没退完就起了新的。
+    /// 而**由游戏进程派生的任何助手**在真实流程里都会起出一个卡住的实例
+    /// （`winhttp` 装了但 UMM 不被调用），同样的脚本手工跑却一切正常——
+    /// 这条差异我始终没能在本地复现，所以不再赌它。
+    ///
+    /// 安装本身是可靠的（每次都能把版本号换掉），不可靠的只是"重启"这一步。
+    /// 于是把它去掉：装完写一条日志，让用户自己重开。强制更新的语义不变
+    /// ——不更新照样不让用——只是最后一步交给用户。
     ///
     /// 为什么能热替换正在运行的 dll：UMM 启动时先把 .dll 复制成
     /// .dll.&lt;PID&gt;.cache 再加载副本，所以磁盘上那个 .dll 全程没被锁。
@@ -76,12 +90,19 @@ namespace ADOFAIEditorStudio
 
         private const int TimeoutMs = 15000;
 
-        // 「这次重启是更新引起的」标记。存在 PlayerPrefs 里，
-        // 新进程起来能读到。
-        //
-        // 没有它的话，一旦清单写错（比如 min 比实际发出去的包还高），
-        // 每次启动都会下载、替换、重启 —— 无限循环，用户再也进不去。
-        private const string RestartFlagKey = "ADOFAIEditorStudio_UpdatedRestart";
+        /// <summary>
+        /// 上一次**成功装成**的版本号。
+        ///
+        /// 这里原来是一个「本次启动是重启来的」布尔标志，装完置上、
+        /// 下次启动无条件跳过整个检查。那样有个实际问题：**一次启动
+        /// 只能升一级**——用户升到 0.9.5 之后，我们在服务器上发了
+        /// 0.9.6，但那次启动已经把检查跳过了，必须再手动重启一次才看得到。
+        ///
+        /// 换成记录「装过哪个版本」，判断的是「清单要的这个版本我是不是
+        /// 已经装过了」。防无限重启的效果一样（装完版本号没变说明这个包
+        /// 有问题，不再重试），但每次启动都会正常检查。
+        /// </summary>
+        private const string LastInstalledKey = "ADOFAIEditorStudio_LastInstalled";
 
         // 后台线程跑完把结果放这儿，主线程的 Update 取走。
         private static volatile string pendingManifest;
@@ -89,19 +110,13 @@ namespace ADOFAIEditorStudio
         private static volatile bool workDone;
         private static volatile bool needZipDownload;
         private static volatile string pendingZipUrl;
+        // 这一轮要试的下载地址（主 + 备用）。
+        private static List<string> pendingZipUrls = new List<string>();
+        // 这次要装的版本号，下载完成后 HandleDownloadFinished 要用。
+        private static volatile string pendingLatest;
 
         internal static void Check(ModEntry mod)
         {
-            // 上次就是被更新重启的。跳过检查，否则清单一旦写错
-            // 会无限重启。
-            if (PlayerPrefs.GetInt(RestartFlagKey, 0) == 1)
-            {
-                PlayerPrefs.DeleteKey(RestartFlagKey);
-                PlayerPrefs.Save();
-                Main.Logger.Log("[Update] 上一次启动是更新引起的，跳过本次检查。");
-                return;
-            }
-
             var host = new GameObject("ADOFAIEditorStudio.VersionGate");
             UnityEngine.Object.DontDestroyOnLoad(host);
             host.AddComponent<Runner>().Begin(mod);
@@ -141,8 +156,53 @@ namespace ADOFAIEditorStudio
 
             private void DownloadThread()
             {
-                pendingZip = TryDownload(pendingZipUrl);
+                for (int i = 0; i < pendingZipUrls.Count && pendingZip == null; i++)
+                {
+                    if (i > 0)
+                    {
+                        Main.Logger.Log("[Update] 换备用地址重试：" + pendingZipUrls[i]);
+                    }
+                    pendingZip = TryDownload(pendingZipUrls[i]);
+                }
                 workDone = true;
+            }
+
+            /// <summary>
+            /// 由 jsDelivr 的地址推出 raw.githubusercontent.com 的等价地址。
+            ///
+            ///   gcore.jsdelivr.net/gh/OWNER/REPO@REF/path
+            ///   → raw.githubusercontent.com/OWNER/REPO/REF/path
+            /// </summary>
+            private static string BuildRawMirror(string url)
+            {
+                const string marker = "jsdelivr.net/gh/";
+                int at = url.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+                if (at < 0)
+                {
+                    return null;
+                }
+                string tail = url.Substring(at + marker.Length);
+                int slash = tail.IndexOf('/');
+                if (slash <= 0)
+                {
+                    return null;
+                }
+                string ownerRepo = tail.Substring(0, slash);
+                string rest = tail.Substring(slash + 1);
+                int atSign = rest.IndexOf('@');
+                if (atSign < 0)
+                {
+                    return null;
+                }
+                int pathSlash = rest.IndexOf('/', atSign);
+                if (pathSlash < 0)
+                {
+                    return null;
+                }
+                string reference = rest.Substring(atSign + 1, pathSlash - atSign - 1);
+                string path = rest.Substring(pathSlash + 1);
+                return "https://raw.githubusercontent.com/" + ownerRepo + "/"
+                    + reference + "/" + path;
             }
 
             private void Update()
@@ -193,6 +253,32 @@ namespace ADOFAIEditorStudio
                     return;
                 }
 
+                // 这个版本已经装过了，装完却还是旧版 —— 说明那个包本身
+                // 有问题（或者文件被占用没换掉）。再装一次只会无限重启，
+                // 所以放行，让用户至少能进游戏。
+                string lastInstalled = PlayerPrefs.GetString(LastInstalledKey, "");
+                if (!string.IsNullOrEmpty(lastInstalled) && lastInstalled == latest)
+                {
+                    Main.Logger.Error("[Update] 已经装过 " + latest
+                        + "，但当前仍是 " + current + "；不再重试，以免反复重启。");
+                    Finish();
+                    return;
+                }
+
+                // 清单里通常只给一条地址（jsDelivr）。那条挂了就整趟更新
+                // 失败，而同一份包在 raw.githubusercontent.com 上一定有。
+                // 两个都记下来，挨个试。
+                pendingZipUrls = new List<string>();
+                if (!string.IsNullOrEmpty(zipUrl))
+                {
+                    pendingZipUrls.Add(zipUrl);
+                }
+                string mirror = BuildRawMirror(zipUrl);
+                if (!string.IsNullOrEmpty(mirror) && mirror != zipUrl)
+                {
+                    pendingZipUrls.Add(mirror);
+                }
+
                 if (string.IsNullOrEmpty(zipUrl))
                 {
                     Main.Logger.Error("[Update] 需要更新到 " + latest + "，但清单没给下载地址。");
@@ -205,6 +291,7 @@ namespace ADOFAIEditorStudio
 
                 downloading = true;
                 pendingZipUrl = zipUrl;
+                pendingLatest = latest;
                 var thread = new Thread(DownloadThread) { IsBackground = true };
                 thread.Start();
             }
@@ -226,10 +313,10 @@ namespace ADOFAIEditorStudio
                     return;
                 }
 
-                Main.Logger.Log("[Update] 已装好，重启游戏以生效。");
-                PlayerPrefs.SetInt(RestartFlagKey, 1);
+                Main.Logger.Log("[Update] 已装好 " + pendingLatest
+                    + "。请关闭并重新打开游戏以生效。");
+                PlayerPrefs.SetString(LastInstalledKey, pendingLatest);
                 PlayerPrefs.Save();
-                RestartGame();
             }
 
             private void Finish()
@@ -287,8 +374,49 @@ namespace ADOFAIEditorStudio
             /// 「连不上」和「清单内容不对」在日志里长得一样，
             /// 而这两种情况的修法完全不同。
             /// </summary>
+            private static bool tlsConfigured;
+
+            /// <summary>
+            /// 显式把 TLS 拉到 1.2/1.3。
+            ///
+            /// Mono 的默认值可能还停在 TLS 1.0，而 jsDelivr 这类 CDN
+            /// 早就只收 1.2+。表现是握手被对端直接掐断：
+            ///   SecureChannelFailure (Authentication failed because
+            ///   the remote party has closed the transport stream.)
+            /// —— 看起来像断网，其实是协议版本谈不拢。
+            ///
+            /// 只设一次；用 try/catch 包住是因为个别运行时不认某些枚举值。
+            /// </summary>
+            private static void EnsureTls()
+            {
+                if (tlsConfigured)
+                {
+                    return;
+                }
+                tlsConfigured = true;
+                try
+                {
+                    // 有 1.3 就带上，没有就算了。
+                    const SecurityProtocolType modern =
+                        SecurityProtocolType.Tls12 | (SecurityProtocolType)12288;
+                    ServicePointManager.SecurityProtocol = modern;
+                }
+                catch (Exception)
+                {
+                    try
+                    {
+                        ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+                    }
+                    catch (Exception)
+                    {
+                        // 这个运行时两样都不认，只能用它自己的默认值。
+                    }
+                }
+            }
+
             private static byte[] TryDownload(string url, bool gitHubApi = false)
             {
+                EnsureTls();
                 try
                 {
                     var request = (HttpWebRequest)WebRequest.Create(url);
@@ -442,32 +570,6 @@ namespace ADOFAIEditorStudio
                 {
                     // 同上。
                 }
-            }
-
-            /// <summary>
-            /// 重启游戏。走 Steam 启动能让 Steam 认得出是同一个游戏，
-            /// 直接起 exe 的话 Steam 可能把它当成第二个实例。
-            /// </summary>
-            private static void RestartGame()
-            {
-                try
-                {
-                    if (ADOFAI.SteamIntegration.SteamController.initialized)
-                    {
-                        Application.OpenURL("steam://launch/977950/Dialog");
-                    }
-                    else
-                    {
-                        System.Diagnostics.Process.Start(
-                            Application.dataPath.Replace("_Data", ".exe"));
-                    }
-                }
-                catch (Exception exception)
-                {
-                    Main.Logger.Error("[Update] 重启失败，请手动重开游戏：" + exception.Message);
-                    return;
-                }
-                Application.Quit();
             }
 
             private static Version Parse(string text)

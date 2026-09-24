@@ -63,6 +63,38 @@ namespace ADOFAIEditorStudio.Preview.Domains
             internal ParticleAction AppliedTargetMode;
 
             /// <summary>
+            /// 上一次求值时这个系统是不是被装饰物域藏起来的。
+            ///
+            /// 用来抓住"重新被放出来"的那一帧：在隐藏状态下系统即使调过
+            /// Play()，isPlaying 也可能报 true（标志置了位，但没有真正模拟），
+            /// 光看 isPlaying 会以为"已经在播了"而不再启动，于是这个
+            /// 发射器永远起不来。
+            /// </summary>
+            internal bool WasHidden;
+
+            /// <summary>
+            /// 这个装饰物声明了 autoPlay，且还没有被"自动播放"过。
+            ///
+            /// 原版 scrParticleDecoration.Update 是：
+            ///
+            ///     if (atStart) {
+            ///         if (autoPlay &amp;&amp; !ADOBase.controller.paused) particleSystem.Play();
+            ///         autoPlay = false;   // 无论播没播，都会被清掉
+            ///     }
+            ///
+            /// AES 预览时 controller.paused 恒为 true，Play() 被跳过，
+            /// 而 autoPlay 照样清零——这个发射器就永远不播了。
+            /// 这里把这个职责接过来。它和「ApplyEventsToFloors 的 paused 闸」
+            /// 是同一类问题的第三个实例：原生逻辑只要挂在 paused 后面，
+            /// 在预览里就永远不会发生，而且往往还顺手把状态标记吃掉了。
+            ///
+            /// 另外，原版那个 Update 只在**自身激活**时才会跑，所以
+            /// 自动播放实际发生在它第一次可见的时候；隐藏期间这个机会
+            /// 不会被消费掉。这里照同样的语义。
+            /// </summary>
+            internal bool AutoPlayPending;
+
+            /// <summary>
             /// 最近触发的 Emit 动作，以及它触发的真实时间。参考
             /// 预览器会在活跃的 emit 事件变化时重新触发，或者
             /// 同一个事件已经活跃了一阵子时——这是个重复守卫，不是
@@ -79,6 +111,24 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
         private readonly List<DecoState> states = new List<DecoState>();
         private int particleLogCount;
+        // 上一次求值的时刻。用来察觉"向后拖动"——时间倒退说明用户在
+        // 回拖定位，此时必须丢掉所有"已经应用过"的闩，否则向前重放时
+        // 那些 Start 不会再跑一次。
+        private float lastEvaluatedTime = float.NegativeInfinity;
+        private int lastDirection;
+
+        /// <summary>
+        /// 丢掉所有"已经应用过"的闩，让下一个 Start 必须重新跑一次。
+        /// </summary>
+        private void ResetLatches()
+        {
+            for (int i = 0; i < states.Count; i++)
+            {
+                states[i].AppliedTargetMode = null;
+                states[i].EmittedLast = null;
+                states[i].EmittedAtUnscaledTime = float.NegativeInfinity;
+            }
+        }
 
         public string Name
         {
@@ -99,6 +149,10 @@ namespace ADOFAIEditorStudio.Preview.Domains
             Collect(context, manager, LevelEventType.SetParticle, ParticleActionKind.TargetMode);
             Collect(context, manager, LevelEventType.SetParticle, ParticleActionKind.SimulationSpeed);
             Collect(context, manager, LevelEventType.EmitParticle, ParticleActionKind.Emit);
+
+            // 没有事件的粒子装饰物也要收进来——它们靠 autoPlay 自己起，
+            // 而那个自动播放写在原生的 paused 闸之后，预览里永远不会发生。
+            CollectAutoPlayDecorations(manager);
 
             int actionCount = 0;
             int withSystem = 0;
@@ -178,6 +232,60 @@ namespace ADOFAIEditorStudio.Preview.Domains
             }
         }
 
+        /// <summary>
+        /// 把声明了 autoPlay 的粒子装饰物登记下来，由求值器替原生补上
+        /// 那一次自动播放。
+        ///
+        /// 走 allDecorations 而不是 GetTaggedDecorations：自动播放和 tag
+        /// 无关，每个粒子装饰物都有自己的 autoPlay 标记。
+        /// </summary>
+        private void CollectAutoPlayDecorations(scrDecorationManager manager)
+        {
+            List<scrDecoration> all = manager.allDecorations;
+            if (all == null)
+            {
+                return;
+            }
+
+            int autoPlayCount = 0;
+            for (int i = 0; i < all.Count; i++)
+            {
+                scrParticleDecoration particle = all[i] as scrParticleDecoration;
+                if (particle == null)
+                {
+                    continue;
+                }
+
+                DecoState state = GetOrCreateState(particle);
+                LevelEvent source = particle.sourceLevelEvent;
+                if (source == null)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    if (source.GetBool("autoPlay"))
+                    {
+                        state.AutoPlayPending = true;
+                        autoPlayCount++;
+                    }
+                }
+                catch
+                {
+                    // 没声明 autoPlay 的装饰物读不出这个键，跳过即可。
+                }
+            }
+
+            if (autoPlayCount > 0)
+            {
+                Main.Logger.Log("[StaticPreview/Particle] " + autoPlayCount
+                    + " decorations want autoPlay; the native autoplay sits behind"
+                    + " the paused gate and never runs in preview, so the evaluator"
+                    + " takes it over.");
+            }
+        }
+
         private static IEnumerable<scrParticleDecoration> ResolveTargets(
             PreviewTimelineContext context, scrDecorationManager manager,
             PreviewEventSnapshot levelEvent)
@@ -245,6 +353,27 @@ namespace ADOFAIEditorStudio.Preview.Domains
         {
             float time = frame.Time;
 
+            // 时间方向翻转 = 用户在回拖定位。
+            //
+            // 必须清掉所有"这个动作已经跑过了"的闩。闩记的是"我跑过"，
+            // 不是"系统现在是什么状态"；而回拖时装饰物域会把手里的装饰物
+            // 藏起来（SetVisible(false) 对粒子装饰物就是 SetActive(false)），
+            // 系统实际已经停了。不清闩的话，向前重放时这里认为
+            // "Start 早就跑过了"而不动手，粒子再也回不来。
+            //
+            // 只在**翻转的那一帧**清，不是每个后退帧都清：持续回拖时
+            // 每帧都清会让 StartFresh 每帧重跑一遍，粒子系统被反复重启。
+            int direction = time > lastEvaluatedTime ? 1 : (time < lastEvaluatedTime ? -1 : 0);
+            if (direction == -1 && lastDirection == 1)
+            {
+                ResetLatches();
+            }
+            if (direction != 0)
+            {
+                lastDirection = direction;
+            }
+            lastEvaluatedTime = time;
+
             for (int i = 0; i < states.Count; i++)
             {
                 DecoState state = states[i];
@@ -281,9 +410,43 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     }
                 }
 
+                ApplyAutoPlay(state);
                 ApplyTargetMode(state, currentMode, time);
                 ApplySimulationSpeed(state, previousSpeed, currentSpeed, time);
                 ApplyEmit(state, currentEmit, time);
+            }
+        }
+
+        /// <summary>
+        /// 替原版补上那一次 autoPlay。
+        ///
+        /// 只在装饰物**可见**时才消费掉这次机会，照抄原版的语义：
+        /// 原生那段代码在 Update 里，而 Update 只在自身激活时跑，
+        /// 所以隐藏期间这个机会一直留着，等它第一次露面才播。
+        /// </summary>
+        private static void ApplyAutoPlay(DecoState state)
+        {
+            if (!state.AutoPlayPending)
+            {
+                return;
+            }
+
+            ParticleSystem system = state.Deco.particleSystem;
+            if (system == null)
+            {
+                return;
+            }
+
+            // 还藏着就先不动；等装饰物域把它放出来再播。
+            if (!system.gameObject.activeSelf)
+            {
+                return;
+            }
+
+            state.AutoPlayPending = false;
+            if (!system.isPlaying)
+            {
+                system.Play();
             }
         }
 
@@ -312,10 +475,55 @@ namespace ADOFAIEditorStudio.Preview.Domains
             }
 
             bool alreadyApplied = state.AppliedTargetMode == current;
+
+            // 回拖到"这个动作生效之前"：闩必须作废。
+            //
+            // 闩记的是"我跑过这个动作"，而现在时间已经退到它之前了，
+            // 装饰物域把系统藏了起来。只靠"时间倒退的那一帧清闩"不够——
+            // 拖动可能是从更早的位置朝这个动作前进的，那样根本没有
+            // 倒退的那一帧。这里按时间判断，两个方向都覆盖。
+            if (alreadyApplied && time < current.StartTime)
+            {
+                state.AppliedTargetMode = null;
+                alreadyApplied = false;
+            }
+
+            // 系统没在播（或被藏起来了）时，Start 必须重跑，不管闩记着什么。
+            //
+            // 但**不能**顺手把它 SetActive(true)——那是装饰物域的职责。
+            // 谱面会让一个 MoveDecorations visible:false 把一批粒子装饰物
+            // 连同它们的 tag 一起藏掉（本谱 2106 格正是如此，藏的是
+            // 1947 格 SetParticle Start 起来的那两个）。装饰物域把
+            // GameObject 关掉，这里如果每帧再给它打开，两边就每帧
+            // 打一次架、净结果是粒子常亮——用户看到的就是"该关的
+            // 发射器没关"。
+            //
+            // 这里只承认"藏"这个事实：系统被关着就不再重复 Start，
+            // 等装饰物域把它放出来（visible 重新为真）时再重新播。
+            bool hidden = !system.gameObject.activeSelf;
+
+            // 刚刚从隐藏变回可见：必须强制重启一次。
+            //
+            // 在隐藏状态下系统即使调过 Play()，isPlaying 也可能报 true——
+            // 标志置了位但没有真正模拟。直接看 isPlaying 会得出
+            // "已经在播了"的结论而跳过启动，这个发射器就再也起不来了。
+            // 所以用"上一帧还藏着"这个事实来判定，比任何标志都可靠。
+            bool justRevealed = state.WasHidden && !hidden;
+            state.WasHidden = hidden;
+
             bool needsRestart = current.Mode == ParticlePlayMode.Start
-                && (!system.isPlaying || !system.gameObject.activeSelf);
+                && !hidden
+                && (justRevealed || !system.isPlaying);
             if (alreadyApplied && !needsRestart)
             {
+                return;
+            }
+            if (hidden)
+            {
+                // 系统被装饰物域藏着。记下这个动作已经"处理过"，
+                // 免得每帧重进这个分支；等它被放出来时 needsRestart
+                // 会自然成立，Start 会重新跑。
+                state.AppliedTargetMode = current;
                 return;
             }
 
@@ -378,16 +586,13 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
         private static void StartFresh(scrParticleDecoration deco, ParticleSystem system)
         {
-            // 挂在未激活 GameObject 上的粒子系统根本不会被模拟，
-            // 对它调 Play() 会静默失败。SetVisible 直接映射到
-            // "particleSystem.gameObject.SetActive(visible)"，所以一个被留在
-            // 隐藏状态的装饰物，不管被叫多少次播放都还是未激活——这
-            // 就是为什么每个 Start 都跑了，喷发却始终不出现。
-            if (!system.gameObject.activeSelf)
-            {
-                system.gameObject.SetActive(true);
-            }
-
+            // 只处理"系统存在但不播"的情况。
+            //
+            // 以前这里还会 SetActive(true)——那是**越权**：可见性归装饰物域
+            // （它按 MoveDecorations 的 visible 调 SetVisible，对粒子装饰物
+            // 就是 SetActive）。两个域都去动同一个开关，就会每帧打架，
+            // 表现为"该关的发射器关不掉"。这里不再碰激活状态，
+            // 调用方已经确认过系统是活的。
             if (deco.sourceLevelEvent != null)
             {
                 deco.ResetParticle(deco.sourceLevelEvent, true);

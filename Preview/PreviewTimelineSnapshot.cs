@@ -53,6 +53,9 @@ namespace ADOFAIEditorStudio.Preview
                 : source.startRot.WithZ(source.startRot.z + source.rotationOffset);
             StartScale = source == null ? Vector3.one : source.startScale;
             BaseOpacity = source == null ? 1f : source.opacityVal;
+            BallPosition = source == null
+                ? Vector3.zero
+                : (StickToFloor ? source.startPos + source.offsetPos : source.startPos);
         }
 
         internal int Index { get; private set; }
@@ -88,6 +91,22 @@ namespace ADOFAIEditorStudio.Preview
         internal Vector3 StartRotation { get; private set; }
         internal Vector3 StartScale { get; private set; }
         internal float BaseOpacity { get; private set; }
+
+        /// <summary>
+        /// 球在这一格上真正的落点，也就是行星绕着的那个中心。
+        ///
+        /// 由 stickToFloor 决定，原生 scrPlanet 是二选一：
+        ///
+        ///   if (stickToFloor) pos = floor.transform.position;  // startPos + offsetPos
+        ///   else              pos = floor.startPos;            // 作者摆的布局位
+        ///
+        /// 为什么不能直接用 StartPosition：那个值只包含**位移**语义
+        /// （作者把轨道推下去之后，相机也要跟着下去），对「不粘」的格
+        /// 是错的——轨道被推走了，球却留在布局位上，相机再锚到位移后的
+        /// 位置就会偏出去。第 7 格 offset=(1,-1) 时那个偏差正好是
+        /// 往右偏一格的量。
+        /// </summary>
+        internal Vector3 BallPosition { get; private set; }
     }
 
     internal sealed class PreviewEventSnapshot
@@ -165,6 +184,61 @@ namespace ADOFAIEditorStudio.Preview
         internal bool ContainsKey(string key)
         {
             return data.ContainsKey(key);
+        }
+
+        /// <summary>
+        /// 只读诊断：把键的原始值原样交出来，不做任何类型转换。
+        ///
+        /// 用于确认数组里的 null 在运行时到底是什么 —— 是 null、
+        /// 是 double.NaN，还是已经被读成了 0。相机那些「NaN 轴表示保持
+        /// 不动」的判据全靠这个区分。
+        /// </summary>
+        /// <summary>
+        /// 读一个二维向量，并且**保住数组里 null 的语义**。
+        ///
+        /// 原生的 RDUtils.GetRandomVector2 对数组里的 null 返回 NaN，
+        /// 而 NaN 是「这个轴不动」的信号——相机那道逐轴的门就是靠它
+        /// 决定要不要重启一根轴的 tween。
+        ///
+        /// 通用 GetValue&lt;Vector2&gt; 走的是 Convert.ChangeType，
+        /// 对 List&lt;object&gt; 会抛异常后回落到 fallback；实测
+        /// `position: [-4, null]` 读出来 Y 是 0 而不是 NaN，
+        /// 于是「null 表示不动」这条规则从来没生效过——
+        /// 相机每遇到一个只写单轴的位置事件就重启另一根轴，
+        /// 把它正在跑的 tween 连同目标一起丢掉。
+        /// </summary>
+        internal Vector2 GetVector2WithNaN(string key, Vector2 fallback)
+        {
+            object raw = GetRawValue(key);
+            IList<object> list = raw as IList<object>;
+            if (list == null || list.Count < 2)
+            {
+                return fallback;
+            }
+
+            return new Vector2(AxisOrNaN(list[0]), AxisOrNaN(list[1]));
+        }
+
+        private static float AxisOrNaN(object value)
+        {
+            if (value == null)
+            {
+                return float.NaN;
+            }
+            try
+            {
+                return Convert.ToSingle(value, System.Globalization.CultureInfo.InvariantCulture);
+            }
+            catch
+            {
+                return float.NaN;
+            }
+        }
+
+        internal object GetRawValue(string key)
+        {
+            object value;
+            return data.TryGetValue(key, out value) ? value : null;
         }
 
         internal bool IsPropertyEnabled(string key)

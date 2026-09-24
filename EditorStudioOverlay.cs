@@ -585,6 +585,10 @@ namespace ADOFAIEditorStudio
             {
                 ApplyPreviewViewport();
                 EditorPlaybackBridge.EnforcePreviewZoomLock();
+                // 编辑器专属的装饰（位置轨道的滚动虚线、粒子发射器图标）
+                // 只能在这里压：游戏自己的 Update 会在本帧稍后把它们
+                // 重新点亮，放在求值阶段压等于白压。
+                Preview.PreviewEvaluationEngine.TickEditorScaffoldingLate();
             }
             else
             {
@@ -657,6 +661,19 @@ namespace ADOFAIEditorStudio
             {
                 SetVisible(false);
             }
+
+            // 工作台开着的时候，随时把按钮的"选中"状态清掉。
+            //
+            // Unity 的 StandaloneInputModule 把 Space 映射成 Submit，
+            // 而 EventSystem 会记住上一次点过的那个按钮；只要它还处在
+            // 选中态，按一次空格播放/暂停就会顺带把那个按钮再点一次。
+            // 表现就是「每次按空格，时间轴就切换一次堆叠/卷帘模式」——
+            // 因为用户之前点过那个按钮。
+            //
+            // 之前只在 SetVisible(false)（按 F8 关闭）时清，所以开着
+            // 工作台一直用就会一直复发。每帧清一次是标准做法，
+            // 代价只是把已经是 null 的引用再写一遍 null。
+            ClearUiButtonSelection();
 
 
             if (!visible)
@@ -2166,6 +2183,44 @@ namespace ADOFAIEditorStudio
             {
                 BuildLaneFilterButtons(previewToolbar);
             }
+        }
+
+        /// <summary>
+        /// 清掉 EventSystem 里记住的那个**按钮**。
+        ///
+        /// 用途只有一个：让 Space 之类的 Submit 键不会再点一次用户上次
+        /// 点过的按钮。工作台里按钮从来不需要"键盘焦点"这个概念，
+        /// 所以可以无条件清。
+        ///
+        /// **输入框必须放过。** 用户正在参数栏里打字时，
+        /// currentSelectedGameObject 就是那个输入框，而
+        /// <see cref="IsTextInputFocused"/> 也正是靠它判断的——
+        /// 在这里清掉会让输入框当场失焦，表现是"打字打到一半光标没了"。
+        /// </summary>
+        private void ClearUiButtonSelection()
+        {
+            EventSystem system = EventSystem.current;
+            if (system == null || uiRoot == null)
+            {
+                return;
+            }
+            GameObject selected = system.currentSelectedGameObject;
+            if (selected == null)
+            {
+                return;
+            }
+            // 只清工作台自己建的：游戏那边可能正当使用着选中态。
+            if (!selected.transform.IsChildOf(uiRoot.transform))
+            {
+                return;
+            }
+            // 输入框保留焦点。
+            if (selected.GetComponentInParent<TMP_InputField>() != null)
+            {
+                return;
+            }
+
+            system.SetSelectedGameObject(null);
         }
 
         private void SetVisible(bool value)

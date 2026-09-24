@@ -556,7 +556,6 @@ namespace ADOFAIEditorStudio
                 enumPopup.Clear();
             }
             HandleEnumPopupOutsideClick();
-            ProbeGeometry();
 
             if (now < nextSelectionPoll)
             {
@@ -579,78 +578,6 @@ namespace ADOFAIEditorStudio
             {
                 Show(null);
             }
-        }
-
-        // ---------------------------------------------------------------- 临时探针
-        // 【临时】只读几何探针。定位"拖动时间轴高度时参数栏输入框被裁剪"。
-        // 只打印尺寸变化的那一帧，不写任何状态、不改任何布局。查完即删。
-        private float probeLastPanelHeight = float.NaN;
-        private float probeLastPanelWidth = float.NaN;
-        private float probeLastViewportHeight = float.NaN;
-        private float probeLastViewportWidth = float.NaN;
-
-        private void ProbeGeometry()
-        {
-            if (panelRoot == null || viewport == null)
-            {
-                return;
-            }
-            float ph = panelRoot.rect.height;
-            float pw = panelRoot.rect.width;
-            float vh = viewport.rect.height;
-            float vw = viewport.rect.width;
-            if (Mathf.Approximately(ph, probeLastPanelHeight)
-                && Mathf.Approximately(pw, probeLastPanelWidth)
-                && Mathf.Approximately(vh, probeLastViewportHeight)
-                && Mathf.Approximately(vw, probeLastViewportWidth))
-            {
-                return;
-            }
-            probeLastPanelHeight = ph;
-            probeLastPanelWidth = pw;
-            probeLastViewportHeight = vh;
-            probeLastViewportWidth = vw;
-
-            int visible = 0;
-            int below = 0;
-            float worstControlOverflow = 0f;
-            for (int i = 0; i < rows.Count; i++)
-            {
-                Row row = rows[i];
-                if (row == null || row.Root == null || !row.Root.activeSelf)
-                {
-                    continue;
-                }
-                float top = row.Rect.anchoredPosition.y;
-                if (-top < vh)
-                {
-                    visible++;
-                }
-                else
-                {
-                    below++;
-                }
-
-                // 真正要盯的量：ControlHost 的实际宽度 vs 它按当前行宽
-                // 应有的宽度。不相等就说明行被复用时没跟着新宽度重算，
-                // 输入框就会溢出到面板右边被裁掉。
-                if (row.ControlHost != null)
-                {
-                    float expected = Mathf.Max(60f, vw - CheckWidth - LabelWidth - Padding);
-                    float overflow = row.ControlHost.rect.width - expected;
-                    if (overflow > worstControlOverflow)
-                    {
-                        worstControlOverflow = overflow;
-                    }
-                }
-            }
-
-            Main.Logger.Log("[PanelGeom] panel=" + pw.ToString("0.0") + "x" + ph.ToString("0.0")
-                + " viewport=" + vw.ToString("0.0") + "x" + vh.ToString("0.0")
-                + " scrollRect=" + (scrollRectTransform == null ? -1f : scrollRectTransform.rect.height).ToString("0.0")
-                + " contentH=" + (content == null ? -1f : content.rect.height).ToString("0.0")
-                + " rows=" + rows.Count + " visible=" + visible + " below=" + below
-                + " ctrlOverflow=" + worstControlOverflow.ToString("0.0"));
         }
 
         private static bool IsStillLive(LevelEvent levelEvent)

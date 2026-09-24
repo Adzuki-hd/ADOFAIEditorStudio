@@ -370,7 +370,26 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // 说明方向就是角度本身。
             double radius = context.TileSize * floor.RadiusScale;
 
-            Vector3 centre = boundFloor.transform.position;
+            // 行星骑在哪一格的位置上，由 stickToFloor 决定。
+            //
+            // 原生 scrPlanet 是二选一：
+            //
+            //   if (scrFloor2.stickToFloor) pos = scrFloor2.transform.position;
+            //   else                        pos = scrFloor2.startPos;
+            //
+            // 也就是「粘住」时骑着格子被挪到的地方，「不粘」时回到作者
+            // 摆的布局位置。这个开关来自 PositionTrack 的 stickToFloors 参数，
+            // 而且它是**逐格累积**的粘性状态，初值取 settings.stickToFloors
+            // （scnGame 里 flag 一路带下去，每格写进 floor.stickToFloor）。
+            //
+            // 求值器以前恒用 transform.position，等于永远粘住，于是
+            // 「黏性轨道」这个参数在预览里完全没有作用——把它关掉，
+            // 画面照旧跟着轨道跑。
+            // 行星绕着的中心。用快照的 BallPosition，而不是在这里
+            // 再判一次 stickToFloor —— 相机跟随也读同一个字段。
+            // 这个 bug 最初就是"两个地方各算一遍、只改了一处"造成的，
+            // 所以定义只留一份。
+            Vector3 centre = floor.BallPosition;
             Vector3 offset = AngleToVector(renderedAngle) * (float)radius;
             Vector3 position = centre + offset;
 
@@ -397,7 +416,14 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // 停在它加载时被留在的地方。求值器接管预览期间
             // 球自己的 Update 是关的，所以无论姿态还是 sprite 可见性
             // 都不会被别的东西还原。
-            Vector3 pivot = boundFloor.transform.position;
+            // 另一颗球停在同一个位置——但要用**和选中球同一个基准**。
+            //
+            // 以前这里写的是 boundFloor.transform.position（实位），
+            // 而这个开关关掉时选中球已经改用 startPos 了。两颗球于是
+            // 被摆到两个不同的地方：日志里 f7 是
+            //   选中球 (9.00,0.03) 按 layout 算，非选中球 (12.00,-1.50) 还在实位，
+            // 差 2.12 —— 正是"黏性轨道没生效"看起来的样子。
+            Vector3 pivot = centre;
             for (int i = 0; i < planetarySystem.planetList.Count; i++)
             {
                 scrPlanet planet = planetarySystem.planetList[i];
@@ -847,4 +873,4 @@ namespace ADOFAIEditorStudio.Preview.Domains
             CosmeticAngleTweenField.SetValue(planet, null);
         }
     }
-}
+}

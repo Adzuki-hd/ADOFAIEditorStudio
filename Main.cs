@@ -125,6 +125,12 @@ namespace ADOFAIEditorStudio
         // 在 1440p / 4K 上会显得比工作台其它面板小一号。
         // 1.0 = 原始大小；面板不变大，里面的字和控件等比放大。
         public float PropertyPanelScale = 1.5f;
+        // 时间轴上拖动事件块时，要不要吸附到格边界。
+        //
+        // 默认开：ADOFAI 里一格就是一拍，所以对齐格边界天然就是
+        // 节拍吸附，这正是做谱时绝大多数时候想要的。要微调时
+        // 按住 Alt 可临时反转，不用来回点开关。
+        public bool SnapTimelineDrag = true;
         public float TimelineHeight = 292f;
         public float TimelineRowHeight = 30f;
     }
