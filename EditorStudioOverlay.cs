@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using ADOFAI;
+using ADOFAIEditorStudio.Multiplayer;
 using TMPro;
 using UnityEngine;
 using UnityEngine.EventSystems;
@@ -301,6 +302,13 @@ namespace ADOFAIEditorStudio
         private RectTransform matteLeft;
         private RectTransform matteRight;
         private EditorTimelineView timelineView;
+        /// <summary>
+        /// 联机面板。挂在 designRoot 上而不是某个面板里——它是「模式切换」，
+        /// 开着时要盖住整个工作台。
+        /// </summary>
+        private MultiplayerPanel multiplayerPanel;
+        /// <summary>顶部那枚「联机」按钮，用它把面板叫出来。</summary>
+        private Button multiplayerButton;
         private Camera previewCamera;
         private Rect previewCameraOriginalRect;
         private bool previewCameraModified;
@@ -353,6 +361,23 @@ namespace ADOFAIEditorStudio
                 // 靠的就是这个。
                 return timelineView == null ? null : timelineView.SelectedEvent;
             }
+        }
+
+        /// <summary>
+        /// 联机改了本机正在看的这个事件，把参数栏刷成新值，并说明是谁改的。
+        ///
+        /// 除了即时同步，这还挡下了一类静默的错误：面板上显示的是旧值，
+        /// 而谱面里已经是新值，用户照着旧数字继续改就会覆盖对方。
+        /// </summary>
+        internal void RefreshInspectorFromRemote(string who, bool isDecoration)
+        {
+            if (propertyPanel != null)
+            {
+                propertyPanel.RefreshFromRemoteEdit();
+            }
+
+            SetSceneSelectionStatus("「" + who + "」改了"
+                + (isDecoration ? "这个装饰物" : "这个事件") + "，已同步。");
         }
 
         internal bool IsPreviewZoomLocked
@@ -628,6 +653,20 @@ namespace ADOFAIEditorStudio
                 {
                     EditorPlaybackBridge.TickPreview(null);
                 }
+
+                // 工作台关着也要把联机会话推一下。
+                //
+                // 网络读线程是一直在收的，收到的消息进 ConcurrentQueue 等着
+                // 主线程来取。主线程不取的话队列只进不出——而对方推一份谱面
+                // 就是一两百 KB，挂着几小时会一直涨。这里驱动一次就够
+                // （不刷新界面，关着没人看）。
+                if (multiplayerPanel != null)
+                {
+                    multiplayerPanel.Tick();
+                }
+                // 加载遮罩挂在独立的 canvas 上，不随工作台重建，
+                // 所以工作台关着的时候也要驱动它。
+                TickLoadingScreen();
                 return;
             }
 
@@ -636,6 +675,14 @@ namespace ADOFAIEditorStudio
             EditorPlaybackBridge.TickPreview(previewViewport);
             RefreshPlaybackState();
             TickProjectWorkspace();
+
+            // 联机面板自己管界面显隐；会话本身要继续跑（后台线程在收发），
+            // 所以这个 Tick 是无条件调的。
+            if (multiplayerPanel != null)
+            {
+                multiplayerPanel.Tick();
+            }
+            TickLoadingScreen();
         }
 
         private void BuildRuntimeUi()
@@ -703,6 +750,7 @@ namespace ADOFAIEditorStudio
             BuildPreview(designRoot);
             BuildInspector(designRoot);
             BuildTimeline(designRoot);
+            BuildMultiplayer(designRoot);
 
             built = true;
             uiRoot.SetActive(false);
@@ -756,6 +804,129 @@ namespace ADOFAIEditorStudio
             statusLabel.color = Accent;
 
             CreateText("Shortcut", header.rectTransform, DesignWidth - 230f, 13f, 206f, 28f, "F8  工作台  ·  Esc  关闭", 12f, TextMuted, TextAlignmentOptions.MidlineRight, false);
+
+            // 联机入口。放在状态读数和快捷键提示之间那段空档里——
+            // 它是个偶尔才点的东西，不该挤到常用控件那一带。
+            TextMeshProUGUI multiplayerLabel;
+            multiplayerButton = CreateButton("Multiplayer", header.rectTransform,
+                1540f, 13f, 96f, 28f, "联机", false,
+                delegate
+                {
+                    if (multiplayerPanel != null)
+                    {
+                        multiplayerPanel.Toggle();
+                    }
+                }, out multiplayerLabel);
+        }
+
+        /// <summary>
+        /// 建联机面板并挂到 designRoot。
+        ///
+        /// 挂 designRoot 而不是 uiRoot：designRoot 是 1920×1080 的设计坐标，
+        /// 面板的位置和尺寸可以直接按设计尺寸写；挂 uiRoot 会被画布缩放
+        /// 再套一层。它最后建，所以默认就在最上层。
+        /// </summary>
+        /// <summary>
+        /// 加载遮罩所在的那层 canvas。
+        ///
+        /// **刻意不挂在工作台的 `uiRoot` 上**：那个对象在重建时会被销毁，
+        /// 而遮罩恰恰要在重建期间一直盖着——挂上去就会跟着一起消失，
+        /// 底下那一下闪烁又露出来了。
+        ///
+        /// 给它更高的 sortingOrder（31000 对工作台的 30000），所以永远在最上面。
+        /// </summary>
+        private GameObject loadingCanvas;
+        private Multiplayer.MultiplayerLoadingScreen loadingScreen;
+
+        private void EnsureLoadingScreen()
+        {
+            if (loadingScreen != null)
+            {
+                return;
+            }
+            if (uiFont == null)
+            {
+                uiFont = ResolveFont();
+            }
+
+            loadingCanvas = new GameObject(
+                "ADOFAIEditorStudio.LoadingCanvas",
+                typeof(RectTransform),
+                typeof(Canvas),
+                typeof(CanvasScaler),
+                typeof(GraphicRaycaster));
+            // 挂在 overlay 自己身上，它和工作台一起存在、不参与重建。
+            loadingCanvas.transform.SetParent(transform, false);
+
+            RectTransform canvasRect = loadingCanvas.GetComponent<RectTransform>();
+            canvasRect.anchorMin = Vector2.zero;
+            canvasRect.anchorMax = Vector2.one;
+            canvasRect.offsetMin = Vector2.zero;
+            canvasRect.offsetMax = Vector2.zero;
+
+            Canvas loading = loadingCanvas.GetComponent<Canvas>();
+            loading.renderMode = RenderMode.ScreenSpaceOverlay;
+            loading.overrideSorting = true;
+            loading.sortingOrder = 31000;
+            loading.pixelPerfect = false;
+
+            CanvasScaler scaler = loadingCanvas.GetComponent<CanvasScaler>();
+            scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
+            scaler.referenceResolution = new Vector2(DesignWidth, DesignHeight);
+            scaler.screenMatchMode = CanvasScaler.ScreenMatchMode.Expand;
+
+            // 遮罩本体是 canvas 的子物体，这样「隐藏」只关它、不关 canvas。
+            RectTransform screenRoot = CreateTopLeftRect("Screen", canvasRect, 0f, 0f,
+                DesignWidth, DesignHeight);
+            loadingScreen = screenRoot.gameObject.AddComponent<Multiplayer.MultiplayerLoadingScreen>();
+            loadingScreen.Initialize(screenRoot, uiFont, GetRoundedSprite(24, CornerLarge, false, 0f));
+        }
+
+        /// <summary>加入房间期间的加载遮罩。会话层只描述状态，显示由这里做。</summary>
+        private void TickLoadingScreen()
+        {
+            if (Multiplayer.MultiplayerSession.Loading)
+            {
+                EnsureLoadingScreen();
+                if (loadingScreen != null)
+                {
+                    loadingScreen.Show(Multiplayer.MultiplayerSession.LoadingText,
+                        Multiplayer.MultiplayerSession.LoadingProgress);
+                }
+                return;
+            }
+
+            if (loadingScreen != null && loadingScreen.IsShowing)
+            {
+                loadingScreen.Hide();
+            }
+        }
+
+        /// <summary>
+        /// 把整个工作台拆掉重建。
+        ///
+        /// 加入房间结束时调它：那时候谱面、媒体、装饰物都刚换了内容，
+        /// 而有些东西（**文字装饰物**是最明显的一个）不会自己刷新，
+        /// 表现为「进了房间有几行字不见了」——但重进一次工作台就正常。
+        /// 与其去追每一个漏刷的地方，不如在加载结束时整体重建一次；
+        /// 反正遮罩盖着，用户看不到这一下。
+        /// </summary>
+        internal void RebuildWorkbench()
+        {
+            if (!built)
+            {
+                return;
+            }
+            RebuildRuntimeUiForResolution();
+        }
+
+        private void BuildMultiplayer(RectTransform parent)
+        {
+            RectTransform host = CreateTopLeftRect("MultiplayerLayer", parent, 0f, 0f,
+                DesignWidth, DesignHeight);
+
+            multiplayerPanel = host.gameObject.AddComponent<MultiplayerPanel>();
+            multiplayerPanel.Initialize(host, uiFont, GetRoundedSprite(24, CornerLarge, false, 0f));
         }
 
         private void BuildBrowser(RectTransform parent)
@@ -2566,6 +2737,8 @@ namespace ADOFAIEditorStudio
             matteLeft = null;
             matteRight = null;
             timelineView = null;
+            multiplayerPanel = null;
+            multiplayerButton = null;
         }
 
         private void RestorePreviewViewport()

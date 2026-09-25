@@ -1018,10 +1018,17 @@ namespace ADOFAIEditorStudio
             // ShowEvent 会把 visible 写进 LevelEvent，也就是会落到谱面文件里。
             // 这是有意的：单行眼睛管的就是作者数据里的显隐。批量开关
             // 才是纯临时的那一个（见 ToggleBatchHidden）。
+            bool next = !entry.Visible;
             using (new SaveStateScope(editor))
             {
-                editor.ShowEvent(entry.Source, !entry.Visible);
+                editor.ShowEvent(entry.Source, next);
             }
+
+            // 这一处也绕过了工作台历史（只用了游戏的 SaveStateScope），
+            // 联机要同步它，所以补一次上报。
+            Multiplayer.MultiplayerEditSink.Report(editor, entry.Source,
+                new[] { "visible" }, new object[] { next }, new[] { false });
+
             RefreshNow();
         }
 
@@ -1034,10 +1041,15 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
+            bool next = !entry.Locked;
             using (new SaveStateScope(editor))
             {
-                editor.LockEvent(entry.Source, !entry.Locked);
+                editor.LockEvent(entry.Source, next);
             }
+
+            Multiplayer.MultiplayerEditSink.Report(editor, entry.Source,
+                new[] { "locked" }, new object[] { next }, new[] { false });
+
             RefreshNow();
         }
 
@@ -1060,9 +1072,11 @@ namespace ADOFAIEditorStudio
             // DeleteMultiSelectionDecorations。后者走 RemoveEvent 的默认分支，
             // 会链到 UpdateDecorationObjects → decManager.ClearDecorations()，
             // 把每个装饰物重建一遍，顺手摧毁预览求值器仍然持有的对象引用。
-            // 我们的 RecordDecorationRemove 底层用 skipDecorationUpdate:true
+            // 我们的 RemoveDecoration 底层用 skipDecorationUpdate:true
             // 绕开它，并且记进撤销历史。
-            EditorCommandHistory.RecordDecorationRemove(editor, entry.Source, index);
+            //
+            // 注意 index 是**删除前**取的（上面那行），撤销时要插回这个位置。
+            EditorCommandHistory.RemoveDecoration(editor, entry.Source, index);
             RefreshNow();
         }
 

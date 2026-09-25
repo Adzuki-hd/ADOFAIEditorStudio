@@ -26,6 +26,8 @@ namespace ADOFAIEditorStudio
             // 版本闸门。低于清单要求的 min 就自动下载新版、
             // 覆盖、重启游戏，用户不用做任何事。
             VersionGate.Check(modEntry);
+            // 清掉上一次崩溃留下的联机会话副本。
+            Multiplayer.ChartTransfer.SweepLeftoversInBackground();
         }
 
         private static bool OnToggle(ModEntry modEntry, bool toggle)
@@ -64,6 +66,11 @@ namespace ADOFAIEditorStudio
             else
             {
                 SaveSettings();
+
+                // 模组被卸载时把联机会话收干净：删掉会话副本、
+                // 断开连接。不做的话那个副本会一直留在谱面目录里。
+                Multiplayer.MultiplayerSession.Stop();
+
                 if (Overlay != null)
                 {
                     UnityEngine.Object.Destroy(Overlay.gameObject);
@@ -133,6 +140,18 @@ namespace ADOFAIEditorStudio
         public bool SnapTimelineDrag = true;
         public float TimelineHeight = 292f;
         public float TimelineRowHeight = 30f;
+
+        // ---------------------------------------------------------------- 联机
+        //
+        // 这三项只是「下次打开联机面板时预填什么」，不是联机状态本身——
+        // 会话是临时的，关掉工作台就断，没有东西需要持久化。
+
+        /// <summary>上次用的名字。省得每局都重打。</summary>
+        public string MultiplayerName = string.Empty;
+        /// <summary>开房/加入用的端口。0 = 还没设置过，回落到默认端口。</summary>
+        public int MultiplayerPort = 0;
+        /// <summary>上次连的地址。主机换了地址时要记得改。</summary>
+        public string MultiplayerAddress = string.Empty;
     }
 
     internal static class EditorBridge

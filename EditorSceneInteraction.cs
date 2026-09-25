@@ -722,6 +722,7 @@ namespace ADOFAIEditorStudio
             }
 
             scnEditor editor = scnEditor.instance;
+
             string originalTag = pendingDecoration.sourceLevelEvent.GetString("tag");
             bool originalTagDisabled = pendingDecoration.sourceLevelEvent.disabled.ContainsKey("tag")
                 && pendingDecoration.sourceLevelEvent.disabled["tag"];
@@ -812,7 +813,17 @@ namespace ADOFAIEditorStudio
             Reset();
             if (changed)
             {
-                ReportSelection("当前帧关键帧已写入，可按 Ctrl+Z 撤回");
+                // **拖装饰物是结构性改动，要通知联机层。**
+                //
+                // 它做的事是「往 events 里追加一个关键帧」——新增事件
+                // 没法增量同步（没有稳定下标），只能整份重推。
+                // `OnLocalStructuralChange` 会排一次自动同步，所以拖完
+                // 对面自动就能看到，不需要用户做任何事。
+                Multiplayer.MultiplayerSession.OnLocalStructuralChange();
+
+                ReportSelection("当前帧关键帧已写入"
+                    + (Multiplayer.MultiplayerSession.IsLinked
+                        ? "，会自动同步给其他人" : "，可按 Ctrl+Z 撤回"));
             }
             if (shouldResume)
             {

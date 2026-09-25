@@ -167,6 +167,9 @@ namespace ADOFAIEditorStudio
                     bool spritesLoaded;
                     manager.CreateDecoration(decoration, out spritesLoaded, at - 1);
                 }
+
+                // 同上：集合变了就要重建快照缓存。
+                EditorPlaybackBridge.RequestEvaluatorRebuild("decoration-insert");
             }
             catch (Exception exception)
             {
@@ -372,6 +375,112 @@ namespace ADOFAIEditorStudio
             {
                 undoStack.RemoveAt(0);
             }
+
+            ReportToMultiplayer(command);
+        }
+
+        /// <summary>
+        /// 把这次改动报给联机层。
+        ///
+        /// 放在 <see cref="Record"/> 里是因为**它是所有命令唯一的收口**——
+        /// 五个 RecordXxx 入口都经过它，在这里接一次就全覆盖了。
+        ///
+        /// 分两类：
+        ///
+        ///   **值改动**（改属性、拖块）→ 报「哪个事件的哪个键变成了什么」。
+        ///   联机按这个增量同步，几百字节的事。
+        ///
+        ///   **结构性改动**（新建/删除装饰物）→ 只报「结构变了」。
+        ///   这类绝不能增量同步：事件没有 ID，全靠数组下标定位，
+        ///   删掉一个后面全部位移，按旧下标去写就会改到别人的事件上。
+        ///   所以接收方收到这个信号后走整体重同步。
+        /// </summary>
+        /// <summary>
+        /// 把这次改动报给联机层。
+        ///
+        /// 放在 <see cref="Record"/> 里是因为**它是所有命令唯一的收口**——
+        /// 五个 RecordXxx 入口都经过它，在这里接一次就全覆盖了。
+        ///
+        /// `undone` 表示这次是**撤回**而不是新编辑：撤回之后实际生效的是
+        /// 旧值，要报旧值出去。不区分方向的话，撤回会把新值再发一遍，
+        /// 对面看到的是「什么都没变」——撤回同步不了就是这么来的。
+        ///
+        /// 分两类：
+        ///
+        ///   **值改动**（改属性、拖块）→ 报「哪个事件的哪个键变成了什么」。
+        ///   联机按这个增量同步，几百字节的事。
+        ///
+        ///   **结构性改动**（新建/删除装饰物、拖装饰物）→ 只报「结构变了」。
+        ///   这类绝不能增量同步：事件没有 ID，全靠数组下标定位，
+        ///   删掉一个后面全部位移，按旧下标去写就会改到别人的事件上。
+        ///   所以走整份重推。
+        /// </summary>
+        private static void ReportToMultiplayer(ICommand command)
+        {
+            ReportToMultiplayer(command, false);
+        }
+
+        private static void ReportToMultiplayer(ICommand command, bool undone)
+        {
+            if (Multiplayer.MultiplayerEditSink.Suspended)
+            {
+                // 远端改动正在落地，它自己不能再报出去，否则会来回弹。
+                return;
+            }
+
+            try
+            {
+                PropertyEditCommand single = command as PropertyEditCommand;
+                if (single != null)
+                {
+                    Multiplayer.MultiplayerEditSink.Report(single.Editor, single.Target,
+                        new[] { single.Key },
+                        new[] { undone ? single.OldValue : single.NewValue },
+                        new[] { undone ? single.OldDisabled : single.NewDisabled });
+                    return;
+                }
+
+                MultiPropertyEditCommand multi = command as MultiPropertyEditCommand;
+                if (multi != null)
+                {
+                    Multiplayer.MultiplayerEditSink.Report(multi.Editor, multi.Target,
+                        multi.Keys,
+                        undone ? multi.OldValues : multi.NewValues,
+                        undone ? multi.OldDisabled : multi.NewDisabled);
+                    return;
+                }
+
+                if (command is DecorationMoveCommand
+                    || command is CreateDecorationCommand
+                    || command is RemoveDecorationCommand)
+                {
+                    // **这三类都是结构性改动，不能按增量同步。**
+                    //
+                    // 事件没有 ID，全靠数组下标定位，而这三类都会往
+                    // `editor.events` 里插入或删除事件——后面所有事件的下标
+                    // 整体位移。如果按「旧下标 + 新值」发出去，对面会拿这个
+                    // 下标去写**另一个事件**，改坏别人的数据，而且两边
+                    // 都不会收到任何提示。
+                    //
+                    // 拖装饰物看起来像「改个位置」，实际是新建一个
+                    // MoveDecorations 关键帧事件（见
+                    // EditorSceneInteraction.BeginDecorationDrag），
+                    // 所以它属于这一类，不是值改动。
+                    //
+                    // 撤回/重做同样走这里：它们也是删/建关键帧事件，
+                    // 一样只能整份重推。所以不看 `undone`。
+                    Multiplayer.MultiplayerSession.OnLocalStructuralChange();
+                    return;
+                }
+            }
+            catch (Exception exception)
+            {
+                // 联机上报出问题绝不能影响编辑本身。
+                if (Main.Logger != null)
+                {
+                    Main.Logger.Warning("[联机] 上报本地改动失败：" + exception.Message);
+                }
+            }
         }
 
         internal static void RecordDecorationCreate(scnEditor editor, LevelEvent decoration, int index)
@@ -384,14 +493,42 @@ namespace ADOFAIEditorStudio
             });
         }
 
-        internal static void RecordDecorationRemove(scnEditor editor, LevelEvent decoration, int index)
+        /// <summary>
+        /// 删掉一个装饰物并记进撤销历史。
+        ///
+        /// **名字里带 Remove 而不是 Record，因为它会真的动手删。**
+        ///
+        /// 这里原先叫 `RecordDecorationRemove`，只往撤销栈里塞了一条命令
+        /// 就完事——而命令的 `Redo()` 只在「重做」时才会被调用，于是
+        /// 删除动作**从来没有真正执行过**：点了删除，历史里多一条记录，
+        /// 装饰物还在原地。这是那一整套「先做后记」约定里唯一漏掉
+        /// 执行的一处（对照 `editor.AddDecoration` 之后才 Record 的
+        /// 新建路径）。
+        ///
+        /// 所以这里先执行、再记录，把约定补齐。调用方不需要自己做删除。
+        ///
+        /// **index 必须在删除之前取好**——删完后面的下标会整体前移，
+        /// 那是撤销时要插回去的位置。
+        /// </summary>
+        internal static bool RemoveDecoration(scnEditor editor, LevelEvent decoration, int index)
         {
+            if (editor == null || decoration == null)
+            {
+                return false;
+            }
+
+            if (!RemoveDecorationNow(editor, decoration))
+            {
+                return false;
+            }
+
             Record(new RemoveDecorationCommand
             {
                 Editor = editor,
                 Decoration = decoration,
                 Index = index
             });
+            return true;
         }
 
         internal static void RecordPropertyEdit(
@@ -504,6 +641,15 @@ namespace ADOFAIEditorStudio
             undoStack.RemoveAt(undoStack.Count - 1);
             redoStack.Add(command);
             status = "已撤回" + command.Description;
+
+            // **撤回也要同步出去。**
+            //
+            // 这里原本只动本地栈，联机完全不知道撤回了什么——所以撤回在
+            // 对面看是「没反应」，而两台机器就此分叉。
+            //
+            // 报的是 `undone = true`：撤回之后生效的是**旧值**，
+            // 拿新值去报等于把刚撤掉的东西又推回去。
+            ReportToMultiplayer(command, true);
             return true;
         }
 
@@ -534,6 +680,9 @@ namespace ADOFAIEditorStudio
             redoStack.RemoveAt(redoStack.Count - 1);
             undoStack.Add(command);
             status = "已重做" + command.Description;
+
+            // 重做就是重新施加新值，和当初那次编辑报的一样。
+            ReportToMultiplayer(command, false);
             return true;
         }
 
@@ -587,6 +736,17 @@ namespace ADOFAIEditorStudio
                     UnityEngine.Object.DestroyImmediate(doomed.gameObject);
                 }
             }
+
+            // 装饰物的集合变了，求值器的快照缓存得重建。
+            //
+            // 不重建的话它还握着刚被销毁的那个对象的引用，下一帧去碰
+            // 就是 MissingReferenceException。这和 PropertyEditCommand
+            // 改完值要请求重建是同一个道理。
+            //
+            // 放在这里而不是调用方，是因为删除有四条路径
+            // （直接删、撤销新建、重做删除、以及将来可能的批量删），
+            // 放在辅助函数里一次覆盖全。
+            EditorPlaybackBridge.RequestEvaluatorRebuild("decoration-remove");
 
             return true;
         }

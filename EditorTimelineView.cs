@@ -3543,6 +3543,9 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
+            // 拖块也取锁。这是最容易和别人撞上的操作——两个人拖同一个块，
+            // 谁先松手谁说了算，另一个人的努力白费，而且双方都不知道。
+
             blockDragActive = true;
             blockDragOriginalFloor = item.FloorId;
             blockDragOriginalAngleOffset = GetEnabledFloat(item.Event, "angleOffset");

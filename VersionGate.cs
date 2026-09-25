@@ -72,10 +72,27 @@ namespace ADOFAIEditorStudio
                 Url = "https://api.github.com/repos/{REPO}/contents/version.json",
                 IsGitHubApi = true
             },
-            // 备用。内容可能是旧的，但至少不会失败。
+            // 备用。**只用 cdn.jsdelivr.net，不要用 gcore。**
+            //
+            // gcore 曾长期返回一份几个月前的旧副本，purge 也清不掉——
+            // 实测同一时刻 cdn / fastly / testingcf 三个节点都是新的，
+            // 只有 gcore 是旧的。而旧的清单危害是**静默**的：里面
+            // min 和 latest 都是老版本，于是「当前版本 >= min」成立，
+            // 判定成「版本正常」，用户重启多少次都不会更新，还查不出
+            // 原因。宁可换一个已知健康的节点。
             new ManifestSource
             {
-                Url = "https://gcore.jsdelivr.net/gh/{REPO}@main/version.json",
+                Url = "https://cdn.jsdelivr.net/gh/{REPO}@main/version.json",
+                IsGitHubApi = false
+            },
+            new ManifestSource
+            {
+                Url = "https://fastly.jsdelivr.net/gh/{REPO}@main/version.json",
+                IsGitHubApi = false
+            },
+            new ManifestSource
+            {
+                Url = "https://testingcf.jsdelivr.net/gh/{REPO}@main/version.json",
                 IsGitHubApi = false
             },
             new ManifestSource
@@ -141,17 +158,73 @@ namespace ADOFAIEditorStudio
                 thread.Start();
             }
 
+            /// <summary>
+            /// 同时问所有源，取**版本号最大**的那份清单。
+            ///
+            /// 这里原本是「问到第一个能用的就停」。那个做法有个要命的
+            /// 漏洞：CDN 会缓存分支内容，于是某个节点可能拿一份**几个月前**
+            /// 的清单回来，而旧清单里 min 是老版本，判定结果就是「版本正常」
+            /// ——用户永远收不到更新，且日志里没有任何异常可循。
+            /// 真实发生过：API 限流 403 之后回退到 CDN，CDN 给的是旧副本。
+            ///
+            /// 改成全问一遍取最新。清单是个几百字节的常量文件，多问几个源
+            /// 的代价可以忽略，换来的是「单个节点缓存过期」不再能骗过我们。
+            ///
+            /// 一个源都没成功时仍然返回 null，交给上层「清单不可达，
+            /// 跳过检查」——不能让源挂一天就全员卡死。
+            /// </summary>
             private void FetchManifestThread()
             {
-                string json = null;
-                for (int s = 0; s < ManifestSources.Length && string.IsNullOrEmpty(json); s++)
+                string best = null;
+                Version bestVersion = null;
+
+                for (int s = 0; s < ManifestSources.Length; s++)
                 {
                     ManifestSource source = ManifestSources[s];
                     string url = source.Url.Replace("{REPO}", Repo);
-                    json = FetchManifest(source, url);
+                    string json = FetchManifest(source, url);
+                    if (string.IsNullOrEmpty(json))
+                    {
+                        continue;
+                    }
+
+                    Version version = ManifestVersion(json);
+                    if (version == null)
+                    {
+                        continue;
+                    }
+
+                    if (bestVersion == null || version > bestVersion)
+                    {
+                        bestVersion = version;
+                        best = json;
+                    }
                 }
-                pendingManifest = json;
+
+                pendingManifest = best;
                 workDone = true;
+            }
+
+            /// <summary>
+            /// 一份清单里的版本号，用来在多个源之间挑最新的一份。
+            ///
+            /// 看的是 min 和 latest 里**大**的那个：旧清单的特征正是
+            /// 两个数一起变小。解析不出来时返回 null，那一份就作废——
+            /// 宁可少一个候选，也不能拿一份读不懂的清单去比版本。
+            /// </summary>
+            private static Version ManifestVersion(string json)
+            {
+                try
+                {
+                    JObject root = JObject.Parse(json);
+                    Version min = Parse((string)root["min"]);
+                    Version latest = Parse((string)root["latest"]);
+                    return min > latest ? min : latest;
+                }
+                catch
+                {
+                    return null;
+                }
             }
 
             private void DownloadThread()

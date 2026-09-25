@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using ADOFAI;
+using ADOFAIEditorStudio.Multiplayer;
 using TMPro;
 using UnityEngine;
 using UnityEngine.EventSystems;
@@ -85,6 +86,11 @@ namespace ADOFAIEditorStudio
             internal TextMeshProUGUI Label;
             internal RectTransform ControlHost;
             internal readonly List<GameObject> Controls = new List<GameObject>();
+            /// <summary>
+            /// 这一行是哪个属性。联机时用来在重建之后把焦点还给同一个属性——
+            /// 行是按枚举顺序生成的，靠名字找比靠下标稳（属性增删不会错位）。
+            /// </summary>
+            internal string Key;
         }
 
         private EditorStudioOverlay owner;
@@ -110,6 +116,15 @@ namespace ADOFAIEditorStudio
         private bool built;
         private bool syncing;
         private bool refreshQueued;
+
+        // 焦点快照。重建会销毁所有控件，正在编辑的输入框随之失效，
+        // 所以重建之前把「在改哪个属性、光标在第几个字」记下来。
+        private string focusSnapshotKey;
+        private LevelEvent focusSnapshotTarget;
+        private int focusSnapshotCaret;
+        private bool focusRestorePending;
+        /// <summary>这次重建是不是为了「把焦点还回去」——只有联机改值才需要。</summary>
+        private bool captureFocusOnRefresh;
 
         private readonly List<GameObject> enumPopup = new List<GameObject>();
         private LevelEvent enumTarget;
@@ -537,10 +552,29 @@ namespace ADOFAIEditorStudio
             }
 
             float now = Time.unscaledTime;
+
             if (refreshQueued)
             {
                 refreshQueued = false;
+
+                // 重建之前先记下焦点。只有联机改值提示的那次重建才需要
+                // （captureFocusOnRefresh）——普通的选择变化重建时，焦点
+                // 本来就该跟着新事件走，硬拉回去反而会跳。
+                if (captureFocusOnRefresh)
+                {
+                    captureFocusOnRefresh = false;
+                    CaptureEditingFocus();
+                }
+
                 Show(currentEvent);
+
+                // 重画完了，把焦点和光标位置还给同一个属性。
+                if (focusRestorePending && ReferenceEquals(currentEvent, focusSnapshotTarget))
+                {
+                    focusRestorePending = false;
+                    ReapplyEditingFocus();
+                }
+
                 nextSelectionPoll = now + 0.12f;
                 return;
             }
@@ -665,7 +699,171 @@ namespace ADOFAIEditorStudio
             refreshQueued = true;
         }
 
-        internal void Show(LevelEvent levelEvent)
+        /// <summary>
+        /// 联机那边改了本机正在看的这个事件，把参数栏重画一遍。
+        ///
+        /// **不能只改控件里的文字。** 行的内容是按 `PropertyInfo` 元数据
+        /// 生成的，改一个键可能要连带改别的东西（启用开关的勾选、缓动曲线
+        /// 的形状），只改文字会留下一个半新半旧的面板。
+        ///
+        /// 重画会销毁正在编辑的输入框，所以先把焦点和光标位置记下来，
+        /// 重建之后还回去——见 <see cref="CaptureEditingFocus"/>。
+        /// </summary>
+        internal void RefreshFromRemoteEdit()
+        {
+            captureFocusOnRefresh = true;
+            QueueRefresh();
+        }
+
+        /// <summary>
+        /// 记下当前正在编辑的控件和光标位置。
+        ///
+        /// 两种时候用得上：联机改了本机正在看的这个事件（重画参数栏），
+        /// 以及对方增删了事件导致整份谱面重载（所有对象都换新的）。
+        /// 不记的话，对面动一下你正在打的字就没了，还不知道去哪了。
+        /// </summary>
+        internal void CaptureEditingFocus()
+        {
+            EventSystem system = EventSystem.current;
+            if (system == null || rows.Count == 0)
+            {
+                return;
+            }
+
+            GameObject selected = system.currentSelectedGameObject;
+            if (selected == null)
+            {
+                // 没有控件的焦点也可能有事件级的焦点（用户选中了某个事件
+                // 在看参数），那种情况下面恢复到事件即可。
+                if (currentEvent != null)
+                {
+                    focusRestorePending = true;
+                }
+                return;
+            }
+
+            // 从光标控件往上找它属于哪一行。
+            for (int i = 0; i < rows.Count; i++)
+            {
+                Row row = rows[i];
+                if (row == null || row.ControlHost == null || string.IsNullOrEmpty(row.Key))
+                {
+                    continue;
+                }
+
+                if (selected.transform.IsChildOf(row.ControlHost))
+                {
+                    focusSnapshotKey = row.Key;
+                    focusSnapshotTarget = currentEvent;
+                    focusSnapshotTarget = currentEvent;
+
+                    TMP_InputField field = selected.GetComponent<TMP_InputField>();
+                    if (field != null)
+                    {
+                        focusSnapshotCaret = field.caretPosition;
+                    }
+
+                    focusRestorePending = true;
+                    return;
+                }
+            }
+
+            // 焦点不在任何一行上（可能停在启用开关之类的地方），
+            // 那就只恢复到事件级。
+            if (currentEvent != null)
+            {
+                focusSnapshotTarget = currentEvent;
+                focusRestorePending = true;
+            }
+        }
+
+        /// <summary>
+        /// 把重建之前记下的焦点还回去。
+        ///
+        /// 跟的是**属性键**而不是控件下标：行是按枚举顺序生成的，靠下标
+        /// 找在属性增删之后会错位，靠键名找永远对得上。
+        /// </summary>
+        private void ReapplyEditingFocus()
+        {
+            LevelEvent target = currentEvent;
+            if (focusSnapshotTarget == null || target == null
+                || !ReferenceEquals(target, focusSnapshotTarget))
+            {
+                return;
+            }
+
+            ApplyFocusToRows();
+        }
+
+        /// <summary>
+        /// 按记下的属性键和光标位置，把焦点装回新造出来的那批行上。
+        /// 调用方保证 `currentEvent` 已经是重建后的正确事件。
+        /// </summary>
+        private void ApplyFocusToRows()
+        {
+            string key = focusSnapshotKey;
+            int caret = focusSnapshotCaret;
+            ClearFocusSnapshot();
+
+            if (string.IsNullOrEmpty(key))
+            {
+                return;
+            }
+
+            for (int i = 0; i < rows.Count; i++)
+            {
+                Row row = rows[i];
+                if (row == null || row.Root == null || !row.Root.activeSelf
+                    || !string.Equals(row.Key, key, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                TMP_InputField field = row.ControlHost == null
+                    ? null
+                    : row.ControlHost.GetComponentInChildren<TMP_InputField>(true);
+                if (field != null && field.interactable)
+                {
+                    field.ActivateInputField();
+                    // 光标位置放在激活之后设，否则 TMP 会按自己的规则
+                    // 把光标归到开头或结尾。
+                    field.caretPosition = Mathf.Clamp(
+                        caret, 0, field.text == null ? 0 : field.text.Length);
+                }
+                else
+                {
+                    // 这一行的控件不是输入框（开关、枚举、颜色），
+                    // 那就把焦点还给行的控件，别让键盘快捷键落空。
+                    SelectRowControl(row);
+                }
+                break;
+            }
+        }
+
+        private void SelectRowControl(Row row)
+        {
+            if (row == null || row.ControlHost == null)
+            {
+                return;
+            }
+
+            Selectable selectable = row.ControlHost.GetComponentInChildren<Selectable>(true);
+            if (selectable != null && selectable.interactable)
+            {
+                EventSystem system = EventSystem.current;
+                if (system != null)
+                {
+                    system.SetSelectedGameObject(selectable.gameObject);
+                }
+            }
+        }
+
+        private void ClearFocusSnapshot()
+        {
+            focusSnapshotKey = null;
+            focusSnapshotTarget = null;
+            focusSnapshotCaret = 0;
+        }        internal void Show(LevelEvent levelEvent)
         {
             currentEvent = levelEvent;
             CloseEnumPopup();
@@ -706,6 +904,7 @@ namespace ADOFAIEditorStudio
 
                     Row row = ObtainRow(rowIndex, rowWidth);
                     float rowHeight = RowHeightFor(info, rowWidth);
+                    row.Key = pair.Key;
                     BuildRow(row, levelEvent, info, y, rowWidth, rowHeight);
                     rowY.Add(y);
                     y += rowHeight;
@@ -969,9 +1168,21 @@ namespace ADOFAIEditorStudio
                 {
                     return;
                 }
+
+                // 这一处以前直接改 floor 并只调 editor.SaveState，
+                // **没有进工作台自己的历史**。联机要同步所有写谱面的动作，
+                // 所以在这里补一次上报（旧值要在写之前取）。
+                int oldFloor = bound.floor;
+
                 editor.SaveState();
                 bound.floor = parsed;
                 QueueRefresh();
+
+                if (oldFloor != parsed)
+                {
+                    Multiplayer.MultiplayerEditSink.Report(editor, bound,
+                        new[] { "floor" }, new object[] { parsed }, new[] { false });
+                }
             });
         }
 
@@ -1006,7 +1217,16 @@ namespace ADOFAIEditorStudio
             {
                 editor.SaveState();
             }
+
+            bool changed = levelEvent.disabled[key] != disabled;
             levelEvent.disabled[key] = disabled;
+
+            // 同上：这一处原先只有 SaveState，没进工作台历史。
+            if (changed && editor != null)
+            {
+                Multiplayer.MultiplayerEditSink.Report(editor, levelEvent,
+                    new[] { key }, new object[] { levelEvent[key] }, new[] { disabled });
+            }
         }
 
         /// <summary>
