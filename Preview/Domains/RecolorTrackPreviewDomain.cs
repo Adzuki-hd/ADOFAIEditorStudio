@@ -292,6 +292,17 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 // 换材质不保证保住它的颜色，所以把一个没变的颜色
                 // 当成「已经应用过」，可能让格停在新样式的
                 // 默认值上。样式变化很少见，强制写的代价可以忽略。
+                // **接管必须在缓存判断之前。**
+                //
+                // 游戏的辉度 tween 是每次 StartEffect 重新建的，而预览
+                // 拖动会重建特效——所以那条 tween 会反复复活。要是把接管
+                // 放在下面那个「值没变就 continue」之后，值一稳定下来
+                // 我们就再也不会去杀新生的 tween，辉度又会被改回去。
+                //
+                // 放在这里就是每帧都确认一次所有权：杀过即移出字典，
+                // 之后的 TryGetValue 都是廉价失败。
+                PreviewEase.TakeOverGlow(floor);
+
                 bool cacheSafe = !styleChanged
                     && (current.ColorType == TrackColorType.Single
                         || current.ColorType == TrackColorType.Stripes);
@@ -306,6 +317,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
                 floor.SetColor(color);
                 floor.glowMultiplier = glow;
+
 
                 // 让游戏自己去驱动这些格的颜色，而不是只把颜色写上去。
                 //

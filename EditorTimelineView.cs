@@ -996,6 +996,7 @@ namespace ADOFAIEditorStudio
             {
                 RefreshGeometry();
             }
+
             UpdatePlayhead(snapshot);
         }
 

@@ -578,6 +578,7 @@ namespace ADOFAIEditorStudio
             {
                 Show(null);
             }
+
         }
 
         private static bool IsStillLive(LevelEvent levelEvent)

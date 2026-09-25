@@ -80,6 +80,46 @@ namespace ADOFAIEditorStudio.Preview.Domains
         private Dictionary<long, List<int>> chunkFloors;
         private readonly List<int> visibleFloors = new List<int>();
 
+        /// <summary>
+        /// 这一帧算好、但还没写下去的格状态。
+        ///
+        /// 为什么不直接写：**游戏的原生组件跑在求值器之后**，会把
+        /// floor.transform 重置回烘焙值。实测同一帧里，求值刚写完是
+        /// rot=45 / scale=0,2，到帧末读回来已经是 rot=0 / scale=1——
+        /// 也就是玩家看到的一直是原始姿态，MoveTrack 等于没生效。
+        ///
+        /// 所以改成求值只算、入队，帧末在 LateUpdate 里再写。
+        /// 这和粒子发射器图标、编辑器引导线是同一个修法。
+        /// </summary>
+        internal struct PendingWrite
+        {
+            internal scrFloor Floor;
+            // 要写哪几个通道。MoveTrack 四个都写；AnimateTrack 只写它
+            // 真正驱动的那些——它从不碰的通道绝不能被写回，否则会盖掉
+            // MoveTrack 设的值（有张谱面用 MoveTrack(opacity 0) 藏后面的格，
+            // 结果被全局消失动画把不透明度改回了基线）。
+            internal bool WritePosition;
+            internal bool WriteRotation;
+            internal bool WriteScale;
+            internal bool WriteOpacity;
+            internal Vector3 Position;
+            internal Quaternion Rotation;
+            internal Vector3 Scale;
+            internal float Opacity;
+        }
+
+        private readonly List<PendingWrite> pendingWrites = new List<PendingWrite>();
+
+        /// <summary>
+        /// 交一笔延迟写入。AnimateTrack 用它排在自己那些格上，
+        /// 排在 MoveTrack 之后，于是在帧末下发时仍然赢过 MoveTrack——
+        /// 与两者原来直写时的先后关系一致。
+        /// </summary>
+        internal void QueueWrite(PendingWrite write)
+        {
+            pendingWrites.Add(write);
+        }
+
         private static long ChunkKey(int x, int y)
         {
             return ((long)x << 32) ^ (uint)y;
@@ -100,6 +140,9 @@ namespace ADOFAIEditorStudio.Preview.Domains
         internal void AttachAnimateTrack(AnimateTrackPreviewDomain domain)
         {
             animateTrack = domain;
+            // 反向引用：AnimateTrack 的写入要经本域的延迟队列，
+            // 排在 MoveTrack 之后，才能在帧末下发时保持「它胜出」。
+            domain.AttachOwner(this);
         }
 
         public void Analyze(PreviewTimelineContext context)
@@ -404,6 +447,9 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
         public void Evaluate(PreviewEvaluationFrame frame)
         {
+            // 上一帧的队列正常情况下已经被 ApplyPendingWrites 消费掉了；
+            // 这里再清一次是防它没跑（比如工作台中途被关掉）。
+            pendingWrites.Clear();
             bool chunked = CollectVisibleFloors();
             if (chunked)
             {
@@ -506,32 +552,105 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 }
             }
 
-            // 只在变化时写入。这段每帧对每个格都跑，而
-            // transform 的 setter 加上 SetOpacity 都不便宜；有几千个
-            // MoveTrack 事件时，无条件写入压过了整帧。
+            // 只入队，不写。真正的写入在 ApplyPendingWrites（LateUpdate），
+            // 因为原生组件会在本帧稍后把这些值重置回烘焙状态。
             Vector3 wantedPosition = new Vector3(position.x, position.y, floor.transform.position.z);
-            if ((floor.transform.position - wantedPosition).sqrMagnitude > 0.000001f)
-            {
-                floor.transform.position = wantedPosition;
-            }
-
             Quaternion wantedRotation = Quaternion.Euler(0f, 0f, rotation);
-            if (Quaternion.Angle(floor.transform.rotation, wantedRotation) > 0.02f)
-            {
-                floor.transform.rotation = wantedRotation;
-            }
-
             Vector3 wantedScale = new Vector3(scale.x / 100f, scale.y / 100f, baseline.Scale.z);
-            if ((floor.transform.localScale - wantedScale).sqrMagnitude > 0.000001f)
+            float wantedOpacity = Mathf.Clamp01(opacity / 100f);
+
+            pendingWrites.Add(new PendingWrite
             {
-                floor.transform.localScale = wantedScale;
+                Floor = floor,
+                WritePosition = true,
+                WriteRotation = true,
+                WriteScale = true,
+                WriteOpacity = true,
+                Position = wantedPosition,
+                Rotation = wantedRotation,
+                Scale = wantedScale,
+                Opacity = wantedOpacity
+            });
+        }
+
+        /// <summary>
+        /// 把这一帧算好的格状态真正写下去。由
+        /// PreviewEvaluationEngine.TickEditorScaffoldingLate 在 LateUpdate 里调用。
+        ///
+        /// 必须放在 LateUpdate：游戏自己的组件在 Update 阶段跑，
+        /// 会把 floor.transform 重置回烘焙值。LateUpdate 保证在所有 Update
+        /// 之后、渲染之前，那才是这一帧画面真正读到 transform 的时刻。
+        ///
+        /// 每一步都带变化检测，所以原生要是没覆盖，这里就是一次空转——
+        /// 不会为了保险而无条件写几百个 transform。
+        /// </summary>
+        internal void ApplyPendingWrites()
+        {
+            if (pendingWrites.Count == 0)
+            {
+                return;
             }
 
-            float wantedOpacity = Mathf.Clamp01(opacity / 100f);
-            if (Mathf.Abs(floor.opacity - wantedOpacity) > 0.002f)
+            for (int i = 0; i < pendingWrites.Count; i++)
             {
-                floor.SetOpacity(wantedOpacity);
+                PendingWrite write = pendingWrites[i];
+                scrFloor floor = write.Floor;
+                if (floor == null)
+                {
+                    continue;
+                }
+
+                if (write.WritePosition)
+                {
+                    if ((floor.transform.position - write.Position).sqrMagnitude > 0.000001f)
+                    {
+                        floor.transform.position = write.Position;
+                    }
+                    // 游戏的 ffxMoveFloorPlus 用 PositionX/PositionY，
+                    // 别的特效可能用整体的 Position，一并接管。
+                    PreviewEase.TakeOverChannel(floor, TweenType.Position);
+                    PreviewEase.TakeOverChannel(floor, TweenType.PositionX);
+                    PreviewEase.TakeOverChannel(floor, TweenType.PositionY);
+                }
+
+                if (write.WriteRotation)
+                {
+                    if (Quaternion.Angle(floor.transform.rotation, write.Rotation) > 0.02f)
+                    {
+                        floor.transform.rotation = write.Rotation;
+                    }
+
+                    // **必须同步影子状态。** 游戏的旋转不是直接写在 transform 上的：
+                    // tween 写 floor.tweenRot，再由它的 OnUpdate 每帧
+                    // 推给 transform.eulerAngles。只改 transform 的话，
+                    // 那个驻留的 tween 下一帧就把旧值推回来——
+                    // 这正是「MoveTrack 看起来从没生效」的根因。
+                    floor.tweenRot = write.Rotation.eulerAngles;
+                    PreviewEase.TakeOverChannel(floor, TweenType.Rotation);
+                }
+
+                if (write.WriteScale)
+                {
+                    if ((floor.transform.localScale - write.Scale).sqrMagnitude > 0.000001f)
+                    {
+                        floor.transform.localScale = write.Scale;
+                    }
+                    PreviewEase.TakeOverChannel(floor, TweenType.Scale);
+                    PreviewEase.TakeOverChannel(floor, TweenType.ScaleX);
+                    PreviewEase.TakeOverChannel(floor, TweenType.ScaleY);
+                }
+
+                if (write.WriteOpacity)
+                {
+                    if (Mathf.Abs(floor.opacity - write.Opacity) > 0.002f)
+                    {
+                        floor.SetOpacity(write.Opacity);
+                    }
+                    PreviewEase.TakeOverChannel(floor, TweenType.Opacity);
+                }
             }
+
+            pendingWrites.Clear();
         }
 
         public void EndSession()

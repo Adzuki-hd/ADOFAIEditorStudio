@@ -177,6 +177,15 @@ namespace ADOFAIEditorStudio.Preview.Domains
         // 发生跳变的那些帧，就能看出这个求值器是否复现了那次
         // 稳定、幅度是多大。
         private float lastLoggedZoom = float.NaN;
+        /// <summary>
+        /// CameraCmp 的采样节流。
+        ///
+        /// 这条日志曾经每帧都打，占掉整个 Player.log 的 80%。它要回答的
+        /// 是「求值器算出的相机位置和场景实际的对不对得上」，抽样看就够；
+        /// 每帧都看既没有更多信息，又把真正有用的日志淹了。
+        /// </summary>
+        private const int CameraCompareIntervalFrames = 30;
+        private int lastCameraCompareFrame = -10000;
         private Vector2 lastLoggedPosition = new Vector2(float.NaN, float.NaN);
         private float lastLoggedRotation = float.NaN;
 
@@ -483,12 +492,20 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 return;
             }
 
+            if (Time.frameCount - lastCameraCompareFrame < CameraCompareIntervalFrames)
+            {
+                return;
+            }
+            lastCameraCompareFrame = Time.frameCount;
+
             scrCamera camera = scrCamera.instance;
             if (camera == null)
             {
                 return;
             }
 
+            // 这一次求值只服务于打印，但打印里确实要它（follow= 那一项），
+            // 所以留着。节流到 30 帧一次之后，它的代价也跟着降到 1/30。
             Vector2 follow = EvaluateFollow(floorIndex, time);
             Vector2 actual = camera.transform.position;
             Vector2 local = camera.transform.localPosition;

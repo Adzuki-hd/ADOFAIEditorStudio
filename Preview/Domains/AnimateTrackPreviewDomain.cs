@@ -43,6 +43,23 @@ namespace ADOFAIEditorStudio.Preview.Domains
             internal Vector2 Scale;
             internal bool HasOpacity;
             internal float Opacity;
+
+            /// <summary>
+            /// 这一段跑完之后，它驱动的通道要不要**继续保持**在终点值上。
+            ///
+            /// 两类段的语义正好相反，用一个标志区分：
+            ///
+            ///   · 落地段（appear 的 settle）：不保持。跑完就松手，
+            ///     把姿态交还给同时在跑的其它域（MoveTrack 的长位移）。
+            ///     早期的毛病是它**永远**在生效，每帧把 MoveTrack 写好的
+            ///     旋转改回基线——那才是「MoveTrack 从没生效」的根因。
+            ///
+            ///   · 消失段（disappear）：保持。它要把格淡出/缩没，跑完之后
+            ///     必须一直停在那儿。松手的话，MoveTrack 会照写它自己的
+            ///     透明度，把已经消失的格又写回来——表现就是
+            ///     「前面的轨道该消失却还在」。
+            /// </summary>
+            internal bool PersistAfter;
         }
 
         private sealed class FloorAnimation
@@ -102,6 +119,13 @@ namespace ADOFAIEditorStudio.Preview.Domains
             int aheadFloor = 0;
             int behindFloor = 0;
 
+            // 事件的**原始**拍数。每个格都从它重算一次缩放，
+            // 绝不拿上一格算好的结果再乘——那样是逐格累乘，
+            // 在 BPM 突变处（有的谱面瞬时几万 BPM）会指数级偏离，
+            // 表现就是「原版十几个格一起出现，这里一格一格来」。
+            float rawBeatsAhead = 0f;
+            float rawBeatsBehind = 0f;
+
             LevelData levelData = scnGame.instance == null ? null : scnGame.instance.levelData;
             if (levelData != null)
             {
@@ -109,6 +133,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 disappear = levelData.trackDisappearAnimation;
                 beatsAhead = levelData.trackBeatsAhead;
                 beatsBehind = levelData.trackBeatsBehind;
+                rawBeatsAhead = beatsAhead;
+                rawBeatsBehind = beatsBehind;
             }
 
             int cursor = 0;
@@ -119,30 +145,38 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     PreviewEventSnapshot levelEvent = events[cursor];
                     cursor++;
 
-                    if (!context.IsPropertyEnabled(levelEvent, "trackAnimation"))
-                    {
-                        beatsAhead = ScaleBeats(context, beatsAhead, aheadFloor, floorIndex);
-                    }
-                    else
+                    // 这里只维护**原始值**与锚点格；缩放挪到下面每格都做。
+                    if (context.IsPropertyEnabled(levelEvent, "trackAnimation"))
                     {
                         appear = context.GetValue(levelEvent, "trackAnimation", appear);
-                        beatsAhead = context.GetValue(levelEvent, "beatsAhead", beatsAhead);
+                        rawBeatsAhead = context.GetValue(levelEvent, "beatsAhead", rawBeatsAhead);
                         aheadFloor = floorIndex;
                     }
 
-                    if (!context.IsPropertyEnabled(levelEvent, "trackDisappearAnimation"))
-                    {
-                        beatsBehind = ScaleBeats(context, beatsBehind, behindFloor, floorIndex);
-                    }
-                    else
+                    if (context.IsPropertyEnabled(levelEvent, "trackDisappearAnimation"))
                     {
                         disappear = context.GetValue(levelEvent, "trackDisappearAnimation", disappear);
-                        beatsBehind = context.GetValue(levelEvent, "beatsBehind", beatsBehind);
+                        rawBeatsBehind = context.GetValue(levelEvent, "beatsBehind", rawBeatsBehind);
                         behindFloor = floorIndex;
                     }
                 }
 
-                BuildFloor(context, floorIndex, appear, beatsAhead, disappear, beatsBehind);
+                // **每格都重算缩放**，这是关键。
+                //
+                // 游戏那边（scnGame 逐格烘入）：
+                //     float num18 = speed / num6;        // speed 是**当前格**的
+                //     orAddComponent.tilesAhead = num3 * num18;
+                // 所以提前量随当前格 BPM 一起变。
+                //
+                // 之前只在遇到 AnimateTrack 事件那一格才重算，中间一直沿用旧值，
+                // 于是 BPM 涨上去之后提前量还是老值——表现就是
+                // 「原版十几个格一起出现，这里一格一格来」。
+                float scaledAhead = ScaleBeats(context, rawBeatsAhead, aheadFloor, floorIndex);
+                float scaledBehind = ScaleBeats(context, rawBeatsBehind, behindFloor, floorIndex);
+                beatsAhead = scaledAhead;
+                beatsBehind = scaledBehind;
+
+                BuildFloor(context, floorIndex, appear, scaledAhead, disappear, scaledBehind);
             }
 
             int segmentCount = 0;
@@ -383,7 +417,10 @@ namespace ADOFAIEditorStudio.Preview.Domains
             {
                 Start = start,
                 Duration = duration,
-                Ease = AnimEase
+                Ease = AnimEase,
+                // 消失是「终态」：跑完必须一直保持，否则 MoveTrack 会把
+                // 已经淡出的格又写回来（前面的轨道该不见却还在）。
+                PersistAfter = true
             };
 
             UnityEngine.Random.State savedState = UnityEngine.Random.state;
@@ -437,6 +474,17 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
             animation.Segments.Add(gone);
         }
+        /// <summary>
+        /// 宿主 MoveTrack 域。本域由它驱动，写入也经它的延迟队列下发，
+        /// 这样两者在帧末的先后关系与原来直写时一致。
+        /// </summary>
+        private MoveTrackPreviewDomain ownerTrack;
+
+        internal void AttachOwner(MoveTrackPreviewDomain track)
+        {
+            ownerTrack = track;
+        }
+
         public void Evaluate(PreviewEvaluationFrame frame)
         {
             PreviewTimelineContext context = frame.Context;
@@ -479,6 +527,31 @@ namespace ADOFAIEditorStudio.Preview.Domains
                         break;
                     }
 
+                    // 段的时间窗。原生那边每个段都是一次性 tween，跑完就松手，
+                    // 姿态交给同时段还在跑的其他特效（比如 MoveTrack 的长位移）。
+                    //
+                    // 这个求值器是每帧重算的，如果不过滤「已经结束」的段，
+                    // 那个把姿态落回基线的 settle 段就会**永远**在生效，
+                    // 每帧把 MoveTrack 写好的旋转/缩放改回基线——
+                    // 表现就是「MoveTrack 从没生效过」。
+                    //
+                    // 窗口的右端取「下一段的起点」，所以同一时刻只有一个段在驱动；
+                    // 最后一段则取它自己跑完的时刻。散开段从无限早开始、是持续状态，
+                    // 它由下一段（settle）接管。
+                    double segmentEnd = i + 1 < animation.Segments.Count
+                        ? animation.Segments[i + 1].Start
+                        : (double.IsNegativeInfinity(segment.Start)
+                            ? double.PositiveInfinity
+                            // 末段的结束点：要保持的段（消失）跑完仍算生效，
+                            // 不保持的（落地）跑完就松手。
+                            : (segment.PersistAfter
+                                ? double.PositiveInfinity
+                                : segment.Start + segment.Duration));
+                    if (frame.Time >= segmentEnd)
+                    {
+                        continue;
+                    }
+
                     float ratio = segment.Duration <= 0f
                         ? 1f
                         : Mathf.Clamp01((frame.Time - (float)segment.Start) / segment.Duration);
@@ -512,23 +585,44 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     }
                 }
 
-                if (touchedPosition)
+                // 不直接写，交给 MoveTrack 的延迟队列在帧末统一下发。
+                //
+                // 两个理由：
+                //   · 游戏的原生组件跑在求值器之后，会把这些 transform
+                //     重置回烘焙值，直写等于白写。
+                //   · 本域的写入必须排在 MoveTrack 之后才能「胜出」，
+                //     而两者原来就是直写时的先后关系；走同一条队列、
+                //     按入队顺序下发，这个先后关系原样保留。
+                //
+                // 只标 touched 的通道：本域从不碰的通道绝不能被写回，
+                // 否则会盖掉 MoveTrack 设的值。
+                if (ownerTrack == null)
                 {
-                    binding.transform.position = position;
+                    // 宿主没接上时退回直写。正常路径不会走到这里
+                    // （AttachAnimateTrack 会一并注入宿主），但宁可写得
+                    // 难看一点，也不要因为接不上就整段不生效。
+                    if (touchedPosition) { binding.transform.position = position; }
+                    if (touchedRotation) { binding.transform.rotation = Quaternion.Euler(0f, 0f, rotation); }
+                    if (touchedScale)
+                    {
+                        binding.transform.localScale = new Vector3(
+                            scale.x / 100f, scale.y / 100f, animation.BaseScale.z);
+                    }
+                    if (touchedOpacity) { binding.SetOpacity(Mathf.Clamp01(opacity / 100f)); }
+                    continue;
                 }
-                if (touchedRotation)
+                ownerTrack.QueueWrite(new MoveTrackPreviewDomain.PendingWrite
                 {
-                    binding.transform.rotation = Quaternion.Euler(0f, 0f, rotation);
-                }
-                if (touchedScale)
-                {
-                    binding.transform.localScale = new Vector3(
-                        scale.x / 100f, scale.y / 100f, animation.BaseScale.z);
-                }
-                if (touchedOpacity)
-                {
-                    binding.SetOpacity(Mathf.Clamp01(opacity / 100f));
-                }
+                    Floor = binding,
+                    WritePosition = touchedPosition,
+                    WriteRotation = touchedRotation,
+                    WriteScale = touchedScale,
+                    WriteOpacity = touchedOpacity,
+                    Position = position,
+                    Rotation = Quaternion.Euler(0f, 0f, rotation),
+                    Scale = new Vector3(scale.x / 100f, scale.y / 100f, animation.BaseScale.z),
+                    Opacity = Mathf.Clamp01(opacity / 100f)
+                });
             }
         }
 

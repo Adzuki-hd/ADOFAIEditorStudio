@@ -547,6 +547,7 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
+
             if (!EditorBridge.IsEditorActive() && !EditorPlaybackBridge.IsRestartingPreview)
             {
                 if (visible)
@@ -631,30 +632,11 @@ namespace ADOFAIEditorStudio
             }
 
             UpdateNonPreviewPointerCapture();
-            long frameStart = Main.Settings != null && Main.Settings.VerboseDiagnostics
-                ? System.Diagnostics.Stopwatch.GetTimestamp()
-                : 0L;
+
             EditorPlaybackBridge.TickPreview(previewViewport);
-            long afterPreview = System.Diagnostics.Stopwatch.GetTimestamp();
             RefreshPlaybackState();
-            long afterState = System.Diagnostics.Stopwatch.GetTimestamp();
             TickProjectWorkspace();
-            long afterWorkspace = System.Diagnostics.Stopwatch.GetTimestamp();
-
-            if (frameStart != 0L && Time.frameCount - lastOverlayCostFrame >= 60)
-            {
-                lastOverlayCostFrame = Time.frameCount;
-                double frequency = System.Diagnostics.Stopwatch.Frequency / 1000.0;
-                Main.Logger.Log("[OverlayCost] preview="
-                    + ((afterPreview - frameStart) / frequency).ToString("0.00")
-                    + "ms state=" + ((afterState - afterPreview) / frequency).ToString("0.00")
-                    + "ms workspace=" + ((afterWorkspace - afterState) / frequency).ToString("0.00")
-                    + "ms total=" + ((afterWorkspace - frameStart) / frequency).ToString("0.00")
-                    + "ms fps=" + (1f / Mathf.Max(0.0001f, Time.unscaledDeltaTime)).ToString("0") + ".");
-            }
         }
-
-        private int lastOverlayCostFrame = -10000;
 
         private void BuildRuntimeUi()
         {
@@ -1385,6 +1367,7 @@ namespace ADOFAIEditorStudio
                     break;
                 }
             }
+
         }
 
         private void DecodeMediaThumbnail(MediaThumbnailRequest request)

@@ -575,6 +575,13 @@ namespace ADOFAIEditorStudio
     {
         private static void Prefix(int floorNum, float? windbackTime, bool movePos, bool doingRevive)
         {
+            // 诊断门控。这条会 dump Environment.StackTrace——捕获完整调用栈
+            // 本身就不便宜，而 UMM 的写入还是同步的 Console.WriteLine。
+            // 它是排查「按一下之后那 600 帧」用的，不该在正常情况下跑。
+            if (Main.Settings == null || !Main.Settings.VerboseDiagnostics)
+            {
+                return;
+            }
             if (Time.frameCount - EditorPlaybackBridge.LastTrackBPressFrame > 600)
             {
                 return;
@@ -2222,6 +2229,14 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private static void TraceAudioSync()
         {
+            // 诊断门控。这条日志走 UMM 的 Logger，而它内部第一句是
+            // Console.WriteLine——同步写控制台。实测一条这样的日志单独
+            // 占掉过一整帧 176ms。这一族都是排查特定问题时加的，
+            // 不该在正常播放路径上跑。
+            if (!VerboseDiagnostics)
+            {
+                return;
+            }
             if (!previewClockRunning)
             {
                 syncTraceNext = 0;
@@ -3089,6 +3104,14 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private static void LogTrackBEffects(string phase)
         {
+            // 诊断门控。这条日志走 UMM 的 Logger，而它内部第一句是
+            // Console.WriteLine——同步写控制台。实测一条这样的日志单独
+            // 占掉过一整帧 176ms。这一族都是排查特定问题时加的，
+            // 不该在正常播放路径上跑。
+            if (!VerboseDiagnostics)
+            {
+                return;
+            }
             scrVfxPlus vfx = scrVfxPlus.instance;
             scrConductor conductor = scrConductor.instance;
             if (vfx == null || vfx.effects == null)
@@ -3128,6 +3151,14 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private static void LogTrackBCamera(string phase)
         {
+            // 诊断门控。这条日志走 UMM 的 Logger，而它内部第一句是
+            // Console.WriteLine——同步写控制台。实测一条这样的日志单独
+            // 占掉过一整帧 176ms。这一族都是排查特定问题时加的，
+            // 不该在正常播放路径上跑。
+            if (!VerboseDiagnostics)
+            {
+                return;
+            }
             scrCamera camera = scrCamera.instance;
             scnGame level = scnGame.instance;
             if (camera == null)
@@ -3175,6 +3206,14 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private static void LogTrackBAudio(string phase, scrConductor conductor, float targetTime)
         {
+            // 诊断门控。这条日志走 UMM 的 Logger，而它内部第一句是
+            // Console.WriteLine——同步写控制台。实测一条这样的日志单独
+            // 占掉过一整帧 176ms。这一族都是排查特定问题时加的，
+            // 不该在正常播放路径上跑。
+            if (!VerboseDiagnostics)
+            {
+                return;
+            }
             if (conductor == null || conductor.song == null)
             {
                 return;
@@ -6549,7 +6588,11 @@ namespace ADOFAIEditorStudio
             bool profile = VerboseDiagnostics;
             long t0 = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
 
-            if (Time.frameCount - lastTrackCTrace > 60)
+            // 诊断门控。**这一条原先没有门控**，于是对一个公开发布的 mod，
+            // 玩家正常播放时每 60 帧就会同步往控制台写一条长字符串
+            // （UMM 的 Logger 内部第一句就是 Console.WriteLine）。
+            // 实测这一条单独占掉一整帧 176ms。
+            if (VerboseDiagnostics && Time.frameCount - lastTrackCTrace > 60)
             {
                 lastTrackCTrace = Time.frameCount;
                 scrConductor traceConductor = scrConductor.instance;

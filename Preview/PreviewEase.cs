@@ -36,6 +36,48 @@ namespace ADOFAIEditorStudio.Preview
     internal static class PreviewEase
     {
         /// <summary>
+        /// 把一条格通道从游戏手里接过来：杀掉它那条 tween，
+        /// 让它不再按自己的时间线往回推我们写好的值。
+        ///
+        /// 为什么需要：游戏的 MoveTrack / RecolorTrack 等特效都是用
+        /// DOTween 驱动格属性的，而且 tween 一旦建好就会一直跑到它
+        /// 自己的时间线结束。求值器是按预览时间重新求值的，
+        /// 两者会互相覆盖——表现就是「事件看起来完全没生效」。
+        ///
+        /// 已确认游戏会在格上驱动这些通道（见 ffxMoveFloorPlus /
+        /// ffxRecolorFloorPlus / ffxFloorAppearPlus / DisappearPlus）：
+        ///   Position, PositionX, PositionY, Rotation,
+        ///   Scale, ScaleX, ScaleY, Opacity, Color, Glow
+        /// 少接一个，那一个通道就会被游戏改回去。
+        ///
+        /// 查不到时几乎不花钱，杀过即移出字典，不会反复查。
+        /// </summary>
+        internal static void TakeOverChannel(scrFloor floor, TweenType type)
+        {
+            if (floor == null || floor.moveTweens == null)
+            {
+                return;
+            }
+
+            Tween tween;
+            if (!floor.moveTweens.TryGetValue(type, out tween))
+            {
+                return;
+            }
+
+            if (tween != null && tween.active)
+            {
+                tween.Kill(false);
+            }
+            floor.moveTweens.Remove(type);
+        }
+
+        /// <summary>辉度通道。</summary>
+        internal static void TakeOverGlow(scrFloor floor)
+        {
+            TakeOverChannel(floor, TweenType.Glow);
+        }
+        /// <summary>
         /// 按原生 tween 的方式求缓动值。Flash 家族会先把振幅截断成整数，
         /// 与 <c>SetEase</c> 的行为一致。
         /// </summary>

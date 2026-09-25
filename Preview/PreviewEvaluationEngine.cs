@@ -27,6 +27,9 @@ namespace ADOFAIEditorStudio.Preview
                 // 因为现在 ball follow 和 MoveCamera 都由同一个写入者负责，
                 // 不再是 SyncResidentNativeCameraFocus 旁边的第二个写入者。
                 MoveTrack,
+                // 点亮球已踩过的格。辉度的显隐由 hasLit 决定，而格子建出来时
+                // 它是 false——预览里没有球踩过，不补这一步辉度永远看不见。
+                new LightedTrackPreviewDomain(),
                 new CameraPreviewDomain(),
                 new RecolorTrackPreviewDomain(),
                 new DecorationCorePreviewDomain(),
@@ -214,6 +217,11 @@ namespace ADOFAIEditorStudio.Preview
                 return;
             }
             SuppressEditorScaffolding(scnEditor.instance);
+
+            // MoveTrack 的格 transform 必须在这里写，不能放在求值里：
+            // 游戏的原生组件跑在求值器之后，会把它们重置回烘焙值。
+            // 和上面那两条引导线是同一个道理。
+            MoveTrack.ApplyPendingWrites();
         }
 
         /// <summary>
