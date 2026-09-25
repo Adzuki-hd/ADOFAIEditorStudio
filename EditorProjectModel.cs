@@ -1,30 +1,15 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Security.Cryptography;
-using System.Text;
 using ADOFAI;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
 using UnityEngine;
 
 namespace ADOFAIEditorStudio
 {
-    [Serializable]
-    internal sealed class EditorProjectDocument
-    {
-        public string format = "ADOFAIEditorStudioProject";
-        public int version = 1;
-        public string projectId;
-        public string level;
-        public string levelFingerprint;
-        public List<string> mediaRoots = new List<string> { "." };
-        public List<string> media = new List<string>();
-
-        [JsonExtensionData]
-        public IDictionary<string, JToken> extensionData = new Dictionary<string, JToken>();
-    }
-
+    /// <summary>
+    /// 媒体列表里的一条。谱面文件夹下每一张能被当成装饰物素材的图，
+    /// 都对应这里的一条记录。
+    /// </summary>
     internal sealed class EditorProjectMediaItem
     {
         internal string RelativePath;
@@ -40,6 +25,17 @@ namespace ADOFAIEditorStudio
         internal long LastWriteUtcTicks;
     }
 
+    /// <summary>
+    /// 当前谱面的媒体索引：递归扫一遍谱面所在目录，把里面所有图片
+    /// 收成一张表，供左侧媒体网格显示和拖放。
+    ///
+    /// 这里**不落任何文件**。它曾经会写一个 .adofaiprj「工程文件」，
+    /// 里面存一份同样的媒体路径表、一个随机 GUID、以及谱面文件的
+    /// SHA256。那几样东西全项目没有任何地方在读——路径表每半秒扫盘
+    /// 就能重建，GUID 从生成那天起就没人看过。代价却是每打开一张谱面，
+    /// 都往作者的谱面文件夹里多写三个文件（.adofaiprj/.bak/.tmp）。
+    /// 索引本来就是从磁盘算出来的，没有理由再往磁盘写回去。
+    /// </summary>
     internal sealed class EditorProjectSession
     {
         private static readonly HashSet<string> ImageExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -60,20 +56,15 @@ namespace ADOFAIEditorStudio
             "__MACOSX"
         };
 
-        internal EditorProjectDocument Document { get; private set; }
         internal string LevelPath { get; private set; }
-        internal string ProjectPath { get; private set; }
         internal string RootDirectory { get; private set; }
         internal List<EditorProjectMediaItem> Media { get; private set; }
-        internal List<string> MediaDirectories { get; private set; }
         internal string Error { get; private set; }
         private long mediaFingerprint;
-        private long levelFileStamp;
 
         private EditorProjectSession()
         {
             Media = new List<EditorProjectMediaItem>();
-            MediaDirectories = new List<string>();
         }
 
         internal static EditorProjectSession LoadCurrent()
@@ -92,14 +83,17 @@ namespace ADOFAIEditorStudio
             var session = new EditorProjectSession
             {
                 LevelPath = levelPath,
-                ProjectPath = Path.ChangeExtension(levelPath, ".adofaiprj"),
                 RootDirectory = Path.GetDirectoryName(levelPath)
             };
-            session.LoadDocument();
             session.RefreshMediaIndex();
             return session;
         }
 
+        /// <summary>
+        /// 重新扫一遍。返回「内容变了没有」——调用方据此决定
+        /// 要不要重建列表。指纹里带文件长度和修改时间，所以增删图片、
+        /// 或者覆盖保存一张图，都能被认出来。
+        /// </summary>
         internal bool RefreshMediaIndex()
         {
             if (string.IsNullOrWhiteSpace(RootDirectory) || !Directory.Exists(RootDirectory))
@@ -112,14 +106,11 @@ namespace ADOFAIEditorStudio
             files.Sort(StringComparer.OrdinalIgnoreCase);
 
             var nextMedia = new List<EditorProjectMediaItem>(files.Count);
-            var nextPaths = new List<string>(files.Count);
-            var directories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             long nextFingerprint = 17L;
             for (int i = 0; i < files.Count; i++)
             {
                 string absolute = files[i];
                 string relative = ToRelativePath(absolute);
-                string directory = NormalizeDirectory(Path.GetDirectoryName(relative));
                 long lastWriteTicks = 0L;
                 try
                 {
@@ -134,13 +125,10 @@ namespace ADOFAIEditorStudio
                     RelativePath = relative,
                     AbsolutePath = absolute,
                     FileName = Path.GetFileName(relative),
-                    DirectoryPath = directory,
+                    DirectoryPath = NormalizeDirectory(Path.GetDirectoryName(relative)),
                     Extension = Path.GetExtension(relative).ToLowerInvariant(),
                     LastWriteUtcTicks = lastWriteTicks
                 });
-                nextPaths.Add(relative);
-                directories.Add(directory);
-                AddParentDirectories(directory, directories);
                 try
                 {
                     var info = new FileInfo(absolute);
@@ -157,139 +145,10 @@ namespace ADOFAIEditorStudio
                 }
             }
 
-            directories.Remove(".");
-            var nextDirectories = new List<string>(directories);
-            nextDirectories.Sort(CompareDirectoryPaths);
-
-            bool indexChanged = !SequenceEquals(Document.media, nextPaths);
-            bool mediaChanged = nextFingerprint != mediaFingerprint;
+            bool changed = nextFingerprint != mediaFingerprint;
             mediaFingerprint = nextFingerprint;
-            if (Document.media == null)
-            {
-                Document.media = new List<string>();
-            }
-            if (Document.mediaRoots == null || Document.mediaRoots.Count == 0)
-            {
-                Document.mediaRoots = new List<string> { "." };
-                indexChanged = true;
-            }
-            if (indexChanged)
-            {
-                Document.media = nextPaths;
-                SaveDocument();
-            }
-            RefreshLevelFingerprint();
-
             Media = nextMedia;
-            MediaDirectories = nextDirectories;
-            return indexChanged || mediaChanged;
-        }
-
-        private void RefreshLevelFingerprint()
-        {
-            try
-            {
-                var info = new FileInfo(LevelPath);
-                long nextStamp;
-                unchecked
-                {
-                    nextStamp = info.Length * 397L ^ info.LastWriteTimeUtc.Ticks;
-                }
-                if (levelFileStamp != 0L && nextStamp != levelFileStamp)
-                {
-                    SaveDocument();
-                }
-                levelFileStamp = nextStamp;
-            }
-            catch
-            {
-                // 编辑器保存时可能以原子替换的方式换掉谱面文件。
-            }
-        }
-
-        internal void SaveDocument()
-        {
-            try
-            {
-                if (Document == null || string.IsNullOrWhiteSpace(ProjectPath))
-                {
-                    return;
-                }
-
-                if (string.IsNullOrWhiteSpace(Document.projectId))
-                {
-                    Document.projectId = Guid.NewGuid().ToString("N");
-                }
-                Document.format = "ADOFAIEditorStudioProject";
-                Document.version = 1;
-                Document.level = Path.GetFileName(LevelPath);
-                Document.levelFingerprint = ComputeFileFingerprint(LevelPath);
-
-                string json = JsonConvert.SerializeObject(Document, Formatting.Indented);
-                string temporaryPath = ProjectPath + ".tmp";
-                File.WriteAllText(temporaryPath, json, new UTF8Encoding(false));
-                if (File.Exists(ProjectPath))
-                {
-                    string backupPath = ProjectPath + ".bak";
-                    File.Replace(temporaryPath, ProjectPath, backupPath, true);
-                }
-                else
-                {
-                    File.Move(temporaryPath, ProjectPath);
-                }
-                Error = null;
-            }
-            catch (Exception exception)
-            {
-                Error = "工程文件保存失败：" + exception.Message;
-                if (Main.Logger != null)
-                {
-                    Main.Logger.Warning(Error);
-                }
-            }
-        }
-
-        private void LoadDocument()
-        {
-            Document = null;
-            if (File.Exists(ProjectPath))
-            {
-                try
-                {
-                    Document = JsonConvert.DeserializeObject<EditorProjectDocument>(File.ReadAllText(ProjectPath, Encoding.UTF8));
-                    if (Document == null || !string.Equals(Document.format, "ADOFAIEditorStudioProject", StringComparison.Ordinal))
-                    {
-                        Document = null;
-                    }
-                }
-                catch (Exception exception)
-                {
-                    Error = "工程文件读取失败：" + exception.Message;
-                }
-            }
-
-            if (Document == null)
-            {
-                Document = new EditorProjectDocument
-                {
-                    projectId = Guid.NewGuid().ToString("N"),
-                    level = Path.GetFileName(LevelPath),
-                    mediaRoots = new List<string> { "." },
-                    media = new List<string>()
-                };
-                SaveDocument();
-            }
-            else
-            {
-                if (Document.media == null)
-                {
-                    Document.media = new List<string>();
-                }
-                if (Document.mediaRoots == null || Document.mediaRoots.Count == 0)
-                {
-                    Document.mediaRoots = new List<string> { "." };
-                }
-            }
+            return changed;
         }
 
         private void CollectImageFiles(string directory, List<string> files)
@@ -334,66 +193,6 @@ namespace ADOFAIEditorStudio
                 return ".";
             }
             return path.Replace(Path.DirectorySeparatorChar, '/').Replace(Path.AltDirectorySeparatorChar, '/').Trim('/');
-        }
-
-        private static void AddParentDirectories(string directory, HashSet<string> directories)
-        {
-            string current = directory;
-            while (!string.IsNullOrWhiteSpace(current) && current != ".")
-            {
-                int slash = current.LastIndexOf('/');
-                current = slash < 0 ? "." : current.Substring(0, slash);
-                if (current != ".")
-                {
-                    directories.Add(current);
-                }
-            }
-        }
-
-        private static int CompareDirectoryPaths(string left, string right)
-        {
-            int depthLeft = left.Split('/').Length;
-            int depthRight = right.Split('/').Length;
-            int result = depthLeft.CompareTo(depthRight);
-            return result != 0 ? result : StringComparer.OrdinalIgnoreCase.Compare(left, right);
-        }
-
-        private static bool SequenceEquals(List<string> left, List<string> right)
-        {
-            if (left == null || left.Count != right.Count)
-            {
-                return false;
-            }
-            for (int i = 0; i < left.Count; i++)
-            {
-                if (!string.Equals(left[i], right[i], StringComparison.OrdinalIgnoreCase))
-                {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        private static string ComputeFileFingerprint(string path)
-        {
-            try
-            {
-                using (var stream = File.OpenRead(path))
-                using (var sha = SHA256.Create())
-                {
-                    byte[] hash = sha.ComputeHash(stream);
-                    var builder = new StringBuilder(hash.Length * 2);
-                    for (int i = 0; i < hash.Length; i++)
-                    {
-                        builder.Append(hash[i].ToString("x2"));
-                    }
-                    return builder.ToString();
-                }
-            }
-            catch
-            {
-                return string.Empty;
-            }
         }
 
         internal static string GetCurrentLevelPath()

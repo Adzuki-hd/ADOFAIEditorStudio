@@ -7,7 +7,7 @@
     <RootNamespace>ADOFAIEditorStudio</RootNamespace>
     <!-- 和 Info.json 的 Version 保持一致。UMM 用的是 Info.json 那个，
          这里只是程序集版本，两边对不上会让人分不清哪个是真的。 -->
-    <Version>0.10.8</Version>
+    <Version>0.10.9</Version>
     <Nullable>disable</Nullable>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>

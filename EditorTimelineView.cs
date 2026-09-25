@@ -85,6 +85,8 @@ namespace ADOFAIEditorStudio
         /// EditorTimelineView.OnPointerDown，只会多一处要协调的状态。
         /// 而 IBeginDragHandler 是沿父链查找的：marker 自己实现了，
         /// 视图的 OnBeginDrag 就不会被调用，这正是我们要的切入点。
+        /// 代价是按下点落在块上时视图什么也收不到，所以中键要由这里
+        /// 显式转交回去（见 OnBeginDrag 开头那段）。
         /// </summary>
         private sealed class TimelineBlockDrag : MonoBehaviour,
             IPointerMoveHandler, IPointerExitHandler,
@@ -148,8 +150,38 @@ namespace ADOFAIEditorStudio
             {
                 mode = Mode.None;
                 dragging = false;
-                if (view == null || marker == null || marker.Item == null
-                    || eventData.button != PointerEventData.InputButton.Left)
+
+                // 中键不是拖块的，是平移时间轴的。这里必须转交出去。
+                //
+                // 事件系统是按「按下点」去找拖拽处理者的（GetEventHandler 从
+                // pointerPress 沿父链往上找第一个实现 IDragHandler 的物体），
+                // 所以中键落在块身上时找到的是 marker，视图自己的 OnBeginDrag
+                // 根本不会被调用——它的中键平移也就无从触发，表现为
+                // 「在块上按中键拖不动」。落在空白处时链上只有视图，
+                // 于是照常平移，这正是不对称的来源。
+                //
+                // 借用视图那条现成的路径，不自己另写一套平移逻辑。
+                // 放在 marker 判空之前：平移跟这块还在不在没关系。
+                if (eventData.button == PointerEventData.InputButton.Middle)
+                {
+                    // 块身上挂着 Button，按下点又在它身上，所以事件系统
+                    // 认为这也可能是一次点击——拖动结束后会把 click
+                    // 派发给它，平移一次就顺手选中一个事件，参数栏跟着跳。
+                    // 拖过就算平移，点击在此作废。
+                    eventData.eligibleForClick = false;
+                    if (view != null)
+                    {
+                        view.OnBeginDrag(eventData);
+                    }
+                    return;
+                }
+
+                if (view == null || marker == null || marker.Item == null)
+                {
+                    return;
+                }
+
+                if (eventData.button != PointerEventData.InputButton.Left)
                 {
                     return;
                 }
@@ -198,6 +230,17 @@ namespace ADOFAIEditorStudio
 
             public void OnDrag(PointerEventData eventData)
             {
+                // 中键平移期间 OnBeginDrag 把事件交给了视图，这里跟着转交，
+                // 否则中键会走进下面按左键写的那套块拖动逻辑。
+                if (eventData.button == PointerEventData.InputButton.Middle)
+                {
+                    if (view != null)
+                    {
+                        view.OnDrag(eventData);
+                    }
+                    return;
+                }
+
                 if (!dragging || view == null || marker == null)
                 {
                     return;
@@ -253,6 +296,18 @@ namespace ADOFAIEditorStudio
 
             public void OnEndDrag(PointerEventData eventData)
             {
+                // 中键的收尾也归视图：居中浏览模式下它在 OnEndDrag 里
+                // 关掉自己开的那次 scrub，漏掉就会一直挂着，
+                // 之后的定位提交全被静默拒绝。
+                if (eventData.button == PointerEventData.InputButton.Middle)
+                {
+                    if (view != null)
+                    {
+                        view.OnEndDrag(eventData);
+                    }
+                    return;
+                }
+
                 if (!dragging)
                 {
                     return;
@@ -383,6 +438,31 @@ namespace ADOFAIEditorStudio
         // 这里跟着变高，时间轴可视区相应变矮。见 RefreshEventPalette。
         private float headerHeight = 42f + ToolRowHeight + ToolRowGap;
         private const float GutterWidth = 12f;
+        /// <summary>
+        /// 左端让给装饰物列表的宽度。
+        ///
+        /// 时间轴内容（标尺、事件画布、顶部那排按钮、事件按钮）全部整体
+        /// 右移这么多，左边腾出来的竖条放装饰物列表。腾出来之后事件按钮
+        /// 一行排不下，会自己多占一行，工具区跟着变高——那是想要的：
+        /// 竖条高一点，列表就能多显示几行。
+        /// </summary>
+        private const float DecoPaneWidth = 290f;
+        /// <summary>竖条与时间轴内容之间的留缝。没有它两块会贴在一起。</summary>
+        private const float DecoPaneGap = 14f;
+        /// <summary>
+        /// 时间轴内容整体右移的量。顶部那排按钮、标题、事件按钮、
+        /// 视口都用它定位——改竖条宽度时只要改这一处，不会漏。
+        /// </summary>
+        private const float ContentShift = DecoPaneWidth + DecoPaneGap;
+        /// <summary>
+        /// 竖条顶端离面板顶的距离。
+        ///
+        /// 它**不**从 headerHeight 起——headerHeight 是事件按钮占了几行之后
+        /// 才定下来的，跟着它走的话，竖条顶端会随调色板行数上下跳，
+        /// 而且一开始就比「时间轴」标题低一大截。竖条是整块面板的一个
+        /// 兄弟区域，顶端贴面板顶、底端铺到面板下沿，跟调色板占几行无关。
+        /// </summary>
+        private const float DecoPaneTop = 8f;
         private const float RulerHeight = 28f;
         // 播放头：青色发光，由三层叠出来（外辉光 / 内辉光 / 实心芯线）。
         private const float PlayheadCoreWidth = 2f;
@@ -463,13 +543,26 @@ namespace ADOFAIEditorStudio
         private static readonly Color TextMuted = Palette.TextMuted;
         // 每条泳道一个色相，颜色一眼就能告诉你事件属于哪个家族。
         private static readonly float[] LaneBaseHues = { 0.53f, 0.72f, 0.42f, 0.94f, 0.10f, 0.58f };
-        // 浅色填充配深色标签。这里标签不能从填充色推导：
-        // 填充接近白色，老的「把填充调亮」规则会得出
-        // 白块上的白标签。所以两者改成成对写死。
-        private const float BlockSaturation = 0.34f;
-        private const float BlockValue = 0.93f;
-        private const float LabelSaturation = 0.72f;
-        private const float LabelValue = 0.34f;
+        // 同一泳道里每个事件按自身 id 在色相上错开一点的幅度。
+        private const float BlockHueJitter = 0.10f;
+        // 事件块的亮度（相对亮度，不是 HSV 的 V）。
+        //
+        // 0.45 落在「不深不浅」那一段：对分类框底色约 7:1，六个家族彼此
+        // 又在同一条亮度线上，所以谁也不会比谁更抢眼，但每个色相都还
+        // 认得出来。低了整片读成灰，高了就刺眼。
+        private const float BlockBrightness = 0.45f;
+        // 块上文字（以及缓速曲线、选中描边）的亮度。压到接近黑，
+        // 对块本身约 7:1，小块上的小字也清楚。
+        private const float LabelBrightness = 0.020f;
+        // 块填充允许的最大饱和度。黄绿这一类色相本身就亮，不设上限的话
+        // 它们会被推到接近纯色，反而比别的家族跳。到顶之后就靠降 V 收。
+        private const float BlockTintMaxSaturation = 0.85f;
+        // 求文字亮度时用的参考饱和度。文字偏灰一点更像墨，
+        // 而且比高饱和的深色读起来舒服。
+        private const float LabelReferenceSaturation = 0.80f;
+        // 反解亮度的二分次数。20 次已经远超 8 位色深的分辨力，
+        // 而且只在事件数据变化时算，不进每帧路径。
+        private const int LuminanceSearchSteps = 20;
 
         private readonly List<TimelineItem>[] laneItems = new List<TimelineItem>[LaneCount];
         private readonly List<TimelineItem> layoutItems = new List<TimelineItem>();
@@ -525,6 +618,7 @@ namespace ADOFAIEditorStudio
         private TextMeshProUGUI zoomText;
         private TMP_FontAsset font;
         private Sprite roundedSprite;
+        private EditorDecorationList decoPane;
         private Texture2D circleTexture;
         private Sprite circleSprite;
         private Texture2D roundedTexture;
@@ -712,6 +806,10 @@ namespace ADOFAIEditorStudio
         private void OnDestroy()
         {
             anyPointerCapture = false;
+            // 装饰物列表的批量隐藏/锁定只改运行时对象，销毁前必须让它收回去
+            // （它的 OnDestroy 会处理，但那个组件的 GameObject 是 root 的子节点，
+            // 顺序上不保证先于这里）。
+            decoPane = null;
             EditorPlaybackBridge.CancelTimelineScrub();
             if (circleTexture != null)
             {
@@ -784,10 +882,16 @@ namespace ADOFAIEditorStudio
             // 缩放窗口高度才被纠正——表现出来就是面板「要点一下才出来」。
             lastRootWidth = rootWidth;
             lastRootHeight = rootHeight;
-            bodyWidth = rootWidth - GutterWidth - 10f;
+            bodyWidth = rootWidth - (GutterWidth + ContentShift) - 10f;
             bodyHeight = rootHeight - headerHeight - 8f;
 
-            SetTopLeft(viewport, GutterWidth, headerHeight, bodyWidth, bodyHeight);
+            SetTopLeft(viewport, GutterWidth + ContentShift, headerHeight, bodyWidth, bodyHeight);
+            if (decoPane != null)
+            {
+                decoPane.SetPaneRect(GutterWidth, DecoPaneTop, DecoPaneWidth,
+                    Mathf.Max(RowPaneMinimumHeight, rootHeight - DecoPaneTop - 8f));
+            }
+
             SetTopLeft(markerLayer, 0f, 0f, bodyWidth, bodyHeight);
             SetTopLeft(rulerBackdrop, 0f, 0f, bodyWidth, RulerHeight);
 
@@ -834,6 +938,10 @@ namespace ADOFAIEditorStudio
             {
                 RefreshData(false);
                 nextDataRefresh = now + DataRefreshInterval;
+                if (decoPane != null)
+                {
+                    decoPane.MarkDataDirty();
+                }
             }
             if (now >= nextSelectionRefresh)
             {
@@ -842,6 +950,10 @@ namespace ADOFAIEditorStudio
                 {
                     selectionFingerprint = fingerprint;
                     visualsDirty = true;
+                }
+                if (decoPane != null)
+                {
+                    decoPane.MarkSelectionDirty();
                 }
                 nextSelectionRefresh = now + SelectionRefreshInterval;
             }
@@ -1368,11 +1480,12 @@ namespace ADOFAIEditorStudio
         {
             float rootWidth = Mathf.Max(800f, root.rect.width);
             float rootHeight = Mathf.Max(220f, root.rect.height);
-            bodyWidth = rootWidth - GutterWidth - 10f;
+            bodyWidth = rootWidth - (GutterWidth + ContentShift) - 10f;
             bodyHeight = rootHeight - headerHeight - 8f;
             lastRootHeight = rootHeight;
 
-            CreateText("Heading", root, 18f, 7f, 78f, 30f, "时间轴", 17f, TextPrimary, TextAlignmentOptions.MidlineLeft, true);
+            // 标题和它右边那排模式按钮整体右移，给左侧的装饰物列表让位。
+            CreateText("Heading", root, 18f + ContentShift, 7f, 78f, 30f, "时间轴", 17f, TextPrimary, TextAlignmentOptions.MidlineLeft, true);
 
             // 车道筛选按钮原来在这里，是一排文字按钮（全部/镜头/视效/…）。
             // 现在改成原生图标、无文字、多选，挂在预览面板的工具栏上——
@@ -1381,26 +1494,26 @@ namespace ADOFAIEditorStudio
             // 排列方式与播放方式的切换按钮，放第一行左侧。
             // 图标自绘：字体里没有可靠的表意字形，缺字会渲染成方块。
             layoutModeButton = CreateButton(
-                "LayoutMode", root, 100f, 7f, 32f, 29f, string.Empty,
+                "LayoutMode", root, 100f + ContentShift, 7f, 32f, 29f, string.Empty,
                 delegate { ToggleLayoutMode(); ApplyLayoutModeIcon(); });
             ApplyLayoutModeIcon();
 
             followModeButton = CreateButton(
-                "FollowMode", root, 136f, 7f, 32f, 29f, string.Empty,
+                "FollowMode", root, 136f + ContentShift, 7f, 32f, 29f, string.Empty,
                 delegate { ToggleFollowMode(); ApplyFollowModeIcon(); });
             ApplyFollowModeIcon();
 
             // 点事件时要不要把画面和时间轴一起挪过去。默认关，
             // 因为点一下通常只是想改参数，画面跟着跳会打断正在看的那段。
             selectionFollowButton = CreateButton(
-                "SelectionFollow", root, 172f, 7f, 32f, 29f, string.Empty,
+                "SelectionFollow", root, 172f + ContentShift, 7f, 32f, 29f, string.Empty,
                 delegate { ToggleSelectionFollow(); ApplySelectionFollowIcon(); });
             ApplySelectionFollowIcon();
 
             // 拖动事件块时是否吸附到格边界。放在一排开关的最后，
             // 和上面三个一样是"模式开关"的性质。
             snapDragButton = CreateButton(
-                "SnapDrag", root, 208f, 7f, 32f, 29f, string.Empty,
+                "SnapDrag", root, 208f + ContentShift, 7f, 32f, 29f, string.Empty,
                 delegate { ToggleSnapDrag(); });
             ApplySnapDragIcon();
 
@@ -1422,7 +1535,7 @@ namespace ADOFAIEditorStudio
             viewLockButton = CreateButton(
                 "ViewLock",
                 root,
-                550f,
+                550f + ContentShift,
                 7f,
                 32f,
                 29f,
@@ -1439,7 +1552,13 @@ namespace ADOFAIEditorStudio
             }
 
             timeText = CreateText("Time", root, rootWidth - 420f, 8f, 240f, 28f, "00:00.000 / 00:00.000", 12f, TextSecondary, TextAlignmentOptions.MidlineRight, false);
-            summaryText = CreateText("Summary", root, 590f, 8f, Mathf.Max(100f, rootWidth - 1030f), 28f, string.Empty, 11f, TextMuted, TextAlignmentOptions.MidlineLeft, false);
+            // 宽度按「从起点到时间读数左缘」算，不能写死。
+            // 时间读数右对齐占 rootWidth-420 起的一段，摘要右移之后
+            // 如果还按老的定宽铺开，会直接压在读数上。
+            float summaryLeft = 590f + ContentShift;
+            summaryText = CreateText("Summary", root, summaryLeft, 8f,
+                Mathf.Max(100f, rootWidth - 420f - summaryLeft - 12f), 28f, string.Empty, 11f,
+                TextMuted, TextAlignmentOptions.MidlineLeft, false);
             summaryText.overflowMode = TextOverflowModes.Ellipsis;
 
             // 时间轴主体是浮在面板上的一张卡片，不是面板上的凹槽。它曾经用 PanelAlt
@@ -1450,7 +1569,7 @@ namespace ADOFAIEditorStudio
             //
             // 它的尺寸已经通过 Relayout 跟随面板高度，所以缩放手柄
             // 这里不需要额外处理。
-            Image viewportImage = CreateImage("Viewport", root, GutterWidth, headerHeight, bodyWidth, bodyHeight, TimelineCard);
+            Image viewportImage = CreateImage("Viewport", root, GutterWidth + ContentShift, headerHeight, bodyWidth, bodyHeight, TimelineCard);
             viewportImage.raycastTarget = true;
             if (roundedSprite != null)
             {
@@ -1596,8 +1715,39 @@ namespace ADOFAIEditorStudio
             resizeHandle.Initialize(owner, root);
             resizeHandleImage.transform.SetAsLastSibling();
 
+            BuildDecorationPane();
+
             UpdateFilterVisuals();
         }
+
+        /// <summary>
+        /// 左侧那块竖条：装饰物列表。
+        ///
+        /// 它挂在 root 上、而不是 viewport 里——viewport 上有 RectMask2D，
+        /// 会把画到它边界外的东西裁掉，而竖条本来就落在 viewport 左边。
+        /// 背景用 TimelineCard，跟事件画布同一档，两块读起来是同一层表面。
+        ///
+        /// 高度按整块面板算，跟事件按钮占几行无关——见 DecoPaneTop。
+        /// </summary>
+        private void BuildDecorationPane()
+        {
+            float paneHeight = Mathf.Max(RowPaneMinimumHeight, root.rect.height - DecoPaneTop - 8f);
+            Image background = CreateImage("DecoPane", root, GutterWidth, DecoPaneTop,
+                DecoPaneWidth, paneHeight, TimelineCard);
+            background.raycastTarget = true;
+            if (roundedSprite != null)
+            {
+                background.sprite = roundedSprite;
+                background.type = Image.Type.Sliced;
+            }
+
+            decoPane = background.gameObject.AddComponent<EditorDecorationList>();
+            decoPane.Initialize(background.rectTransform, font, roundedSprite, DecoPaneWidth);
+            decoPane.SetPaneRect(GutterWidth, DecoPaneTop, DecoPaneWidth, paneHeight);
+        }
+
+        /// <summary>竖条的最小高度。再矮就没法放搜索框和一行列表了。</summary>
+        private const float RowPaneMinimumHeight = 140f;
 
         /// <summary>
         /// 构建可点击的分类框表头：图标、事件名，以及该框持有的
@@ -2835,7 +2985,7 @@ namespace ADOFAIEditorStudio
         }
 
 
-        private void ApplyMarkerIcon(TimelineMarker marker, TimelineItem item, float height)
+        private void ApplyMarkerIcon(TimelineMarker marker, TimelineItem item, float height, bool exactSelected)
         {
             Sprite icon = GetEventIcon(item.Event);
             float iconSize = GetMarkerIconSize(rowHeight);
@@ -2845,6 +2995,12 @@ namespace ADOFAIEditorStudio
             if (shown)
             {
                 marker.Icon.sprite = icon;
+                // 图标是白色剪影（游戏里正是靠这个把它染成黑色或
+                // vfxIconColor 来表示状态），所以贴在彩色块上必须自己上色，
+                // 否则白对彩，小尺寸下糊成一团。默认用块自己的深色，
+                // 和文字一致；精确选中的那块换成白色，因为那时
+                // 填充被提亮、描边也变深了，反倒需要图标跳出来。
+                marker.Icon.color = exactSelected ? Color.white : item.LabelColor;
                 SetTopLeft(marker.Icon.rectTransform, MarkerIconLeft, 0f, iconSize, height);
             }
 
@@ -2867,14 +3023,14 @@ namespace ADOFAIEditorStudio
             float height)
         {
             SetTopLeft(marker.Rect, x, y, width, height);
-            ApplyMarkerIcon(marker, item, height);
+            ApplyMarkerIcon(marker, item, height, exactSelected);
             Color baseColor = item.BlockColor;
             if (!item.Active)
             {
                 baseColor.a = 0.38f;
             }
             // 两档高亮：
-            //   exactSelected —— 点中的就是这一个事件，白色描边 + 轻微提亮
+            //   exactSelected —— 点中的就是这一个事件，深色描边 + 轻微提亮
             //   inSelectedFloor —— 只是它所在的格被选中，仅轻微提亮
             // 以前两档合成一档，于是选中一格会让整行所有事件一起变样，
             // 看不出点的到底是哪个。
@@ -2891,17 +3047,21 @@ namespace ADOFAIEditorStudio
                 marker.Outline.gameObject.SetActive(exactSelected);
                 if (exactSelected)
                 {
+                    // 描边用块自己的深色，不用白色：白描边是浅填充时期
+                    // 定下的，现在填充是饱和的中调色，白框会亮过块本身，
+                    // 选中反而看不清轮廓。深色框和块同色相，读起来是
+                    // 「这个块被圈出来了」而不是「这个块发光了」。
+                    marker.Outline.color = item.LabelColor;
                     // 尺寸跟着传入的行高走，所以 ALT+滚轮调整时间块高度后
                     // 下一帧描边就贴合新高度，不用额外通知。
                     SetTopLeft(marker.Outline.rectTransform, 0f, 0f, width, height);
                 }
             }
-            // The cap is a deeper tint of the block's hue rather than a lighter one: the fill is
-            // already near-white, so lightening it further would erase the cap into the block and
-            // lose the mark that says where the event starts.
+            // 起点圆头：夹在填充和文字之间的中深色。比文字浅一点，
+            // 才看得出它是标在块上的一个记号，而不是块被切开的一道缝。
             if (marker.Cap != null)
             {
-                Color capColor = Color.Lerp(baseColor, item.LabelColor, 0.45f);
+                Color capColor = Color.Lerp(item.BlockColor, item.LabelColor, 0.45f);
                 capColor.a = item.Active ? 0.95f : 0.40f;
                 marker.Cap.color = capColor;
             }
@@ -4673,57 +4833,138 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>
-        /// A pale tint of the lane's hue. Every event in a family therefore reads as the same
-        /// colour, with the per-event offset only separating neighbours; the old table of forty
-        /// hand-picked dark colours made each event its own colour and lost the grouping.
+        /// 事件块的填充色：泳道色相，固定感知亮度。
         ///
-        /// The lane filter buttons use the same hues, so a band's colour matches the button that
-        /// turns it on.
-        /// </summary>
-
-
-        /// <summary>
-        /// A pale tint of the lane's hue. Every event in a family therefore reads as the same
-        /// colour, with the per-event offset only separating neighbours; the old table of forty
-        /// hand-picked dark colours made each event its own colour and lost the grouping.
+        /// 亮度是解出来的，不是写死的。HSV 的 V 不是感知亮度，
+        /// 同一个 V 下蓝紫这类色相天生比黄绿暗得多——旧配色把饱和度压到
+        /// 极低、V 拉到 0.93，结果六个家族的填充最大通道都是 237、
+        /// 最小都是 157，只有中间通道在变，看着就是同一片灰白。
         ///
-        /// The lane filter buttons use the same hues, so a band's colour matches the button that
-        /// turns it on.
+        /// 做法是：能提饱和就提饱和，提到该色相能达到目标亮度的上限为止
+        /// （黄绿先撞到这个上限），剩下的靠 V 收。于是每个家族都落在
+        /// 同一条亮度线上，色相各自又保住了。
+        ///
+        /// 泳道筛选按钮用的是同一组色相，所以一个分类框的颜色
+        /// 和打开它的那个按钮是对得上的。
         /// </summary>
         private static Color GetEventTypeColor(LevelEventType eventType, TimelineLane lane)
         {
-            Color color = Color.HSVToRGB(GetEventHue(eventType, lane), BlockSaturation, BlockValue);
+            float hue = GetEventHue(eventType, lane);
+            float saturation = BlockTintMaxSaturation;
+            if (Luminance(Color.HSVToRGB(hue, saturation, 1f)) < BlockBrightness)
+            {
+                saturation = SaturationForLuminance(hue, BlockBrightness);
+            }
+
+            Color color = Color.HSVToRGB(
+                hue,
+                saturation,
+                ValueForLuminance(hue, saturation, BlockBrightness)
+            );
             color.a = 1f;
             return color;
         }
 
-        /// <summary>The dark partner of the block's pale fill, for the block's own label.</summary>
-
-
-        /// <summary>The dark partner of the block's pale fill, for the block's own label.</summary>
+        /// <summary>
+        /// 块上文字的颜色：同色相的深色。缓速曲线和选中描边也用这个。
+        ///
+        /// 也不写死一个深色，同样反解出来。深色比浅色更受色相影响，
+        /// 固定值会让某几个家族的字明显比别的浅——旧的 v=0.34 就是
+        /// 这样，紫色那族一直偏淡。
+        /// </summary>
         private static Color GetEventLabelColor(LevelEventType eventType, TimelineLane lane)
         {
-            Color color = Color.HSVToRGB(GetEventHue(eventType, lane), LabelSaturation, LabelValue);
+            float hue = GetEventHue(eventType, lane);
+            Color color = Color.HSVToRGB(
+                hue,
+                LabelReferenceSaturation,
+                ValueForLuminance(hue, LabelReferenceSaturation, LabelBrightness)
+            );
             color.a = 1f;
             return color;
         }
 
         /// <summary>
-        /// The lane's hue, nudged by the event's own id. A golden-ratio stride throws adjacent
-        /// ids far apart in hue, so two neighbours in a list do not land on near-identical
-        /// colours; the nudge is kept small enough that the lane still reads as the family it is.
-        /// </summary>
-
-
-        /// <summary>
-        /// The lane's hue, nudged by the event's own id. A golden-ratio stride throws adjacent
-        /// ids far apart in hue, so two neighbours in a list do not land on near-identical
-        /// colours; the nudge is kept small enough that the lane still reads as the family it is.
+        /// 泳道色相，按事件自身 id 再错开一点。黄金分割步长让相邻 id
+        /// 在色相上离得很远，列表里挨着的两个事件不会撞成几乎一样的颜色；
+        /// 错开幅度又足够小，一眼还是能看出它属于哪个家族。
         /// </summary>
         private static float GetEventHue(LevelEventType eventType, TimelineLane lane)
         {
             float variation = Mathf.Repeat(Mathf.Abs((int)eventType) * 0.6180339f, 1f);
-            return Mathf.Repeat(LaneBaseHues[(int)lane] + (variation - 0.5f) * 0.10f, 1f);
+            return Mathf.Repeat(LaneBaseHues[(int)lane] + (variation - 0.5f) * BlockHueJitter, 1f);
+        }
+
+        /// <summary>
+        /// 在给定饱和度下，二分出使 HSV 颜色相对亮度等于 target 的 V。
+        ///
+        /// 亮度随 V 单调递增，所以二分必定收敛。用迭代而不是解析解，
+        /// 是因为相对亮度里夹了一段 sRGB 的幂函数，反解出来
+        /// 一样是近似值，还更难读。
+        /// </summary>
+        private static float ValueForLuminance(float hue, float saturation, float target)
+        {
+            float low = 0f;
+            float high = 1f;
+            for (int i = 0; i < LuminanceSearchSteps; i++)
+            {
+                float mid = (low + high) * 0.5f;
+                if (Luminance(Color.HSVToRGB(hue, saturation, mid)) < target)
+                {
+                    low = mid;
+                }
+                else
+                {
+                    high = mid;
+                }
+            }
+
+            return (low + high) * 0.5f;
+        }
+
+        /// <summary>
+        /// 使 HSV(hue, s, 1) 的相对亮度正好等于 target 的饱和度。
+        ///
+        /// 亮度随饱和度单调递减，同样二分。求出来的值可能超过上限，
+        /// 那说明该色相本身够亮、不该再提饱和（黄绿一类），
+        /// 夹到上限是调用方的事。
+        /// </summary>
+        private static float SaturationForLuminance(float hue, float target)
+        {
+            float low = 0f;
+            float high = 1f;
+            for (int i = 0; i < LuminanceSearchSteps; i++)
+            {
+                float mid = (low + high) * 0.5f;
+                if (Luminance(Color.HSVToRGB(hue, mid, 1f)) > target)
+                {
+                    low = mid;
+                }
+                else
+                {
+                    high = mid;
+                }
+            }
+
+            return (low + high) * 0.5f;
+        }
+
+        /// <summary>
+        /// sRGB 相对亮度（WCAG 那个定义）。用它而不是 RGB 均值来给
+        /// 配色排序深浅：均值会把蓝色算得比实际亮得多，六个家族排不齐。
+        /// </summary>
+        private static float Luminance(Color color)
+        {
+            return 0.2126f * Linearize(color.r)
+                + 0.7152f * Linearize(color.g)
+                + 0.0722f * Linearize(color.b);
+        }
+
+        private static float Linearize(float channel)
+        {
+            return channel <= 0.04045f
+                ? channel / 12.92f
+                : Mathf.Pow((channel + 0.055f) / 1.055f, 2.4f);
         }
 
 
@@ -5589,7 +5830,7 @@ namespace ADOFAIEditorStudio
             // 行高超过预留的那一行，最右边几个就被裁掉，看着像「没显示
             // 完全、要点一下才出来」。现在保持按钮的正常尺寸，放不下就往
             // 下排，工具区跟着变高。
-            float available = Mathf.Max(80f, root.rect.width - PaletteMargin * 2f);
+            float available = Mathf.Max(80f, root.rect.width - ContentShift - PaletteMargin * 2f);
             int layoutRows = LayoutPaletteRows(available);
 
         }
@@ -5606,7 +5847,7 @@ namespace ADOFAIEditorStudio
             float size = PaletteMaxButtonSize;
             float groupGap = Mathf.Max(PaletteMinGroupGap, size * 0.6f);
 
-            float x = PaletteMargin;
+            float x = PaletteMargin + ContentShift;
             float y = PaletteRowY;
             int rows = 1;
 
@@ -5616,9 +5857,10 @@ namespace ADOFAIEditorStudio
                 float advance = size + PaletteGap + (groupStart ? groupGap : 0f);
 
                 // 换行判定：这一行已经放了东西，再加这个就超宽。
-                if (x > PaletteMargin + 0.01f && x + advance - PaletteGap > PaletteMargin + available)
+                if (x > PaletteMargin + ContentShift + 0.01f
+                    && x + advance - PaletteGap > PaletteMargin + ContentShift + available)
                 {
-                    x = PaletteMargin;
+                    x = PaletteMargin + ContentShift;
                     y += size + PaletteGap;
                     rows++;
                     groupStart = false;
@@ -5671,7 +5913,14 @@ namespace ADOFAIEditorStudio
                 // 把整个 UI 构建打挂（F8 没反应就是这么来的）。
                 if (viewport != null)
                 {
-                    SetTopLeft(viewport, GutterWidth, headerHeight, bodyWidth, bodyHeight);
+                    SetTopLeft(viewport, GutterWidth + ContentShift, headerHeight, bodyWidth, bodyHeight);
+                    // 竖条不跟着 headerHeight 走（它铺满整块面板的高度），
+                    // 但调色板换行会改 bodyHeight，这里顺带重算一次没有坏处。
+                    if (decoPane != null)
+                    {
+                        decoPane.SetPaneRect(GutterWidth, DecoPaneTop, DecoPaneWidth,
+                            Mathf.Max(RowPaneMinimumHeight, rootHeight - DecoPaneTop - 8f));
+                    }
                 }
             }
             return rows;

@@ -32,36 +32,42 @@ namespace ADOFAIEditorStudio
         private const float HeaderHeight = 54f;
         private const float OuterMargin = 12f;
         private const float PanelGap = 12f;
-        // 舞台在 1080p 下受高度限制，几乎没有富余可以分：真正决定舞台靠左到哪、
-        // 参数栏能分到多少空间的是左面板的最小宽度。
-        // 从 440 调低，让舞台左移，右列因此多出明确的约 68px，
-        // 够再放一列属性。
-        private const float MinimumLeftPanelWidth = 360f;
-        private const float MinimumRightPanelWidth = 290f;
 
-        // 舞台之外剩余的宽度如何在左右两个侧面板之间分配。媒体列
-        // 只需要显示一个缩略图和一个文件名，而参数栏是以后新增属性列的地方，
-        // 所以富余主要给右边。
-        private const float LeftPanelExtraShare = 0.15f;
+        // 两侧面板的宽度。两边**永远等宽**，因为舞台要被夹在正中间——
+        // 两栏不一样宽，舞台就会偏，看起来像被谁挤了一下。
+        //
+        // 宽度是算出来的，不是定的。唯一真正定死的量是舞台：
+        // 它只受可用高度限制（高度不够就矮，宽度随之按比例缩），
+        // 横向余量则由两栏平分。所以时间轴拉高、舞台变矮时，
+        // 两栏自动变宽，媒体网格也就自动多出一列——列数是按面板宽度
+        // 现算的，不需要为「什么时候该多一列」写死任何阈值。
+        //
+        // 这个最小值只在一件事上生效：极端情况下（屏幕特别宽）
+        // 防止两侧被舞台挤没。1920 设计宽度下不会碰到它。
+        private const float MinimumSidePanelWidth = 200f;
         private const float DefaultTimelineHeight = 292f;
         private const float MinimumTimelineHeight = 220f;
         private const float MaximumTimelineHeight = 520f;
         private const float TimelinePanelWidth = DesignWidth - 24f;
         private const float PreviewPanelY = HeaderHeight + 12f;
         private const float PreviewStageInsetY = 58f;
-        private const float BrowserRowHeight = 32f;
-        private const float BrowserDataRefreshInterval = 0.5f;
-        private const float BrowserSelectionRefreshInterval = 0.12f;
-        private const float ProjectTreeWidthRatio = 0.38f;
-
-        // 项目树只显示文件夹名，所以面板变窄时可以让出宽度给
-        // 媒体列。这是按典型谱面文件夹里的名字量的，
-        // 那些名字都很短。
-        private const float MinimumProjectTreeWidth = 118f;
-        private const float MaximumProjectTreeWidth = 190f;
-        private const float ProjectTreeRowHeight = 30f;
-        private const float MediaCardHeight = 126f;
-        private const float MediaCardGap = 8f;
+        // 目标列数。实际列数由当前面板宽度算出来，不是钉死的——
+        // 面板变窄时宁可少一列，也不要把格子压到看不清缩略图。
+        private const int MediaGridTargetColumns = 6;
+        private const float MediaGridColumnGap = 6f;
+        private const float MediaGridRowGap = 8f;
+        // 网格整体离视口边缘的留白，和每张卡片自己的内边距。
+        // 分开是因为它们作用相反：外面那圈要够宽，网格才不贴着
+        // 滚动条；里面那圈要够窄，缩略图才拿得到宽度——格子本来
+        // 就只有八十来像素，被内边距吃掉 16px 就明显小了。
+        private const float MediaGridPadding = 10f;
+        private const float MediaCardInset = 4f;
+        // 一列窄到这个数就不能再挤了：再窄缩略图就小而糊，
+        // 干脆少一列。填不满六列时宁可这样，也不要六格都看不清。
+        private const float MediaGridMinColumnWidth = 56f;
+        // 卡片高度和列宽无关，是「缩略图方块 + 下面一行文件名」的高。
+        private const float MediaCardLabelHeight = 18f;
+        private const float MediaCardHeight = 112f;
         // 缓存的核心就是每个媒体文件一条记录：列表是要滚动的，被淘汰的条目
         // 下一趟就得从几 MB 的源图重新解码。Digital Warrior 文件夹里有 178 张图，
         // 其中好几张 5000+ px、4-5MB，而 64 条的上限意味着滚动时会不停地
@@ -70,19 +76,6 @@ namespace ADOFAIEditorStudio
         private const int MediaThumbnailCacheCapacity = 512;
         private const float MediaThumbnailLoadDelay = 0.12f;
         private const string UiGlyphProbe = "编辑器工作台工程媒体文件目录未保存浏览全部装饰物轨道预览参数时间轴锁定缩放镜头视效音频游戏其他第格图片文本粒子对象";
-
-        private enum BrowserFilter
-        {
-            All,
-            Decorations,
-            Tracks
-        }
-
-        private enum BrowserItemKind
-        {
-            Track,
-            Decoration
-        }
 
         private struct PreviewLayout
         {
@@ -93,35 +86,6 @@ namespace ADOFAIEditorStudio
             public float StageWidth;
             public float StageHeight;
             public float InspectorX;
-        }
-
-        private sealed class BrowserItem
-        {
-            public BrowserItemKind Kind;
-            public int FloorId;
-            public int SourceOrder;
-            public string Label;
-            public scrFloor Floor;
-            public scrDecoration Decoration;
-        }
-
-        private sealed class BrowserRow
-        {
-            public GameObject GameObject;
-            public RectTransform Rect;
-            public Button Button;
-            public TextMeshProUGUI Label;
-            public int BoundIndex = -1;
-        }
-
-        private sealed class ProjectTreeRow
-        {
-            public GameObject GameObject;
-            public RectTransform Rect;
-            public Button Button;
-            public TextMeshProUGUI Label;
-            public string Directory;
-            public bool Selectable;
         }
 
         private sealed class MediaCard
@@ -135,9 +99,12 @@ namespace ADOFAIEditorStudio
             public int BoundIndex = -1;
             public string BoundPath;
             public string TexturePath;
-            public float CardWidth;
-            public float ThumbnailHeight;
-            public float ThumbnailWidth;
+            // 缩略图方框，卡片局部坐标。存下来是因为缩略图是异步解出来的：
+            // 它到达时布局可能已经变过，要按「此刻」的方框重新等比适配。
+            public float ThumbBoxX;
+            public float ThumbBoxY;
+            public float ThumbBoxWidth;
+            public float ThumbBoxHeight;
         }
 
         private sealed class MediaThumbnailCacheEntry
@@ -275,13 +242,6 @@ namespace ADOFAIEditorStudio
         internal static Color TextPrimaryColor { get { return TextPrimary; } }
         internal static Color TextSecondaryColor { get { return TextSecondary; } }
         internal static Color TextMutedColor { get { return TextMuted; } }
-
-        private readonly List<Button> browserFilterButtons = new List<Button>();
-        private readonly List<TextMeshProUGUI> browserFilterLabels = new List<TextMeshProUGUI>();
-        private readonly List<BrowserItem> allBrowserItems = new List<BrowserItem>();
-        private readonly List<BrowserItem> filteredBrowserItems = new List<BrowserItem>();
-        private readonly List<BrowserRow> browserRows = new List<BrowserRow>();
-        private readonly List<ProjectTreeRow> projectTreeRows = new List<ProjectTreeRow>();
         private readonly List<MediaCard> mediaCards = new List<MediaCard>();
         private readonly Dictionary<string, MediaThumbnailCacheEntry> mediaThumbnailCache =
             new Dictionary<string, MediaThumbnailCacheEntry>(StringComparer.OrdinalIgnoreCase);
@@ -316,15 +276,10 @@ namespace ADOFAIEditorStudio
         private PreviewLayout previewLayout;
         private RectTransform designRoot;
         private RectTransform browserPanel;
-        private RectTransform projectTreePanel;
-        private RectTransform projectTreeViewport;
-        private RectTransform projectTreeContent;
         private RectTransform mediaPanel;
         private RectTransform mediaViewport;
         private RectTransform mediaContent;
-        private TextMeshProUGUI projectTitle;
         private TextMeshProUGUI mediaTitle;
-        private ScrollRect projectTreeScroll;
         private ScrollRect mediaScroll;
         private RectTransform previewPanel;
         private RectTransform previewToolbar;
@@ -352,18 +307,7 @@ namespace ADOFAIEditorStudio
         private bool nonPreviewPointerCapture;
         private static MethodInfo loadImageMethod;
         private static bool imageLoaderSearched;
-
-        private BrowserFilter browserFilter;
-        private ScrollRect browserScroll;
-        private RectTransform browserContent;
-        private int browserFingerprint;
-        private bool browserFingerprintValid;
-        private bool browserDataDirty = true;
-        private bool browserSelectionDirty = true;
-        private float nextBrowserDataRefresh;
-        private float nextBrowserSelectionRefresh;
         private EditorProjectSession projectSession;
-        private string selectedProjectDirectory = ".";
         private string selectedMediaPath;
         private readonly List<EditorProjectMediaItem> visibleProjectMedia = new List<EditorProjectMediaItem>();
         private bool projectDataDirty = true;
@@ -842,22 +786,17 @@ namespace ADOFAIEditorStudio
             browserPanel = root;
             float panelWidth = previewLayout.LeftPanelWidth;
             float innerWidth = panelWidth - 24f;
-            float treeWidth = Mathf.Clamp(innerWidth * ProjectTreeWidthRatio, MinimumProjectTreeWidth, MaximumProjectTreeWidth);
-            float mediaWidth = innerWidth - treeWidth - 8f;
+            // 左栏现在只有媒体网格一块。这里曾经并排着「工程」树和媒体列，
+            // 工程树占掉了将近四成宽度却只显示文件夹名——而媒体列表是
+            // 唯一有内容的东西，它被挤到两百来像素，一次只看得见一行。
+            float mediaWidth = innerWidth;
             float listY = 46f;
-            float listHeight = height - listY - 12f;
             float mediaListY = listY + MediaSearchRowHeight;
             float mediaListHeight = height - mediaListY - 12f;
 
-            Image treeImage = CreateRoundedPanel("ProjectTree", root, 12f, 10f, treeWidth, height - 20f, Panel, CornerSmall);
-            Image mediaImage = CreateRoundedPanel("Media", root, 12f + treeWidth + 8f, 10f, mediaWidth, height - 20f, Panel, CornerSmall);
-            AddPanelBorder(treeImage, CornerSmall);
+            Image mediaImage = CreateRoundedPanel("Media", root, 12f, 10f, mediaWidth, height - 20f, Panel, CornerSmall);
             AddPanelBorder(mediaImage, CornerSmall);
-            projectTreePanel = treeImage.rectTransform;
             mediaPanel = mediaImage.rectTransform;
-            projectTitle = CreateText("ProjectTitle", projectTreePanel, PanelHeadingInset, 0f,
-                treeWidth - PanelHeadingInset * 2f, PanelHeadingHeight, "工程", 13f,
-                TextPrimary, TextAlignmentOptions.MidlineLeft, true);
             mediaTitle = CreateText("MediaTitle", mediaPanel, PanelHeadingInset, 0f,
                 mediaWidth - PanelHeadingInset * 2f, PanelHeadingHeight, "媒体", 13f,
                 TextPrimary, TextAlignmentOptions.MidlineLeft, true);
@@ -868,21 +807,14 @@ namespace ADOFAIEditorStudio
             // 读起来是标题的下划线；一条两头都到边的
             // 读起来是两个区域之间的分界，这才是重点。
             //
-            // 它也在下面那些滚动视图之后创建，因为后加的同级节点
+            // 它也在下面那个滚动视图之后创建，因为后加的同级节点
             // 画在上面：先做的话，列表自己的背景会盖住它，线就永远不出现。
-            Image treeRule = null;
-            Image mediaRule = null;
-
             CreateMediaSearchControls(mediaPanel, mediaWidth, mediaListY - 10f);
 
-            projectTreeScroll = CreateProjectScroll("ProjectTreeScroll", projectTreePanel, 8f, listY - 10f, treeWidth - 16f, listHeight, out projectTreeViewport, out projectTreeContent);
             mediaScroll = CreateProjectScroll("MediaScroll", mediaPanel, 8f, mediaListY - 10f, mediaWidth - 16f, mediaListHeight, out mediaViewport, out mediaContent);
-            treeRule = CreateHeadingRule("TreeRule", projectTreePanel, PanelHeadingRule);
-            mediaRule = CreateHeadingRule("MediaRule", mediaPanel, PanelHeadingRule);
-            projectTreeScroll.onValueChanged.AddListener(delegate { UpdateProjectTreeRows(); });
+            CreateHeadingRule("MediaRule", mediaPanel, PanelHeadingRule);
             mediaScroll.onValueChanged.AddListener(OnMediaScrollChanged);
-            EnsureProjectTreeRows(32);
-            EnsureMediaCards(20);
+            EnsureMediaCards(24);
             RefreshProjectWorkspace(true);
         }
 
@@ -930,39 +862,6 @@ namespace ADOFAIEditorStudio
             return scroll;
         }
 
-        private void EnsureProjectTreeRows(int count)
-        {
-            while (projectTreeRows.Count < count)
-            {
-                ProjectTreeRow row = null;
-                TextMeshProUGUI label;
-                Button button = CreateButton(
-                    "ProjectTreeRow" + projectTreeRows.Count,
-                    projectTreeContent,
-                    0f,
-                    0f,
-                    100f,
-                    ProjectTreeRowHeight - 2f,
-                    string.Empty,
-                    false,
-                    delegate { ActivateProjectTreeRow(row); },
-                    out label
-                );
-                label.alignment = TextAlignmentOptions.MidlineLeft;
-                label.margin = new Vector4(8f, 0f, 6f, 0f);
-                label.fontSize = 10.5f;
-                row = new ProjectTreeRow
-                {
-                    GameObject = button.gameObject,
-                    Rect = button.GetComponent<RectTransform>(),
-                    Button = button,
-                    Label = label
-                };
-                row.GameObject.SetActive(false);
-                projectTreeRows.Add(row);
-            }
-        }
-
         private void EnsureMediaCards(int count)
         {
             bool created = false;
@@ -977,7 +876,7 @@ namespace ADOFAIEditorStudio
                 );
                 cardObject.transform.SetParent(mediaContent, false);
                 RectTransform rect = cardObject.GetComponent<RectTransform>();
-                SetTopLeftRect(rect, 0f, 0f, 100f, MediaCardHeight - MediaCardGap);
+                SetTopLeftRect(rect, 0f, 0f, 100f, MediaCardHeight - MediaGridRowGap);
                 Image background = cardObject.GetComponent<Image>();
                 // 卡片是凸起内容，所以远高于它们所落的面板
                 // (0.137 对 0.071)，而不是只高一线。还用老的 ButtonNormal
@@ -989,11 +888,19 @@ namespace ADOFAIEditorStudio
                 Button button = cardObject.GetComponent<Button>();
                 button.targetGraphic = background;
                 button.navigation = new Navigation { mode = Navigation.Mode.None };
-                // 比它所落的卡片高一档，这样缩略图读起来是卡片
-                // 里的内容，而不是卡片上的一个洞。
-                RawImage image = CreateRawImage("Thumbnail", rect, 6f, 6f, 90f, 76f, ThumbWell);
+                // 图在卡片内居中、字在下方——两者都是定尺寸的对齐，
+                // 所以位置和大小都写死，跟着卡片走。尺寸每帧由
+                // UpdateMediaCards 重算，卡片池是复用的，布局随时会变。
+                //
+                // 缩略图框是正方形：它比卡片矮一截，宽度留出 LabelHeight，
+                // 而卡片的宽高比不固定（面板能拉能缩），所以正方形的做法是
+                // 「取宽高中较小的那个」，而不是钉死一个边长。
+                RawImage image = CreateRawImage("Thumbnail", rect, 6f, 5f, 90f, 80f, ThumbWell);
                 image.raycastTarget = false;
-                TextMeshProUGUI label = CreateText("Label", rect, 7f, 86f, 90f, 28f, string.Empty, 9.5f, TextSecondary, TextAlignmentOptions.MidlineLeft, false);
+                // 文件名在缩略图下面、单行居中。9.5 号字配 Ellipsis，
+                // 90px 宽的格子里放不下完整文件名就截断——六列格子本来
+                // 就没打算放下全名，悬停会有完整名字的提示留给以后加。
+                TextMeshProUGUI label = CreateText("Label", rect, 4f, MediaCardHeight - MediaGridRowGap - MediaCardLabelHeight - 2f, 90f, MediaCardLabelHeight, string.Empty, 9.5f, TextSecondary, TextAlignmentOptions.Center, false);
                 label.overflowMode = TextOverflowModes.Ellipsis;
                 label.raycastTarget = false;
                 card = new MediaCard
@@ -1024,10 +931,8 @@ namespace ADOFAIEditorStudio
             {
                 ReleaseMediaTextures();
                 projectSession = EditorProjectSession.LoadCurrent();
-                selectedProjectDirectory = ".";
                 selectedMediaPath = null;
                 projectDataDirty = false;
-                RebuildProjectTree();
                 RebuildVisibleMedia();
                 return;
             }
@@ -1035,7 +940,6 @@ namespace ADOFAIEditorStudio
             if (projectSession != null && projectSession.RefreshMediaIndex())
             {
                 ReleaseMediaTextures();
-                RebuildProjectTree();
                 RebuildVisibleMedia();
             }
             projectDataDirty = false;
@@ -1043,7 +947,7 @@ namespace ADOFAIEditorStudio
 
         private void TickProjectWorkspace()
         {
-            if (!visible || projectTreeContent == null)
+            if (!visible || mediaContent == null)
             {
                 return;
             }
@@ -1056,7 +960,6 @@ namespace ADOFAIEditorStudio
                 nextProjectRefresh = now + 1.2f;
                 RefreshProjectWorkspace(projectDataDirty);
             }
-            UpdateProjectTreeRows();
             if (mediaCardsDirty)
             {
                 UpdateMediaCards();
@@ -1176,7 +1079,7 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
-            int rowCount = Mathf.CeilToInt(visibleProjectMedia.Count / 2f);
+            int rowCount = Mathf.Max(1, Mathf.CeilToInt(visibleProjectMedia.Count / (float)GetMediaColumnCount()));
             int firstRow = Mathf.Clamp(
                 Mathf.FloorToInt(Mathf.Max(0f, mediaContent.anchoredPosition.y) / MediaCardHeight),
                 0,
@@ -1190,93 +1093,6 @@ namespace ADOFAIEditorStudio
             }
         }
 
-        private void RebuildProjectTree()
-        {
-            if (projectTreeContent == null)
-            {
-                return;
-            }
-
-            var labels = new List<string>();
-            var directories = new List<string>();
-            var selectable = new List<bool>();
-            labels.Add(projectSession == null ? "未保存谱面" : Path.GetFileNameWithoutExtension(projectSession.ProjectPath));
-            directories.Add(".");
-            selectable.Add(false);
-            if (projectSession != null)
-            {
-                labels.Add("  " + Path.GetFileName(projectSession.LevelPath));
-                directories.Add(".");
-                selectable.Add(false);
-                labels.Add("媒体  ·  " + projectSession.Media.Count);
-                directories.Add(".");
-                selectable.Add(true);
-                for (int i = 0; i < projectSession.MediaDirectories.Count; i++)
-                {
-                    string directory = projectSession.MediaDirectories[i];
-                    int depth = directory.Split('/').Length;
-                    int slash = directory.LastIndexOf('/');
-                    string displayName = slash < 0 ? directory : directory.Substring(slash + 1);
-                    labels.Add(new string(' ', Mathf.Clamp(depth, 1, 4) * 2) + displayName);
-                    directories.Add(directory);
-                    selectable.Add(true);
-                }
-            }
-
-            EnsureProjectTreeRows(Mathf.Max(1, labels.Count));
-            projectTreeContent.sizeDelta = new Vector2(0f, Mathf.Max(projectTreeViewport.rect.height, labels.Count * ProjectTreeRowHeight));
-            for (int i = 0; i < projectTreeRows.Count; i++)
-            {
-                ProjectTreeRow row = projectTreeRows[i];
-                if (i >= labels.Count)
-                {
-                    row.Label.text = string.Empty;
-                    row.Directory = null;
-                    row.Selectable = false;
-                    row.GameObject.SetActive(false);
-                    continue;
-                }
-                row.Directory = directories[i];
-                row.Selectable = selectable[i];
-                row.Rect.anchoredPosition = new Vector2(0f, -i * ProjectTreeRowHeight);
-                row.Rect.sizeDelta = new Vector2(projectTreeViewport.rect.width, ProjectTreeRowHeight - 2f);
-                row.Label.text = labels[i];
-                row.Button.interactable = row.Selectable;
-                SetButtonPalette(row.Button, row.Selectable && string.Equals(row.Directory, selectedProjectDirectory, StringComparison.OrdinalIgnoreCase));
-                row.GameObject.SetActive(true);
-            }
-        }
-
-        private void UpdateProjectTreeRows()
-        {
-            if (projectTreeScroll == null || projectTreeContent == null)
-            {
-                return;
-            }
-            float offset = Mathf.Max(0f, projectTreeContent.anchoredPosition.y);
-            int first = Mathf.Clamp(Mathf.FloorToInt(offset / ProjectTreeRowHeight), 0, Mathf.Max(0, projectTreeRows.Count - 1));
-            int visible = Mathf.CeilToInt(projectTreeViewport.rect.height / ProjectTreeRowHeight) + 2;
-            for (int i = 0; i < projectTreeRows.Count; i++)
-            {
-                projectTreeRows[i].GameObject.SetActive(i >= first && i < first + visible && projectTreeRows[i].Label.text.Length > 0);
-            }
-        }
-
-        private void ActivateProjectTreeRow(ProjectTreeRow row)
-        {
-            if (row == null || !row.Selectable)
-            {
-                return;
-            }
-            selectedProjectDirectory = string.IsNullOrWhiteSpace(row.Directory) ? "." : row.Directory;
-            if (mediaContent != null)
-            {
-                mediaContent.anchoredPosition = Vector2.zero;
-            }
-            RebuildProjectTree();
-            RebuildVisibleMedia();
-        }
-
         private void RebuildVisibleMedia(bool resetScroll = true)
         {
             ClearMediaThumbnailQueue();
@@ -1286,12 +1102,6 @@ namespace ADOFAIEditorStudio
                 for (int i = 0; i < projectSession.Media.Count; i++)
                 {
                     EditorProjectMediaItem item = projectSession.Media[i];
-                    if (selectedProjectDirectory != "."
-                        && !string.Equals(item.DirectoryPath, selectedProjectDirectory, StringComparison.OrdinalIgnoreCase)
-                        && !item.DirectoryPath.StartsWith(selectedProjectDirectory + "/", StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
                     if (!MediaMatchesSearch(item))
                     {
                         continue;
@@ -1318,8 +1128,12 @@ namespace ADOFAIEditorStudio
             }
             if (mediaContent != null)
             {
-                int rows = visibleProjectMedia.Count;
-                mediaContent.sizeDelta = new Vector2(0f, Mathf.Max(mediaViewport.rect.height, rows * MediaCardHeight));
+                int columns = GetMediaColumnCount();
+                int rows = Mathf.CeilToInt(visibleProjectMedia.Count / (float)columns);
+                mediaContent.sizeDelta = new Vector2(
+                    0f,
+                    Mathf.Max(mediaViewport.rect.height, MediaGridPadding * 2f + rows * MediaCardHeight)
+                );
                 if (resetScroll)
                 {
                     mediaContent.anchoredPosition = Vector2.zero;
@@ -1354,26 +1168,43 @@ namespace ADOFAIEditorStudio
 
         private string mediaSearchQuery = string.Empty;
 
+        /// <summary>当前视口宽度下能排几列。视口还没建好时按目标列数算。</summary>
+        private int GetMediaColumnCount()
+        {
+            if (mediaViewport == null)
+            {
+                return MediaGridTargetColumns;
+            }
+            float viewportWidth = Mathf.Max(1f, mediaViewport.rect.width);
+            int columns = Mathf.FloorToInt(
+                (viewportWidth - MediaGridPadding * 2f + MediaGridColumnGap)
+                / (MediaGridMinColumnWidth + MediaGridColumnGap));
+            return Mathf.Clamp(columns, 1, MediaGridTargetColumns);
+        }
+
         private void UpdateMediaCards()
         {
             if (mediaScroll == null || mediaContent == null || mediaViewport == null)
             {
                 return;
             }
-            // 一行一张卡片。两列会把缩略图砍半、把名字挤成
-            // 省略号，而媒体列表是装饰物的拖放来源，
-            // 所以更宽的行值得多滚几下。
-            float cardWidth = Mathf.Max(40f, mediaViewport.rect.width);
-            int requiredRows = Mathf.CeilToInt(mediaViewport.rect.height / MediaCardHeight) + 2;
-            EnsureMediaCards(Mathf.Max(4, requiredRows));
-            int rowCount = visibleProjectMedia.Count;
+
+            float viewportWidth = Mathf.Max(1f, mediaViewport.rect.width);
+            int columns = GetMediaColumnCount();
+            float cardWidth = (viewportWidth - MediaGridPadding * 2f - MediaGridColumnGap * (columns - 1)) / columns;
+            int totalItems = visibleProjectMedia.Count;
+            int totalRows = Mathf.Max(1, Mathf.CeilToInt(totalItems / (float)columns));
+
             int firstRow = Mathf.Clamp(
                 Mathf.FloorToInt(Mathf.Max(0f, mediaContent.anchoredPosition.y) / MediaCardHeight),
                 0,
-                Mathf.Max(0, rowCount - 1)
+                Mathf.Max(0, totalRows - 1)
             );
+            int visibleRows = Mathf.CeilToInt(mediaViewport.rect.height / MediaCardHeight) + 2;
+            EnsureMediaCards(Mathf.Max(columns, (visibleRows + 1) * columns));
+
             bool bindingChanged = firstRow != mediaCardsBoundFirstRow
-                || visibleProjectMedia.Count != mediaCardsBoundVisibleCount
+                || totalItems != mediaCardsBoundVisibleCount
                 || mediaCards.Count != mediaCardsBoundPoolCount
                 || !Mathf.Approximately(cardWidth, mediaCardsBoundWidth)
                 || !string.Equals(selectedMediaPath, mediaCardsBoundSelectionPath, StringComparison.OrdinalIgnoreCase);
@@ -1384,47 +1215,58 @@ namespace ADOFAIEditorStudio
             }
 
             mediaCardsBoundFirstRow = firstRow;
-            mediaCardsBoundVisibleCount = visibleProjectMedia.Count;
+            mediaCardsBoundVisibleCount = totalItems;
             mediaCardsBoundPoolCount = mediaCards.Count;
             mediaCardsBoundWidth = cardWidth;
             mediaCardsBoundSelectionPath = selectedMediaPath;
-            int firstIndex = firstRow;
+            // 只绑当前可见的那几行。池子按行循环使用，滚动时
+            // 每张卡片重新指向新的下标——所以手上有 card.BoundIndex
+            // 的地方（拖放、选中）必须当它是「此刻」的值，不能缓存。
+            int firstIndex = firstRow * columns;
+            float labelTop = MediaCardHeight - MediaGridRowGap - MediaCardLabelHeight;
             for (int i = 0; i < mediaCards.Count; i++)
             {
                 int itemIndex = firstIndex + i;
                 MediaCard card = mediaCards[i];
-                if (itemIndex >= visibleProjectMedia.Count)
+                if (itemIndex >= totalItems)
                 {
                     UnbindMediaCard(card);
                     continue;
                 }
                 EditorProjectMediaItem item = visibleProjectMedia[itemIndex];
+                int cellRow = itemIndex / columns;
+                int cellColumn = itemIndex % columns;
                 card.BoundIndex = itemIndex;
                 card.BoundPath = item.RelativePath;
-                card.Rect.anchoredPosition = new Vector2(0f, -itemIndex * MediaCardHeight);
-                card.Rect.sizeDelta = new Vector2(cardWidth, MediaCardHeight - MediaCardGap);
+                card.Rect.anchoredPosition = new Vector2(
+                    MediaGridPadding + cellColumn * (cardWidth + MediaGridColumnGap),
+                    -(MediaGridPadding + cellRow * MediaCardHeight));
+                card.Rect.sizeDelta = new Vector2(cardWidth, MediaCardHeight - MediaGridRowGap);
 
-                // 缩略图在左，名字占满这一行剩下的部分。方形，但从不超过
-                // 整行的约 45%，这样窄的媒体列在省略号开始之前
-                // 仍然给文件名留得下位置。
-                float thumbnailHeight = MediaCardHeight - MediaCardGap - 12f;
-                float thumbnailWidth = Mathf.Min(thumbnailHeight, Mathf.Max(40f, cardWidth * 0.45f));
-                card.CardWidth = cardWidth;
-                card.ThumbnailHeight = thumbnailHeight;
-                card.ThumbnailWidth = thumbnailWidth;
+                // 缩略图取正方形：宽度是格子宽减两侧内边距，高度是
+                // 它上方到文件名之间的距离；两者取小，保证图不压到字上。
+                // 只有在格子又窄又高的时候高度才是瓶颈，而那时
+                // 图片更应该靠宽度定。
+                float thumbnailSize = Mathf.Max(
+                    16f,
+                    Mathf.Min(cardWidth - MediaCardInset * 2f, labelTop - MediaCardInset)
+                );
+                card.ThumbBoxX = (cardWidth - thumbnailSize) * 0.5f;
+                card.ThumbBoxY = MediaCardInset;
+                card.ThumbBoxWidth = thumbnailSize;
+                card.ThumbBoxHeight = thumbnailSize;
 
                 // 把纹理按比例装进新框里，而不是直接把框赋给它。
-                // 裸用 SetTopLeftRect 会把贴图拉伸填满，所以每次重新布局——
-                // 拖时间轴会改变面板宽度，也就改变了这个框——都会
-                // 让图片被压成新框碰巧具有的那个宽高比。这里
+                // 裸用 SetTopLeftRect 会把贴图拉伸填满，所以每次重新布局
+                // 都会让图片被压成新框碰巧具有的那个宽高比。这里
                 // 也是缩略图首次加载时应用等比适配的地方。
-                LayoutMediaThumbnail(card, thumbnailWidth, thumbnailHeight);
+                LayoutMediaThumbnail(card);
                 SetTopLeftRect(
                     card.Label.rectTransform,
-                    thumbnailWidth + 12f,
-                    0f,
-                    Mathf.Max(20f, cardWidth - thumbnailWidth - 20f),
-                    MediaCardHeight - MediaCardGap);
+                    MediaCardInset,
+                    labelTop,
+                    Mathf.Max(16f, cardWidth - MediaCardInset * 2f),
+                    MediaCardLabelHeight);
                 card.Label.text = item.FileName;
                 card.Label.color = string.Equals(selectedMediaPath, item.RelativePath, StringComparison.OrdinalIgnoreCase) ? TextPrimary : TextSecondary;
                 SetButtonPalette(card.Button, string.Equals(selectedMediaPath, item.RelativePath, StringComparison.OrdinalIgnoreCase));
@@ -1608,7 +1450,7 @@ namespace ADOFAIEditorStudio
                     && string.Equals(card.TexturePath, key, StringComparison.OrdinalIgnoreCase))
                 {
                     ApplyMediaThumbnailToCard(card, entry);
-                    LayoutMediaThumbnail(card, card.ThumbnailWidth, card.ThumbnailHeight);
+                    LayoutMediaThumbnail(card);
                 }
             }
         }
@@ -1779,10 +1621,17 @@ namespace ADOFAIEditorStudio
         /// 缩略图占满整行时成立；行改成「缩略图在左、名字在右」之后，
         /// 适配跑在一个比缩略图实际占位宽得多的框上，把图压扁了。
         /// </summary>
-        private static void LayoutMediaThumbnail(MediaCard card, float availableWidth, float availableHeight)
+        /// <summary>
+        /// 把纹理等比装进卡片上的缩略图方框，居中。
+        ///
+        /// 方框本身由调用方写进 card.ThumbBox*，这里只按它算图片的
+        /// 实际位置和大小——图中图外都留一圈底色，看起来才像
+        /// 「一张图放在一个槽里」，而不是被框裁掉一块。
+        /// </summary>
+        private static void LayoutMediaThumbnail(MediaCard card)
         {
-            availableWidth = Mathf.Max(1f, availableWidth);
-            availableHeight = Mathf.Max(1f, availableHeight);
+            float availableWidth = Mathf.Max(1f, card.ThumbBoxWidth);
+            float availableHeight = Mathf.Max(1f, card.ThumbBoxHeight);
             float width = availableWidth;
             float height = availableHeight;
             if (card.Texture != null && card.Texture.width > 0 && card.Texture.height > 0)
@@ -1800,8 +1649,8 @@ namespace ADOFAIEditorStudio
             }
             SetTopLeftRect(
                 card.Image.rectTransform,
-                6f + (availableWidth - width) * 0.5f,
-                6f + (availableHeight - height) * 0.5f,
+                card.ThumbBoxX + (availableWidth - width) * 0.5f,
+                card.ThumbBoxY + (availableHeight - height) * 0.5f,
                 width,
                 height
             );
@@ -1842,36 +1691,6 @@ namespace ADOFAIEditorStudio
             mediaThumbnailCache.Clear();
             mediaThumbnailUseCounter = 0;
             mediaThumbnailLoadNotBefore = 0f;
-        }
-
-        private void CreateBrowserRow(float width)
-        {
-            BrowserRow row = null;
-            TextMeshProUGUI label;
-            Button button = CreateButton(
-                "ObjectRow" + browserRows.Count,
-                browserContent,
-                0f,
-                0f,
-                width,
-                BrowserRowHeight - 2f,
-                string.Empty,
-                false,
-                delegate { ActivateBrowserRow(row); },
-                out label
-            );
-            label.alignment = TextAlignmentOptions.MidlineLeft;
-            label.margin = new Vector4(10f, 0f, 8f, 0f);
-            label.fontSize = 11.5f;
-            row = new BrowserRow
-            {
-                GameObject = button.gameObject,
-                Rect = button.GetComponent<RectTransform>(),
-                Button = button,
-                Label = label
-            };
-            row.GameObject.SetActive(false);
-            browserRows.Add(row);
         }
 
         private void BuildPreview(RectTransform parent)
@@ -2260,334 +2079,8 @@ namespace ADOFAIEditorStudio
             }
         }
 
-
-        private void SetBrowserFilter(BrowserFilter value)
-        {
-            if (browserFilter == value && filteredBrowserItems.Count > 0)
-            {
-                return;
-            }
-
-            browserFilter = value;
-            ApplyBrowserFilter(true);
-        }
-
-        private void RefreshBrowserIfNeeded()
-        {
-            float now = Time.unscaledTime;
-            if (browserDataDirty || now >= nextBrowserDataRefresh)
-            {
-                RefreshBrowserData(browserDataDirty);
-                nextBrowserDataRefresh = now + BrowserDataRefreshInterval;
-            }
-
-            if (browserSelectionDirty || now >= nextBrowserSelectionRefresh)
-            {
-                browserSelectionDirty = false;
-                nextBrowserSelectionRefresh = now + BrowserSelectionRefreshInterval;
-                UpdateBrowserRows();
-            }
-        }
-
-        private void RefreshBrowserData(bool force)
-        {
-            browserDataDirty = false;
-            scnEditor editor = scnEditor.instance;
-            scrDecorationManager manager = scrDecorationManager.instance;
-            int fingerprint = ComputeBrowserFingerprint(editor, manager);
-            if (!force && browserFingerprintValid && fingerprint == browserFingerprint)
-            {
-                return;
-            }
-
-            browserFingerprint = fingerprint;
-            browserFingerprintValid = true;
-            allBrowserItems.Clear();
-
-            if (editor != null && editor.floors != null)
-            {
-                for (int i = 0; i < editor.floors.Count; i++)
-                {
-                    scrFloor floor = editor.floors[i];
-                    if (floor == null)
-                    {
-                        continue;
-                    }
-
-                    allBrowserItems.Add(new BrowserItem
-                    {
-                        Kind = BrowserItemKind.Track,
-                        FloorId = floor.seqID,
-                        SourceOrder = i,
-                        Floor = floor,
-                        Label = "轨道  ·  第 " + floor.seqID + " 格"
-                    });
-                }
-            }
-
-            if (manager != null && manager.allDecorations != null)
-            {
-                for (int i = 0; i < manager.allDecorations.Count; i++)
-                {
-                    scrDecoration decoration = manager.allDecorations[i];
-                    if (decoration == null || decoration.sourceLevelEvent == null)
-                    {
-                        continue;
-                    }
-
-                    int floorId = decoration.sourceLevelEvent.floor;
-                    allBrowserItems.Add(new BrowserItem
-                    {
-                        Kind = BrowserItemKind.Decoration,
-                        FloorId = floorId,
-                        SourceOrder = i,
-                        Decoration = decoration,
-                        Label = "装饰物  ·  " + GetDecorationDisplayName(decoration) + "  ·  第 " + floorId + " 格"
-                    });
-                }
-            }
-
-            allBrowserItems.Sort(CompareBrowserItems);
-            ApplyBrowserFilter(false);
-        }
-
-        private static int ComputeBrowserFingerprint(scnEditor editor, scrDecorationManager manager)
-        {
-            unchecked
-            {
-                int hash = 17;
-                if (editor != null)
-                {
-                    hash = hash * 31 + editor.GetInstanceID();
-                    if (editor.floors != null)
-                    {
-                        hash = hash * 31 + editor.floors.Count;
-                        for (int i = 0; i < editor.floors.Count; i++)
-                        {
-                            scrFloor floor = editor.floors[i];
-                            hash = hash * 31 + (floor == null ? 0 : floor.GetInstanceID());
-                            hash = hash * 31 + (floor == null ? -1 : floor.seqID);
-                        }
-                    }
-                }
-
-                if (manager != null && manager.allDecorations != null)
-                {
-                    hash = hash * 31 + manager.allDecorations.Count;
-                    for (int i = 0; i < manager.allDecorations.Count; i++)
-                    {
-                        scrDecoration decoration = manager.allDecorations[i];
-                        hash = hash * 31 + (decoration == null ? 0 : decoration.GetInstanceID());
-                        LevelEvent source = decoration == null ? null : decoration.sourceLevelEvent;
-                        hash = hash * 31 + (source == null ? -1 : source.floor);
-                    }
-                }
-                return hash;
-            }
-        }
-
-        private static int CompareBrowserItems(BrowserItem left, BrowserItem right)
-        {
-            int result = left.FloorId.CompareTo(right.FloorId);
-            if (result != 0)
-            {
-                return result;
-            }
-
-            result = left.Kind.CompareTo(right.Kind);
-            return result != 0 ? result : left.SourceOrder.CompareTo(right.SourceOrder);
-        }
-
-        private void ApplyBrowserFilter(bool resetScroll)
-        {
-            filteredBrowserItems.Clear();
-            int decorationCount = 0;
-            int trackCount = 0;
-            for (int i = 0; i < allBrowserItems.Count; i++)
-            {
-                BrowserItem item = allBrowserItems[i];
-                if (item.Kind == BrowserItemKind.Track)
-                {
-                    trackCount++;
-                }
-                else
-                {
-                    decorationCount++;
-                }
-
-                if (browserFilter == BrowserFilter.All
-                    || (browserFilter == BrowserFilter.Decorations && item.Kind == BrowserItemKind.Decoration)
-                    || (browserFilter == BrowserFilter.Tracks && item.Kind == BrowserItemKind.Track))
-                {
-                    filteredBrowserItems.Add(item);
-                }
-            }
-
-            UpdateFilterVisuals(decorationCount, trackCount);
-            if (browserContent != null)
-            {
-                float viewportHeight = browserScroll == null || browserScroll.viewport == null
-                    ? 1f
-                    : browserScroll.viewport.rect.height;
-                browserContent.sizeDelta = new Vector2(0f, Mathf.Max(viewportHeight, filteredBrowserItems.Count * BrowserRowHeight));
-                if (resetScroll)
-                {
-                    browserContent.anchoredPosition = Vector2.zero;
-                }
-            }
-
-            browserSelectionDirty = true;
-            UpdateBrowserRows();
-        }
-
-        private void UpdateFilterVisuals(int decorationCount, int trackCount)
-        {
-            string[] labels =
-            {
-                "全部 " + (decorationCount + trackCount),
-                "装饰物 " + decorationCount,
-                "轨道 " + trackCount
-            };
-            for (int i = 0; i < browserFilterButtons.Count; i++)
-            {
-                SetButtonPalette(browserFilterButtons[i], i == (int)browserFilter);
-                if (i < browserFilterLabels.Count)
-                {
-                    browserFilterLabels[i].text = labels[i];
-                }
-            }
-        }
-
-        private void UpdateBrowserRows()
-        {
-            if (browserContent == null || browserRows.Count == 0)
-            {
-                return;
-            }
-
-            float offset = Mathf.Max(0f, browserContent.anchoredPosition.y);
-            int maximumFirst = Mathf.Max(0, filteredBrowserItems.Count - browserRows.Count);
-            int first = Mathf.Clamp(Mathf.FloorToInt(offset / BrowserRowHeight), 0, maximumFirst);
-            for (int i = 0; i < browserRows.Count; i++)
-            {
-                BrowserRow row = browserRows[i];
-                int itemIndex = first + i;
-                if (itemIndex >= filteredBrowserItems.Count)
-                {
-                    row.BoundIndex = -1;
-                    row.GameObject.SetActive(false);
-                    continue;
-                }
-
-                BrowserItem item = filteredBrowserItems[itemIndex];
-                row.BoundIndex = itemIndex;
-                row.Rect.anchoredPosition = new Vector2(0f, -itemIndex * BrowserRowHeight);
-                row.Label.text = item.Label;
-                SetButtonPalette(row.Button, IsBrowserItemSelected(item));
-                row.GameObject.SetActive(true);
-            }
-        }
-
-        private static bool IsBrowserItemSelected(BrowserItem item)
-        {
-            scnEditor editor = scnEditor.instance;
-            if (editor == null)
-            {
-                return false;
-            }
-
-            if (item.Kind == BrowserItemKind.Track)
-            {
-                return item.Floor != null
-                    && editor.selectedFloors != null
-                    && editor.selectedFloors.Contains(item.Floor);
-            }
-
-            LevelEvent source = item.Decoration == null ? null : item.Decoration.sourceLevelEvent;
-            return source != null
-                && editor.selectedDecorations != null
-                && editor.selectedDecorations.Contains(source);
-        }
-
-        private void ActivateBrowserRow(BrowserRow row)
-        {
-            if (row == null || row.BoundIndex < 0 || row.BoundIndex >= filteredBrowserItems.Count)
-            {
-                return;
-            }
-
-            scnEditor editor = scnEditor.instance;
-            if (editor == null)
-            {
-                return;
-            }
-
-            BrowserItem item = filteredBrowserItems[row.BoundIndex];
-            if (item.Kind == BrowserItemKind.Track)
-            {
-                if (item.Floor != null)
-                {
-                    editor.SelectFloor(item.Floor, cameraJump: false);
-                }
-            }
-            else if (item.Decoration != null && item.Decoration.sourceLevelEvent != null)
-            {
-                editor.SelectDecoration(
-                    item.Decoration.sourceLevelEvent,
-                    jumpToDecoration: false,
-                    showPanel: false,
-                    ignoreDeselection: false,
-                    ignoreAdjustRect: true
-                );
-            }
-
-            browserSelectionDirty = true;
-            UpdateBrowserRows();
-        }
-
-        private static string GetDecorationDisplayName(scrDecoration decoration)
-        {
-            LevelEvent source = decoration.sourceLevelEvent;
-            string value;
-            switch (source.eventType)
-            {
-                case LevelEventType.AddDecoration:
-                    if (source.TryGet<string>("decorationImage", out value) && !string.IsNullOrWhiteSpace(value))
-                    {
-                        return NormalizeBrowserLabel(value);
-                    }
-                    return "图片";
-                case LevelEventType.AddText:
-                    if (source.TryGet<string>("decText", out value) && !string.IsNullOrWhiteSpace(value))
-                    {
-                        return NormalizeBrowserLabel(value);
-                    }
-                    return "文本";
-                case LevelEventType.AddParticle:
-                    if (source.TryGet<string>("decorationImage", out value) && !string.IsNullOrWhiteSpace(value))
-                    {
-                        return NormalizeBrowserLabel(value);
-                    }
-                    return "粒子";
-                case LevelEventType.AddObject:
-                    return "对象";
-                default:
-                    if (source.TryGet<string>("tag", out value) && !string.IsNullOrWhiteSpace(value))
-                    {
-                        return NormalizeBrowserLabel(value);
-                    }
-                    return source.eventType.ToString();
-            }
-        }
-
-        private static string NormalizeBrowserLabel(string value)
-        {
-            return value.Replace('\r', ' ').Replace('\n', ' ').Trim();
-        }
-
         internal void SetSceneSelectionStatus(string message)
         {
-            browserSelectionDirty = true;
 
             // 这条消息以前被丢在地上没人管——只置了脏标志，所以
             // 场景交互报上来的任何东西都从来没有显示过。现在它驱动
@@ -2874,23 +2367,41 @@ namespace ADOFAIEditorStudio
                 screenAspect = Mathf.Max(0.1f, Screen.width / (float)Screen.height);
             }
 
-            float maxStageWidth = DesignWidth
-                - OuterMargin * 2f
-                - PanelGap * 2f
-                - MinimumLeftPanelWidth
-                - MinimumRightPanelWidth;
-            float stageHeight = Mathf.Min(PreviewStageAvailableHeight, maxStageWidth / screenAspect);
+            float chrome = OuterMargin * 2f + PanelGap * 2f;
+
+            // 舞台大小只由可用高度决定。它**不**跟着两侧面板走：
+            // 反过来的话，两栏一变舞台就要重算，而舞台一变两栏又要重算，
+            // 是个绕不出去的关系。高度是这条链上唯一的外生量，从它出发
+            // 算一次就完了。
+            //
+            // 老写法还有个实际后果：右栏用 Mathf.Max(290, 余量) 兜底，
+            // 余量不够也硬占 290，于是参数栏有一截伸到屏幕外面——
+            // 舞台上方的视口又是按 previewLayout 定位的，整个工作台
+            // 会跟着往右偏。两栏等宽之后这个兜底就不存在了。
+            float stageHeight = PreviewStageAvailableHeight;
             float stageWidth = stageHeight * screenAspect;
-            float remainingWidth = DesignWidth - OuterMargin * 2f - PanelGap * 2f - stageWidth;
-            float extraPanelWidth = Mathf.Max(0f, remainingWidth - MinimumLeftPanelWidth - MinimumRightPanelWidth);
-            float leftPanelWidth = MinimumLeftPanelWidth + extraPanelWidth * LeftPanelExtraShare;
-            float rightPanelWidth = MinimumRightPanelWidth + extraPanelWidth * (1f - LeftPanelExtraShare);
-            float stageX = OuterMargin + leftPanelWidth + PanelGap;
+
+            // 横向余量由两栏平分。这里不再给某一边「多分一点」——
+            // 分了舞台就偏心了。
+            float panelWidth = (DesignWidth - chrome - stageWidth) * 0.5f;
+
+            // 兜底：屏幕特别宽时舞台会把两侧挤到没有。这时把舞台收回来，
+            // 两栏一起保到最小宽度。1920 设计宽度下不会走到这里。
+            float minimumStageWidth = DesignWidth - chrome - MinimumSidePanelWidth * 2f;
+            if (minimumStageWidth > 1f && stageWidth > minimumStageWidth)
+            {
+                stageWidth = minimumStageWidth;
+                stageHeight = stageWidth / screenAspect;
+                panelWidth = MinimumSidePanelWidth;
+            }
+
+            panelWidth = Mathf.Max(MinimumSidePanelWidth, panelWidth);
+            float stageX = OuterMargin + panelWidth + PanelGap;
 
             return new PreviewLayout
             {
-                LeftPanelWidth = leftPanelWidth,
-                RightPanelWidth = rightPanelWidth,
+                LeftPanelWidth = panelWidth,
+                RightPanelWidth = panelWidth,
                 StageX = stageX,
                 StageY = PreviewPanelY + PreviewStageInsetY + (PreviewStageAvailableHeight - stageHeight) * 0.5f,
                 StageWidth = stageWidth,
@@ -2969,36 +2480,28 @@ namespace ADOFAIEditorStudio
 
         private void RelayoutProjectWorkspace(float previewHeight)
         {
-            if (browserPanel == null || projectTreePanel == null || mediaPanel == null)
+            if (browserPanel == null || mediaPanel == null)
             {
                 return;
             }
 
             float panelWidth = previewLayout.LeftPanelWidth;
             float innerWidth = panelWidth - 24f;
-            float treeWidth = Mathf.Clamp(innerWidth * ProjectTreeWidthRatio, MinimumProjectTreeWidth, MaximumProjectTreeWidth);
-            float mediaWidth = innerWidth - treeWidth - 8f;
+            float mediaWidth = innerWidth;
             float innerHeight = Mathf.Max(64f, previewHeight - 20f);
             float listY = 36f;
-            // 媒体列在列表上方有一条搜索行；项目树没有，
-            // 所以两者不能共用偏移。
+            // 媒体列在列表上方有一条搜索行。
             float mediaListY = listY + MediaSearchRowHeight;
-            float listHeight = Mathf.Max(32f, innerHeight - listY - 10f);
             float mediaListHeight = Mathf.Max(32f, innerHeight - mediaListY - 10f);
-            SetTopLeftRect(projectTreePanel, 12f, 10f, treeWidth, innerHeight);
-            SetTopLeftRect(mediaPanel, 12f + treeWidth + 8f, 10f, mediaWidth, innerHeight);
-            SetTopLeftRect(projectTitle.rectTransform, 12f, 8f, treeWidth - 24f, 28f);
+            SetTopLeftRect(mediaPanel, 12f, 10f, mediaWidth, innerHeight);
             SetTopLeftRect(mediaTitle.rectTransform, 12f, 8f, mediaWidth - 24f, 28f);
-            SetTopLeftRect(projectTreeScroll.GetComponent<RectTransform>(), 8f, listY, treeWidth - 16f, listHeight);
             SetTopLeftRect(mediaScroll.GetComponent<RectTransform>(), 8f, mediaListY, mediaWidth - 16f, mediaListHeight);
             LayoutMediaSearchControls(mediaWidth);
-            int requiredTreeRows = Mathf.CeilToInt(listHeight / ProjectTreeRowHeight) + 2;
-            EnsureProjectTreeRows(requiredTreeRows);
+            // 卡片池按整个可见区域来备：面板一拉高，行数就变，
+            // 池子要够覆盖当前能看见的那些行。
             int requiredMediaCards = Mathf.CeilToInt(mediaListHeight / MediaCardHeight) + 2;
             EnsureMediaCards(requiredMediaCards);
-            projectTreeContent.sizeDelta = new Vector2(0f, Mathf.Max(listHeight, projectTreeContent.sizeDelta.y));
             mediaContent.sizeDelta = new Vector2(0f, Mathf.Max(mediaListHeight, mediaContent.sizeDelta.y));
-            RebuildProjectTree();
             RebuildVisibleMedia(false);
         }
 
@@ -3051,30 +2554,18 @@ namespace ADOFAIEditorStudio
         private void ClearRuntimeUiReferences()
         {
             ReleaseMediaTextures();
-            browserFilterButtons.Clear();
-            browserFilterLabels.Clear();
-            browserRows.Clear();
-            allBrowserItems.Clear();
-            filteredBrowserItems.Clear();
             uiRoot = null;
             canvas = null;
             designRoot = null;
             browserPanel = null;
-            projectTreePanel = null;
-            projectTreeViewport = null;
-            projectTreeContent = null;
             mediaPanel = null;
             mediaViewport = null;
             mediaContent = null;
-            projectTitle = null;
             mediaTitle = null;
-            projectTreeScroll = null;
             mediaScroll = null;
-            projectTreeRows.Clear();
             mediaCards.Clear();
             visibleProjectMedia.Clear();
             projectSession = null;
-            selectedProjectDirectory = ".";
             selectedMediaPath = null;
             projectDataDirty = true;
             previewPanel = null;
@@ -3092,11 +2583,6 @@ namespace ADOFAIEditorStudio
             matteLeft = null;
             matteRight = null;
             timelineView = null;
-            browserScroll = null;
-            browserContent = null;
-            browserFingerprintValid = false;
-            browserDataDirty = true;
-            browserSelectionDirty = true;
         }
 
         private void RestorePreviewViewport()
@@ -3829,22 +3315,20 @@ namespace ADOFAIEditorStudio
             mediaSearchField.caretWidth = 2;
             mediaSearchField.caretBlinkRate = 0.85f;
 
-            RectTransform textRect = CreateTopLeftRect("Text", rect, 7f, 0f, searchWidth - 14f, searchHeight);
-            TextMeshProUGUI text = textRect.gameObject.AddComponent<TextMeshProUGUI>();
-            if (uiFont != null)
-            {
-                text.font = uiFont;
-            }
-            text.fontSize = 11.5f;
-            text.color = TextPrimary;
-            text.alignment = TextAlignmentOptions.MidlineLeft;
-            text.raycastTarget = false;
-            ApplyTextShadow(text);
-
-            TextMeshProUGUI placeholder = CreateText(
-                "Placeholder", rect, 7f, 0f, searchWidth - 14f, searchHeight,
-                "搜索图片…", 11.5f, TextSecondary, TextAlignmentOptions.MidlineLeft, false);
-            placeholder.raycastTarget = false;
+            // 文本与占位符都铺满输入框。这里是照装饰物搜索框那套写的——
+            // 那一个是可用的，所以结构上跟它保持一致，不要自己另发明一套。
+            //
+            // 两个要点：
+            //   · 全新 GameObject，不用 CreateTopLeftRect。那个辅助按左上枢轴
+            //     摆位，虽然随后会改锚点，但枢轴会留在 (0,1)。而
+            //     TMP_InputField 的光标是挂在文本父节点下的**兄弟**，
+            //     它的锚点/枢轴/位置/尺寸由 AssignPositioningIfNeeded()
+            //     整套从文本抄过去，于是文本枢轴一偏，光标跟着偏。
+            //   · 锚点改成拉伸，左右各留 7 像素。
+            TextMeshProUGUI text = CreateStretchedFieldText("Text", rect, 7f,
+                string.Empty, 11.5f, TextPrimary, uiFont);
+            TextMeshProUGUI placeholder = CreateStretchedFieldText("Placeholder", rect, 7f,
+                "搜索图片…", 11.5f, TextSecondary, uiFont);
 
             mediaSearchField.textViewport = rect;
             mediaSearchField.textComponent = text;
@@ -3873,6 +3357,40 @@ namespace ADOFAIEditorStudio
         private TMP_InputField mediaSearchField;
         private Button mediaRefreshButton;
         private TextMeshProUGUI mediaRefreshLabel;
+
+        /// <summary>
+        /// 输入框内部的文本：铺满父节点、左右各留 inset。
+        ///
+        /// 用全新 GameObject 而不是 CreateTopLeftRect：后者会先把枢轴设成
+        /// 左上，改锚点之后枢轴仍留在 (0,1)。输入框的光标是文本的兄弟节点，
+        /// TMP_InputField 会把文本的锚点/枢轴/位置/尺寸整套抄给光标，
+        /// 所以文本枢轴一偏，光标就跟着偏。新建对象的枢轴是默认正中，不会出这问题。
+        /// </summary>
+        private static TextMeshProUGUI CreateStretchedFieldText(string name, RectTransform parent,
+            float inset, string value, float size, Color color, TMP_FontAsset uiFont)
+        {
+            GameObject gameObject = new GameObject(name, typeof(RectTransform));
+            gameObject.transform.SetParent(parent, false);
+            RectTransform rect = gameObject.GetComponent<RectTransform>();
+            rect.anchorMin = Vector2.zero;
+            rect.anchorMax = Vector2.one;
+            rect.pivot = new Vector2(0.5f, 0.5f);
+            rect.offsetMin = new Vector2(inset, 0f);
+            rect.offsetMax = new Vector2(-inset, 0f);
+
+            TextMeshProUGUI text = gameObject.AddComponent<TextMeshProUGUI>();
+            if (uiFont != null)
+            {
+                text.font = uiFont;
+            }
+            text.text = value;
+            text.fontSize = size;
+            text.color = color;
+            text.alignment = TextAlignmentOptions.MidlineLeft;
+            text.raycastTarget = false;
+            ApplyTextShadow(text);
+            return text;
+        }
 
         private static RectTransform CreateTopLeftRect(string name, RectTransform parent, float x, float y, float width, float height)
         {
