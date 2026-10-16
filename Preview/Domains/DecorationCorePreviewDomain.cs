@@ -517,7 +517,15 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     continue;
                 }
 
-                decoration.SetVisible(visible && !decoration.forceHide);
+                // 可见性**先不写**，挪到遮罩之后。
+                //
+                // 原生 SetVisible 是这样推的：
+                //   spriteRenderer.enabled = !isMask() & visible;
+                //   spriteMask.enabled     =  isMask() & visible;
+                // 两行都读 maskingType。所以顺序反了的话，类型刚变的那一帧
+                // 用的是**旧类型**：一个刚被设成 Mask 的装饰物会把 sprite 画出来、
+                // 同时遮罩不启用——正好是"该被遮的没被遮、还多出一块"。
+                // 排到遮罩之后，enabled 就总是按刚写下去的类型算。
 
                 // 遮罩走原生 setter，它才是决定装饰物到底是否渲染的
                 // 东西。它的实现是
@@ -574,6 +582,10 @@ namespace ADOFAIEditorStudio.Preview.Domains
                         state.AppliedMaskingBackDepth = maskingBackDepth;
                     }
                 }
+
+                // 遮罩写完了，现在才推可见性——SetVisible 正是从 maskingType
+                // 推导 sprite / spriteMask 的 enabled 的，所以它必须排在后面。
+                decoration.SetVisible(visible && !decoration.forceHide);
 
                 // 每帧重试直到成功：sprite 可能还在加载。
                 if (!string.Equals(state.AppliedImage, imageFilename, StringComparison.Ordinal))
@@ -657,7 +669,14 @@ namespace ADOFAIEditorStudio.Preview.Domains
         {
             if (string.IsNullOrEmpty(filename))
             {
-                return false;
+                // 空文件名不是"没什么可设的"，而是作者在**清掉这张图**，
+                // 好让装饰物消失——574 格那种"该消失的没消失"就是这么来的。
+                //
+                // 原生：SetSprite(customSprites.GetValueOrDefault(name ?? "", null))。
+                // 名字为空时取到的是 null，SetSprite(null) 把 spriteRenderer
+                // 和 spriteMask 一起清空。早先这里直接 return false，
+                // 于是那条事件被当成空操作，装饰物保持上一张图。
+                return ClearSprite(decoration);
             }
 
             scrDecorationManager manager = scrDecorationManager.instance;
@@ -688,6 +707,30 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 // bool)。反编译的源码树用的是旧的两参数形式，带一个
                 // 已经不存在的 ImageOptions 枚举。
                 visual.SetSprite(sprite);
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// 把装饰物身上的图清掉。走的是和 <see cref="ApplyImage"/> 同一条
+        /// 原生 setter——对 scrVisualDecoration 它会同时清掉 spriteRenderer
+        /// 和 spriteMask，这一点和原生传 null 时的行为一致。
+        /// </summary>
+        private static bool ClearSprite(scrDecoration decoration)
+        {
+            scrParticleDecoration particle = decoration as scrParticleDecoration;
+            if (particle != null)
+            {
+                particle.SetSprite((TextureManager.CustomSprite)null);
+                return true;
+            }
+
+            scrVisualDecoration visual = decoration as scrVisualDecoration;
+            if (visual != null)
+            {
+                visual.SetSprite((TextureManager.CustomSprite)null);
                 return true;
             }
 

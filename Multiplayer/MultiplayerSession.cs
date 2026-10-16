@@ -88,11 +88,30 @@ namespace ADOFAIEditorStudio.Multiplayer
         private const string MsgMediaWant = "mediawant";
         private const string MsgMedia = "media";
 
+        /// <summary>
+        /// 协议版本。`hello` 和 `welcome` 都带上它。
+        ///
+        /// **这个字段是后补的，补它的理由值得记住。** 协议原本没有任何
+        /// 版本协商：`hello` 只带一个名字。于是两个人跑**不同版本的 AES**
+        /// 时没有任何东西会报错 —— 字段名变了、语义变了，对端照样把消息
+        /// 收下，然后**安静地改坏对方的谱面**。这是最难查的一类问题：
+        /// 没有异常、没有日志、画面看起来也正常，只是数据不对。
+        ///
+        /// 所以规则是：**对不上就拒绝这个会话**，并且把原因说清楚。
+        /// 宁可连不上，也不要两个人对着同一张谱各写各的。
+        ///
+        /// **改动协议语义或字段含义时必须 +1。**
+        /// （只加可选字段、对方忽略也无害的，不需要 +1。）
+        /// </summary>
+        private const int ProtocolVersion = 1;
+
         // ---------------------------------------------------------------- 载荷
 
         private sealed class HelloPayload
         {
             public string name;
+            /// <summary>见 <see cref="ProtocolVersion"/>。对不上会被拒绝。</summary>
+            public int protocol;
         }
 
         private sealed class WelcomePayload
@@ -101,6 +120,14 @@ namespace ADOFAIEditorStudio.Multiplayer
             public List<PeerInfo> members;
             /// <summary>主机当前的谱面全文，每次加入都带。</summary>
             public string chart;
+            /// <summary>
+            /// 见 <see cref="ProtocolVersion"/>。
+            ///
+            /// 成员这一侧**必须也查**：新成员连旧主机时，旧主机不认识
+            /// 协议号、会照常回一条不带它的欢迎消息 —— 只有成员自己
+            /// 能发现这件事。
+            /// </summary>
+            public int protocol;
         }
 
         private sealed class ChartPayload
@@ -133,6 +160,19 @@ namespace ADOFAIEditorStudio.Multiplayer
         private sealed class LeavePayload
         {
             public int id;
+        }
+
+        /// <summary>
+        /// 告别。`reason` **只在拒绝加入时**带，正常退出时是空的。
+        ///
+        /// 老版本的对端只认消息类型、不看载荷，所以加这个字段不会把它弄坏；
+        /// 而新版本收到带理由的告别，就能把「你的 AES 版本和房主不一致」
+        /// 直接显示出来 —— 否则用户只会看到「主机结束了联机」，
+        /// 完全查不到原因。
+        /// </summary>
+        private sealed class ByePayload
+        {
+            public string reason;
         }
 
         /// <summary>
@@ -413,9 +453,14 @@ namespace ADOFAIEditorStudio.Multiplayer
 
             Role = MultiplayerRole.Member;
 
-            // 握手：带上名字、头像和本地谱面指纹。指纹一致的话主机
-            // 只回成员表，不用把整份谱面发过来。
-            hostLink.Send(MsgHello, new HelloPayload { name = localName });
+            // 握手：带名字 + 协议号。主机按协议号决定收不收 —— 见 ProtocolVersion。
+            // （谱面全文一律由主机回，不做「指纹一致就免传」：指纹只算谱面
+            // 文本，算不到音乐和贴图，免传会把媒体同步整条跳过。）
+            hostLink.Send(MsgHello, new HelloPayload
+            {
+                name = localName,
+                protocol = ProtocolVersion
+            });
 
             // **立刻切到会话副本，并把它在编辑器里打开。**
             //
@@ -670,8 +715,11 @@ namespace ADOFAIEditorStudio.Multiplayer
             {
                 case MsgBye:
                     // 对方主动告别。这是**确定的**离开，不是网络抖动，
-                    // 所以立刻清理：还他的锁、从成员表里拿掉。
-                    OnPeerSaidBye(link, memberId);
+                    // 所以立刻清理：把他从成员表里拿掉。
+                    //
+                    // 载荷里可能带理由（协议号对不上被拒时会带），
+                    // 交给 OnPeerSaidBye 显示出来。
+                    OnPeerSaidBye(link, memberId, NetLink.Payload<ByePayload>(json));
                     break;
 
                 case MsgPing:
@@ -759,6 +807,25 @@ namespace ADOFAIEditorStudio.Multiplayer
                 return;
             }
 
+            // **协议号对不上就明确拒绝，别让他进来。**
+            //
+            // 放进来会怎样：两边对同一个字段的理解不同，消息照样收发成功，
+            // 只是写进去的值不对 —— 没有异常、没有日志，双方都察觉不到。
+            // 这里拒掉是唯一能保证「不同版本的 AES 不会互相改坏谱面」的位置。
+            //
+            // 协议号 0 表示对方根本没带这个字段（旧版 AES）。
+            if (hello.protocol != ProtocolVersion)
+            {
+                string why = hello.protocol == 0
+                    ? "对方的 AES 是旧版本（握手没带协议号）"
+                    : "对方协议号 " + hello.protocol + "，本机是 " + ProtocolVersion;
+                Main.Logger.Log("[联机] 拒绝了 " + (string.IsNullOrEmpty(hello.name) ? "一个成员" : hello.name)
+                    + "：" + why + "。联机双方必须用同一版本的 AES。");
+                link.SendNow(MsgBye, new ByePayload { reason = why + "，联机双方必须用同一版本的 AES。" });
+                link.Stop();
+                return;
+            }
+
             var peer = new PeerInfo
             {
                 Id = memberId,
@@ -831,7 +898,8 @@ namespace ADOFAIEditorStudio.Multiplayer
             {
                 id = memberId,
                 members = new List<PeerInfo>(members.Values),
-                chart = ChartTransfer.EncodeMemoryChart()
+                chart = ChartTransfer.EncodeMemoryChart(),
+                protocol = ProtocolVersion
             });
 
             Main.Logger.Log("[联机] " + peer.Name + " 加入，已发谱面全文（媒体由对方按需来取）。");
@@ -841,6 +909,20 @@ namespace ADOFAIEditorStudio.Multiplayer
         {
             if (welcome == null)
             {
+                return;
+            }
+
+            // **成员这一侧也必须查。** 新成员连旧主机时，旧主机不认识
+            // 协议号、会照常回一条不带它的欢迎消息 —— 主机那边什么都不会
+            // 报，只有成员自己发现得了。见 ProtocolVersion。
+            if (welcome.protocol != ProtocolVersion)
+            {
+                string why = welcome.protocol == 0
+                    ? "房主的 AES 是旧版本（欢迎消息没带协议号）"
+                    : "房主协议号 " + welcome.protocol + "，本机是 " + ProtocolVersion;
+                LastError = "连不上：" + why + "，联机双方必须用同一版本的 AES。";
+                Main.Logger.Log("[联机] " + LastError);
+                Stop();
                 return;
             }
 
@@ -1164,7 +1246,7 @@ namespace ADOFAIEditorStudio.Multiplayer
         /// （见 <see cref="Tick"/>），因为多半是网络抖一下、过会儿就回来；
         /// 而这条消息是对方明确说他走了，可以放心收摊。
         /// </summary>
-        private static void OnPeerSaidBye(NetLink link, int memberId)
+        private static void OnPeerSaidBye(NetLink link, int memberId, ByePayload bye)
         {
             if (Role == MultiplayerRole.Host && memberId > 0)
             {
@@ -1173,7 +1255,12 @@ namespace ADOFAIEditorStudio.Multiplayer
             }
 
             // 成员收到主机告别：主机不干了，我们这边也收摊。
-            LastError = "主机结束了联机。";
+            //
+            // 告别带理由时（比如协议号对不上被拒）要把理由显出来 ——
+            // 否则用户只看到「主机结束了联机」，完全不知道是自己的
+            // AES 版本旧了，只会以为是网络问题反复重试。
+            string reason = bye == null ? null : bye.reason;
+            LastError = string.IsNullOrEmpty(reason) ? "主机结束了联机。" : reason;
             Main.Logger.Log("[联机] " + LastError);
             Stop();
         }

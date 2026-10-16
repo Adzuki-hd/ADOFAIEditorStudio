@@ -15,7 +15,10 @@ namespace ADOFAIEditorStudio.Preview
         private static readonly PreviewDomainCoverage[] Coverage =
         {
             new PreviewDomainCoverage("Planet", PreviewDomainState.Active,
-                "two-planet floors are evaluated directly; complex floors use a native floor checkpoint"),
+                "two- and three-planet floors are evaluated directly (role handover, hold slide, "
+                + "multi-planet layout); freeroam parks the ball on the entry grid tile"),
+            new PreviewDomainCoverage("FreeRoam", PreviewDomainState.Active,
+                "grid colouring, the exit fade/fly-out of the ball's tile, and the exit camera move"),
             new PreviewDomainCoverage("Camera", PreviewDomainState.Active,
                 "MoveCamera position, rotation, zoom and easing"),
             new PreviewDomainCoverage("Flash", PreviewDomainState.Active,

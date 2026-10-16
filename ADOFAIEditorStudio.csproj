@@ -7,11 +7,27 @@
     <RootNamespace>ADOFAIEditorStudio</RootNamespace>
     <!-- 和 Info.json 的 Version 保持一致。UMM 用的是 Info.json 那个，
          这里只是程序集版本，两边对不上会让人分不清哪个是真的。 -->
-    <Version>0.16.4</Version>
+    <Version>0.29.2</Version>
     <Nullable>disable</Nullable>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <!-- ImGui 桥接要直接读原生顶点缓冲（ImDrawVert*），必须开不安全代码。 -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
+    <!-- ImGui。运行时和 cimgui.dll 一起随包分发，所以引用的是打包目录里那份，
+         保证编译用的和发出去的是同一个二进制。
+         版本必须和 cimgui.dll 配套：ImGui.NET 1.91.6.1 ↔ cimgui 1.91.6。 -->
+    <Reference Include="ImGui.NET">
+      <HintPath>$(MSBuildProjectDirectory)\dist\ADOFAIEditorStudio\ImGui.NET.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- ImGui.NET 的顶点类型用的是 System.Numerics.Vector2/Vector4，
+         不引这个，所有 ImGui 的签名都解析不出来（而且会连带报出一堆
+         看起来无关的错，比如找不到 CanvasScaler）。游戏自带这份。 -->
+    <Reference Include="System.Numerics.Vectors">
+      <HintPath>D:\SteamLibrary\steamapps\common\A Dance of Fire and Ice\A Dance of Fire and Ice_Data\Managed\System.Numerics.Vectors.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="Assembly-CSharp">
       <HintPath>D:\SteamLibrary\steamapps\common\A Dance of Fire and Ice\A Dance of Fire and Ice_Data\Managed\Assembly-CSharp.dll</HintPath>
       <Private>false</Private>
@@ -67,6 +83,12 @@
       <HintPath>D:\SteamLibrary\steamapps\common\A Dance of Fire and Ice\A Dance of Fire and Ice_Data\Managed\UnityEngine.Physics2DModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <!-- 复制群号要 GUIUtility.systemCopyBuffer，它在 IMGUIModule 里。
+         项目原来没引用这个程序集（界面全是 uGUI，用不到 IMGUI）。 -->
+    <Reference Include="UnityEngine.IMGUIModule">
+      <HintPath>D:\SteamLibrary\steamapps\common\A Dance of Fire and Ice\A Dance of Fire and Ice_Data\Managed\UnityEngine.IMGUIModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="UnityEngine.ParticleSystemModule">
       <HintPath>D:\SteamLibrary\steamapps\common\A Dance of Fire and Ice\A Dance of Fire and Ice_Data\Managed\UnityEngine.ParticleSystemModule.dll</HintPath>
       <Private>false</Private>
@@ -100,7 +122,10 @@
     <!-- The isolated frame-cache experiment must never enter the UMM Mod assembly. -->
     <Compile Remove="FrameCacheSpike\\**" />
     <Compile Remove="Backups\\**" />
+    <!-- tools 下面是自己用的离线工具（比如布局预览），不是模组的一部分。 -->
+    <Compile Remove="tools\\**" />
     <None Remove="FrameCacheSpike\\**" />
     <None Remove="Backups\\**" />
+    <None Remove="tools\\**" />
   </ItemGroup>
 </Project>

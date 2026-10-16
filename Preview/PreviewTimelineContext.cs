@@ -243,10 +243,46 @@ namespace ADOFAIEditorStudio.Preview
                 + " worstDelta=" + worstDelta.ToString("F3")
                 + " worst=" + worstDetail + ".");
         }
-
         internal scrFloor GetFloorBinding(int index)
         {
             return index < 0 || index >= floorBindings.Length ? null : floorBindings[index];
+        }
+
+        /// <summary>
+        /// 球在这一格上真正绕着的中心。
+        ///
+        /// 原生 scrPlanet 是二选一：
+        ///   stickToFloor → scrFloor.transform.position（**活的**）
+        ///   否则         → scrFloor.startPos（作者摆的布局位）
+        ///
+        /// 快照里的 BallPosition 是**静态近似**——它把活位置写成
+        /// startPos + offsetPos，那对 PositionTrack 是对的（原生正是把格摆到
+        /// 那里、并把同一个值写进 offsetPos）。但 MoveTrack 不是：
+        /// ffxMoveFloorPlus 直接对 transform.position 起 DOTween，从不碰
+        /// offsetPos。而快照建一次就定下来，装不下随时间变的位置，
+        /// 所以粘住的格必须现读活位置——不读的话，轨道动到哪，
+        /// 球都还停在快照拍下它的那一刻。
+        ///
+        /// 定义只留这一份：球从这里取，免得又多一处各算一遍。
+        /// </summary>
+        internal Vector3 ResolveBallCentre(int index)
+        {
+            PreviewFloorSnapshot floor = GetFloor(index);
+            if (floor == null)
+            {
+                return Vector3.zero;
+            }
+
+            if (floor.StickToFloor)
+            {
+                scrFloor bound = GetFloorBinding(index);
+                if (bound != null)
+                {
+                    return PreviewEvaluationEngine.FloorPositionThisFrame(bound);
+                }
+            }
+
+            return floor.BallPosition;
         }
 
         internal PreviewFloorSnapshot GetFloor(int index)
@@ -599,7 +635,7 @@ namespace ADOFAIEditorStudio.Preview
             return Math.Max(0d, Convert.ToDouble(floor.EntryTime) + seconds);
         }
 
-        private float GetFloorTravelAngle(PreviewFloorSnapshot floor)
+        internal float GetFloorTravelAngle(PreviewFloorSnapshot floor)
         {
             if (floor == null || floor.Index < 0 || floor.Index >= floorTravelAngle.Length)
             {

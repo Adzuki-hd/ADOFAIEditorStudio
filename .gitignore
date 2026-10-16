@@ -30,3 +30,10 @@ FrameCacheSpike/obj/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Claude Code 本机设置（hook 等），不进仓库
+.claude/settings.local.json
+
+# 工具的输出图（布局预览、图标自检），是产物不是源码
+tools/layout-preview/*.png
+tools/icons/selftest.png

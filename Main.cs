@@ -44,11 +44,19 @@ namespace ADOFAIEditorStudio
                     var host = new GameObject("ADOFAIEditorStudio.Host");
                     UnityEngine.Object.DontDestroyOnLoad(host);
                     Overlay = host.AddComponent<EditorStudioOverlay>();
+
+                    // ImGui 桥接。
+                    //
+                    // 这一步只画一个测试窗口，目的是验证「ImGui 产出顶点 → Unity 的
+                    // CanvasRenderer 画出来」这条路通不通。**现有 uGUI 界面完全不动**
+                    // ——这是共存渐进的第一步，不是替换；两条路会并行一段时间，
+                    // 面板一个一个搬过去。
+                    host.AddComponent<EditorImGuiBridge>();
                 }
 
                 Overlay.Configure(Settings);
 
-                // 两个记录器是排查暂停格交接问题时用的调试仪器(行星角度 / 相机路径),
+                // 三个记录器是排查轨道/行星问题的调试仪器(行星角度 / 相机路径 / 球轨迹),
                 // 会各自 Harmony patch 一个游戏方法。它们只在按下热键后才写文件,输出也没有
                 // 任何代码在读,所以默认不挂载 —— 对一个公开发布的 mod 来说,无条件 patch
                 // 游戏方法只为产出没人看的日志是不合适的。
@@ -59,6 +67,12 @@ namespace ADOFAIEditorStudio
                 {
                     PlanetAngleRecorder.Ensure();
                     CameraPathRecorder.Ensure();
+                    // 球轨迹记录器：逐帧写下每颗球**各自**的位置，用来查长按里
+                    // 那颗球的轨迹和双球角度差。它 patch 的是 scrPlanet.LateUpdate，
+                    // 输出 CSV 会长到几百 MB，所以和上面两个一样只在诊断开关
+                    // 打开时挂载。双球角度那条还没收，需要时把 Settings.xml 里的
+                    // VerboseDiagnostics 打开即可。
+                    PlanetTrajectoryRecorder.Ensure();
                 }
 
                 Logger.Log("ADOFAI Editor Studio " + Mod.Version + " loaded");
@@ -123,6 +137,12 @@ namespace ADOFAIEditorStudio
         // 这些 trace，用来诊断「拖动定位后再恢复播放」的缺陷。默认关闭：它们
         // 很吵，只在排查特定播放问题时才需要。
         public bool VerboseDiagnostics = false;
+        // 上一次「看过更新内容」的版本号。
+        //
+        // 更新窗口只在**换了版本之后第一次**打开工作台时弹一次，判据就是这个
+        // 字段和当前版本号比 —— 不是一个「弹过了」的布尔：那样永远只弹一次，
+        // 之后每次更新都不弹了。空字符串表示从没看过（新装的第一进来就弹）。
+        public string LastSeenVersion = string.Empty;
         // 选中一个事件时，是否把预览画面和时间轴一起挪过去。
         //
         // 默认关掉：点一下事件只是想改它的参数，画面跟着跳会打断正在看的

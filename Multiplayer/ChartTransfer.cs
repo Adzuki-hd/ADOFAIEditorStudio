@@ -807,13 +807,6 @@ namespace ADOFAIEditorStudio.Multiplayer
             }
         }
 
-        /// <summary>当前关卡的文件名（如 main.adofai）。没有打开关卡时返回 null。</summary>
-        internal static string CurrentLevelFileName()
-        {
-            string path = CurrentLevelPath;
-            return path == null ? null : Path.GetFileName(path);
-        }
-
         /// <summary>
         /// 内存里当前的谱面文本。取不到时返回 null。
         ///
@@ -855,43 +848,6 @@ namespace ADOFAIEditorStudio.Multiplayer
                 Warn("读取谱面失败", exception);
                 return null;
             }
-        }
-
-        /// <summary>
-        /// 有没有未保存的改动。
-        ///
-        /// 判定办法是「内存里现在的谱面」和「磁盘上那份」是不是同一份内容。
-        /// 项目本身不跟踪 dirty 状态，而 `scnEditor` 私有属性 `unsavedChanges`
-        /// 只在它自己的 `SaveState` 里置位——我们工作台的编辑路径不一定
-        /// 经过那里，所以读它不可靠，直接用内容比对更实在。
-        ///
-        /// 比对前两边都做一次归一化（去 BOM、统一换行、去首尾空白），
-        /// 否则一份是被外部工具或旧版本写过的文件会永远被判成「有改动」。
-        /// 归一化之后仍不同就当作有改动——**这个方向的误判是安全的**：
-        /// 大不了多问用户一次，而反过来漏判会让「改了半小时没存」
-        /// 被无声覆盖。读不到任一一边时保守地返回 true。
-        /// </summary>
-        internal static bool HasUnsavedChanges()
-        {
-            // 比的是**我们要写的那个文件**：加入了房间就是会话副本。
-            // 拿原文件比的话，加入者会永远被判成「有未保存改动」
-            // （副本里有对方的谱面、原文件是他自己的），于是一次都同步不了。
-            string path = TargetPath();
-            if (path == null)
-            {
-                return false;
-            }
-
-            string memory = EncodeMemoryChart();
-            string disk = ReadDiskChart(path);
-            if (memory == null || disk == null)
-            {
-                // 有一边读不到，说不清有没有改动。这一步是「覆盖前的检查」，
-                // 所以宁可当作有改动让用户确认。
-                return true;
-            }
-
-            return !string.Equals(Normalize(memory), Normalize(disk), StringComparison.Ordinal);
         }
 
         /// <summary>
@@ -964,8 +920,8 @@ namespace ADOFAIEditorStudio.Multiplayer
         ///
         /// `scnEditor.OpenLevel(path)` 是干净的直接重载入口——它只做
         /// 「暂停 + 起协程载入」，**不会**像无参那个重载一样弹未保存提示。
-        /// 所以覆盖前的检查必须由调用方先做（见 <see cref="HasUnsavedChanges"/>），
-        /// 这也正是我们要的：让联机面板去问用户，而不是让游戏自己去问。
+        /// 所以覆盖前的判断必须由调用方先做（见联机层的
+        /// `OfferChart`），而不是让游戏自己去弹窗。
         ///
         /// 返回是否真的写了文件；重载是协程，不在这里等它完成。
         /// </summary>

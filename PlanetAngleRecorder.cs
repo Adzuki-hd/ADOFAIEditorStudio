@@ -82,7 +82,16 @@ namespace ADOFAIEditorStudio
                 writer.WriteLine(
                     "time,floor,planetIndex,isChosen,angle,cosmeticAngle,snappedLastAngle,"
                     + "targetExitAngle,posX,posY,extraBeats,angleCorrectionType,"
-                    + "entryAngle,exitAngle,angleLength,nextEntryAngle");
+                    + "entryAngle,exitAngle,angleLength,nextEntryAngle,"
+                    // 长按相关。原本没有这几列，排查长按时只能看到球在哪、
+                    // 看不到它**为什么**在那：storedPosition 是圆心基准，
+                    // holdOffsetPos 是这一段滑移，两者相加才是长按期间的位置。
+                    + "holdLength,radiusScale,storedX,storedY,holdOffX,holdOffY,"
+                    + "nextPosX,nextPosY,cosmeticRadius,currFloorX,currFloorY,"
+                    // 排查"两颗球颜色反了"。列的是**组件自己认的身份**
+                    // （isRed 来自 name.Contains("Red")），和它实际挂在哪个
+                    // GameObject 上，好判断是身份错了还是渲染器被刷错了。
+                    + "isRed,planetName,rendererName");
                 rowsWritten = 0;
                 framesUntilFlush = 0;
                 Main.Logger.Log("[AngleRecorder] recording to " + OutputPath
@@ -195,6 +204,26 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>
+        /// 取 GameObject 的名字。逗号换成下划线——名字里带逗号会把 CSV 的
+        /// 列冲掉，那正是这次要看的证据，不能让它把行读歪。
+        /// </summary>
+        private static string SafeName(GameObject gameObject)
+        {
+            try
+            {
+                if (gameObject == null)
+                {
+                    return "-";
+                }
+                return gameObject.name.Replace(',', '_');
+            }
+            catch (Exception)
+            {
+                return "?";
+            }
+        }
+
+        /// <summary>
         /// 由 scrPlanet.Update_RefreshAngles 的 postfix 调用，那是游戏
         /// 为这一帧定下行星角度的唯一位置。
         /// </summary>
@@ -224,7 +253,31 @@ namespace ADOFAIEditorStudio
                     .Append(floor == null ? 0d : floor.entryangle).Append(',')
                     .Append(floor == null ? 0d : floor.exitangle).Append(',')
                     .Append(floor == null ? 0d : floor.angleLength).Append(',')
-                    .Append(floor == null || floor.nextfloor == null ? 0d : floor.nextfloor.entryangle);
+                    .Append(floor == null || floor.nextfloor == null ? 0d : floor.nextfloor.entryangle).Append(',')
+                    .Append(floor == null ? -1 : floor.holdLength).Append(',')
+                    .Append(floor == null ? 0f : floor.radiusScale).Append(',')
+                    .Append(planet.storedPosition.x.ToString("0.000", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(planet.storedPosition.y.ToString("0.000", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(planet.holdOffsetPos.x.ToString("0.000", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(planet.holdOffsetPos.y.ToString("0.000", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(floor == null || floor.nextfloor == null
+                        ? "0.000"
+                        : floor.nextfloor.transform.position.x.ToString("0.000", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(floor == null || floor.nextfloor == null
+                        ? "0.000"
+                        : floor.nextfloor.transform.position.y.ToString("0.000", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(planet.cosmeticRadius.ToString("0.000", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(floor == null
+                        ? "0.000"
+                        : floor.transform.position.x.ToString("0.000", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(floor == null
+                        ? "0.000"
+                        : floor.transform.position.y.ToString("0.000", CultureInfo.InvariantCulture)).Append(',')
+                    .Append(planet.isRed ? 1 : 0).Append(',')
+                    .Append(SafeName(planet.gameObject)).Append(',')
+                    .Append(planet.planetRenderer == null
+                        ? "-"
+                        : SafeName(planet.planetRenderer.gameObject));
 
                 writer.WriteLine(row.ToString());
                 rowsWritten++;

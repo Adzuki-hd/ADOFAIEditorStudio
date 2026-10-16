@@ -44,6 +44,31 @@ namespace ADOFAIEditorStudio.Preview.Domains
             internal Filter Filter;
         }
 
+        /// <summary>
+        /// 谱面是不是老格式的补间（`settings.version &lt; 14` 会自动置位，
+        /// 也可以显式写 `legacyTween`）。
+        ///
+        /// 它决定滤镜淡入的**起点**怎么取。原生 ffxSetFilter.StartEffect：
+        ///
+        ///     bool on = filterToComp[filter].enabled;     // 组件**此刻**是否启用
+        ///     if (duration == 0f) { filterCurrIntensity[filter] = intensity; SetFilter(...); }
+        ///     else {
+        ///         if (!on &amp;&amp; !ADOBase.controller.legacyTween)
+        ///             filterCurrIntensity[filter] = vfx.filterDefaultValues.GetValueOrDefault(filter, 0f);
+        ///         filterTween[filter] = DOTween.To(() =&gt; filterCurrIntensity[filter], ..., intensity, duration);
+        ///     }
+        ///
+        /// 也就是说：**新格式**在事件开始那一刻组件是关着的时，先把强度
+        /// 重置回该滤镜的默认值再缓动；**老格式从不重置**，直接接上一手
+        /// 留下的值。
+        ///
+        /// 本域原来只在「该滤镜的第一个事件」用默认值播种，之后一律接
+        /// 上一个事件的目标值 —— 那其实**已经等价于老格式**了，
+        /// 缺的是新格式那条「重新触发时重置」。所以这里加的是新格式
+        /// 那一支，老格式谱的行为保持不变。
+        /// </summary>
+        private bool legacyTween;
+
         public string Name
         {
             get { return "Filter"; }
@@ -53,6 +78,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
         {
             events.Clear();
             defaults.Clear();
+            // 和原生同一个表达式 —— 原生那段用的就是 ADOBase.controller.legacyTween。
+            legacyTween = ADOBase.controller != null && ADOBase.controller.legacyTween;
             components = scrVfxPlus.instance == null ? null : scrVfxPlus.instance.filterToComp;
             if (scrVfxPlus.instance != null && scrVfxPlus.instance.filterDefaultValues != null)
             {
@@ -197,9 +224,22 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     continue;
                 }
 
-                float oldIntensity = previous == null
-                    ? (defaults.ContainsKey(pair.Key) ? defaults[pair.Key] : 0f)
-                    : previous.Intensity;
+                // 淡入的起点值。见 legacyTween 那段说明。
+                //
+                // 「事件开始那一刻组件是否启用」用**上一个事件的启用标志**
+                // 代理：没有上一个事件 = 该滤镜还没被任何事件驱动过 = 关着。
+                // disableOthers 造成的关闭不在这里体现 —— 那种时刻上面
+                // IsSuppressedByAnother 已经把整个滤镜跳过去了。
+                float fallback = defaults.ContainsKey(pair.Key) ? defaults[pair.Key] : 0f;
+                float oldIntensity;
+                if (previous == null || (!legacyTween && !previous.Enabled))
+                {
+                    oldIntensity = fallback;
+                }
+                else
+                {
+                    oldIntensity = previous.Intensity;
+                }
                 float ratio = current.Duration <= 0f
                     ? 1f
                     : Mathf.Clamp01((frame.Time - (float)current.Start) / current.Duration);

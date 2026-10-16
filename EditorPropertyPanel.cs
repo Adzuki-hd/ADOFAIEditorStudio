@@ -1,7 +1,8 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using ADOFAI;
 using ADOFAIEditorStudio.Multiplayer;
+using ADOFAIEditorStudio.Ui;
 using TMPro;
 using UnityEngine;
 using UnityEngine.EventSystems;
@@ -31,8 +32,35 @@ namespace ADOFAIEditorStudio
         private const float Padding = 10f;
         private const float CheckWidth = 22f;
         private const float LabelWidth = 104f;
+        /// <summary>批量模式下「多个值」那块标签占的宽度（在控件右边）。</summary>
+        private const float MixedChipWidth = 56f;
         private const float ControlHeight = 30f;
         private const float PreviewHeight = 116f;
+
+        /// <summary>
+        /// 预览块在面板里的位置与高度，以及**滚动区上沿**。
+        ///
+        /// 这几个数是绑在一起的，不能各写各的 —— 原来就是这么错开的：
+        /// 块摆在 34 起、高 `PreviewHeight - 10`（=34..140），块内的说明文字
+        /// 用 `PreviewHeight - 30` 定位、一直落到 142，而滚动区从
+        /// `PreviewHeight + 8`（=124）开始 —— **说明文字被滚动区压住 18px**，
+        /// 面板里第一行属性（标签）正好摞在文件名上。
+        ///
+        /// 现在统一：块内元素按块高排，滚动区从"块底 + 间距"起。
+        /// </summary>
+        private const float PreviewHostTop = 34f;
+        private const float PreviewHostHeight = PreviewHeight - 10f;
+        /// <summary>有预览块时，滚动区上沿。</summary>
+        private const float ScrollTopWithPreview = PreviewHostTop + PreviewHostHeight + 6f;
+        /// <summary>
+        /// 没有预览块时，滚动区上沿。
+        ///
+        /// **仍然要让开顶上那条标题栏**（"参数"两个字那一带，占 0..PreviewHostTop）。
+        /// 这里原来图省事写了 8 —— 而 8 落在标题栏里，滚动区的半透明底
+        /// 就把"参数"盖掉一半。原来那条 `PreviewHeight + 8` 之所以没暴露
+        /// 这个问题，只是因为它顺带躲开了标题栏。
+        /// </summary>
+        private const float ScrollTopWithoutPreview = PreviewHostTop + 8f;
 
         // 工作台调色板的镜像，而不是共享：本面板和工作台是两个不同的
         // MonoBehaviour，为了取颜色向对方伸手，只会把两者绑死，没有任何好处。
@@ -42,16 +70,24 @@ namespace ADOFAIEditorStudio
         private static readonly Color FieldFill = Palette.FieldWell;
         private static readonly Color FieldBorder = new Color(1f, 1f, 1f, 0.10f);
         private static readonly Color FieldBorderHover = new Color(1f, 1f, 1f, 0.20f);
-        private static readonly Color FieldBorderFocus = new Color(0.286f, 0.827f, 0.796f, 0.85f);
+        private static Color FieldBorderFocus { get { return UiTheme.Current.BorderFocus; } }
         private static readonly Color LabelColor = Palette.TextSecondary;
-        private static readonly Color LabelDisabled = new Color(0.420f, 0.420f, 0.420f, 1f);
+        private static Color LabelDisabled { get { return UiTheme.Current.TextDisabled; } }
         private static readonly Color TextPrimary = Palette.TextPrimary;
-        private static readonly Color Placeholder = new Color(0.420f, 0.420f, 0.420f, 1f);
+        private static Color Placeholder { get { return UiTheme.Current.TextMuted; } }
         private static readonly Color Accent = Palette.Accent;
         // caret 用白色，理由和面板边框一样：在近黑底色上，
         // 有颜色的 caret 会和自己要指示的文字抢注意力。
         private static readonly Color CaretColor = new Color(0.960f, 0.960f, 0.960f, 1f);
-        private static readonly Color SelectionColor = new Color(0.310f, 0.839f, 0.788f, 0.30f);
+        private static Color SelectionColor
+        {
+            get
+            {
+                Color color = UiTheme.Current.ActionPrimary;
+                color.a = 0.30f;
+                return color;
+            }
+        }
         private const float FieldFontSize = 13f;
 
 
@@ -61,22 +97,51 @@ namespace ADOFAIEditorStudio
         // 改为纵向堆叠控件，高度翻倍。
         private const float MinimumTwoAcrossWidth = 190f;
 
+        /// <summary>
+        /// 「标签 + 控件并排」所需的最小控件宽度。低于它就把标签挪到单独一行。
+        ///
+        /// **没有这一条时的表现**：控件宽度卡在 `Mathf.Max(60f, ...)` 那个下限上
+        /// 不再缩，整块**溢出到面板右边被裁掉** —— 看着像"自适应坏了"，其实是
+        /// 根本没换行。把时间轴拖矮、面板跟着变窄的时候就会走到这一步。
+        /// </summary>
+        private const float MinimumInlineControlWidth = 100f;
+
+        /// <summary>堆叠行里「标签」独占的那一行的高度。</summary>
+        private const float StackedLabelHeight = 22f;
+
         // 堆叠行里两个字段的纵向位置。行高 76，
         // 每个字段 30，所以 3 + 30 + 10 + 30 在底部还剩 3。
         private const float StackedFieldTop = 3f;
         private const float StackedFieldGap = 10f;
 
-        // 缓速曲线图。原版 EaseGraphRenderer 的 pointCount 是 100；
-        // 缩略图这个尺寸用不到那么多点，24 个足够圆滑。
-        private const int EaseGraphPoints = 24;
-        private const float EaseGraphHeight = 16f;
+        // 缓速曲线图。**照原版 EaseGraphRenderer 的 pointCount = 100。**
+        //
+        // 原来取 24，理由是"缩略图这么小用不到那么多点"。但这条曲线是拿来
+        // 当"图片标志"看的，点数一少，陡峭段（Back / Elastic 那类）就能看出
+        // 折线。其余设置本来就已经和原版一致：原版只赋 Points，其它全吃
+        // UILineRenderer 的默认值，而默认值是 Bevel 接头、None 贝塞尔、
+        // LineCaps=false —— 本类原先显式写的那几项和默认值相同，不是差异所在。
+        internal const int EaseGraphPoints = 100;
+        // 曲线框的高度。
+        //
+        // **原来取 16，太扁了** —— 和原版并排比，原版的曲线占行高的比重
+        // 明显更大（大约 0.54 对 0.37）。曲线的"高矮"直接决定它读不读得出
+        // 是哪条缓动：扁下去之后 In/Out/InOut 三者的差别也跟着糊了。
+        // 21 是按那个比值反推的，同时给上下各留 2.5px 不至于顶到行边。
+        internal const float EaseGraphHeight = 21f;
         // 下拉行左侧那条缩略曲线占的宽度，以及它相对行左边缘的起点。
         // 勾画在 PopupCheckColumn 那一段里，曲线跟在它后面，
         // 标签再跟在曲线后面——三者错开。
-        private const float OptionGraphX = 20f;
-        private const float OptionGraphWidth = 44f;
+        internal const float OptionGraphX = 20f;
+        internal const float OptionGraphWidth = 44f;
 
-        private static readonly Color CurveLine = new Color(0.94f, 0.96f, 1f, 0.90f);
+        private static Color CurveLine { get { return WithAlpha(UiTheme.Current.TextPrimary, 0.90f); } }
+
+        private static Color WithAlpha(Color color, float alpha)
+        {
+            color.a = alpha;
+            return color;
+        }
 
         private sealed class Row
         {
@@ -85,6 +150,14 @@ namespace ADOFAIEditorStudio
             internal Toggle Enable;
             internal TextMeshProUGUI Label;
             internal RectTransform ControlHost;
+            /// <summary>
+            /// 批量模式下这个属性各项取值不一致时，挂在**控件右边**的「多个值」。
+            ///
+            /// 它挂在 `Rect` 上、**不在** `ControlHost` 里 —— 控件会为了给它
+            /// 让位而收窄，但两者是并排的兄弟，收窄不能顺手把它也裁掉。
+            /// 每行建一次，之后按需开关、按需摆位，不给每次重画都新建一个。
+            /// </summary>
+            internal TextMeshProUGUI MixedLabel;
             internal readonly List<GameObject> Controls = new List<GameObject>();
             /// <summary>
             /// 这一行是哪个属性。联机时用来在重建之后把焦点还给同一个属性——
@@ -95,23 +168,65 @@ namespace ADOFAIEditorStudio
 
         private EditorStudioOverlay owner;
         private TMP_FontAsset font;
-        private RectTransform panelRoot;
-        // 参数栏的外壳。缩放 = 1 时它和 panelRoot 是同一个；
+        private RectTransform panelRoot;        // 参数栏的外壳。缩放 = 1 时它和 panelRoot 是同一个；
         // 缩放 > 1 时 panelRoot 是内层容器，panelRect 才是外壳。
         private RectTransform panelRect;
         private ScrollRect scroll;
         private RectTransform scrollRectTransform;
         private RectTransform content;
         private RectTransform viewport;
+        /// <summary>未选中任何东西时的占位块。见 BuildEmptyState。</summary>
+        private RectTransform emptyState;
         private RectTransform heading;
         private RectTransform previewHost;
         private RawImage previewImage;
         private TextMeshProUGUI previewCaption;
         private Image previewPlaceholder;
 
+        /// <summary>
+        /// 预览块此刻是不是显示着。
+        ///
+        /// **它必须参与布局。** 原来只有 `ShowPreview` 把块 `SetActive(false)`，
+        /// 而滚动区的位置是写死的 `PreviewHeight + 8`，于是非装饰物事件（MoveTrack、
+        /// MoveCamera……）选中的时候，顶部会**空出一条 116px 的空白带** ——
+        /// 块没了、位置还占着，看上去就像"这里应该有东西但坏了"。
+        /// </summary>
+        private bool previewVisible;
+
         private readonly List<Row> rows = new List<Row>();
         private readonly List<float> rowY = new List<float>();
         private LevelEvent currentEvent;
+
+        /// <summary>
+        /// 当前显示的是不是**一页设置**（歌曲设置 / 轨道 / 背景 / 相机……）。
+        ///
+        /// 非 null 时这个参数栏实例就不再跟时间轴的选中了，写回也要多两步
+        /// 副作用 —— 见 <see cref="ApplySettingsSideEffects"/>。
+        /// </summary>
+        private LevelEvent settingsPage;
+
+        /// <summary>
+        /// 这一份实例要不要跟时间轴的选中。
+        ///
+        /// 设置页那一份**不跟**：它显示的是谱面设置，跟用户在时间轴上点了什么
+        /// 是两回事 —— 不挡的话，点一个事件块就会把左边的设置页顶掉。
+        /// </summary>
+        private bool followTimelineSelection = true;
+
+        /// <summary>
+        /// 批量模式选中的那一批；单选时是 null。
+        ///
+        /// 非 null 就说明参数栏画的是**一批**而不是一个事件：只列公共属性、
+        /// 不一致的画成「多个值」、控件全部只读。
+        /// </summary>
+        private List<LevelEvent> batchEvents;
+
+        /// <summary>批量模式下**每个选中事件都有**的属性键 —— 只有这些能上参数栏。</summary>
+        private readonly HashSet<string> batchKeys = new HashSet<string>();
+
+        /// <summary>批量模式下**取值还全等**的键。不在里面的画成「多个值」。</summary>
+        private readonly HashSet<string> batchUniformKeys = new HashSet<string>();
+
         private float nextSelectionPoll;
         private bool built;
         private bool syncing;
@@ -131,6 +246,20 @@ namespace ADOFAIEditorStudio
         // 弹出层自己的状态，不塞进 enumPopup 那个列表里 ——
         // 那个列表是给「一次性销毁全部」用的，多一样东西就多一处要对齐。
         private RectTransform enumPopupRoot;
+
+        // 调色盘的弹出层。和枚举那套是同一个套路：一个根节点 + 一串待销毁的
+        // 物体 + 当前绑定的目标；关闭时补记一步撤销（拖动期间是实时写、不记的）。
+        private readonly List<GameObject> colorPopup = new List<GameObject>();
+        private RectTransform colorPopupRoot;
+        private LevelEvent colorTarget;
+        private string colorKey;
+        private string colorOriginalHex;
+        private bool colorOriginalDisabled;
+        private Button colorAnchorButton;
+        private Image colorSwatch;
+        private TMP_InputField colorHexField;
+        /// <summary>调色盘最后报上来的颜色。收尾要拿它补写一次。</summary>
+        private Color colorLiveValue = Color.white;
         private Button enumAnchorButton;
         private Image enumAnchorCaret;
 
@@ -214,14 +343,10 @@ namespace ADOFAIEditorStudio
 
             RectTransform scrollRect = EnsureChildRect("PropertyScroll");
             scrollRectTransform = scrollRect;
-            float scrollTop = PreviewHeight + 8f;
-            float scrollHeight = Mathf.Max(
-                60f,
-                panelRoot.rect.height - scrollTop - 8f - 8f);
-            SetTopLeft(scrollRect, 0f, scrollTop, panelRoot.rect.width, scrollHeight);
+            ApplyScrollLayout(panelRoot.rect.width, panelRoot.rect.height);
 
             Image background = scrollRect.gameObject.AddComponent<Image>();
-            background.color = new Color(0.055f, 0.060f, 0.074f, 0.35f);
+            background.color = WithAlpha(UiTheme.Current.SurfacePage, 0.35f);
             background.raycastTarget = true;
 
             scroll = scrollRect.gameObject.AddComponent<ScrollRect>();
@@ -251,24 +376,119 @@ namespace ADOFAIEditorStudio
             content.anchorMax = new Vector2(1f, 1f);
             content.pivot = new Vector2(0.5f, 1f);
             content.anchoredPosition = Vector2.zero;
-            content.sizeDelta = new Vector2(0f, scrollHeight);
+            // 初始高度按「预览块此刻的显隐」算，和 ApplyScrollLayout 同一套。
+            // ShowPreview 之后还会再算一次（选中项进来时会重排）。
+            float initialScrollTop = previewVisible ? ScrollTopWithPreview : ScrollTopWithoutPreview;
+            content.sizeDelta = new Vector2(0f,
+                Mathf.Max(60f, panelRoot.rect.height - initialScrollTop - 16f));
 
             scroll.viewport = viewport;
             scroll.content = content;
+
+            BuildEmptyState();
+
+            // 首次进来必须主动 Show 一次。轮询那套只在「选中项变了」时刷新，
+            // 而初始状态两边都是 null、ReferenceEquals(null, null) 为真，
+            // 于是 Show 永远不被调用——空状态也就永远不显示，面板是纯空白。
+            Show(null);
+        }
+
+        /// <summary>
+        /// 未选中任何对象时的占位。
+        ///
+        /// 这里原本是纯空白——那读起来不像「等着你选」，像「这一页加载失败了」。
+        /// 给一句话说明会显示什么、怎么让它有内容，空状态才算被考虑过，
+        /// 而不是被忘掉。
+        ///
+        /// 用锚点 (0.5, 0.5) 居中而不是按坐标摆：Show(null) 时 content 会被
+        /// 拉到与 viewport 等高，锚点居中自动就是面板居中；按坐标算的话
+        /// 每次布局都得跟着更新一遍。
+        /// </summary>
+        private const float EmptyCardWidth = 248f;
+        private const float EmptyCardHeight = 180f;
+        private const float EmptyMarkSize = 56f;
+
+        private void BuildEmptyState()
+        {
+            RectTransform box = NewChildRect("EmptyState", content);
+            emptyState = box;
+            box.anchorMin = new Vector2(0.5f, 0.5f);
+            box.anchorMax = new Vector2(0.5f, 0.5f);
+            box.pivot = new Vector2(0.5f, 0.5f);
+            box.anchoredPosition = Vector2.zero;
+            box.sizeDelta = new Vector2(EmptyCardWidth, EmptyCardHeight);
+
+            // 一整块实心卡片。
+            //
+            // 原本这里只有两行字浮在面板上，面板空着的时候就是真的一整块空的——
+            // 工作台上将近六分之一的面积是它。铺一块实心底之后，空状态才有
+            // "这是一块有边界的区域，里面等着放东西"的意思。
+            Image card = CreateChildImage("Card", box, 0f, 0f, EmptyCardWidth, EmptyCardHeight);
+            card.sprite = GetRoundedSprite(24, 8f, false);
+            card.type = Image.Type.Sliced;
+            card.color = UiTheme.Current.SurfaceRaised;
+
+            BuildEmptyStateMark(box, (EmptyCardWidth - EmptyMarkSize) * 0.5f, 24f, EmptyMarkSize);
+
+            TextMeshProUGUI title = CreateChildText(
+                "Title", box, 0f, 96f, EmptyCardWidth, 24f, "未选中任何对象", 13f);
+            title.alignment = TextAlignmentOptions.Center;
+            title.color = UiTheme.Current.TextPrimary;
+
+            TextMeshProUGUI hint = CreateChildText(
+                "Hint", box, 16f, 122f, EmptyCardWidth - 32f, 48f,
+                "在时间轴上点一个事件块，\n或在左栏的装饰物列表里选一个", 11f);
+            hint.alignment = TextAlignmentOptions.Center;
+            // 次要色，不是弱化色：弱化色压在卡片上只有 3.0:1，够不着正文的 4.5:1。
+            hint.color = UiTheme.Current.TextSecondary;
+
+            box.gameObject.SetActive(false);
+        }
+
+        /// <summary>
+        /// 空状态上方那组取景框角标——四个 L 形角，围出一个"东西放这里"的框。
+        ///
+        /// 用角标而不是画一个完整的方框：完整的框读成"一个输入区"，
+        /// 会被当成能点的地方；四个角读成取景器，既是这台工具该有的图形语言，
+        /// 也不抢下面两行字的视线。
+        /// </summary>
+        private void BuildEmptyStateMark(RectTransform parent, float x, float y, float size)
+        {
+            const float arm = 14f;
+            const float thickness = 2f;
+            // 弱化色而不是禁用色：角标是衬托，不该压过下面两行字，
+            // 但要够到"图形≥3:1"这条线——禁用色压在卡片上只有 1.9:1，等于没画。
+            Color color = UiTheme.Current.TextMuted;
+
+            for (int i = 0; i < 4; i++)
+            {
+                bool right = i >= 2;
+                bool down = (i & 1) == 1;
+                // 横臂贴着上沿或下沿，竖臂贴着左沿或右沿，两条在角上拼成 L。
+                CreateChildImage("CornerH" + i, parent,
+                    x + (right ? size - arm : 0f),
+                    y + (down ? size - thickness : 0f),
+                    arm, thickness).color = color;
+                CreateChildImage("CornerV" + i, parent,
+                    x + (right ? size - thickness : 0f),
+                    y + (down ? size - arm : 0f),
+                    thickness, arm).color = color;
+            }
         }
 
         private void BuildPreviewSlot()
         {
             RectTransform slot = EnsureChildRect("DecorationPreview");
-            SetTopLeft(slot, Padding, 34f, panelRoot.rect.width - Padding * 2f, PreviewHeight - 10f);
+            SetTopLeft(slot, Padding, PreviewHostTop,
+                panelRoot.rect.width - Padding * 2f, PreviewHostHeight);
             previewHost = slot;
 
             Image frame = slot.gameObject.AddComponent<Image>();
-            frame.color = new Color(0.055f, 0.060f, 0.074f, 1f);
+            frame.color = UiTheme.Current.SurfacePage;
             frame.raycastTarget = false;
 
             previewPlaceholder = CreateChildImage("Placeholder", slot, 1f, 1f, 1f, 1f);
-            previewPlaceholder.color = new Color(0.13f, 0.14f, 0.17f, 1f);
+            previewPlaceholder.color = UiTheme.Current.SurfaceRaised;
 
             previewImage = CreateChildRawImage("Image", slot, 1f, 1f, 1f, 1f);
             previewImage.color = Color.white;
@@ -304,12 +524,18 @@ namespace ADOFAIEditorStudio
 
             float slotWidth = Mathf.Max(1f, panelWidth - Padding * 2f);
             float boxWidth = Mathf.Max(1f, slotWidth - 2f);
-            float boxHeight = Mathf.Max(1f, PreviewHeight - 34f);
+            // 说明文字占底部 24px（22 高 + 2 间距），图片框吃掉剩下的部分。
+            // 两者都按**块高**排，不再按 PreviewHeight —— 原来那样会让说明文字
+            // 落到块外、进而被滚动区压住。
+            const float captionHeight = 22f;
+            const float captionGap = 2f;
+            float boxHeight = Mathf.Max(1f, PreviewHostHeight - captionHeight - captionGap - 2f);
             const float boxY = 1f;
 
             SetTopLeft(previewPlaceholder.rectTransform, 1f, boxY, boxWidth, boxHeight);
-            SetTopLeft(previewCaption.rectTransform, 6f, PreviewHeight - 30f,
-                Mathf.Max(1f, slotWidth - 12f), 22f);
+            SetTopLeft(previewCaption.rectTransform, 6f,
+                PreviewHostHeight - captionHeight - captionGap,
+                Mathf.Max(1f, slotWidth - 12f), captionHeight);
 
             float width = boxWidth;
             float height = boxHeight;
@@ -529,7 +755,7 @@ namespace ADOFAIEditorStudio
             }
             text.text = value;
             text.fontSize = size;
-            text.color = new Color(0.78f, 0.81f, 0.87f, 1f);
+            text.color = UiTheme.Current.TextSecondary;
             text.alignment = TextAlignmentOptions.MidlineLeft;
             text.overflowMode = TextOverflowModes.Ellipsis;
             text.raycastTarget = false;
@@ -566,7 +792,17 @@ namespace ADOFAIEditorStudio
                     CaptureEditingFocus();
                 }
 
-                Show(currentEvent);
+                // 重画要**接着原来那条路**走。这里过去一律调 Show ——
+                // 批量模式下那会让面板在一次编辑之后突然掉回「只画一个事件」，
+                // 而作者看到的会是：改一下值，半张面板没了。
+                if (batchEvents != null && batchEvents.Count > 1)
+                {
+                    ShowBatch(batchEvents);
+                }
+                else
+                {
+                    Show(currentEvent);
+                }
 
                 // 重画完了，把焦点和光标位置还给同一个属性。
                 if (focusRestorePending && ReferenceEquals(currentEvent, focusSnapshotTarget))
@@ -591,13 +827,61 @@ namespace ADOFAIEditorStudio
             }
             HandleEnumPopupOutsideClick();
 
+            // 设置页那一份实例不跟时间轴的选中，到这里就够 —— 上面该跑的都
+            // 跑完了（枚举弹窗收尾、重建标记）。不挡的话，点一个事件块就会把
+            // 左边的设置页顶掉。
+            if (!followTimelineSelection)
+            {
+                return;
+            }
+
             if (now < nextSelectionPoll)
             {
                 return;
             }
             nextSelectionPoll = now + 0.12f;
 
-            LevelEvent selected = owner == null ? null : owner.TimelineSelection;
+            // **选集一律以时间轴那份为准**（多选优先，否则主选中那一个）。
+            //
+            // 不能再用 `TimelineSelection`：它只认主选中。Ctrl 只选了一个、
+            // 或反选到只剩一个的时候，主选中还是 null —— 面板会整个空着，
+            // 看上去像"选中了却没反应"。
+            //
+            // 见 EditorTimelineView.PanelSelection：它和删除/复制用的
+            // CollectSelection 是同一条判断，**只差不排除装饰物**（参数栏
+            // 要给装饰物显示图片预览）。
+            List<LevelEvent> selection = owner == null || owner.Timeline == null
+                ? null
+                : owner.Timeline.PanelSelectionWithDecorations();
+
+            // 两个以上才算批量。
+            if (selection != null && selection.Count > 1 && CountLive(selection) > 1)
+            {
+                if (!SameBatch(selection) || !BatchStillLive())
+                {
+                    ShowBatch(selection);
+                }
+                return;
+            }
+
+            // 一个（或零个）走单选那条路。死引用当成没选中 —— 原生撤销会
+            // 整体替换 levelData，读一个失效事件得不到有用信息，
+            // 写进去则会弄坏无关数据。
+            LevelEvent selected = selection != null && selection.Count == 1
+                && IsLive(selection[0])
+                ? selection[0]
+                : null;
+
+            // 刚刚还在批量、现在退回来了：把占位痕迹撤掉，交回 Show 重画。
+            // Show 自己会把每一行的痕迹清干净（见 BuildRow），这里只要清掉
+            // 「当前是批量」这个状态。
+            if (batchEvents != null)
+            {
+                ClearBatchState();
+                Show(selected);
+                return;
+            }
+
             if (!ReferenceEquals(selected, currentEvent))
             {
                 Show(selected);
@@ -608,14 +892,30 @@ namespace ADOFAIEditorStudio
             // 面板持有的每个 LevelEvent 随之变成悬空引用。出现这种情况时，
             // 时间轴会清掉自己的选中项；在它清掉之前，在这里读一个失效事件
             // 得不到有用信息，写进去则会弄坏无关数据。
-            if (currentEvent != null && !IsStillLive(currentEvent))
+            if (currentEvent != null && !IsLive(currentEvent))
             {
                 Show(null);
             }
 
         }
 
-        private static bool IsStillLive(LevelEvent levelEvent)
+        /// <summary>
+        /// 「这个东西还在不在」。
+        ///
+        /// 设置页要**单独放行**：原生那套存活判断认的是 `editor.events` /
+        /// `editor.decorations`，而设置页两边都不在（它挂在 `levelData` 上）——
+        /// 照那个判，设置页会被当成死引用，读不出、也写不进。
+        /// </summary>
+        private bool IsLive(LevelEvent levelEvent)
+        {
+            if (levelEvent != null && ReferenceEquals(levelEvent, settingsPage))
+            {
+                return true;
+            }
+            return IsStillLiveCore(levelEvent);
+        }
+
+        private static bool IsStillLiveCore(LevelEvent levelEvent)
         {
             scnEditor editor = scnEditor.instance;
             if (editor == null)
@@ -675,17 +975,43 @@ namespace ADOFAIEditorStudio
 
         private void RelayoutInner(float width, float height)
         {
-            SetTopLeft(previewHost, Padding, 34f, width - Padding * 2f, PreviewHeight - 10f);
+            SetTopLeft(previewHost, Padding, PreviewHostTop, width - Padding * 2f, PreviewHostHeight);
             LayoutPreviewSlot(width);
-
-            float scrollTop = PreviewHeight + 8f;
-            float scrollHeight = Mathf.Max(60f, height - scrollTop - 16f);
-            SetTopLeft(scrollRectTransform, 0f, scrollTop, width, scrollHeight);
+            ApplyScrollLayout(width, height);
 
             if (currentEvent != null)
             {
-                Show(currentEvent);
+                // 重画要**接着原来那条路**走：批量模式下调 Show 会让面板
+                // 掉回「只画一个事件」。和 refresh 那条路同样的处理。
+                if (batchEvents != null && batchEvents.Count > 1)
+                {
+                    ShowBatch(batchEvents);
+                }
+                else
+                {
+                    Show(currentEvent);
+                }
             }
+        }
+
+        /// <summary>
+        /// 滚动区的位置。**预览块不显示时要把那 116px 还回去**，
+        /// 不然面板顶部会留一条空白带。见 previewVisible。
+        /// </summary>
+        private void ApplyScrollLayout(float width, float height)
+        {
+            if (scrollRectTransform == null)
+            {
+                return;
+            }
+
+            // 设置页那一份顶部不留预留：`PreviewHostTop` 那一截存在的理由是
+            // 「顶部可能有装饰物图片」，设置页没有图片，留着就是一条无来由的空带。
+            float scrollTop = settingsPage != null
+                ? Padding
+                : (previewVisible ? ScrollTopWithPreview : ScrollTopWithoutPreview);
+            float scrollHeight = Mathf.Max(60f, height - scrollTop - 16f);
+            SetTopLeft(scrollRectTransform, 0f, scrollTop, width, scrollHeight);
         }
 
         /// <summary>
@@ -867,13 +1193,23 @@ namespace ADOFAIEditorStudio
         {
             currentEvent = levelEvent;
             CloseEnumPopup();
+            CloseColorPopup();
             ClearRows();
 
             if (levelEvent == null || levelEvent.info == null || levelEvent.info.propertiesInfo == null)
             {
                 ShowPreview(null);
+                if (emptyState != null)
+                {
+                    emptyState.gameObject.SetActive(true);
+                }
                 content.sizeDelta = new Vector2(0f, viewport == null ? 0f : viewport.rect.height);
                 return;
+            }
+
+            if (emptyState != null)
+            {
+                emptyState.gameObject.SetActive(false);
             }
 
             ShowPreview(levelEvent);
@@ -905,7 +1241,7 @@ namespace ADOFAIEditorStudio
                     Row row = ObtainRow(rowIndex, rowWidth);
                     float rowHeight = RowHeightFor(info, rowWidth);
                     row.Key = pair.Key;
-                    BuildRow(row, levelEvent, info, y, rowWidth, rowHeight);
+                    BuildRow(row, levelEvent, info, y, rowWidth, rowHeight, false);
                     rowY.Add(y);
                     y += rowHeight;
                     rowIndex++;
@@ -919,6 +1255,450 @@ namespace ADOFAIEditorStudio
             content.sizeDelta = new Vector2(
                 0f,
                 Mathf.Max(viewport == null ? 0f : viewport.rect.height, y));
+        }
+
+        /// <summary>
+        /// 显示**一页设置**（歌曲设置 / 轨道 / 背景 / 相机……）。
+        ///
+        /// 设置页在游戏里**本来就是 `LevelEvent`** —— `LevelData.songSettings`
+        /// 那些字段的类型就是它，`info` 取自 `GCS.settingsInfo`。所以行、控件、
+        /// 撤销这一整套一个字都不用改，只是喂给它的东西从「时间轴里的一个事件」
+        /// 换成「一页设置」。这也是为什么这里不需要另写一套设置控件。
+        ///
+        /// 写回时多两步副作用，见 <see cref="ApplySettingsSideEffects"/>。
+        /// </summary>
+        internal void ShowSettingsPage(LevelEvent page)
+        {
+            settingsPage = page;
+            followTimelineSelection = false;
+            Show(page);
+        }
+
+        /// <summary>退回跟时间轴选中的那一份。</summary>
+        internal void ClearSettingsPage()
+        {
+            settingsPage = null;
+            followTimelineSelection = true;
+            Show(null);
+        }
+
+        /// <summary>
+        /// 只记下"当前这一页是设置页"，**不建行、不显示**。
+        ///
+        /// 给 ImGui 版用：行是它自己画的，但设置页特有的那几步副作用
+        /// （路径/格位重算、背景重铺）是由这里认人的 —— 靠 <see cref="settingsPage"/>
+        /// 判断。不打这个标记，ImGui 那边改设置就会"值变了、画面不跟"。
+        /// </summary>
+        internal void MarkSettingsPage(LevelEvent page)
+        {
+            settingsPage = page;
+        }
+
+        /// <summary>
+        /// 进入批量模式，并把两个键集算好。**给 ImGui 那版参数栏的口子。**
+        ///
+        /// uGUI 这一扇整块被 `SetActive(false)`（见 `EditorImGuiBridge`），
+        /// 它自己的轮询不再跑，`ShowBatch` 就没人调了 —— 于是 ImGui 那边
+        /// 多选时在这里把状态喂进来。
+        ///
+        /// **行仍由 ImGui 自己画，但写入路径和键集规则沿用这同一套**：
+        /// `Commit` 会看到 `batchEvents` 自动转 `CommitBatch`，
+        /// 一次改值落到整批、只记一步撤销。这正是这个功能最容易做坏的地方，
+        /// 所以宁可两边共用，也不在 ImGui 那边另写一条写路径。
+        /// </summary>
+        /// <returns>活着的够两个才算批量；不够就顺手退出批量并返回 false。</returns>
+        internal bool EnterBatch(IList<LevelEvent> events)
+        {
+            List<LevelEvent> live = new List<LevelEvent>();
+            if (events != null)
+            {
+                for (int i = 0; i < events.Count; i++)
+                {
+                    LevelEvent candidate = events[i];
+                    if (candidate != null && candidate.info != null
+                        && candidate.info.propertiesInfo != null && IsLive(candidate))
+                    {
+                        live.Add(candidate);
+                    }
+                }
+            }
+            if (live.Count < 2)
+            {
+                ExitBatch();
+                return false;
+            }
+
+            batchEvents = live;
+            currentEvent = live[0];
+            ComputeBatchKeys();
+            return true;
+        }
+
+        /// <summary>
+        /// 退出批量模式。
+        ///
+        /// **必须有这一条**：退到只剩一个（或零个）之后如果不清，下一次单选改值
+        /// 会看到过期的 `batchEvents`，把值写给一批早就不是选中的事件。
+        /// </summary>
+        internal void ExitBatch()
+        {
+            ClearBatchState();
+        }
+
+        /// <summary>现在是不是批量模式（选了两个及以上）。</summary>
+        internal bool InBatch
+        {
+            get { return batchEvents != null && batchEvents.Count > 1; }
+        }
+
+        /// <summary>这一批的事件。顺序不承诺，只用来取"第一个"当画的抓手。</summary>
+        internal List<LevelEvent> BatchEvents
+        {
+            get { return batchEvents; }
+        }
+
+        /// <summary>这个键是不是**每个选中事件都有**（没有的不该出现在批量行里）。</summary>
+        internal bool BatchHasKey(string key)
+        {
+            return batchKeys.Contains(key);
+        }
+
+        /// <summary>这个键在这一批里取值是不是**全等**。不等就要挂「多个值」。</summary>
+        internal bool BatchIsUniform(string key)
+        {
+            return batchUniformKeys.Contains(key);
+        }
+
+        /// <summary>
+        /// 批量模式：把选中的**一批**事件画进参数栏。
+        ///
+        /// 三条规则：
+        ///   · 只列**每个选中事件都有**的属性 —— 别人没有的键不出现，
+        ///     否则会写到一个它根本不认识的地方去。
+        ///   · 取值全等的照常显示；不等的顶上盖一块「多个值」，真的控件藏掉。
+        ///   · 这一版**只读**，所有控件置灰不给改。
+        ///
+        /// 放开编辑时只要把 <see cref="FinishBatchRow"/> 里那道闸去掉，
+        /// 再把写入改成遍历 batchEvents —— 版式和信息不用重做。
+        /// </summary>
+        internal void ShowBatch(IList<LevelEvent> events)
+        {
+            List<LevelEvent> live = new List<LevelEvent>();
+            for (int i = 0; i < events.Count; i++)
+            {
+                LevelEvent candidate = events[i];
+                if (candidate != null && candidate.info != null
+                    && candidate.info.propertiesInfo != null && IsLive(candidate))
+                {
+                    live.Add(candidate);
+                }
+            }
+
+            // 掉到只剩一个（或零个）了：这一批已经不算数。
+            //
+            // 这里**不画**，只把批量状态清掉，交回轮询 —— 它下一轮
+            // （0.12 秒后）看到活着的不足两个，就会走单选那条路重画。
+            // 在这里自己调 Show 会在「单选还是那个主选中项」和
+            // 「批量没了」之间来回切，反而更难收敛。
+            if (live.Count < 2)
+            {
+                ClearBatchState();
+                return;
+            }
+
+            batchEvents = live;
+            currentEvent = live[0];
+            ComputeBatchKeys();
+
+            CloseEnumPopup();
+            CloseColorPopup();
+            ClearRows();
+            if (emptyState != null)
+            {
+                emptyState.gameObject.SetActive(false);
+            }
+            // 批量没有「这一个事件」的图可给，预览块整个收掉。
+            ShowPreview(null);
+
+            float rowWidth = viewport == null || viewport.rect.width < 1f
+                ? Mathf.Max(120f, panelRoot.rect.width - Padding * 2f)
+                : viewport.rect.width;
+
+            float y = 0f;
+            syncing = true;
+            try
+            {
+                int rowIndex = 0;
+                foreach (KeyValuePair<string, ADOFAI.PropertyInfo> pair in live[0].info.propertiesInfo)
+                {
+                    ADOFAI.PropertyInfo info = pair.Value;
+                    if (info == null || string.IsNullOrEmpty(info.name))
+                    {
+                        continue;
+                    }
+                    if (info.invisible || info.controlType == ControlType.Hidden)
+                    {
+                        continue;
+                    }
+                    // 只有每个选中事件都有的属性才上得来。
+                    if (!batchKeys.Contains(pair.Key))
+                    {
+                        continue;
+                    }
+
+                    Row row = ObtainRow(rowIndex, rowWidth);
+                    float rowHeight = RowHeightFor(info, rowWidth);
+                    row.Key = pair.Key;
+                    bool mixed = !batchUniformKeys.Contains(pair.Key);
+                    // 值一律取第一个选中事件的：控件总得有个东西可画，
+                    // 而且它同时就是作者要改的那个抓手。不一致这件事
+                    // 由 FinishBatchRow 在右边那块标签表达。
+                    BuildRow(row, live[0], info, y, rowWidth, rowHeight, mixed);
+                    FinishBatchRow(row, rowWidth, rowHeight, mixed);
+                    rowY.Add(y);
+                    y += rowHeight;
+                    rowIndex++;
+                }
+            }
+            finally
+            {
+                syncing = false;
+            }
+
+            content.sizeDelta = new Vector2(
+                0f,
+                Mathf.Max(viewport == null ? 0f : viewport.rect.height, y));
+        }
+
+        /// <summary>把「当前是批量」这个状态清掉，连同两个键集。</summary>
+        private void ClearBatchState()
+        {
+            batchEvents = null;
+            batchKeys.Clear();
+            batchUniformKeys.Clear();
+        }
+
+        /// <summary>这一批里还活着的有几个。「够不够两个」是算不算批量的门槛。</summary>
+        private int CountLive(IList<LevelEvent> events)
+        {
+            int live = 0;
+            for (int i = 0; i < events.Count; i++)
+            {
+                LevelEvent candidate = events[i];
+                if (candidate != null && candidate.info != null
+                    && candidate.info.propertiesInfo != null && IsLive(candidate))
+                {
+                    live++;
+                }
+            }
+            return live;
+        }
+
+        /// <summary>这一批里还有死引用吗（原生撤销会整体换掉 levelData）。</summary>
+        private bool BatchStillLive()
+        {
+            if (batchEvents == null)
+            {
+                return true;
+            }
+            for (int i = 0; i < batchEvents.Count; i++)
+            {
+                if (!IsLive(batchEvents[i]))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 轮询到的这一批，和正在画的是不是同一批。
+        ///
+        /// 按**集合**比而不是按顺序比：时间轴那边的多选是个 HashSet，
+        /// 枚举顺序不是承诺。按顺序比会在什么都没变的时候每轮都判成
+        /// 「换了」，于是每 0.12 秒无谓地重建一次面板。
+        /// </summary>
+        private bool SameBatch(List<LevelEvent> batch)
+        {
+            if (batchEvents == null || batchEvents.Count != batch.Count)
+            {
+                return false;
+            }
+            HashSet<LevelEvent> incoming = new HashSet<LevelEvent>(batch);
+            for (int i = 0; i < batchEvents.Count; i++)
+            {
+                if (!incoming.Contains(batchEvents[i]))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 算出这一批里**每个事件都有**的属性键，以及其中**取值还全等**的那些。
+        ///
+        /// 走键的基准是第一个选中事件的属性表，所以顺序稳定、不受别人
+        /// 增删属性的影响 —— 多选集合每次枚举顺序不同，块就不会跟着跳。
+        /// </summary>
+        private void ComputeBatchKeys()
+        {
+            batchKeys.Clear();
+            batchUniformKeys.Clear();
+            if (batchEvents == null || batchEvents.Count == 0)
+            {
+                return;
+            }
+
+            foreach (KeyValuePair<string, ADOFAI.PropertyInfo> pair in batchEvents[0].info.propertiesInfo)
+            {
+                ADOFAI.PropertyInfo info = pair.Value;
+                if (info == null || string.IsNullOrEmpty(info.name))
+                {
+                    continue;
+                }
+                if (info.invisible || info.controlType == ControlType.Hidden)
+                {
+                    continue;
+                }
+
+                bool presentEverywhere = true;
+                bool uniform = true;
+                string firstValue = null;
+
+                for (int i = 0; i < batchEvents.Count; i++)
+                {
+                    ADOFAI.PropertyInfo other = FindInfo(batchEvents[i], pair.Key);
+                    if (other == null || other.invisible || other.controlType == ControlType.Hidden)
+                    {
+                        presentEverywhere = false;
+                        break;
+                    }
+
+                    string value = BatchValueKey(batchEvents[i], other);
+                    if (i == 0)
+                    {
+                        firstValue = value;
+                    }
+                    else if (value != firstValue)
+                    {
+                        uniform = false;
+                    }
+                }
+
+                if (!presentEverywhere)
+                {
+                    continue;
+                }
+
+                batchKeys.Add(pair.Key);
+                if (uniform)
+                {
+                    batchUniformKeys.Add(pair.Key);
+                }
+            }
+        }
+
+        /// <summary>在这个事件的属性表里找一项，没有则 null。</summary>
+        private static ADOFAI.PropertyInfo FindInfo(LevelEvent levelEvent, string key)
+        {
+            ADOFAI.PropertyInfo info;
+            if (levelEvent == null || levelEvent.info == null
+                || levelEvent.info.propertiesInfo == null
+                || !levelEvent.info.propertiesInfo.TryGetValue(key, out info))
+            {
+                return null;
+            }
+            return info;
+        }
+
+        /// <summary>
+        /// 一个属性在某个事件上的取值化成字符串，用来判断「这一批一致吗」。
+        ///
+        /// 必须按类型走强类型读取。统一读成 object 再比会踩精度的坑：
+        /// 作者根本没动过的两个值，装箱之后也可能判成不同。浮点按三位
+        /// 小数比 —— 那正是参数栏自己显示用的精度。
+        /// </summary>
+        private static string BatchValueKey(LevelEvent levelEvent, ADOFAI.PropertyInfo info)
+        {
+            switch (info.type)
+            {
+                case PropertyType.Bool:
+                    return SafeGet(levelEvent, info, false) ? "1" : "0";
+                case PropertyType.Int:
+                    return FormatInt(SafeGet(levelEvent, info, 0));
+                case PropertyType.Float:
+                    return FormatFloat(SafeGet(levelEvent, info, 0f));
+                case PropertyType.Vector2:
+                {
+                    Vector2 value = SafeGet(levelEvent, info, Vector2.zero);
+                    return value.x.ToString("0.###") + "," + value.y.ToString("0.###");
+                }
+                case PropertyType.Color:
+                {
+                    Color value = SafeGet(levelEvent, info, Color.white);
+                    return ((int)(value.r * 1000f)) + "," + ((int)(value.g * 1000f)) + ","
+                        + ((int)(value.b * 1000f)) + "," + ((int)(value.a * 1000f));
+                }
+                default:
+                    return SafeGet(levelEvent, info, string.Empty) ?? string.Empty;
+            }
+        }
+
+        /// <summary>
+        /// 批量模式下一行的收尾：值不一致的在控件右边挂一块「多个值」。
+        ///
+        /// 只做这一件事 —— 控件保持原样、可交互。批量改参最有用的用法
+        /// 恰恰是「把选中的这些全设成某个值」，而那种情况下各项几乎必然
+        /// 不相同；把这些行锁掉等于把这个功能废掉。
+        ///
+        /// 标签的位置按**传进来的 rowWidth 算**，不读回 rect：行是从对象池
+        /// 复用来的，那一刻它的 rect 还可能是上一次的宽度。
+        /// </summary>
+        private void FinishBatchRow(Row row, float rowWidth, float rowHeight, bool mixed)
+        {
+            if (row.MixedLabel == null)
+            {
+                return;
+            }
+
+            row.MixedLabel.gameObject.SetActive(mixed);
+            if (!mixed)
+            {
+                return;
+            }
+
+            // **把控件里显示的数值抹掉。**
+            //
+            // 那一格里现在是**第一个选中事件**的值，而它长得和「整批共同
+            // 的值」一模一样。作者点进去又原样点出来，就等于把那个值写给
+            // 了整批 —— 一次什么都没改的操作把各事件本来不同的值统统抹平，
+            // 还占掉一步撤销。这正是「点一下什么都没改也算修改、标签也消失」
+            // 那个反馈的来路。
+            //
+            // 空着之后：没敲东西就离开什么都不会发生（解析失败 → 不提交），
+            // 敲了才落到整批。开关和下拉框不用管 —— 它们只有真的点选才会写值，
+            // 不存在「路过」这种情况。
+            for (int i = 0; i < row.Controls.Count; i++)
+            {
+                if (row.Controls[i] == null)
+                {
+                    continue;
+                }
+                TMP_InputField field = row.Controls[i].GetComponent<TMP_InputField>();
+                if (field != null)
+                {
+                    field.SetTextWithoutNotify(string.Empty);
+                }
+            }
+
+            // 「多个值」贴着控件右边。堆叠时控件另起了一行，标签也挪走了，
+            // 所以这一块要跟着下到控件那一行去，不然它会悬在两行之间的缝上。
+            float chipX = Mathf.Max(CheckWidth + LabelWidth,
+                rowWidth - Padding - MixedChipWidth);
+            float chipY = RowStacks(rowWidth) ? StackedLabelHeight : 0f;
+            SetTopLeft(row.MixedLabel.rectTransform, chipX, chipY, MixedChipWidth,
+                Mathf.Max(ControlHeight, rowHeight - chipY));
         }
 
         private void ClearRows()
@@ -963,6 +1743,13 @@ namespace ADOFAIEditorStudio
             row.ControlHost = NewChildRect("Control", rect);
             SetTopLeft(row.ControlHost, CheckWidth + LabelWidth, 0f,
                 Mathf.Max(40f, rowWidth - CheckWidth - LabelWidth - Padding), RowHeight);
+
+            // 「多个值」标签，摆在控件右边，平时关着。
+            // 真正的位置由 FinishBatchRow 按当次行宽算（行是对象池复用的，
+            // 那一刻只能信传进来的宽度，不能读回 rect）。
+            row.MixedLabel = CreateChildText("Mixed", rect,
+                0f, 0f, MixedChipWidth, RowHeight, "多个值", 11.5f);
+            row.MixedLabel.gameObject.SetActive(false);
             return row;
         }
 
@@ -1053,41 +1840,73 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>
-        /// 一行的高度。多值行在控件无法并排后会纵向堆叠，
-        /// 所以它们需要两倍空间。
+        /// 行窄到标签必须独占一行、控件另起一行。
+        ///
+        /// 和 <see cref="StacksVertically"/> 是两件事：那个管"控件自己要占几行"，
+        /// 这个管"标签还挤不挤得下"。两个可以叠加。
+        /// </summary>
+        private static bool RowStacks(float rowWidth)
+        {
+            return rowWidth - CheckWidth - LabelWidth - Padding < MinimumInlineControlWidth;
+        }
+
+        /// <summary>
+        /// 控件区实际能拿到多宽。**行堆不堆是它的输入**，不是反过来求 ——
+        /// 判定和排版都走这一个函数，免得两边算出来的宽度不一样
+        /// （"判定按 104、排版按 130"那种打架）。
+        /// </summary>
+        private static float ControlWidthFor(float rowWidth, bool rowStacked)
+        {
+            float width = rowStacked
+                ? rowWidth - CheckWidth - Padding
+                : rowWidth - CheckWidth - LabelWidth - Padding;
+            return Mathf.Max(40f, width);
+        }
+
+        /// <summary>
+        /// 一行的高度。两种情况会变高：控件自己并排不下（多值行纵向堆叠），
+        /// 以及标签被挪到了单独一行。**两种可以叠加**，所以分开算再相加。
         /// </summary>
         private static float RowHeightFor(ADOFAI.PropertyInfo info, float rowWidth)
         {
-            if (!StacksVertically(info, rowWidth))
-            {
-                return RowHeight;
-            }
-            return RowHeight * 2f - 4f;
+            bool rowStacked = RowStacks(rowWidth);
+            float controlWidth = ControlWidthFor(rowWidth, rowStacked);
+
+            float height = StacksVertically(info, controlWidth)
+                ? RowHeight * 2f - 4f
+                : RowHeight;
+            return rowStacked ? StackedLabelHeight + height : height;
         }
 
         /// <summary>
         /// 该行的控件是否必须堆叠，而不是并排。
         ///
         /// 只有 Vector2（以及颜色，它要摆四个通道加一个色块）有不止
-        /// 一个控件。阈值卡的是留给控件的宽度，不是面板宽度：
-        /// 标签和启用复选框先分走自己那份，所以看起来够宽的面板
-        /// 也可能剩下太少。
+        /// 一个控件。**参数是控件区宽度，不是面板宽度**：标签和启用复选框
+        /// 先分走自己那份，所以看起来够宽的面板也可能剩下太少。
         /// </summary>
-        private static bool StacksVertically(ADOFAI.PropertyInfo info, float rowWidth)
+        private static bool StacksVertically(ADOFAI.PropertyInfo info, float controlWidth)
         {
             if (info == null || info.type != PropertyType.Vector2)
             {
                 return false;
             }
-
-            float controlWidth = rowWidth - CheckWidth - LabelWidth - Padding;
             return controlWidth < MinimumTwoAcrossWidth;
         }
 
         private void BuildRow(Row row, LevelEvent levelEvent, ADOFAI.PropertyInfo info, float y,
-            float rowWidth, float rowHeight)
+            float rowWidth, float rowHeight, bool mixed)
         {
             SetTopLeft(row.Rect, 0f, y, rowWidth, rowHeight);
+
+            // 行是从对象池里复用的，先把上一轮「多个值」的痕迹清干净。
+            // 批量那一侧会在 BuildRow 之后重新挂上（见 FinishBatchRow）——
+            // 痕迹只在**一处**设置、在一处清除，不会出现某次重画漏掉一半。
+            row.ControlHost.gameObject.SetActive(true);
+            if (row.MixedLabel != null)
+            {
+                row.MixedLabel.gameObject.SetActive(false);
+            }
 
             bool canDisable = info.canBeDisabled;
             row.Enable.gameObject.SetActive(canDisable);
@@ -1129,8 +1948,38 @@ namespace ADOFAIEditorStudio
             // 两个条件都不成立，直接沿用了上一次的宽度——拖动时间轴改变参数栏
             // 宽度后，行本身的 rect 更新了，控件却还按旧宽度摆，右边的输入框
             // 就被面板边缘裁掉。
-            float controlWidth = Mathf.Max(60f, rowWidth - CheckWidth - LabelWidth - Padding);
-            SetTopLeft(row.ControlHost, CheckWidth + LabelWidth, 0f, controlWidth, rowHeight);
+            // 窄到并排不下就把标签挪到单独一行（见 RowStacks）。
+            // 行高在 RowHeightFor 里已经按这个多留出来了。
+            bool rowStacked = RowStacks(rowWidth);
+            float controlWidth = ControlWidthFor(rowWidth, rowStacked);
+            // 批量模式下这一行的值不一致：右边让出一块给「多个值」，
+            // 控件本身照常显示**第一个选中事件**的值 —— 它是给作者改的
+            // 抓手，改一下那一下就会落到整批上。值显示的是谁，
+            // 由旁边那块标签说明。
+            if (mixed)
+            {
+                controlWidth = Mathf.Max(60f, controlWidth - MixedChipWidth);
+            }
+
+            float labelLineHeight = rowStacked ? StackedLabelHeight : 0f;
+            if (rowStacked)
+            {
+                // 标签独占第一行，右边界跟着行宽走（不再被 LabelWidth 钉死）。
+                SetTopLeft(row.Label.rectTransform, CheckWidth, 0f,
+                    Mathf.Max(40f, rowWidth - CheckWidth - Padding), StackedLabelHeight);
+                // 勾选框跟着标签那一行走，不然它会落在两行之间的缝上。
+                SetTopLeft((RectTransform)row.Enable.transform,
+                    8f, (StackedLabelHeight - 18f) * 0.5f, 18f, 18f);
+            }
+            else
+            {
+                SetTopLeft(row.Label.rectTransform, CheckWidth + 4f, 0f,
+                    LabelWidth - 6f, RowHeight);
+            }
+
+            SetTopLeft(row.ControlHost,
+                CheckWidth + (rowStacked ? 0f : LabelWidth), labelLineHeight,
+                controlWidth, Mathf.Max(ControlHeight, rowHeight - labelLineHeight));
 
             // 'floor' 是唯一不在事件 data 字典里的属性：
             // 它挂在 LevelEvent 字段上，所以通用 Get 什么都读不到。
@@ -1198,7 +2047,11 @@ namespace ADOFAIEditorStudio
             row.Controls.Clear();
         }
 
-        private bool IsDisabled(LevelEvent levelEvent, string key)
+        /// <summary>
+        /// 这一条属性在当前事件上是不是被「禁用」了（原生那套 `disabled` 字典）。
+        /// **static** —— 只用到入参，所以 ImGui 那版参数栏能直接复用。
+        /// </summary>
+        internal static bool IsDisabled(LevelEvent levelEvent, string key)
         {
             bool disabled;
             return levelEvent.disabled != null
@@ -1206,9 +2059,88 @@ namespace ADOFAIEditorStudio
                 && disabled;
         }
 
-        private void SetDisabled(LevelEvent levelEvent, string key, bool disabled)
+        /// <summary>
+        /// 事件级的「生效 / 停用」（`LevelEvent.active`）。
+        ///
+        /// **和上面那个 `SetDisabled` 不是一回事**：那是属性级的，只让某一条
+        /// 属性不参与求值；这个让整个事件失效。原版编辑器把这件事放在自己的
+        /// 事件清单上，工作台一直没有入口。
+        ///
+        /// 走游戏自己的 `scnEditor.EnableEvent` —— 它顺手调
+        /// `ApplyEventsToFloors()`，少了那一步值改了、画面和播放都不跟。
+        /// 它自己不记撤销，所以这里补一条（含联机上报）。
+        /// </summary>
+        internal void SetEventActive(LevelEvent levelEvent, bool active)
         {
-            if (levelEvent.disabled == null || !levelEvent.disabled.ContainsKey(key))
+            if (levelEvent == null)
+            {
+                return;
+            }
+
+            scnEditor editor = scnEditor.instance;
+            if (editor == null)
+            {
+                return;
+            }
+
+            // 批量模式下整批一起改 —— 那个勾代表的是"这一批"，
+            // 只改掉一个等于说了句假话（和 SetDisabled 同一条理由）。
+            // 判成员的理由也一样：设置页不属于任何一批。
+            if (batchEvents != null && batchEvents.Count > 1 && BatchContains(levelEvent))
+            {
+                EditorCommandHistory.BeginBatch("批量改生效状态");
+                try
+                {
+                    for (int i = 0; i < batchEvents.Count; i++)
+                    {
+                        ApplyEventActive(editor, batchEvents[i], active);
+                    }
+                }
+                finally
+                {
+                    EditorCommandHistory.EndBatch();
+                }
+                QueueRefresh();
+                return;
+            }
+
+            ApplyEventActive(editor, levelEvent, active);
+            QueueRefresh();
+        }
+
+        /// <summary>一个事件上落一次生效/停用，并按需记一条撤销。</summary>
+        private void ApplyEventActive(scnEditor editor, LevelEvent levelEvent, bool active)
+        {
+            if (levelEvent == null || !IsLive(levelEvent) || levelEvent.active == active)
+            {
+                return;
+            }
+            bool from = levelEvent.active;
+            editor.EnableEvent(levelEvent, active);
+            EditorCommandHistory.RecordEventActive(editor, levelEvent, from, active);
+        }
+
+        internal void SetDisabled(LevelEvent levelEvent, string key, bool disabled)
+        {
+            // 批量模式下「启用 / 禁用」也是整批一起改 —— 行的那个勾选开关
+            // 在批量里代表的是「这一批」，只改掉一个等于说了句假话。
+            // 判成员的理由和 Commit 那条一样：设置页不属于任何一批。
+            if (batchEvents != null && batchEvents.Count > 1 && BatchContains(levelEvent))
+            {
+                for (int i = 0; i < batchEvents.Count; i++)
+                {
+                    SetDisabledOne(batchEvents[i], key, disabled);
+                }
+                return;
+            }
+
+            SetDisabledOne(levelEvent, key, disabled);
+        }
+
+        private void SetDisabledOne(LevelEvent levelEvent, string key, bool disabled)
+        {
+            if (levelEvent == null || !IsLive(levelEvent)
+                || levelEvent.disabled == null || !levelEvent.disabled.ContainsKey(key))
             {
                 return;
             }
@@ -1235,29 +2167,52 @@ namespace ADOFAIEditorStudio
         /// 所以最后兜底渲染键名本身，而不是让这一行
         /// 没有标签。
         /// </summary>
-        private static string ResolveLabel(LevelEvent levelEvent, ADOFAI.PropertyInfo info)
+        /// <summary>
+        /// 解析行标签 —— **完全照原生的 `Property.info` 那三段**（`Property.cs:47-71`）。
+        ///
+        /// **顺序不能换。** `customLabel` 和 `customLocalizationKey` 在原生里
+        /// 是**优先于**那两张本地化表的；反过来的话，凡是指定了这两个的字段都会
+        /// 落到兜底那一步、显示成英文键名 —— 表现就是"一部分参数有翻译、
+        /// 一部分没有"。
+        ///
+        /// 原来的写法正是反的，而且**整个漏掉了 `customLocalizationKey`**：
+        /// 相机设置那页的 `Relative To`、`Start Cam Low VFX` 就是这么漏的。
+        /// </summary>
+        internal static string ResolveLabel(LevelEvent levelEvent, ADOFAI.PropertyInfo info)
         {
-            bool exists;
-            string label = null;
-            if (info.levelEventInfo != null && !string.IsNullOrEmpty(info.levelEventInfo.name))
+            if (info == null)
             {
-                label = RDString.GetWithCheck(
-                    "editor." + info.levelEventInfo.name + "." + info.name, out exists);
+                return string.Empty;
+            }
+
+            if (info.customLabel != null)
+            {
+                return info.customLabel;
+            }
+
+            if (info.customLocalizationKey != null)
+            {
+                return string.IsNullOrEmpty(info.customLocalizationKey)
+                    ? string.Empty
+                    : RDString.Get(info.customLocalizationKey);
+            }
+
+            bool exists;
+            string typeName = info.levelEventInfo == null ? null : info.levelEventInfo.name;
+            if (!string.IsNullOrEmpty(typeName))
+            {
+                string label = RDString.GetWithCheck(
+                    "editor." + typeName + "." + info.name, out exists);
                 if (exists && !string.IsNullOrEmpty(label))
                 {
                     return label;
                 }
             }
 
-            label = RDString.GetWithCheck("editor." + info.name, out exists);
-            if (exists && !string.IsNullOrEmpty(label))
+            string byKey = RDString.GetWithCheck("editor." + info.name, out exists);
+            if (exists && !string.IsNullOrEmpty(byKey))
             {
-                return label;
-            }
-
-            if (!string.IsNullOrEmpty(info.customLabel))
-            {
-                return info.customLabel;
+                return byKey;
             }
 
             return HumaniseKey(info.name);
@@ -1557,10 +2512,18 @@ namespace ADOFAIEditorStudio
             Color value = SafeGetColor(levelEvent, info);
             float swatch = 24f;
 
-            Image preview = CreateChildImage("Swatch", row.ControlHost, x, (RowHeight - swatch) * 0.5f, swatch, swatch);
+            // 色块本身就是**开调色盘的按钮**。它原来 `raycastTarget = false`
+            // ——纯给眼睛看的，于是这个属性只能靠手打 HEX，而原版是有调色盘的。
+            RectTransform swatchRect = NewChildRect("Swatch", row.ControlHost);
+            SetTopLeft(swatchRect, x, (RowHeight - swatch) * 0.5f, swatch, swatch);
+            Image preview = swatchRect.gameObject.AddComponent<Image>();
+            // **实心**圆角，不是空心环：`frame: true` 那张是给描边用的，
+            // 指望 `fillCenter` 把中间补上并不成立 —— 色块会变成一副空心描边，
+            // 看着像这个属性没有颜色。
+            preview.sprite = GetRoundedSprite(Mathf.CeilToInt(swatch * 2f) + 4, 5f, false);
+            preview.type = Image.Type.Sliced;
             preview.color = value;
-            preview.raycastTarget = false;
-            row.Controls.Add(preview.gameObject);
+            row.Controls.Add(swatchRect.gameObject);
 
             TMP_InputField field = CreateInputField(
                 row, "Hex", x + swatch + 6f, width - swatch - 6f, null, ColorToHex(value));
@@ -1568,6 +2531,16 @@ namespace ADOFAIEditorStudio
 
             string key = info.name;
             LevelEvent bound = levelEvent;
+
+            // 绑的是**这一行自己的**色块和 HEX 框：调色盘拖动时实时更新它们，
+            // 但不走重画 —— 重画会把这个弹出层一起销毁，拖到一半盘就没了。
+            Button opener = swatchRect.gameObject.AddComponent<Button>();
+            opener.targetGraphic = preview;
+            opener.navigation = new Navigation { mode = Navigation.Mode.None };
+            opener.onClick.AddListener(delegate
+            {
+                OpenColorPopup(opener, bound, key, preview, field);
+            });
             field.onEndEdit.AddListener(delegate(string text)
             {
                 if (syncing || bound == null)
@@ -1714,9 +2687,11 @@ namespace ADOFAIEditorStudio
             if (enumTarget == levelEvent && enumPopupRoot != null)
             {
                 CloseEnumPopup();
+            CloseColorPopup();
                 return;
             }
             CloseEnumPopup();
+            CloseColorPopup();
             enumTarget = levelEvent;
 
             if (info.enumType == null)
@@ -1887,6 +2862,7 @@ namespace ADOFAIEditorStudio
                 optionButton.onClick.AddListener(delegate
                 {
                     CloseEnumPopup();
+            CloseColorPopup();
                     Commit(bound, key, ParseEnumValue(info, chosen));
                 });
             }
@@ -1906,6 +2882,254 @@ namespace ADOFAIEditorStudio
             Transform caretTransform = anchor.Find("Caret");
             enumAnchorCaret = caretTransform == null ? null : caretTransform.GetComponent<Image>();
             LoadoutAnchor(anchor, currentDisplay);
+        }
+
+        /// <summary>
+        /// 打开调色盘。
+        ///
+        /// 摆位和枚举弹层同一套（贴锚点，下面放不下就往上弹再夹回面板里），
+        /// 这样两个弹层的脾气一致，不用记两套。
+        /// </summary>
+        private void OpenColorPopup(Button anchor, LevelEvent target, string key, Image swatch,
+            TMP_InputField hexField)
+        {
+            CloseColorPopup();
+            CloseEnumPopup();
+
+            RectTransform anchorRect = anchor == null ? null : anchor.transform as RectTransform;
+            if (anchorRect == null || target == null || string.IsNullOrEmpty(key) || panelRoot == null)
+            {
+                return;
+            }
+
+            colorTarget = target;
+            colorKey = key;
+            colorAnchorButton = anchor;
+            colorSwatch = swatch;
+            colorHexField = hexField;
+
+            ADOFAI.PropertyInfo info = FindInfo(target, key);
+            colorOriginalHex = ColorToHex(SafeGetColor(target, info));
+            colorOriginalDisabled = target.disabled != null
+                && target.disabled.ContainsKey(key)
+                && target.disabled[key];
+            colorLiveValue = SafeGetColor(target, info);
+
+            const float padding = 8f;
+            float popupWidth = EditorColorPicker.BodyWidth + padding * 2f;
+            float popupHeight = EditorColorPicker.BodyHeight + padding * 2f;
+
+            float anchorLocalY = panelRoot.InverseTransformPoint(
+                anchorRect.TransformPoint(Vector3.zero)).y;
+            float panelHeight = panelRoot.rect.height;
+
+            float spaceBelow = panelHeight + anchorLocalY - PopupMargin;
+            float spaceAbove = -anchorLocalY - ControlHeight - PopupMargin * 2f - PopupGap;
+            bool dropUp = spaceBelow < popupHeight && spaceAbove > spaceBelow;
+
+            float anchorTop = -anchorLocalY + ControlHeight;
+            float popupTop = dropUp ? anchorTop - popupHeight - PopupGap : anchorTop + PopupGap;
+            popupTop = Mathf.Clamp(popupTop, PopupMargin,
+                Mathf.Max(PopupMargin, panelHeight - popupHeight - PopupMargin));
+
+            RectTransform popup = NewChildRect("ColorPopup", panelRoot);
+            SetTopLeft(popup, Padding, popupTop, popupWidth, popupHeight);
+            ApplyPopupFrame(popup, popupWidth, popupHeight);
+            colorPopupRoot = popup;
+            colorPopup.Add(popup.gameObject);
+
+            RectTransform body = NewChildRect("Body", popup);
+            SetTopLeft(body, padding, padding, EditorColorPicker.BodyWidth, EditorColorPicker.BodyHeight);
+
+            EditorColorPicker picker = popup.gameObject.AddComponent<EditorColorPicker>();
+            picker.Build(body, font, SafeGetColor(target, info),
+                delegate(Color picked) { ApplyColorPreview(picked); },
+                delegate(Color picked) { CommitColorFromPicker(picked); });
+        }
+
+        /// <summary>
+        /// 收起调色盘，并**补记一步撤销**。
+        ///
+        /// 拖动期间是**实时写进谱面**的（这样画面跟着动），但没记历史 ——
+        /// 每帧记一条的话，拖一次鼠标就是上百条，Ctrl+Z 要点到手酸。
+        /// 所以这里是这次调色**唯一**的一条撤销，从进来时那个值记到现在这个值。
+        /// </summary>
+        private void CloseColorPopup()
+        {
+            if (colorTarget != null && !string.IsNullOrEmpty(colorKey) && IsLive(colorTarget))
+            {
+                // 先把最后一次落点补写进去，再读回来记账 —— 顺序反了会记下
+                // 一个"屏幕上是这个颜色、谱面里是上一个值"的偏差。
+                WriteColorNow();
+
+                // **这一次求值器重建放在这里，而不是拖动途中。**
+                // 拖动期间那份基线用不上（逐帧状态是自己播种的），
+                // 只有收尾时才需要它对齐；一次重建和每秒六十次是两个量级。
+                EditorPlaybackBridge.RequestEvaluatorRebuild("color-picker-commit");
+
+                string now = ColorToHex(SafeGetColor(colorTarget, FindInfo(colorTarget, colorKey)));
+                if (!string.Equals(now, colorOriginalHex, StringComparison.OrdinalIgnoreCase))
+                {
+                    EditorCommandHistory.RecordPropertyEdit(
+                        scnEditor.instance, colorTarget, colorKey,
+                        colorOriginalHex, now, colorOriginalDisabled, false);
+                }
+            }
+
+            for (int i = 0; i < colorPopup.Count; i++)
+            {
+                if (colorPopup[i] != null)
+                {
+                    Destroy(colorPopup[i]);
+                }
+            }
+            colorPopup.Clear();
+            colorPopupRoot = null;
+            colorTarget = null;
+            colorKey = null;
+            colorAnchorButton = null;
+            colorSwatch = null;
+            colorHexField = null;
+        }
+
+        /// <summary>
+        /// 调色盘拖动时的实时写入：改数据 + 刷画面，**不记撤销**。
+        ///
+        /// 界面这边只动这一行自己的色块和 HEX 框 —— 不能走 QueueRefresh，
+        /// 一重画这个弹出层就被销毁了。
+        /// </summary>
+        /// <summary>
+        /// 拖动途中的**显示**回调：只把这一行的色块染一下色，**一个字都不写进谱面**。
+        ///
+        /// 每帧都写的话，参数栏每帧都要重跑一次装饰物 Setup —— 那才是拖动
+        /// 卡顿的来源。盘子里自己的色块、色条、指示环是每帧更新的，
+        /// 拖起来照旧跟手；画面等**松手**再变。
+        /// </summary>
+        private void ApplyColorPreview(Color picked)
+        {
+            if (colorSwatch != null)
+            {
+                colorSwatch.color = picked;
+            }
+            colorLiveValue = picked;
+        }
+
+        /// <summary>
+        /// 松手（或输入框改完）：把定下来的颜色**落进谱面**。
+        ///
+        /// 拖动全程只走这一条 —— 一次拖动 = 一次写入，而不是六十次。
+        /// </summary>
+        private void CommitColorFromPicker(Color picked)
+        {
+            colorLiveValue = picked;
+            if (colorHexField != null)
+            {
+                colorHexField.SetTextWithoutNotify(ColorToHex(picked));
+            }
+            WriteColorNow();
+        }
+
+        /// <summary>
+        /// 把 <see cref="colorLiveValue"/> 落进谱面并刷画面。
+        ///
+        /// **只在松手、输入框改完、以及收起调色盘时走这里**，拖动途中不走。
+        /// 一次拖动就是一次写入。
+        /// </summary>
+        private void WriteColorNow()
+        {
+            if (colorTarget == null || string.IsNullOrEmpty(colorKey) || !IsLive(colorTarget))
+            {
+                return;
+            }
+
+            try
+            {
+                colorTarget[colorKey] = ColorToHex(colorLiveValue);
+                if (colorTarget.disabled != null && colorTarget.disabled.ContainsKey(colorKey))
+                {
+                    // 动一个值就意味着作者想让它生效 —— 和别处一致。
+                    colorTarget.disabled[colorKey] = false;
+                }
+            }
+            catch (Exception exception)
+            {
+                Main.Logger.Error("[PropertyPanel] 调色盘写入 " + colorKey + " 失败：" + exception);
+                return;
+            }
+
+            scnEditor editor = scnEditor.instance;
+            if (editor != null && colorTarget.info != null && colorTarget.info.isDecoration)
+            {
+                try
+                {
+                    editor.UpdateDecorationObject(colorTarget);
+                }
+                catch (Exception exception)
+                {
+                    Main.Logger.Error("[PropertyPanel] 调色盘刷新装饰物失败：" + exception);
+                }
+            }
+
+            if (ReferenceEquals(colorTarget, settingsPage))
+            {
+                ApplySettingsSideEffects(FindInfo(colorTarget, colorKey));
+
+                // 改的是背景设置里那个颜色，原生会顺手重铺一次背景
+                // （PropertyControl_Color.OnChange 里就有这一支）。
+                // 不补的话值变了、背景没跟。
+                if (colorTarget.eventType == LevelEventType.BackgroundSettings)
+                {
+                    SetBackgroundSafe();
+                }
+            }
+
+            // **这里没有 RequestEvaluatorRebuild，是照着原版删的。**
+            //
+            // 那个函数第一件事是 evaluatorBackend.End()，把求值器**整个拆掉**、
+            // 下次求值时重来。按帧调就是每秒六十次完全重建 —— 那正是
+            // "卡得要命"的来源，而原生从不做这件事。
+            //
+            // 画面对得上靠的是上面那次 UpdateDecorationObject：求值器的逐帧
+            // 状态本来就是从装饰物那些字段播种的，字段一更新画面就跟上。
+            // 只有 Analyze 期缓的那份基线要等一次重建 —— 那一次放在收起时做
+            // （见 CloseColorPopup）。
+        }
+
+        /// <summary>重铺一次背景。原生改背景设置里的颜色时会顺手做这一步。</summary>
+        private static void SetBackgroundSafe()
+        {
+            try
+            {
+                if (ADOBase.customLevel != null)
+                {
+                    ADOBase.customLevel.SetBackground();
+                }
+            }
+            catch (Exception exception)
+            {
+                Main.Logger.Error("[PropertyPanel] 重铺背景失败：" + exception);
+            }
+        }
+
+        private bool PointerOverColorAnchor()
+        {
+            return colorAnchorButton != null
+                && RectContains(colorAnchorButton.transform as RectTransform);
+        }
+
+        private bool PointerOverColorPopup()
+        {
+            return RectContains(colorPopupRoot);
+        }
+
+        private bool RectContains(RectTransform rect)
+        {
+            if (rect == null)
+            {
+                return false;
+            }
+            Vector2 point = CurrentPointerPosition();
+            return RectTransformUtility.RectangleContainsScreenPoint(rect, point, PopupEventCamera(rect));
         }
 
         private void CloseEnumPopup()
@@ -1936,16 +3160,21 @@ namespace ADOFAIEditorStudio
             // 也不需要防"打开时立刻把自己关掉"：弹出层是按钮的 onClick
             // 打开的，而 onClick 在**抬起**时触发，那时 GetMouseButtonDown
             // 早已为假。
-            if (enumTarget == null || !Input.GetMouseButtonDown(0))
+            if ((enumTarget == null && colorTarget == null) || !Input.GetMouseButtonDown(0))
             {
                 return;
             }
-            if (PointerOverEnumAnchor() || PointerOverEnumPopup())
+            // 两个弹层各查各的锚点和面板。拖色拖到一半**绝不能**把盘收掉：
+            // 拖动是从盘里按下去的，这一帧的按下点就落在 colorPopupRoot 里，
+            // 下面那一句会把它放过去。
+            if (PointerOverEnumAnchor() || PointerOverEnumPopup()
+                || PointerOverColorAnchor() || PointerOverColorPopup())
             {
                 return;
             }
 
             CloseEnumPopup();
+            CloseColorPopup();
         }
 
         private bool PointerOverEnumAnchor()
@@ -1996,7 +3225,7 @@ namespace ADOFAIEditorStudio
         /// 不按属性名匹配 —— 名字可能被本地化或被别的键复用，
         /// 而类型是确定的。
         /// </summary>
-        private static bool IsEaseEnum(ADOFAI.PropertyInfo info)
+        internal static bool IsEaseEnum(ADOFAI.PropertyInfo info)
         {
             return info != null && info.enumType == typeof(DG.Tweening.Ease);
         }
@@ -2019,7 +3248,7 @@ namespace ADOFAIEditorStudio
             }
         }
 
-        private static bool TryParseEase(string name, out DG.Tweening.Ease ease)
+        internal static bool TryParseEase(string name, out DG.Tweening.Ease ease)
         {
             ease = DG.Tweening.Ease.Linear;
             if (string.IsNullOrEmpty(name))
@@ -2070,7 +3299,12 @@ namespace ADOFAIEditorStudio
             UnityEngine.UI.Extensions.UILineRenderer line =
                 graphRect.gameObject.AddComponent<UnityEngine.UI.Extensions.UILineRenderer>();
             line.color = CurveLine;
-            line.LineThickness = 1.6f;
+            // **细一点。** 原版那条 `lineRenderer.Points = ...;` 之外什么都不设，
+            // 但 `UILineRenderer.lineThickness = 2f` 只是**字段初值** ——
+            // prefab 上的序列化值会把它覆盖掉，而原版看起来明显比 2 细。
+            // 从 prefab 读不到那个值，所以按观感取 1：粗一档就会显得笨重，
+            // 而这条曲线是拿来当"标志"看的，细才像原版。
+            line.LineThickness = 1f;
             line.LineCaps = false;
             line.LineJoins = UnityEngine.UI.Extensions.UILineRenderer.JoinType.Bevel;
             line.BezierMode = UnityEngine.UI.Extensions.UILineRenderer.BezierType.None;
@@ -2087,7 +3321,7 @@ namespace ADOFAIEditorStudio
         /// 然后 `if (max > size.y) scale = size.y / max`），所以负值部分
         /// 仍然落在 0 以下、会被画到框外——这是原版就有的行为，照搬。
         /// </summary>
-        private static Vector2[] SampleEaseCurve(DG.Tweening.Ease ease, int pointCount,
+        internal static Vector2[] SampleEaseCurve(DG.Tweening.Ease ease, int pointCount,
             float width, float height)
         {
             int count = Mathf.Max(2, pointCount);
@@ -2124,12 +3358,15 @@ namespace ADOFAIEditorStudio
         // 而不是靠"行高 - 字号"这种跟字体度量绑死的算法。
         private const float PopupLabelHeight = 20f;
 
-        private static readonly Color PopupSurface = new Color(0.105f, 0.115f, 0.142f, 1f);
-        private static readonly Color PopupHover = new Color(0.165f, 0.180f, 0.215f, 1f);
-        private static readonly Color PopupSelected = new Color(0.070f, 0.225f, 0.242f, 1f);
-        private static readonly Color PopupSelectedHover = new Color(0.090f, 0.290f, 0.310f, 1f);
-        private static readonly Color PopupBorder = new Color(0.270f, 0.300f, 0.340f, 0.90f);
-        private static readonly Color PopupShadow = new Color(0f, 0f, 0f, 0.45f);
+        // 弹窗浮在面板之上，所以整组取「浮层」那一档而不是面板自己的色——
+        // 比面板亮一点，读起来才像盖在上面。选中态沿用全局的选中填充，
+        // 不另配一套，这样弹窗里的选中和列表里的选中是同一个视觉语言。
+        private static Color PopupSurface { get { return UiTheme.Current.SurfaceOverlay; } }
+        private static Color PopupHover { get { return UiTheme.Current.SurfaceRaisedHover; } }
+        private static Color PopupSelected { get { return UiTheme.Current.SelectedFill; } }
+        private static Color PopupSelectedHover { get { return UiTheme.Current.SelectedHoverFill; } }
+        private static Color PopupBorder { get { return UiTheme.Current.BorderStrong; } }
+        private static Color PopupShadow { get { return UiTheme.Current.Shadow; } }
 
         /// <summary>
         /// 弹出层的外框：投影 + 圆角面 + 一圈描边。顺序就是子节点的顺序，
@@ -2214,7 +3451,7 @@ namespace ADOFAIEditorStudio
 
         private static readonly Color EnumAnchorOpen = new Color(1.18f, 1.18f, 1.18f, 1f);
 
-        private static object ParseEnumValue(ADOFAI.PropertyInfo info, string name)
+        internal static object ParseEnumValue(ADOFAI.PropertyInfo info, string name)
         {
             try
             {
@@ -2226,7 +3463,11 @@ namespace ADOFAIEditorStudio
             }
         }
 
-        private string ReadEnumName(LevelEvent levelEvent, ADOFAI.PropertyInfo info)
+        /// <summary>
+        /// 读一个枚举属性当前的值（枚举成员名）。**static** —— 它只用到
+        /// `levelEvent` 和 `info`，不碰实例状态，所以 ImGui 那版参数栏能直接复用。
+        /// </summary>
+        internal static string ReadEnumName(LevelEvent levelEvent, ADOFAI.PropertyInfo info)
         {
             object raw = null;
             try
@@ -2256,7 +3497,7 @@ namespace ADOFAIEditorStudio
             return name;
         }
 
-        private static string DisplayEnumName(LevelEvent levelEvent, ADOFAI.PropertyInfo info, string name)
+        internal static string DisplayEnumName(LevelEvent levelEvent, ADOFAI.PropertyInfo info, string name)
         {
             if (string.IsNullOrEmpty(name))
             {
@@ -2277,9 +3518,82 @@ namespace ADOFAIEditorStudio
         /// 每次编辑手势里调用一次，绝不能每敲一个键调一次：
         /// 输入框在 onEndEdit 提交，开关和枚举选择本身就是单次手势。
         /// </summary>
-        private void Commit(LevelEvent levelEvent, string key, object value)
+        internal void Commit(LevelEvent levelEvent, string key, object value)
         {
-            if (levelEvent == null || !IsStillLive(levelEvent))
+            // **批量模式下，一次改值要落到这一批全部事件上。**
+            //
+            // 控件绑的都还是第一个选中事件（ShowBatch / EnterBatch 那里定的），
+            // 所以在这里把目标换成整批 —— 各个 Build* 的写入路径一个字都不用动。
+            //
+            // **但只在写的那一个确实在这一批里的时候才换。**
+            //
+            // 判成员而不是判 "batchEvents 非空"：左边开着设置页时，设置页自己也
+            // 是一个 `LevelEvent`（`levelData.songSettings`），而它永远不属于时间轴
+            // 那一批。按非空判，改一个设置就会把值写给一批正被选中的事件 —— 而且是
+            // 静默的。设置页和参数栏是两块同时在屏上的面板，这条岔路真的走得到。
+            if (batchEvents != null && batchEvents.Count > 1 && BatchContains(levelEvent))
+            {
+                CommitBatch(key, value);
+                return;
+            }
+
+            CommitOne(levelEvent, key, value);
+        }
+
+        /// <summary>这个事件在不在这批里。</summary>
+        private bool BatchContains(LevelEvent levelEvent)
+        {
+            if (levelEvent == null || batchEvents == null)
+            {
+                return false;
+            }
+            for (int i = 0; i < batchEvents.Count; i++)
+            {
+                if (ReferenceEquals(batchEvents[i], levelEvent))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 把同一个值写进这一批全部事件，并且**只记一步撤销**。
+        ///
+        /// 「一步」靠 BeginBatch/EndBatch 攒起来、收口时合成一条复合命令。
+        /// 逐个各自入栈会留下 N 条，作者按一次 Ctrl+Z 只退一个 —— 那正是
+        /// 这个功能最容易做坏的地方。
+        ///
+        /// 死引用（原生撤销会整体换掉 levelData）跳过：写进去会弄坏无关数据，
+        /// 记一步则会让历史里多一条描述「并未发生的编辑」的记录。
+        /// </summary>
+        private void CommitBatch(string key, object value)
+        {
+            EditorCommandHistory.BeginBatch("批量改参 · " + key);
+            try
+            {
+                for (int i = 0; i < batchEvents.Count; i++)
+                {
+                    LevelEvent target = batchEvents[i];
+                    if (target == null || !IsLive(target))
+                    {
+                        continue;
+                    }
+                    CommitOne(target, key, value);
+                }
+            }
+            finally
+            {
+                // 中途抛出去也必须收口：攒下的命令留在 batch 里没人接，
+                // 之后就再也进不了撤销栈了（见 BeginBatch 的说明）。
+                EditorCommandHistory.EndBatch();
+            }
+        }
+
+        /// <summary>把一次改值写进**一个**事件，并按需记一步撤销。</summary>
+        private void CommitOne(LevelEvent levelEvent, string key, object value)
+        {
+            if (levelEvent == null || !IsLive(levelEvent))
             {
                 return;
             }
@@ -2300,6 +3614,20 @@ namespace ADOFAIEditorStudio
             bool previousDisabled = levelEvent.disabled != null
                 && levelEvent.disabled.ContainsKey(key)
                 && levelEvent.disabled[key];
+
+            // 这个事件上的值本来就是这个 —— 什么都不用做。
+            //
+            // 必须挡在**写入之前**。点进输入框又原样点出去就会走到这里，
+            // 而批量模式下这种「没改的提交」要是照写，会把各个事件本来
+            // 不同的值统统抹成第一个事件的那个：一次什么都没改的操作，
+            // 却把整批的差异抹平了，还占掉一步撤销。
+            //
+            // 唯独「本来被禁用」不能走这条路 —— 那种情况写同一个值是有
+            // 意义的，它顺带把属性解禁（见下面）。
+            if (Equals(previousValue, value) && !previousDisabled)
+            {
+                return;
+            }
 
             try
             {
@@ -2346,6 +3674,27 @@ namespace ADOFAIEditorStudio
                 }
             }
 
+            // 设置页写回之后要补上原生的那两步副作用，否则值是变了、画面不跟。
+            // 事件那条路不需要它 —— 事件的 `UpdateDecorationObject` 已经覆盖了。
+            if (ReferenceEquals(levelEvent, settingsPage))
+            {
+                ADOFAI.PropertyInfo settingsInfo = FindInfo(levelEvent, key);
+                ApplySettingsSideEffects(settingsInfo);
+
+                // 改的是背景设置里那个颜色，原生还会顺手重铺一次背景
+                // （PropertyControl_Color.OnChange 里就有这一支）。
+                //
+                // **两条写入路径都要这一步**：uGUI 那条写在调色盘的提交里
+                // （CommitColorFromPicker），ImGui 那条是直接走 Commit 的 ——
+                // 收在这里两边就都盖到了。
+                if (settingsInfo != null
+                    && settingsInfo.type == PropertyType.Color
+                    && levelEvent.eventType == LevelEventType.BackgroundSettings)
+                {
+                    SetBackgroundSafe();
+                }
+            }
+
             // 预览在 Analyze 期间从那些字段缓了一份逐装饰物基线，
             // 所以这次编辑要等一次重建才会上屏。求值器确实会
             // 靠自己的来源签名察觉到变化，但只在它下一次
@@ -2367,7 +3716,100 @@ namespace ADOFAIEditorStudio
             QueueRefresh();
         }
 
+        /// <summary>
+        /// 设置页写回之后的副作用。
+        ///
+        /// 复刻的是原生 `PropertyControl.ApplyTileChanges()` —— 那是原生控件
+        /// 在写值之外**唯一**的副作用入口，只有两个分支：
+        ///
+        ///   · `affectsPath`   → 重算轨道 + 取消装饰物选中 + 重建装饰物对象
+        ///   · `affectsFloors` → 把事件重新摊到地板上
+        ///
+        /// 不补这一步，表现就是「值在存档里变了、画面/时间轴没跟」。
+        ///
+        /// 原生还有个 `OnValueChange`，那只管粒子编辑器的预览（而且粒子编辑器
+        /// 没开时它第一行就返回了），跟设置页无关，所以不搬。
+        /// </summary>
+        private static void ApplySettingsSideEffects(ADOFAI.PropertyInfo info)
+        {
+            if (info == null)
+            {
+                return;
+            }
+
+            scnEditor editor = scnEditor.instance;
+            if (editor == null)
+            {
+                return;
+            }
+
+            try
+            {
+                if (info.affectsPath)
+                {
+                    editor.RemakePath();
+                    editor.DeselectAllDecorations();
+                    editor.UpdateDecorationObjects();
+                }
+                else if (info.affectsFloors)
+                {
+                    editor.ApplyEventsToFloors();
+                }
+            }
+            catch (Exception exception)
+            {
+                Main.Logger.Error("[PropertyPanel] 设置页副作用失败：" + exception);
+            }
+        }
+
         // ---------------------------------------------------------------- 预览
+
+        /// <summary>
+        /// 装饰物事件对应的那张图。**给 ImGui 那版参数栏用的口子。**
+        ///
+        /// 逻辑和 uGUI 那扇的 <see cref="ShowPreview"/> 同源：先看事件自己有没有
+        /// `decorationImage`，没有就拿 `tag` 反查创建该装饰物的事件（见
+        /// <see cref="ResolveDecorationImage"/>）。图的取法也一样 ——
+        /// 从装饰物管理器的 `imageHolder.customSprites` 里按文件名拿。
+        ///
+        /// <returns>
+        /// **是不是装饰物事件。** 不是就整个不画预览块 —— 给 MoveTrack / MoveCamera
+        /// 这类事件顶上留一条空带，只会让人以为"这里应该有东西但坏了"。
+        /// 是装饰物但没图时返回 true、`sprite` 为 null，那边画占位和「<无图片>」。
+        /// </returns>
+        /// </summary>
+        internal bool TryGetDecorationPreview(LevelEvent levelEvent,
+            out Sprite sprite, out string filename)
+        {
+            sprite = null;
+            filename = null;
+
+            // 设置页一律不算装饰物：它的元数据未必把 `isDecoration` 标成 false
+            // （那一位本来是给事件用的）。理由见 ShowPreview。
+            if (settingsPage != null || levelEvent == null
+                || levelEvent.info == null || !levelEvent.info.isDecoration)
+            {
+                return false;
+            }
+
+            filename = ResolveDecorationImage(levelEvent);
+            if (string.IsNullOrEmpty(filename))
+            {
+                return true;
+            }
+
+            scrDecorationManager manager = scrDecorationManager.instance;
+            TextureManager holder = manager == null ? null : manager.imageHolder;
+            if (holder != null && holder.customSprites != null)
+            {
+                TextureManager.CustomSprite custom;
+                if (holder.customSprites.TryGetValue(filename, out custom) && custom != null)
+                {
+                    sprite = custom.sprite;
+                }
+            }
+            return true;
+        }
 
         private void ShowPreview(LevelEvent levelEvent)
         {
@@ -2378,17 +3820,30 @@ namespace ADOFAIEditorStudio
 
             // 只有装饰物事件才有精灵可用来辨认。为
             // 每个 MoveTrack / MoveCamera 事件都显示一个空框，只会白白浪费面板顶部。
-            bool isDecoration = levelEvent != null
+            //
+            // **设置页一律不算装饰物。** 它的元数据未必把 `isDecoration`
+            // 标成 false（那一位本来是给事件用的），照它走会给设置页在顶上
+            // 留出一条 146px 的空带 —— 正是"顶上总空着一块、不知道干嘛用"。
+            bool isDecoration = settingsPage == null
+                && levelEvent != null
                 && levelEvent.info != null
                 && levelEvent.info.isDecoration;
             string filename = isDecoration ? ResolveDecorationImage(levelEvent) : null;
-            if (!isDecoration)
+
+            // **显隐一变就要把空间还给滚动区（或收回来）。** 只 SetActive
+            // 的话块是没了、位置还占着，面板顶部会空出一条 116px 的空白带，
+            // 看上去像"这里应该有东西但坏了"。见 previewVisible。
+            previewVisible = isDecoration;
+            previewHost.gameObject.SetActive(isDecoration);
+            if (panelRoot != null)
             {
-                previewHost.gameObject.SetActive(false);
-                return;
+                ApplyScrollLayout(panelRoot.rect.width, panelRoot.rect.height);
             }
 
-            previewHost.gameObject.SetActive(true);
+            if (!isDecoration)
+            {
+                return;
+            }
             previewCaption.text = string.IsNullOrEmpty(filename) ? "<无图片>" : filename;
 
             Sprite sprite = null;
@@ -2472,7 +3927,7 @@ namespace ADOFAIEditorStudio
 
         // ---------------------------------------------------------------- 取值辅助
 
-        private static T SafeGet<T>(LevelEvent levelEvent, ADOFAI.PropertyInfo info, T fallback)
+        internal static T SafeGet<T>(LevelEvent levelEvent, ADOFAI.PropertyInfo info, T fallback)
         {
             if (levelEvent == null || info == null)
             {
@@ -2488,7 +3943,7 @@ namespace ADOFAIEditorStudio
             }
         }
 
-        private static T SafeGet<T>(LevelEvent levelEvent, string key, T fallback)
+        internal static T SafeGet<T>(LevelEvent levelEvent, string key, T fallback)
         {
             if (levelEvent == null || string.IsNullOrEmpty(key))
             {
@@ -2504,7 +3959,7 @@ namespace ADOFAIEditorStudio
             }
         }
 
-        private static Color SafeGetColor(LevelEvent levelEvent, ADOFAI.PropertyInfo info)
+        internal static Color SafeGetColor(LevelEvent levelEvent, ADOFAI.PropertyInfo info)
         {
             if (levelEvent == null || info == null)
             {
@@ -2520,13 +3975,33 @@ namespace ADOFAIEditorStudio
             }
         }
 
-        private static string FormatFloat(float value)
+        /// <summary>
+        /// 把一个浮点写成界面上显示的文本。
+        ///
+        /// **NaN / 无穷一律写成空字符串。** 谱面里那些没设过的 Vector2
+        /// （位置偏移、大小、视差偏移……）在数据里是 `[null, null]`，读出来就是
+        /// NaN —— 直接写 "NaN" 会让人以为 mod 坏了。空着反而更对：那是"没设过"
+        /// 的诚实表达，而且框里本来就能直接输入。
+        ///
+        /// 放在这里而不是各自的显示代码里，是因为**两扇参数栏都用它** ——
+        /// 改一处两边一起变，不会一个显示 NaN、一个显示空。
+        /// </summary>
+        internal static string FormatFloat(float value)
         {
+            if (float.IsNaN(value) || float.IsInfinity(value))
+            {
+                return string.Empty;
+            }
             return value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
         }
 
-        private static string FormatInt(float value)
+        internal static string FormatInt(float value)
         {
+            // 同理：NaN 取整会变成 0，而那是在说一个假值。空着。
+            if (float.IsNaN(value) || float.IsInfinity(value))
+            {
+                return string.Empty;
+            }
             return Mathf.RoundToInt(value).ToString(System.Globalization.CultureInfo.InvariantCulture);
         }
 

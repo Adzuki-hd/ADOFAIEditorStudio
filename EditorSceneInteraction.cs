@@ -31,6 +31,50 @@ namespace ADOFAIEditorStudio
         private static scrFloor pendingFloor;
         private static LevelEvent decorationSource;
         private static LevelEvent decorationKeyframe;
+
+        // ---------------------------------------------------------------- 装饰物静态拖动
+        //
+        // 场景里拖**已经放好的**装饰物，改的是它**自己那个** AddDecoration
+        // 事件的 `position`（格内偏移），**不动 `floor`**。
+        //
+        // 为什么不学着时间轴那样也改 floor：装饰物归属于某一格，画面里的拖动
+        // 只是在格内挪它。改 floor 的话，时间轴上的块会跟着换格乱跳，
+        // 而用户只是在画面里挪一个装饰物。（要和原版一样"挪到哪格就归哪格"，
+        // 那是另一套，需要时再改 —— 见 DecorationKeyframesEnabled 那段。）
+
+        /// <summary>静态拖动改的那个事件。</summary>
+        private static LevelEvent decorationMoveSource;
+        /// <summary>拖动前的 `position`（格内偏移，单位是格）。撤销要还原它。</summary>
+        private static Vector2 decorationMoveOriginalPosition;
+        private static bool decorationMoveActive;
+
+        /// <summary>
+        /// 此刻是不是**正在调一块装饰物**（媒体拖放中，或拖着已放好的装饰物）。
+        ///
+        /// 滚轮缩放相机的那个补丁要读它：调装饰物时滚轮归装饰物用，
+        /// 否则纯滚轮会被原生拿走变成缩放画面 —— 实测就是
+        /// "Alt / Ctrl 那几档能用，纯滚轮却在缩放画面"。
+        /// </summary>
+        internal static bool IsAdjustingDecoration
+        {
+            get { return mediaDropActive || decorationMoveActive; }
+        }
+
+        // 静态拖动时的**滚轮微调**值。和媒体拖放用的是同一套修饰键映射
+        // （见 ApplyDecorationMoveAdjustments），区别只在于初值是从
+        // **这个装饰物自己的事件**里读出来的，而不是从 100 起。
+        private static float decorationMoveScale = 100f;
+        private static float decorationMoveRotation;
+        private static float decorationMoveOpacity = 100f;
+        private static int decorationMoveDepth;
+        private static float decorationMoveParallax;
+
+        // 上面五个的**原始值**，撤销要还原的就是它们。
+        private static float decorationMoveOriginalScale = 100f;
+        private static float decorationMoveOriginalRotation;
+        private static float decorationMoveOriginalOpacity = 100f;
+        private static int decorationMoveOriginalDepth;
+        private static float decorationMoveOriginalParallax;
         private static Vector2 decorationPositionAtDragStart;
         private static Vector2 decorationPivotOffsetAtDragStart;
 
@@ -48,6 +92,15 @@ namespace ADOFAIEditorStudio
         private static LevelEvent mediaDropEvent;
         private static scrDecoration mediaDropDecoration;
         private static int mediaDropFloor = -1;
+
+        /// <summary>
+        /// 这次媒体拖动**锁定的那一格**。第一次进入画面时定下，之后不变。
+        ///
+        /// 原来每帧都按光标重新取格，于是光标每跨一格、事件的 floor 就变一次，
+        /// 时间轴上的块跟着一格一格地跳 —— 而用户只是在画面里挪这个装饰物。
+        /// 现在只在**第一次点到画面**时定一次，之后只改格内偏移。
+        /// </summary>
+        private static scrFloor mediaDropLockedFloor;
 
         // 滚轮累积出来的微调值，每次变化都写到事件上。
         private static float mediaDropScale = 100f;
@@ -143,6 +196,7 @@ namespace ADOFAIEditorStudio
                 mediaDropDecoration = null;
                 mediaDropEvent = null;
                 mediaDropFloor = -1;
+                mediaDropLockedFloor = null;
 
                 // 关卡的装饰物数量变了，求值器缓存的快照随之
                 // 失效。现在才重建 —— 而不是在装饰物
@@ -366,37 +420,54 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
-            // 绑定到指针下方的 floor，让图片跟着轨道走，
-            // 这是谱面作者对拖到台面上的装饰物的预期。
-            int floorIndex = FindFloorAtWorld(world);
-            if (floorIndex < 0)
+            scnEditor editor = scnEditor.instance;
+            if (editor == null || editor.floors == null || editor.floors.Count == 0)
             {
                 return;
             }
 
-            scnEditor editor = scnEditor.instance;
-            scrFloor floor = editor.floors[floorIndex];
+            // **落格 = 播放头所在的那一格**，而且只在第一次进入画面时定一次。
+            //
+            // 原来按光标取格：光标每跨一格，事件的 floor 就变一次，时间轴上
+            // 的块跟着一格一格地跳 —— 而用户只是在画面里挪这个装饰物。
+            // 改成绑播放头之后，拖到哪里都落在同一格上，块**不会动**，
+            // 画面里的移动只体现为**格内偏移**。
+            bool firstBind = mediaDropLockedFloor == null;
+            scrFloor floor = mediaDropLockedFloor;
+            if (firstBind)
+            {
+                int floorIndex = FindFloorIndexAtTime(editor,
+                    EditorPlaybackBridge.ReadSnapshot().CurrentTime);
+                if (floorIndex < 0)
+                {
+                    return;
+                }
+
+                floor = editor.floors[floorIndex];
+                if (floor == null)
+                {
+                    return;
+                }
+
+                mediaDropLockedFloor = floor;
+                mediaDropFloor = floor.seqID;
+                mediaDropEvent.floor = floor.seqID;
+                mediaDropEvent["relativeTo"] = DecPlacementType.Tile;
+            }
+
             if (floor == null)
             {
                 return;
             }
 
+            // **锚点永远是锁定那一格的位置**，不能跟着光标走 ——
+            // 否则格内偏移每帧都算出 0，图就贴在光标上、不跟轨道了。
             float tileSize = Mathf.Max(0.0001f, ADOBase.controller.tileSize);
             Vector3 anchor = floor.transform.position;
             Vector2 local = new Vector2(
                 (world.x - anchor.x) / tileSize,
                 (world.y - anchor.y) / tileSize);
 
-            // 事件数据才是唯一真相：求值器会用它重新播种每个装饰物，
-            // 保存/撤销快照也把它读回来，所以下面的实时 setter
-            // 只是让改动在这一帧可见。
-            bool floorChanged = floorIndex != mediaDropFloor;
-            if (floorChanged)
-            {
-                mediaDropFloor = floorIndex;
-                mediaDropEvent.floor = floorIndex;
-                mediaDropEvent["relativeTo"] = DecPlacementType.Tile;
-            }
             mediaDropEvent["position"] = local;
 
             scrDecoration decoration = mediaDropDecoration;
@@ -410,12 +481,13 @@ namespace ADOFAIEditorStudio
                 }
             }
 
-            if (floorChanged)
+            if (firstBind)
             {
                 // 从事件的 floor 和 position 重算 startPos，
-                // 求值器的 Baseline 也从这里取。
+                // 求值器的 Baseline 也从这里取。只在锁格那一帧做一遍。
                 decoration.SetPlacementType(DecPlacementType.Tile);
-                decoration.parentFloorNum = floorIndex;
+                // 和事件一样用 seqID —— 它俩是同一个格号的两种表示。
+                decoration.parentFloorNum = floor.seqID;
                 decoration.parentFloor = floor;
             }
 
@@ -449,33 +521,40 @@ namespace ADOFAIEditorStudio
                 DecPlacementType.Tile);
         }
 
-        private static int FindFloorAtWorld(Vector2 world)
+        /// <summary>
+        /// **播放头所在的那一格**（返回 `editor.floors` 里的下标）。
+        ///
+        /// 判定和时间轴 / 参数栏一致：最后一个 `entryTime ≤ 播放头` 的格。
+        ///
+        /// 媒体的落格用它，而**不再按光标取** —— 按光标取的话，光标每跨一格
+        /// 事件的 floor 就变一次，时间轴上的块跟着一格一格地跳，
+        /// 而用户只是在画面里挪这个装饰物。绑播放头之后拖到哪都落在同一格，
+        /// 块不会动，画面里的移动只体现为格内偏移。
+        /// </summary>
+        private static int FindFloorIndexAtTime(scnEditor editor, float time)
         {
-            scnEditor editor = scnEditor.instance;
             if (editor == null || editor.floors == null || editor.floors.Count == 0)
             {
                 return -1;
             }
 
-            int best = -1;
-            float bestDistance = float.MaxValue;
-            for (int i = 0; i < editor.floors.Count; i++)
+            int low = 0;
+            int high = editor.floors.Count;
+            while (low < high)
             {
-                scrFloor floor = editor.floors[i];
-                if (floor == null)
+                int middle = low + (high - low) / 2;
+                scrFloor floor = editor.floors[middle];
+                if (floor != null && Convert.ToSingle(floor.entryTime) <= time)
                 {
-                    continue;
+                    low = middle + 1;
                 }
-
-                float distance = ((Vector2)floor.transform.position - world).sqrMagnitude;
-                if (distance < bestDistance)
+                else
                 {
-                    bestDistance = distance;
-                    best = i;
+                    high = middle;
                 }
             }
 
-            return best;
+            return Mathf.Clamp(low - 1, 0, editor.floors.Count - 1);
         }
 
         /// <summary>
@@ -490,6 +569,7 @@ namespace ADOFAIEditorStudio
             mediaDropActive = false;
             mediaDropDecoration = null;
             mediaDropFloor = -1;
+            mediaDropLockedFloor = null;
 
             if (decoration == null)
             {
@@ -568,6 +648,9 @@ namespace ADOFAIEditorStudio
             pendingFloor = null;
             decorationSource = null;
             decorationKeyframe = null;
+            decorationMoveSource = null;
+            decorationMoveOriginalPosition = Vector2.zero;
+            decorationMoveActive = false;
             CleanupTemporaryFloorColliders();
         }
 
@@ -714,7 +797,233 @@ namespace ADOFAIEditorStudio
             }
         }
 
+        /// <summary>
+        /// 装饰物拖动（关键帧）的开关。**现在是关的。**
+        ///
+        /// 那套会为每一次拖动新建一个 `MoveDecorations` 关键帧 —— 它是
+        /// "做装饰物动画"的机制，而用户当下要的只是"把这个装饰物挪个位置"。
+        /// 两者混在一起表现很怪：拖一次就多一个事件块，并且**不知不觉地**
+        /// 给这个装饰物加了一段动画。关键帧那套还没正式设计过。
+        ///
+        /// 关掉的方式是**不让拖动开始**：调用方看到 false 会直接取消这次拖动
+        /// （不会落到"拖格子"那条路上）。代码整段留着，等设计好了把这里
+        /// 改成 true 就能开。
+        /// </summary>
+        private const bool DecorationKeyframesEnabled = false;
+
         private static bool BeginDecorationDrag()
+        {
+            if (DecorationKeyframesEnabled)
+            {
+                return BeginDecorationKeyframeDrag();
+            }
+
+            // 关键帧那套关着的时候，拖已放好的装饰物走"静态拖动"这条路 ——
+            // 只改它自己事件的格内偏移，不新建任何事件。
+            return BeginDecorationMoveDrag();
+        }
+
+        /// <summary>
+        /// 拖动**已经放好的**装饰物：改它自己那个事件的 `position`（格内偏移），
+        /// **不动 `floor`**。见上面那段说明。
+        /// </summary>
+        private static bool BeginDecorationMoveDrag()
+        {
+            if (pendingDecoration == null || pendingDecoration.sourceLevelEvent == null)
+            {
+                return false;
+            }
+
+            LevelEvent source = pendingDecoration.sourceLevelEvent;
+            if (!source.IsDecoration)
+            {
+                return false;
+            }
+
+            decorationMoveSource = source;
+            decorationMoveOriginalPosition = source["position"] is Vector2 position
+                ? position
+                : Vector2.zero;
+            decorationMoveActive = true;
+
+            // 滚轮微调那五个的初值：**从这个装饰物自己的事件里读**，
+            // 而不是像媒体拖放那样从 100 起 —— 那是给"新拖进来的"用的。
+            decorationMoveScale = ReadNumber(source, "scale", 100f);
+            decorationMoveRotation = ReadNumber(source, "rotation", 0f);
+            decorationMoveOpacity = ReadNumber(source, "opacity", 100f);
+            decorationMoveDepth = Mathf.RoundToInt(ReadNumber(source, "depth", 0f));
+            decorationMoveParallax = ReadNumber(source, "parallax", 0f);
+
+            decorationMoveOriginalScale = decorationMoveScale;
+            decorationMoveOriginalRotation = decorationMoveRotation;
+            decorationMoveOriginalOpacity = decorationMoveOpacity;
+            decorationMoveOriginalDepth = decorationMoveDepth;
+            decorationMoveOriginalParallax = decorationMoveParallax;
+
+            decorationPositionAtDragStart = pendingDecoration.pivotPosVec;
+            decorationPivotOffsetAtDragStart = pendingDecoration.pivotOffsetVec;
+            KillPositionTweens(pendingDecoration.eventTweens);
+
+            // 拖动一开始就在状态栏说明这一套修饰键 —— 不然用户根本不知道
+            // 滚轮能改尺寸、Alt 能转。滚轮一动它就会被具体读数顶掉。
+            ReportAdjustment("拖动装饰物 · 滚轮缩放 / Alt 旋转 / Ctrl 透明度 / Shift 深度 / Shift+Ctrl 视差");
+            return true;
+        }
+
+        /// <summary>
+        /// 从事件数据里读一个数。`scale` / `parallax` 在装饰物上是 Vector2，
+        /// 取它的 x（这两个一直是等值的，媒体拖放写的时候也是 (v, v)）。
+        /// 缺失或类型不认识就退回 fallback。
+        /// </summary>
+        private static float ReadNumber(LevelEvent levelEvent, string key, float fallback)
+        {
+            object value = levelEvent == null ? null : levelEvent[key];
+            if (value == null)
+            {
+                return fallback;
+            }
+            if (value is Vector2 vector)
+            {
+                return vector.x;
+            }
+            if (value is float single)
+            {
+                return single;
+            }
+            if (value is int integer)
+            {
+                return integer;
+            }
+            if (value is double number)
+            {
+                return (float)number;
+            }
+
+            try
+            {
+                return Convert.ToSingle(value);
+            }
+            catch
+            {
+                return fallback;
+            }
+        }
+
+        /// <summary>
+        /// 静态拖动时的**滚轮微调**。修饰键映射和媒体拖放完全相同
+        /// （见 ApplyDropAdjustments），差别只在初值 —— 这几个数是从
+        /// 这个装饰物自己的事件里读出来的，不是从 100 起。
+        ///
+        /// 每帧都要跑：它既是"读滚轮"，也是"把五个值写回事件并施加到装饰物上"。
+        /// </summary>
+        private static void ApplyDecorationMoveAdjustments()
+        {
+            LevelEvent decoration = decorationMoveSource;
+            if (decoration == null)
+            {
+                return;
+            }
+
+            float scroll = Input.GetAxis("Mouse ScrollWheel");
+            if (Mathf.Abs(scroll) > 0.0001f)
+            {
+                float notches = scroll * ScrollNotchesPerUnit;
+                bool shift = Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift);
+                bool control = Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl);
+                if (Input.GetKey(KeyCode.LeftAlt) || Input.GetKey(KeyCode.RightAlt))
+                {
+                    decorationMoveRotation += notches * DropRotatePerNotch;
+                    ReportAdjustment("旋转  " + decorationMoveRotation.ToString("0.#") + "°");
+                }
+                else if (shift && control)
+                {
+                    decorationMoveParallax = Mathf.Clamp(
+                        decorationMoveParallax + notches * DropParallaxPerNotch, -200f, 200f);
+                    ReportAdjustment("平行  X/Y  " + decorationMoveParallax.ToString("0"));
+                }
+                else if (control)
+                {
+                    decorationMoveOpacity = Mathf.Clamp(
+                        decorationMoveOpacity + notches * DropOpacityPerNotch, 0f, 100f);
+                    ReportAdjustment("透明度  " + decorationMoveOpacity.ToString("0") + "%");
+                }
+                else if (shift)
+                {
+                    decorationMoveDepth += Mathf.RoundToInt(notches) * DropDepthPerNotch;
+                    ReportAdjustment("深度  " + decorationMoveDepth);
+                }
+                else
+                {
+                    decorationMoveScale = Mathf.Clamp(
+                        decorationMoveScale * Mathf.Pow(DropScalePerNotch, notches), 1f, 20000f);
+                    ReportAdjustment("缩放  " + decorationMoveScale.ToString("0") + "%");
+                }
+            }
+
+            decoration["scale"] = new Vector2(decorationMoveScale, decorationMoveScale);
+            decoration["rotation"] = decorationMoveRotation;
+            decoration["opacity"] = decorationMoveOpacity;
+            decoration["depth"] = decorationMoveDepth;
+            decoration["parallax"] = new Vector2(decorationMoveParallax, decorationMoveParallax);
+
+            ApplyDecorationMoveValues();
+        }
+
+        /// <summary>
+        /// 把当前那五个值实时施加到装饰物上。
+        ///
+        /// 每一步都得过 setter：只写事件数据的话值存下来了却从不绘制
+        /// （深度映射到排序层、视差要重跑屏幕夹取），屏幕上一点变化都没有。
+        /// 顺序和媒体拖放一致。
+        /// </summary>
+        private static void ApplyDecorationMoveValues()
+        {
+            scrDecoration decoration = pendingDecoration;
+            if (decoration == null)
+            {
+                return;
+            }
+
+            decoration.SetRotation(decorationMoveRotation);
+            decoration.SetScale(new Vector2(decorationMoveScale / 100f, decorationMoveScale / 100f));
+            decoration.SetOpacity(Mathf.Clamp01(decorationMoveOpacity / 100f));
+            decoration.SetDepth(decorationMoveDepth);
+            decoration.SetParallax(
+                new Vector2(decorationMoveParallax, decorationMoveParallax),
+                DecPlacementType.Tile);
+        }
+
+        /// <summary>
+        /// 一次拖动里某个键真的变了就收进撤销记录，并把它的 `disabled` 清掉 ——
+        /// 值写进去但键是禁用的，游戏会当没写。
+        /// </summary>
+        private static void AddDecorationMoveChange(LevelEvent target, string key,
+            object oldValue, object newValue,
+            List<string> keys, List<object> oldValues, List<object> newValues,
+            List<bool> oldDisabled, List<bool> newDisabled)
+        {
+            if (Equals(oldValue, newValue))
+            {
+                return;
+            }
+
+            bool wasDisabled = target.disabled != null
+                && target.disabled.ContainsKey(key)
+                && target.disabled[key];
+
+            keys.Add(key);
+            oldValues.Add(oldValue);
+            newValues.Add(newValue);
+            oldDisabled.Add(wasDisabled);
+            newDisabled.Add(false);
+
+            if (target.disabled != null && target.disabled.ContainsKey(key))
+            {
+                target.disabled[key] = false;
+            }
+        }
+
+        private static bool BeginDecorationKeyframeDrag()
         {
             if (pendingDecoration == null || pendingDecoration.sourceLevelEvent == null)
             {
@@ -780,13 +1089,23 @@ namespace ADOFAIEditorStudio
             {
                 return;
             }
+
+            // 先跑滚轮微调（它也会把缩放/旋转/透明度/深度/视差施加到装饰物上），
+            // 再跑位置 —— 位置那一步会把装饰物摆到指针处，放最后不会被覆盖。
+            ApplyDecorationMoveAdjustments();
+
             Vector2 translation = world - dragOriginWorld;
             UpdateDecorationDrag(translation);
         }
 
         private static void UpdateDecorationDrag(Vector2 translation)
         {
-            if (pendingDecoration == null || decorationKeyframe == null)
+            if (pendingDecoration == null)
+            {
+                return;
+            }
+
+            if (!decorationMoveActive && decorationKeyframe == null)
             {
                 return;
             }
@@ -802,28 +1121,103 @@ namespace ADOFAIEditorStudio
                 adjusted.y = 0f;
             }
 
-            decorationKeyframe["positionOffset"] = adjusted / ADOBase.controller.tileSize;
-            pendingDecoration.SetPosition(decorationPositionAtDragStart + adjusted, decorationPivotOffsetAtDragStart);
+            float tileSize = Mathf.Max(0.0001f, ADOBase.controller.tileSize);
+            if (decorationMoveActive)
+            {
+                // 静态拖动：写回**它自己那个**事件的 `position`。
+                // 单位是格，所以位移要除以 tileSize。
+                decorationMoveSource["position"] = decorationMoveOriginalPosition + adjusted / tileSize;
+            }
+            else
+            {
+                decorationKeyframe["positionOffset"] = adjusted / tileSize;
+            }
+
+            pendingDecoration.SetPosition(
+                decorationPositionAtDragStart + adjusted, decorationPivotOffsetAtDragStart);
         }
 
         private static void EndPointer()
         {
             bool shouldResume = dragging && resumeAfterDrag;
             bool changed = dragging && decorationKeyframe != null;
+
+            // **静态拖动**（改已放好装饰物的格内偏移）。
+            //
+            // 这是一次**值改动** —— 事件本来就在谱面里，只是 `position` 变了 ——
+            // 所以撤销走增量那条路，也**不需要**整份重推。
+            bool movedStatically = dragging && decorationMoveActive;
+            if (movedStatically)
+            {
+                scnEditor editor = scnEditor.instance;
+                if (editor != null && decorationMoveSource != null)
+                {
+                    Vector2 finalPosition = decorationMoveSource["position"] is Vector2 position
+                        ? position
+                        : decorationMoveOriginalPosition;
+
+                    // 一次拖动可能同时改了位置**和**滚轮微调的那几项，
+                    // 所以收成**一条多键**撤销记录 —— 撤销按一次全回来。
+                    List<string> keys = new List<string>();
+                    List<object> oldValues = new List<object>();
+                    List<object> newValues = new List<object>();
+                    List<bool> oldDisabled = new List<bool>();
+                    List<bool> newDisabled = new List<bool>();
+
+                    AddDecorationMoveChange(decorationMoveSource, "position",
+                        decorationMoveOriginalPosition, finalPosition,
+                        keys, oldValues, newValues, oldDisabled, newDisabled);
+                    AddDecorationMoveChange(decorationMoveSource, "scale",
+                        new Vector2(decorationMoveOriginalScale, decorationMoveOriginalScale),
+                        new Vector2(decorationMoveScale, decorationMoveScale),
+                        keys, oldValues, newValues, oldDisabled, newDisabled);
+                    AddDecorationMoveChange(decorationMoveSource, "rotation",
+                        decorationMoveOriginalRotation, decorationMoveRotation,
+                        keys, oldValues, newValues, oldDisabled, newDisabled);
+                    AddDecorationMoveChange(decorationMoveSource, "opacity",
+                        decorationMoveOriginalOpacity, decorationMoveOpacity,
+                        keys, oldValues, newValues, oldDisabled, newDisabled);
+                    AddDecorationMoveChange(decorationMoveSource, "depth",
+                        decorationMoveOriginalDepth, decorationMoveDepth,
+                        keys, oldValues, newValues, oldDisabled, newDisabled);
+                    AddDecorationMoveChange(decorationMoveSource, "parallax",
+                        new Vector2(decorationMoveOriginalParallax, decorationMoveOriginalParallax),
+                        new Vector2(decorationMoveParallax, decorationMoveParallax),
+                        keys, oldValues, newValues, oldDisabled, newDisabled);
+
+                    // 原地按下去又原样放开（一个键都没变）不占一步撤销。
+                    if (keys.Count > 0)
+                    {
+                        EditorCommandHistory.RecordBlockDrag(
+                            editor,
+                            decorationMoveSource,
+                            keys.ToArray(),
+                            oldValues.ToArray(),
+                            newValues.ToArray(),
+                            oldDisabled.ToArray(),
+                            newDisabled.ToArray());
+                        EditorPlaybackBridge.RequestEvaluatorRebuild("decoration-move");
+                        changed = true;
+                    }
+                }
+            }
+
             Reset();
             if (changed)
             {
-                // **拖装饰物是结构性改动，要通知联机层。**
-                //
-                // 它做的事是「往 events 里追加一个关键帧」——新增事件
-                // 没法增量同步（没有稳定下标），只能整份重推。
-                // `OnLocalStructuralChange` 会排一次自动同步，所以拖完
-                // 对面自动就能看到，不需要用户做任何事。
-                Multiplayer.MultiplayerSession.OnLocalStructuralChange();
+                if (!movedStatically)
+                {
+                    // 关键帧那条路是**结构性改动**（往 events 里追加了一个事件），
+                    // 只能整份重推。静态拖动只是改了个值，增量同步就够了，
+                    // 那条路由 RecordPropertyEdit 自己报出去。
+                    Multiplayer.MultiplayerSession.OnLocalStructuralChange();
+                }
 
-                ReportSelection("当前帧关键帧已写入"
-                    + (Multiplayer.MultiplayerSession.IsLinked
-                        ? "，会自动同步给其他人" : "，可按 Ctrl+Z 撤回"));
+                ReportSelection(movedStatically
+                    ? "装饰物已更新，可按 Ctrl+Z 撤回"
+                    : "当前帧关键帧已写入"
+                        + (Multiplayer.MultiplayerSession.IsLinked
+                            ? "，会自动同步给其他人" : "，可按 Ctrl+Z 撤回"));
             }
             if (shouldResume)
             {

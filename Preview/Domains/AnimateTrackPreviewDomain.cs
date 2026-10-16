@@ -126,7 +126,18 @@ namespace ADOFAIEditorStudio.Preview.Domains
             float rawBeatsAhead = 0f;
             float rawBeatsBehind = 0f;
 
-            LevelData levelData = scnGame.instance == null ? null : scnGame.instance.levelData;
+            // 全局动画设置来自关卡数据。scnGame.instance 在编辑器路径上
+            // 可能为空，那就退回编辑器自己持有的 customLevel——否则
+            // 「只写了全局 trackAnimation / trackDisappearAnimation、
+            // 一个 AnimateTrack 事件都没有」的谱面会被整个丢掉，
+            // 表现就是那两个参数像没生效（China E 就是这样）。
+            scnGame game = scnGame.instance;
+            if (game == null && ADOBase.editor != null)
+            {
+                game = ADOBase.editor.customLevel;
+            }
+
+            LevelData levelData = game == null ? null : game.levelData;
             if (levelData != null)
             {
                 appear = levelData.trackAnimation;
@@ -179,6 +190,27 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 BuildFloor(context, floorIndex, appear, scaledAhead, disappear, scaledBehind);
             }
 
+            // 段必须按起始时间升序，Evaluate 才能用「遇到还没开始的段就停」
+            // 这个短路，而且后启动的段要最后应用（后者写值，就赢）。
+            //
+            // AppendAppear 与 AppendDisappear 各自追加时不保证这个顺序：
+            // 出现动画的 scattered 段是 -∞、settle 段在格进入前几拍，而
+            // 消失动画的 gone 段可能远早于 settle（原版不钳，见该处注释）。
+            // 于是数组序会是 [-∞, 15.3, -247]，短路失效，而且 gone 最后应用、
+            // 直接把 settle 盖掉——格就停在散开状态。
+            //
+            // 原版里这两个是各自独立的 tween，后启动的最后写值，所以出现
+            // 动画的 settle 赢过消失动画。按 Start 排序正是复现这个先后。
+            for (int i = 0; i < floors.Length; i++)
+            {
+                FloorAnimation animation = floors[i];
+                if (animation != null && animation.Segments.Count > 1)
+                {
+                    PreviewStableSort.Sort(animation.Segments,
+                        (left, right) => left.Start.CompareTo(right.Start));
+                }
+            }
+
             int segmentCount = 0;
             for (int i = 0; i < floors.Length; i++)
             {
@@ -190,7 +222,6 @@ namespace ADOFAIEditorStudio.Preview.Domains
             Main.Logger.Log("[StaticPreview/AnimateTrack] analyzed " + events.Count
                 + " events, " + segmentCount + " segments.");
         }
-
         private static List<PreviewEventSnapshot> CollectAnimateEvents(PreviewTimelineContext context)
         {
             IList<PreviewEventSnapshot> source = context.GetEvents(LevelEventType.AnimateTrack);
@@ -252,6 +283,14 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 return;
             }
 
+            // 不要拿「编辑器暂停态有没有 ffxFloorAppearPlus /
+            // ffxFloorDisappearPlus」当门。暂停时它们确实一个都没有
+            // （ApplyEventsToFloors 走到 `if (paused) return;` 就不再往下建），
+            // 但开始游玩时 WaitForStartCo 会调
+            // scnGame.PrepVfx(floors, checkpointNum)，而那个重载的
+            // remakeFloors 默认 true——两个组件都会建出来，动画是生效的。
+            //
+            // 真正出问题的是段的应用顺序，见 Analyze 末尾的排序。
             float crotchet = GetCrotchet(context, floorIndex);
             float duration = Mathf.Min(crotchet * 0.5f, 0.5f);
 
@@ -399,8 +438,15 @@ namespace ADOFAIEditorStudio.Preview.Domains
             }
 
             float crotchet = GetCrotchet(context, floorIndex);
-            float start = Convert.ToSingle(next.EntryTime)
-                + Mathf.Max(0f, beatsBehind) * crotchet;
+            // 不钳 beatsBehind，忠实原版
+            //   ffxFloorDisappearPlus.SetStartTime:
+            //     startTime = nextfloor.entryTime + tilesBehind * num
+            // （注意它和 appear 不同——appear 那边有 Mathf.Max(..., 0f)）。
+            // tilesBehind 为 -2000 这种值时 startTime 落到谱面开始之前，
+            // 散开动画在开头就跑完了。保持它很负，好让出现动画的 settle 段
+            // 在 Analyze 末尾排序后位于它之后、把它盖回去——那正是原版
+            // 两个独立 tween 的先后关系。
+            float start = Convert.ToSingle(next.EntryTime) + beatsBehind * crotchet;
 
             // 只设置这个动画真正驱动的通道。原生
             // ffxFloorDisappearPlus 给每种类型建不同的 tween：
@@ -519,6 +565,28 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 bool touchedScale = false;
                 bool touchedOpacity = false;
 
+                // 最后启动的那一段。段升序，所以扫到第一个「还没开始」
+                // 就能停。
+                int lastStarted = -1;
+                for (int i = 0; i < animation.Segments.Count; i++)
+                {
+                    if (animation.Segments[i].Start > frame.Time)
+                    {
+                        break;
+                    }
+                    lastStarted = i;
+                }
+
+                // 这一帧还有没有别人（MoveTrack）在写这一格。位置和不透明度
+                // 两处判据用的是同一个值：有别人在管这一格，本域就让位。
+                bool contestedWrite = ownerTrack != null
+                    && ownerTrack.HasPendingWrite(binding);
+
+                // 有没有「已开始的段在主张透明度」，由下面的值循环填进
+                // touchedOpacity；循环跑完它还是 false 的话，说明这一格
+                // **没有任何人在管透明度**，那里会替它写回 1。
+                // 判据和原因见循环之后那段。
+
                 for (int i = 0; i < animation.Segments.Count; i++)
                 {
                     Segment segment = animation.Segments[i];
@@ -527,35 +595,54 @@ namespace ADOFAIEditorStudio.Preview.Domains
                         break;
                     }
 
-                    // 段的时间窗。原生那边每个段都是一次性 tween，跑完就松手，
-                    // 姿态交给同时段还在跑的其他特效（比如 MoveTrack 的长位移）。
+                    // **值**按 Start 升序逐段叠加（后启动者覆盖），这一层
+                    // 和原生「后启动的 tween 最后写值」等价（升序由 Analyze
+                    // 末尾的排序保证）。
                     //
-                    // 这个求值器是每帧重算的，如果不过滤「已经结束」的段，
-                    // 那个把姿态落回基线的 settle 段就会**永远**在生效，
-                    // 每帧把 MoveTrack 写好的旋转/缩放改回基线——
-                    // 表现就是「MoveTrack 从没生效过」。
+                    // 跑完的段**保持终态**，不「松手」。原生每个段是一次性
+                    // tween，跑完停在终点；求值器每帧重算，所以「已经结束」
+                    // 也必须继续按终态写——否则格会退回上一次写它的值。
+                    // 实测这张谱：散开段写完之后，settle 一跑完就不写，
+                    // 格永远停在散开；而且负责「初始透明」的 scattered 段
+                    // （O=0）窗口被中间插入的消失段截断，settle 变成从 100
+                    // lerp 到 100，淡入整个消失。
                     //
-                    // 窗口的右端取「下一段的起点」，所以同一时刻只有一个段在驱动；
-                    // 最后一段则取它自己跑完的时刻。散开段从无限早开始、是持续状态，
-                    // 它由下一段（settle）接管。
-                    double segmentEnd = i + 1 < animation.Segments.Count
-                        ? animation.Segments[i + 1].Start
-                        : (double.IsNegativeInfinity(segment.Start)
-                            ? double.PositiveInfinity
-                            // 末段的结束点：要保持的段（消失）跑完仍算生效，
-                            // 不保持的（落地）跑完就松手。
-                            : (segment.PersistAfter
-                                ? double.PositiveInfinity
-                                : segment.Start + segment.Duration));
-                    if (frame.Time >= segmentEnd)
-                    {
-                        continue;
-                    }
-
+                    // **但通道的归属要另算。** 原生那条跑完的 tween 会
+                    // 释放通道，之后 MoveTrack 的 tween 才能接管；求值器
+                    // 如果让跑完的段继续主张通道，它就会每帧把位置写回
+                    // 烘焙值，把后入队的 MoveTrack 位移抹掉——Dream Flower
+                    // 第 174 格就是这么不动的（实测同一帧两笔写入：
+                    // MoveTrack 写 (-36.6213)，其后一笔又写回 (-35.1213)，
+                    // 落回烘焙值，因为那条全轨道 Fade 的 appear 段早跑完了
+                    // 却还在每帧主张位置）。
+                    //
+                    // 归属规则：**只有最后启动的那一段**、以及标记了
+                    // PersistAfter 的终态段（消失）才主张通道。
+                    // 「最后启动」这一条是必需的——早先试过单纯「跑完松手」，
+                    // 结果 Duration=0 的散开初态又开始主张，格永远停在散开。
+                    //
+                    // **位置另有一条让位规则**：跑完的 appear 段，在
+                    // 「这一帧确实有别的域在写这一格的位置」时把位置让出去。
+                    // 只在有竞争时才让（而不是一律松手），是因为一旦一律松手，
+                    // 拖动播放头整个跨过该格的动画时，那一帧没有更早的写入
+                    // 打底，格就永久卡在散开初态。
+                    //
+                    // 旋转/缩放/透明度不让：settle 段这三个通道的目标值就是
+                    // 烘焙值本身（BaseRotation / BaseScale / 1），和 MoveTrack
+                    // 非位移事件写的是同一个数，谁写都一样；而透明度是全局
+                    // 消失动画的通道，必须保持「后写者胜」，否则已经淡出的格
+                    // 会被 MoveTrack 写回来。
                     float ratio = segment.Duration <= 0f
                         ? 1f
                         : Mathf.Clamp01((frame.Time - (float)segment.Start) / segment.Duration);
                     float eased = PreviewEase.EasedValue(0f, 1f, ratio, segment.Ease);
+                    bool completed = segment.Duration > 0f
+                        && frame.Time > (float)segment.Start + segment.Duration;
+                    bool owns = segment.PersistAfter || i == lastStarted;
+                    // 终态段（消失）永远主张位置——它必须把轨道收走。
+                    // 其余段只有「最后启动」时才主张，跑完且这一帧有竞争时让位。
+                    bool claimsPosition = segment.PersistAfter
+                        || (i == lastStarted && !(completed && contestedWrite));
 
                     if (segment.HasPosition)
                     {
@@ -563,7 +650,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
                             ? animation.BasePosition + segment.Position
                             : segment.Position;
                         position = Vector3.LerpUnclamped(position, target, eased);
-                        touchedPosition = true;
+                        if (claimsPosition) { touchedPosition = true; }
                     }
                     if (segment.HasRotation)
                     {
@@ -571,18 +658,45 @@ namespace ADOFAIEditorStudio.Preview.Domains
                             ? animation.BaseRotation + segment.Rotation
                             : segment.Rotation;
                         rotation = Mathf.LerpUnclamped(rotation, target, eased);
-                        touchedRotation = true;
+                        if (owns) { touchedRotation = true; }
                     }
                     if (segment.HasScale)
                     {
                         scale = Vector2.LerpUnclamped(scale, segment.Scale, eased);
-                        touchedScale = true;
+                        if (owns) { touchedScale = true; }
                     }
                     if (segment.HasOpacity)
                     {
                         opacity = Mathf.LerpUnclamped(opacity, segment.Opacity * 100f, eased);
-                        touchedOpacity = true;
+                        if (owns) { touchedOpacity = true; }
                     }
+                }
+
+                // **没有任何已开始的段主张透明度 → 这一格此刻就该是正常
+                // 可见，必须显式写回 1。**
+                //
+                // 原版的消失 tween 是一次性的：跑完就把格停在 opacity 0。
+                // 播放头往回跳时，那些消失段的 Start 落在播放头之后，
+                // 值循环第一句就 `break` 掉了；而 MoveTrack 的
+                // RestoreBaseline 刻意不恢复透明度（那是本域的通道）。
+                // 于是格永远停在被淡出过的样子——实测 Offshore 往回拖到
+                // t=1.8、球已经回到第 1 格，场景里仍有 96 格 opacity=0。
+                //
+                // 判据**不能**写成「一段都没开始」（原来的 `lastStarted < 0`）。
+                // 这张谱每格都有一个 appear 的散开段 `s0@-inf`——它一直
+                // 是"已开始"的，所以 lastStarted 从来不是 -1，那条兜底
+                // 一次都没生效过。真正要看的是**有没有已开始的段在写
+                // 透明度这个通道**：s0/s1 都是 `o=-`（不碰透明度），
+                // 只有消失段 s2 才带 `o=0.00`。实测 t=3.90 时
+                // f20/f50/f100 的 last 分别是 1/0/0 而 live 全是 0。
+                //
+                // contestedWrite 是让位规则：MoveTrack 这一帧也在写这一格
+                // （比如 `MoveTrack(opacity 0)` 藏住后面的格）时本域不插手，
+                // 否则会把那次隐藏撤销掉。
+                if (!touchedOpacity && !contestedWrite)
+                {
+                    opacity = 100f;
+                    touchedOpacity = true;
                 }
 
                 // 不直接写，交给 MoveTrack 的延迟队列在帧末统一下发。

@@ -11,6 +11,14 @@ namespace ADOFAIEditorStudio.Preview
         private static readonly MoveTrackPreviewDomain MoveTrack = new MoveTrackPreviewDomain();
         private static readonly List<IPreviewDomain> Domains = BuildDomains();
 
+        /// <summary>上一次求值的播放头时间，用来识别"跳转"。</summary>
+        private static float lastEvaluatedTime;
+        /// <summary>
+        /// 一帧里播放头挪出这么多秒，就认定是拖动 / 瞬间点击而不是正常播放
+        /// （正常一帧约 0.016 秒）。见 TryEvaluate 里"跳转让各域作废历史"。
+        /// </summary>
+        private const float HistoryJumpSeconds = 0.25f;
+
         private static List<IPreviewDomain> BuildDomains()
         {
             // AnimateTrack 与 MoveTrack 共用格的 transform/opacity 通道，
@@ -27,6 +35,9 @@ namespace ADOFAIEditorStudio.Preview
                 // 因为现在 ball follow 和 MoveCamera 都由同一个写入者负责，
                 // 不再是 SyncResidentNativeCameraFocus 旁边的第二个写入者。
                 MoveTrack,
+                // **必须排在最前**：freeroam 出场时它会挪网格格子和球所在那格，
+                // 而 Camera 和 Planet 都读它算出来的位置（运镜起点、球的圆心）。
+                new FreeRoamPreviewDomain(),
                 // 点亮球已踩过的格。辉度的显隐由 hasLit 决定，而格子建出来时
                 // 它是 false——预览里没有球踩过，不补这一步辉度永远看不见。
                 new LightedTrackPreviewDomain(),
@@ -43,6 +54,9 @@ namespace ADOFAIEditorStudio.Preview
                 new FilterPreviewDomain(),
                 new FilterAdvancedPreviewDomain(),
                 new ParticlePreviewDomain(),
+                // 必须排在 Planet 之前：它写 planet.transform.localScale，
+                // 而 Planet 域的圆环要靠那个缩放把自己除回去。
+                new ScalePlanetsPreviewDomain(),
                 new PlanetPreviewDomain()
             };
         }
@@ -225,6 +239,28 @@ namespace ADOFAIEditorStudio.Preview
         }
 
         /// <summary>
+        /// 一格在**本帧**真正在哪。
+        ///
+        /// 先问 MoveTrack 的待写队列，没有才看 transform。
+        /// 不能直接读 transform.position：MoveTrack 的写入排在 LateUpdate
+        /// （原生组件跑在求值器之后，会把 transform 重置回烘焙值），
+        /// 而球和相机都在求值阶段跑，比写入早——直接读会拿到**上一帧**的位置。
+        /// 轨道正在动的时候，那一帧的差就是「球没粘在轨道上」的样子。
+        /// </summary>
+        internal static Vector3 FloorPositionThisFrame(scrFloor floor)
+        {
+            if (floor == null)
+            {
+                return Vector3.zero;
+            }
+
+            Vector3 pending;
+            return MoveTrack.TryGetPendingPosition(floor, out pending)
+                ? pending
+                : floor.transform.position;
+        }
+
+        /// <summary>
         /// 关工作台时把编辑器引导线还回去。
         ///
         /// 它属于原生编辑器：用户在编辑器里改位置轨道时，那几条虚线
@@ -259,6 +295,43 @@ namespace ADOFAIEditorStudio.Preview
             get { return active; }
         }
 
+        /// <summary>
+        /// 补做"只有进播放才会做"的那几件场景准备。
+        ///
+        /// 原生把这一批（SetFxPlusFromComponents / PrepVfx / ColorFreeroam /
+        /// DrawHolds / DrawMultiPlanet）放在 scrController.WaitForStartCo 那个
+        /// 进播放的协程里。求值器接管的预览刻意不调 Play()，于是它们全都不跑。
+        ///
+        /// 目前只有 ColorFreeroam 需要在这里补：它做两件事——
+        ///   1. 把 freeroam 的**生成格**染成入口格的颜色
+        ///      （`item2.SetColor(item.parentFloor.floorRenderer.material.GetColor("_Color"))`）
+        ///   2. 把入口格**本体**的 renderer 关掉，让网格取代它
+        ///      （`item.parentFloor.floorRenderer.renderer.enabled = false`）
+        ///
+        /// 不做的话 freeroam 那一段是"默认外观的网格 + 还多一个正常格"。网格
+        /// 本身是 `ApplyEventsToFloors` 里 `MakeFreeroamGrid` 建的，那条路
+        /// 加载时就跑了，所以格子是有的——只是没人给它上色。
+        ///
+        /// DrawMultiPlanet 在 `ApplyEventsToFloors`（21234）里已经调过，不用补。
+        /// </summary>
+        private static void PrepareEditorScenery()
+        {
+            scrLevelMaker maker = scrLevelMaker.instance;
+            if (maker == null)
+            {
+                return;
+            }
+
+            try
+            {
+                maker.ColorFreeroam();
+            }
+            catch (Exception exception)
+            {
+                Main.Logger.Error("[StaticPreview] ColorFreeroam failed: " + exception);
+            }
+        }
+
         internal static bool TryBegin(scnEditor editor, out string error)
         {
             error = null;
@@ -272,6 +345,7 @@ namespace ADOFAIEditorStudio.Preview
             {
                 End();
                 context = new PreviewTimelineContext(editor);
+                PrepareEditorScenery();
                 int enabledCount = 0;
                 for (int i = 0; i < Domains.Count; i++)
                 {
@@ -348,7 +422,40 @@ namespace ADOFAIEditorStudio.Preview
                 }
 
                 long engineStart = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
-                PreviewEvaluationFrame frame = new PreviewEvaluationFrame(context, Mathf.Max(0f, time));
+                float frameTime = Mathf.Max(0f, time);
+
+                // **播放头跳转 → 让各域作废它们的历史状态。**
+                //
+                // 一帧里挪出超过阈值就一定是拖动或瞬间点击（正常播放一帧只走
+                // 约 0.016 秒）。各域里那些「携带值 / 已应用缓存 / 会话状态」
+                // 都假设播放头连续移动；跳转必须显式告诉它们历史作废，否则它们
+                // 会把上一次的值当成"已经算对了"而跳过写入——实测的表现就是
+                // 慢拖能还原、快拖和瞬间点击不还原。
+                if (lastEvaluatedTime > 0f
+                    && Math.Abs(frameTime - lastEvaluatedTime) > HistoryJumpSeconds)
+                {
+                    for (int i = 0; i < Domains.Count; i++)
+                    {
+                        IHistoryResettable resettable = Domains[i] as IHistoryResettable;
+                        if (resettable == null)
+                        {
+                            continue;
+                        }
+
+                        try
+                        {
+                            resettable.ResetHistory();
+                        }
+                        catch (Exception exception)
+                        {
+                            Main.Logger.Error("ResetHistory failed for "
+                                + Domains[i].Name + ": " + exception);
+                        }
+                    }
+                }
+                lastEvaluatedTime = frameTime;
+
+                PreviewEvaluationFrame frame = new PreviewEvaluationFrame(context, frameTime);
                 int enabledCount = 0;
                 long syncStart = 0L;
                 for (int i = 0; i < Domains.Count; i++)

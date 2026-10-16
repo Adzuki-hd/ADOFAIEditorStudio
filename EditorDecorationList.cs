@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Text;
 using ADOFAI;
 using ADOFAI.LevelEditor.Controls;
+using ADOFAIEditorStudio.Ui;
 using TMPro;
 using UnityEngine;
 using UnityEngine.EventSystems;
@@ -12,6 +13,24 @@ using ModEntry = UnityModManagerNet.UnityModManager.ModEntry;
 namespace ADOFAIEditorStudio
 {
     /// <summary>
+    /// 给 ImGui 版装饰物列表用的一行快照。
+    ///
+    /// 快照里保留 Source，但显示字段都从创建时的副本来——拖动装饰物时，
+    /// EditorCommandHistory 会临时改写运行时对象的 tag，不能每帧回读运行时对象。
+    /// </summary>
+    internal struct ImGuiDecorationEntry
+    {
+        internal LevelEvent Source;
+        internal string DisplayName;
+        internal string Tag;
+        internal LevelEventType Type;
+        internal int Floor;
+        internal bool Visible;
+        internal bool Locked;
+        internal bool Selected;
+    }
+
+    /// <summary>
     /// 时间轴左侧的装饰物列表。仿原版编辑器左栏的那个列表：
     /// 列出当前谱面所有装饰物，能选中、单独隐藏/锁定、删除、批量隐藏/锁定，
     /// 以及按名字、tag、类型、所在格搜索。
@@ -19,16 +38,24 @@ namespace ADOFAIEditorStudio
     /// 它不做拖拽排序——那个功能要改 .adofai 文件里 decorations 数组的
     /// 顺序（游戏按这个顺序决定渲染层级），影响面远超一个列表该有的分量。
     ///
-    /// **这个类不写任何文件，也不依赖 PACL2**。增删改一律把活交给
+    /// **这个类不写任何文件，也不依赖任何别的 mod**。增删改一律把活交给
     /// scnEditor，由它自己的存档与撤销快照兜底；删除走工作台自己的
     /// 路径（见 DeleteRow 的注释），因为原版那条会把每个装饰物重建一遍。
     /// </summary>
     internal sealed class EditorDecorationList : MonoBehaviour
     {
-        /// <summary>一行的高度。30 够放下图标、名字和三个小按钮。</summary>
-        private const float RowHeight = 30f;
-        /// <summary>行与行之间的缝。留一条，选中框才读得出是单独一行。</summary>
-        private const float RowGap = 2f;
+        /// <summary>
+        /// 一行的高度。抬到 42 是为了让左梯形 + 右倒梯形这两块形状真的看得出来——
+        /// 30 的时候形状只有 28 高，斜边短到读不出是斜的。
+        /// </summary>
+        private const float RowHeight = 42f;
+        /// <summary>行与行之间的缝。6 让每行的两块形状各自独立，不连成一片。</summary>
+        private const float RowGap = 6f;
+
+        /// <summary>行内容离面板左右边缘的距离。</summary>
+        private const float RowInset = 10f;
+        /// <summary>行内容的实际高度。</summary>
+        private const float RowBodyHeight = RowHeight - RowGap;
         private const float PanePadding = 8f;
         /// <summary>
         /// 固定头的高度：新建按钮行、搜索框、批量开关行。
@@ -99,6 +126,43 @@ namespace ADOFAIEditorStudio
 
         private static readonly string[] DecoTypeNames = { "图片", "文本", "粒子", "对象" };
 
+        /// <summary>
+        /// 行首那条实心色标，按装饰物类型取色（下标和 <see cref="DecoTypes"/> 对齐）。
+        ///
+        /// 用四个色相而不是"统一的紫"：这个列表要回答的第一个问题就是
+        /// "哪些是图、哪些是文本"，颜色比图标快得多——图标要凑近才认得出。
+        ///
+        /// 四色都取满饱和度。色标只有一格宽，一压暗就成了灰线，等于没画。
+        /// 它们不会和紫/金打架：紫是"能点的"、金是"要读的"，这四个只是分类标签，
+        /// 面积也小到不参与整体色调。
+        /// </summary>
+        private static readonly Color[] TypeChipColors =
+        {
+            UiPrimitives.Hex("38bdf8"),
+            UiPrimitives.Hex("4ade80"),
+            UiPrimitives.Hex("fb7185"),
+            UiPrimitives.Hex("fbbf24")
+        };
+
+        // 色标的尺寸。**不能做成 3px 的细线**——3px 在 1080p 上就是一根
+        // 头发丝，读不出颜色，也就起不到"按类型分堆"的作用。做成一块
+        // 圆角色块，宽度按能看出色相来定。
+        private const float TypeChipWidth = 12f;
+        private const float TypeChipHeight = 18f;
+
+        private static Color TypeChipColor(LevelEventType type)
+        {
+            for (int i = 0; i < DecoTypes.Length; i++)
+            {
+                if (DecoTypes[i] == type)
+                {
+                    return TypeChipColors[i];
+                }
+            }
+
+            return TypeChipColors[TypeChipColors.Length - 1];
+        }
+
         // ---------------------------------------------------------------- 行数据
 
         /// <summary>
@@ -109,7 +173,7 @@ namespace ADOFAIEditorStudio
         /// scrDecoration.decorationTag 去绑定关键帧（松手才还原），
         /// 回读运行时对象会在拖动期间读到假的 tag。
         /// </summary>
-        private sealed class DecoEntry
+        internal sealed class DecoEntry
         {
             internal LevelEvent Source;
             internal string DisplayName;
@@ -125,6 +189,8 @@ namespace ADOFAIEditorStudio
             internal GameObject GameObject;
             internal RectTransform Rect;
             internal Image Background;
+            /// <summary>行首那条实心色标。按类型取色，见 <see cref="TypeChipColors"/>。</summary>
+            internal Image TypeChip;
             internal Image TypeIcon;
             internal TextMeshProUGUI Name;
             internal TextMeshProUGUI Tag;
@@ -183,6 +249,11 @@ namespace ADOFAIEditorStudio
                     Mathf.Max(40f, width - PanePadding * 2f), listHeight);
             }
 
+            // 表头也要跟着重排。搜索框和两个批量按钮的宽度是
+            // "面板宽减内边距"，面板宽会随时间轴高度变——只建一次的话，
+            // 拖时间轴把面板压窄之后它们还保持旧宽度，直接凸到隔壁列去。
+            LayoutHeader();
+
             rowsDirty = true;
             UpdateRows();
         }
@@ -229,8 +300,35 @@ namespace ADOFAIEditorStudio
             UpdateRows();
         }
 
+        /// <summary>
+        /// 被左栏的标签页切走时置位，让 <see cref="OnDisable"/> 跳过批量收尾。
+        ///
+        /// 那种隐藏是暂时的——用户只是去看一眼媒体，切回来时「全部隐藏/锁定」
+        /// 该还在。工作台整个关掉才是真该收掉的时候，那条路径会先把这个标记
+        /// 撤掉再隐藏。
+        /// </summary>
+        internal bool KeepBatchOnDisable;
+
+        /// <summary>
+        /// 工作台要关掉时调这个，把批量隐藏/锁定收干净。
+        ///
+        /// 不能只靠 <see cref="OnDisable"/>：从媒体页关工作台时，装饰物页
+        /// 早在切标签那一步就已经是隐藏的，这次 SetActive 不会再触发它，
+        /// 于是被豁免的批量状态就留在了场景里。
+        /// </summary>
+        internal void ReleaseBatch()
+        {
+            KeepBatchOnDisable = false;
+            ClearBatch();
+        }
+
         private void OnDisable()
         {
+            if (KeepBatchOnDisable)
+            {
+                return;
+            }
+
             // 批量开关只改运行时对象，本来就活不过场景重载。这里显式收掉，
             // 免得工作台被关掉之后装饰物还留在隐藏状态。
             ClearBatch();
@@ -258,17 +356,19 @@ namespace ADOFAIEditorStudio
             {
                 LevelEventType type = DecoTypes[i];
                 Button button = CreateIconTile("Create" + type, root,
-                    PanePadding + i * (tile + gap), 6f, tile, type,
+                    PanePadding + i * (tile + gap), TileRowY, tile, type,
                     delegate { CreateDecoration(type); });
                 SetButtonPalette(button, false);
+                createTiles.Add(button);
             }
 
             float countWidth = 44f;
+            // 计数是"要读的数"，用第二强调色（金），和能点的紫色分开。
             countLabel = CreateText("Count", root, w - countWidth + PanePadding, 6f, countWidth, tile,
-                "0", 10f, Palette.TextMuted, TextAlignmentOptions.MidlineRight, false);
+                "0", 11f, Palette.AccentSecondary, TextAlignmentOptions.MidlineRight, false);
 
             // 第二行：搜索框。原版支持 tag: / type: / floor: 前缀，这里沿用。
-            searchField = CreateSearchField(root, PanePadding, 38f, w, 22f);
+            searchField = CreateSearchField(root, PanePadding, SearchRowY, w, 22f);
 
             // 第三行：批量开关。
             //
@@ -276,9 +376,9 @@ namespace ADOFAIEditorStudio
             // 装饰物的谱面长什么样」用的，不该顺手改掉作者的数据。
             // 图标沿用行上那两个（闭眼 / 闭锁），和原版的总开关一致。
             float batchWidth = (w - 4f) * 0.5f;
-            hideAllButton = CreateBatchButton("HideAll", root, PanePadding, 66f, batchWidth,
+            hideAllButton = CreateBatchButton("HideAll", root, PanePadding, BatchRowY, batchWidth,
                 "全部隐藏", delegate { ToggleBatchHidden(); }, out hideAllIcon);
-            lockAllButton = CreateBatchButton("LockAll", root, PanePadding + batchWidth + 4f, 66f, batchWidth,
+            lockAllButton = CreateBatchButton("LockAll", root, PanePadding + batchWidth + 4f, BatchRowY, batchWidth,
                 "全部锁定", delegate { ToggleBatchLocked(); }, out lockAllIcon);
         }
 
@@ -286,6 +386,58 @@ namespace ADOFAIEditorStudio
         private Button lockAllButton;
         private Image hideAllIcon;
         private Image lockAllIcon;
+
+        /// <summary>四个「新建装饰物」图标按钮。重排表头时要一起摆。</summary>
+        private readonly List<Button> createTiles = new List<Button>();
+
+        /// <summary>
+        /// 按当前 paneWidth 重排表头。
+        ///
+        /// 表头的宽度全是"面板宽减内边距"推出来的，所以面板宽一变就必须重跑。
+        /// 这里踩过坑：原来只在创建时摆一次，拖动时间轴把面板压窄之后，
+        /// 搜索框和两个批量按钮仍保持旧宽度，凸出到隔壁列上。
+        /// </summary>
+        private void LayoutHeader()
+        {
+            const float tile = 26f;
+            const float gap = 4f;
+            const float countWidth = 44f;
+            float w = paneWidth - PanePadding * 2f;
+
+            for (int i = 0; i < createTiles.Count; i++)
+            {
+                SetTopLeft(createTiles[i].GetComponent<RectTransform>(),
+                    PanePadding + i * (tile + gap), 6f, tile, tile);
+            }
+
+            if (countLabel != null)
+            {
+                SetTopLeft(countLabel.rectTransform, w - countWidth + PanePadding, 6f, countWidth, tile);
+            }
+
+            if (searchField != null)
+            {
+                RectTransform rect = searchField.GetComponent<RectTransform>();
+                SetTopLeft(rect, PanePadding, SearchRowY, w, rect.sizeDelta.y);
+            }
+
+            float batchWidth = (w - 4f) * 0.5f;
+            if (hideAllButton != null)
+            {
+                RectTransform rect = hideAllButton.GetComponent<RectTransform>();
+                SetTopLeft(rect, PanePadding, BatchRowY, batchWidth, rect.sizeDelta.y);
+            }
+            if (lockAllButton != null)
+            {
+                RectTransform rect = lockAllButton.GetComponent<RectTransform>();
+                SetTopLeft(rect, PanePadding + batchWidth + 4f, BatchRowY, batchWidth, rect.sizeDelta.y);
+            }
+        }
+
+        /// <summary>表头三行的纵向位置。建和排共用，避免两处各写一份又对不上。</summary>
+        private const float TileRowY = 6f;
+        private const float SearchRowY = 38f;
+        private const float BatchRowY = 66f;
 
         /// <summary>
         /// 方形图标按钮：一个圆角底 + 居中一张事件图标。
@@ -343,7 +495,7 @@ namespace ADOFAIEditorStudio
             iconImage.raycastTarget = false;
 
             CreateText("Label", background.rectTransform, 6f + iconSize + 4f, 0f,
-                Mathf.Max(10f, width - iconSize - 16f), 22f, label, 10f,
+                Mathf.Max(10f, width - iconSize - 16f), 22f, label, 11f,
                 Palette.TextSecondary, TextAlignmentOptions.MidlineLeft, false);
             return button;
         }
@@ -511,6 +663,87 @@ namespace ADOFAIEditorStudio
             }
 
             return builder.ToString();
+        }
+
+        /// <summary>
+        /// 填充 ImGui 版要显示的快照。
+        ///
+        /// 不把私有 `DecoEntry` 暴露出去，也不让 ImGui 自己重建一份装饰物扫描。
+        /// 过滤后的顺序和 uGUI 列表保持一致。
+        /// </summary>
+        internal void FillImGuiEntries(List<ImGuiDecorationEntry> target)
+        {
+            target.Clear();
+            for (int i = 0; i < filtered.Count; i++)
+            {
+                DecoEntry entry = filtered[i];
+                target.Add(new ImGuiDecorationEntry
+                {
+                    Source = entry.Source,
+                    DisplayName = entry.DisplayName,
+                    Tag = entry.Tag,
+                    Type = entry.Type,
+                    Floor = entry.Floor,
+                    Visible = entry.Visible,
+                    Locked = entry.Locked,
+                    Selected = IsSelected(entry.Source)
+                });
+            }
+        }
+
+        // ---------------------------------------------------------------- 给 ImGui 版用
+
+        /// <summary>
+        /// 装饰物列表搬到 ImGui 之后，头部那几个入口也得能用同一套实现。
+        ///
+        /// 一律转发到已有的私有方法上，不复制逻辑 —— 建装饰物、搜索、
+        /// 批量显隐/锁定这三件事都带着副作用（写谱面、记撤销、联机上报），
+        /// 复制一份出来迟早两边不一致。
+        /// </summary>
+        internal int TotalCount { get { return entries.Count; } }
+        internal int FilteredCount { get { return filtered.Count; } }
+        internal bool BatchHidden { get { return batchHidden; } }
+        internal bool BatchLocked { get { return batchLocked; } }
+        internal static int TypeCount { get { return DecoTypes.Length; } }
+        internal static LevelEventType TypeAt(int index) { return DecoTypes[index]; }
+        internal static string TypeNameAt(int index) { return DecoTypeNames[index]; }
+        internal static Color TypeColorAt(int index) { return TypeChipColors[index]; }
+        internal static int SlotOf(LevelEventType type) { return TypeSlotOf(type); }
+        internal void SetSearchText(string text) { OnSearchChanged(text); }
+        internal void ToggleBatchHiddenFromImGui() { ToggleBatchHidden(); }
+        internal void ToggleBatchLockedFromImGui() { ToggleBatchLocked(); }
+        internal void CreateDecorationFromImGui(LevelEventType type) { CreateDecoration(type); }
+
+        /// <summary>
+        /// 按 `LevelEvent` 找回当前条目 —— ImGui 那边手里只有事件的引用。
+        ///
+        /// 在**未过滤**的 entries 里找：ImGui 显示的是过滤后的结果，但条目本身
+        /// 必须始终找得到（否则筛选生效时点某一行会静默失效）。
+        /// </summary>
+        internal DecoEntry EntryFor(LevelEvent source)
+        {
+            if (source == null)
+            {
+                return null;
+            }
+            for (int i = 0; i < entries.Count; i++)
+            {
+                if (ReferenceEquals(entries[i].Source, source))
+                {
+                    return entries[i];
+                }
+            }
+            return null;
+        }
+
+        /// <summary>ImGui 接管左栏时隐藏原来的 uGUI 列表，切回时还原。</summary>
+        internal void SuppressForImGui(bool suppressed)
+        {
+            if (gameObject.activeSelf == !suppressed)
+            {
+                return;
+            }
+            gameObject.SetActive(!suppressed);
         }
 
         private void ApplyFilter()
@@ -717,6 +950,13 @@ namespace ADOFAIEditorStudio
 
             Image background = rowObject.GetComponent<Image>();
             background.color = Palette.ButtonNormal;
+            // 一行一块圆角矩形。
+            //
+            // 中间试过把它斜切成两块梯形（左块装名字、右块装三个按钮），
+            // 读起来是碎的——一行本来就是一个整体，切开以后像是左右两类
+            // 东西，而且斜边还要求内容留出跟着斜角走的边距，得不偿失。
+            background.sprite = roundedSprite;
+            background.type = Image.Type.Sliced;
             background.raycastTarget = true;
 
             Button button = rowObject.GetComponent<Button>();
@@ -732,15 +972,26 @@ namespace ADOFAIEditorStudio
                 GameObject = rowObject,
                 Rect = rect,
                 Background = background,
-                TypeIcon = CreateImage("TypeIcon", rect, 8f, (RowHeight - RowGap - 16f) * 0.5f, 16f, 16f, Color.white),
-                Name = CreateText("Name", rect, 28f, 0f, 100f, RowHeight - RowGap, string.Empty, 11f,
-                    Palette.TextSecondary, TextAlignmentOptions.MidlineLeft, false),
-                Tag = CreateText("Tag", rect, 100f, 0f, 10f, RowHeight - RowGap, string.Empty, 10f,
+                TypeChip = CreateImage("TypeChip", rect, RowInset,
+                    (RowBodyHeight - TypeChipHeight) * 0.5f,
+                    TypeChipWidth, TypeChipHeight, TypeChipColors[0]),
+                TypeIcon = CreateImage("TypeIcon", rect, 22f, (RowBodyHeight - 16f) * 0.5f, 16f, 16f, Color.white),
+                Name = CreateText("Name", rect, 42f, 0f, 100f, RowBodyHeight, string.Empty, UiType.Body,
+                    UiTheme.Current.TextPrimary, TextAlignmentOptions.MidlineLeft, false),
+                Tag = CreateText("Tag", rect, 100f, 0f, 10f, RowBodyHeight, string.Empty, 11f,
                     Palette.TextMuted, TextAlignmentOptions.MidlineRight, false)
             };
-            row.Eye = CreateIconButton("Eye", rect, 0f, eyeOpen, delegate { ToggleRowVisible(row); }, out row.EyeIcon);
-            row.Lock = CreateIconButton("Lock", rect, 0f, lockOpen, delegate { ToggleRowLocked(row); }, out row.LockIcon);
-            row.Delete = CreateIconButton("Delete", rect, 0f, deleteIcon, delegate { DeleteRow(row); }, out row.DeleteIcon);
+            row.Eye = CreateIconButton("Eye", rect, 0f, eyeOpen,
+                delegate { ToggleVisibleEntry(EntryOf(row)); }, out row.EyeIcon);
+            row.Lock = CreateIconButton("Lock", rect, 0f, lockOpen,
+                delegate { ToggleLockedEntry(EntryOf(row)); }, out row.LockIcon);
+            row.Delete = CreateIconButton("Delete", rect, 0f, deleteIcon,
+                delegate { DeleteEntry(EntryOf(row)); }, out row.DeleteIcon);
+            row.TypeChip.raycastTarget = false;
+            // 圆角色块，不是方块：这块 12×18 的形状是行上唯一的纯装饰图形，
+            // 直角在深色底上显得硬，圆角才和标签药丸、面板圆角是同一套语言。
+            row.TypeChip.sprite = roundedSprite;
+            row.TypeChip.type = Image.Type.Sliced;
             row.TypeIcon.raycastTarget = false;
             row.TypeIcon.preserveAspect = true;
             row.Name.overflowMode = TextOverflowModes.Ellipsis;
@@ -751,7 +1002,7 @@ namespace ADOFAIEditorStudio
             DecoRowHover hover = rowObject.AddComponent<DecoRowHover>();
             hover.Initialize(this, row);
 
-            button.onClick.AddListener(delegate { ActivateRow(row); });
+            button.onClick.AddListener(delegate { ActivateEntry(EntryOf(row)); });
 
             rowObject.SetActive(false);
             return row;
@@ -855,18 +1106,29 @@ namespace ADOFAIEditorStudio
 
             bool selected = IsSelected(entry.Source);
             row.Background.color = selected ? Palette.Selected : Palette.ButtonNormal;
-            row.Name.color = selected ? Palette.TextPrimary : Palette.TextSecondary;
+
+            // 名字是这一行的主体，所以两种状态都是主文字色——选中与否靠
+            // 底色和字重区分就够了。原来非选中时给的是次要色，于是整行
+            // 没有主体：名字、tag、三个按钮权重差不多，眼睛不知道该看哪。
+            row.Name.color = UiTheme.Current.TextPrimary;
 
             Sprite typeIcon = null;
             if (GCS.levelEventIcons != null)
             {
                 GCS.levelEventIcons.TryGetValue(entry.Type, out typeIcon);
             }
+            row.TypeChip.color = TypeChipColor(entry.Type);
             row.TypeIcon.sprite = typeIcon;
             row.TypeIcon.enabled = typeIcon != null;
 
             row.Name.text = entry.DisplayName;
             row.Name.fontStyle = selected ? FontStyles.Bold : FontStyles.Normal;
+
+            // 色标、图标、名字依次排开，都从行左缘内缩 RowInset。
+            SetTopLeft(row.TypeChip.rectTransform, RowInset,
+                (RowBodyHeight - TypeChipHeight) * 0.5f, TypeChipWidth, TypeChipHeight);
+            SetTopLeft(row.TypeIcon.rectTransform, RowInset + 20f,
+                (RowBodyHeight - 16f) * 0.5f, 16f, 16f);
 
             // 名字和 tag 抢同一段横向空间。名字给大头（它才是用来分辨
             // 两个装饰物的），tag 只在确实有内容时才占一截。
@@ -875,9 +1137,9 @@ namespace ADOFAIEditorStudio
             // （vni、s1 这种），多数只有几个字符；而名字是文件名，
             // 长得多。按比例分会让 tag 白占掉一截该给名字的地方。
             float buttonsWidth = EyeWidth + LockWidth + DeleteWidth;
-            float textRight = width - 8f - buttonsWidth;
-            float textLeft = 26f;
-            float textHeight = RowHeight - RowGap;
+            float textLeft = RowInset + 42f;
+            float textRight = width - RowInset - buttonsWidth - 8f;
+            float textHeight = RowBodyHeight;
             if (string.IsNullOrEmpty(entry.Tag))
             {
                 row.Tag.text = string.Empty;
@@ -893,10 +1155,11 @@ namespace ADOFAIEditorStudio
                     Mathf.Max(20f, textRight - tagWidth - 6f - textLeft), textHeight);
             }
 
-            // 从右往左排：删除最右，然后锁，然后眼睛。
-            SetTopLeft(row.Delete.GetComponent<RectTransform>(), width - 8f - DeleteWidth, 0f, DeleteWidth, RowHeight - RowGap);
-            SetTopLeft(row.Lock.GetComponent<RectTransform>(), width - 8f - DeleteWidth - LockWidth, 0f, LockWidth, RowHeight - RowGap);
-            SetTopLeft(row.Eye.GetComponent<RectTransform>(), width - 8f - DeleteWidth - LockWidth - EyeWidth, 0f, EyeWidth, RowHeight - RowGap);
+            // 三个按钮贴着右缘，从右往左：删除最右，然后锁，然后眼睛。
+            float buttonsX = width - RowInset - buttonsWidth;
+            SetTopLeft(row.Eye.GetComponent<RectTransform>(), buttonsX, 0f, EyeWidth, RowBodyHeight);
+            SetTopLeft(row.Lock.GetComponent<RectTransform>(), buttonsX + EyeWidth, 0f, LockWidth, RowBodyHeight);
+            SetTopLeft(row.Delete.GetComponent<RectTransform>(), buttonsX + EyeWidth + LockWidth, 0f, DeleteWidth, RowBodyHeight);
 
             row.EyeIcon.sprite = entry.Visible ? eyeOpen : eyeClosed;
             row.LockIcon.sprite = entry.Locked ? lockClosed : lockOpen;
@@ -928,7 +1191,7 @@ namespace ADOFAIEditorStudio
 
             float alpha = row.Hovered ? 1f : 0.72f;
 
-            Color eyeColor = entry.Visible ? Palette.TextMuted : new Color(1f, 0.55f, 0.45f, 1f);
+            Color eyeColor = entry.Visible ? Palette.TextMuted : UiTheme.Current.FeedbackDanger;
             eyeColor.a = alpha;
             row.EyeIcon.color = eyeColor;
 
@@ -975,9 +1238,14 @@ namespace ADOFAIEditorStudio
 
         // ---------------------------------------------------------------- 操作
 
-        private void ActivateRow(DecoRow row)
+        /// <summary>
+        /// 选中这一条（点一下 = 只选这个，Ctrl+点已选中 = 取消选中）。
+        ///
+        /// 收的是 `DecoEntry` 而不是 `DecoRow` —— ImGui 那版没有 uGUI 的行壳子，
+        /// 但它要的是**同一套行为**，所以核心逻辑按条目写，两边都调这里。
+        /// </summary>
+        internal void ActivateEntry(DecoEntry entry)
         {
-            DecoEntry entry = EntryOf(row);
             scnEditor editor = Editor;
             if (entry == null || editor == null)
             {
@@ -1006,9 +1274,8 @@ namespace ADOFAIEditorStudio
             UpdateRows();
         }
 
-        private void ToggleRowVisible(DecoRow row)
+        internal void ToggleVisibleEntry(DecoEntry entry)
         {
-            DecoEntry entry = EntryOf(row);
             scnEditor editor = Editor;
             if (entry == null || editor == null)
             {
@@ -1032,9 +1299,8 @@ namespace ADOFAIEditorStudio
             RefreshNow();
         }
 
-        private void ToggleRowLocked(DecoRow row)
+        internal void ToggleLockedEntry(DecoEntry entry)
         {
-            DecoEntry entry = EntryOf(row);
             scnEditor editor = Editor;
             if (entry == null || editor == null)
             {
@@ -1053,9 +1319,8 @@ namespace ADOFAIEditorStudio
             RefreshNow();
         }
 
-        private void DeleteRow(DecoRow row)
+        internal void DeleteEntry(DecoEntry entry)
         {
-            DecoEntry entry = EntryOf(row);
             scnEditor editor = Editor;
             if (entry == null || editor == null || editor.decorations == null)
             {
@@ -1372,6 +1637,22 @@ namespace ADOFAIEditorStudio
         private Sprite BuildGlyph(string name, bool[] pixels)
         {
             const int size = 12;
+            Texture2D texture = BuildGlyphTexture(name, pixels);
+            Sprite sprite = Sprite.Create(texture, new Rect(0f, 0f, size, size), new Vector2(0.5f, 0.5f), 100f);
+            sprite.name = name;
+            return sprite;
+        }
+
+        /// <summary>
+        /// 手绘位图 → 贴图。
+        ///
+        /// **单独拆出来是给 ImGui 那版用的**（EditorImGuiIcons.TryGetDrawn）——
+        /// 两个界面画的是同一份像素图，但一边要 Sprite、一边要贴图，所以把
+        /// "位图变贴图"这一步提出来共用，免得两边各写一遍迟早走样。
+        /// </summary>
+        internal static Texture2D BuildGlyphTexture(string name, bool[] pixels)
+        {
+            const int size = 12;
             Texture2D texture = new Texture2D(size, size, TextureFormat.RGBA32, false);
             texture.name = name + "Texture";
             texture.filterMode = FilterMode.Bilinear;
@@ -1390,14 +1671,11 @@ namespace ADOFAIEditorStudio
             }
             texture.SetPixels32(colors);
             texture.Apply();
-
-            Sprite sprite = Sprite.Create(texture, new Rect(0f, 0f, size, size), new Vector2(0.5f, 0.5f), 100f);
-            sprite.name = name;
-            return sprite;
+            return texture;
         }
 
         /// <summary>眼睛：一个椭圆轮廓，闭眼时中间加一道斜杠。</summary>
-        private static bool[] EyeGlyph(bool open)
+        internal static bool[] EyeGlyph(bool open)
         {
             const int size = 12;
             bool[] pixels = new bool[size * size];
@@ -1445,7 +1723,7 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>锁：一个方体加一道弧形的梁。</summary>
-        private static bool[] LockGlyph(bool closed)
+        internal static bool[] LockGlyph(bool closed)
         {
             const int size = 12;
             bool[] pixels = new bool[size * size];
@@ -1483,7 +1761,7 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>删除：一个叉。</summary>
-        private static bool[] CrossGlyph()
+        internal static bool[] CrossGlyph()
         {
             const int size = 12;
             bool[] pixels = new bool[size * size];
@@ -1592,7 +1870,7 @@ namespace ADOFAIEditorStudio
             button.transition = Selectable.Transition.None;
             button.navigation = new Navigation { mode = Navigation.Mode.None };
             button.onClick.AddListener(delegate { action(); });
-            CreateText("Label", image.rectTransform, 0f, 0f, width, height, label, 10.5f,
+            CreateText("Label", image.rectTransform, 0f, 0f, width, height, label, 11f,
                 Palette.TextSecondary, TextAlignmentOptions.Center, false);
             return button;
         }

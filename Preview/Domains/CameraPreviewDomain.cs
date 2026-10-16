@@ -67,7 +67,16 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
         // 预计算好的跟随状态，每个格边界一条。
         private Vector2[] cameraAtFloorEntry = new Vector2[0];
+        // 每一格起步时的 zoom 基准。平时等于谱面的 zoom；freeroam 出场会把
+        // 它设成 1（原生 MoveCameraToTile 明确传了 zoom: 1f），之后一直沿用。
+        private float[] zoomBaseAtFloor = new float[0];
         private Vector2[] ballAtFloorEntry = new Vector2[0];
+        // 长按格上相机跟随目标的**起点**和**终点**（两端都是球的位置）。
+        // 非长按格两个都等于 ballAtFloorEntry，于是目标不随时间变，
+        // 和以前完全一样。见 EvaluateFollow。
+        private Vector2[] holdStartAtFloor = new Vector2[0];
+        private Vector2[] holdEndAtFloor = new Vector2[0];
+        private bool[] holdFloor = new bool[0];
         private Vector2[] floorPosition = new Vector2[0];
         private float[] floorEntryTime = new float[0];
         private float[] floorCamspeed = new float[0];
@@ -84,6 +93,34 @@ namespace ADOFAIEditorStudio.Preview.Domains
         private float defaultZoom;
         private float tileSize = 1f;
         private int floorCount;
+
+        /// <summary>
+        /// 谱面是不是老格式的相对定位（`settings.version &lt; 11` 会自动置位，
+        /// 也可以显式写 `legacyCamRelativeTo`）。
+        ///
+        /// **一条事件不写 `relativeTo` 时，两支的行为完全不同**，原生在
+        /// ffxCameraPlus.StartEffect 里分岔：
+        ///
+        ///     if (legacyRelativeTo &amp;&amp; !movementTypeUsed) {
+        ///         Vector2 p = camParent.position;
+        ///         finalPos = positionUsed ? (targetPos + p) : p;
+        ///     } else {
+        ///         switch (movementTypeUsed ? movementType : lastUsedMovementType) { ... }
+        ///     }
+        ///
+        /// 也就是说：**老格式把事件的位置当成「相对相机当前位置的偏移」，
+        /// 而且完全不碰跟随模式**；新格式才是「继承上一个用过的模式」。
+        ///
+        /// 本域一直实现的是**新格式那一支**（注释里那套"缺失的
+        /// relativeTo 是继承已生效的模式"，是为了修 M3 谱第 270/274/277 格
+        /// 相机归零的问题，在非老格式谱上是对的）。
+        ///
+        /// 注意 legacy 那一支的公式和 `LastPosition` 分支**逐字相同**
+        /// （都是 `camParent.position` 加上偏移），而且同样不改跟随模式。
+        /// 所以这里不去新写一段逻辑，只在需要时把模式替换成 LastPosition，
+        /// 复用本域早就调好的那条路径。见 EvaluateChannels 里的 resolveMode。
+        /// </summary>
+        private bool legacyRelativeTo;
 
         // 镜像事件链的工作值，纯粹是为了让 LogCameraCompare 能报出来。
         // 它们是 EvaluateChannels 里的局部变量；LastPosition 事件是针对
@@ -205,6 +242,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
             LevelData levelData = scnGame.instance == null ? null : scnGame.instance.levelData;
             defaultMode = levelData == null ? CamMovementType.Player : levelData.camRelativeTo;
+            // 和原生赋值那一行同源：ffxCameraPlus.legacyRelativeTo = levelData.legacyCamRelativeTo
+            legacyRelativeTo = levelData != null && levelData.legacyCamRelativeTo;
             defaultPosition = levelData == null ? Vector2.zero : levelData.camPosition;
             defaultRotation = levelData == null ? 0f : levelData.camRotation;
             float rawZoom = levelData == null ? 100f : levelData.camZoom;
@@ -310,7 +349,11 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
             floorCount = context.FloorCount;
             cameraAtFloorEntry = new Vector2[floorCount];
+            zoomBaseAtFloor = new float[floorCount];
             ballAtFloorEntry = new Vector2[floorCount];
+            holdStartAtFloor = new Vector2[floorCount];
+            holdEndAtFloor = new Vector2[floorCount];
+            holdFloor = new bool[floorCount];
             floorPosition = new Vector2[floorCount];
             floorEntryTime = new float[floorCount];
             floorCamspeed = new float[floorCount];
@@ -337,6 +380,9 @@ namespace ADOFAIEditorStudio.Preview.Domains
             }
 
             Vector2 camera = Vector2.zero;
+            // 每一格起步时用哪个 zoom 当基准。平时就是谱面的 zoom，但 freeroam
+            // 出场会把 zoom 设成 1，而且那之后一直不变——所以它得跟着递推走。
+            float zoomBase = defaultZoom;
             for (int i = 0; i < floorCount; i++)
             {
                 PreviewFloorSnapshot floor = context.GetFloor(i);
@@ -362,6 +408,20 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 ballAtFloorEntry[i] = ballAnchor;
                 floorPosition[i] = tileAnchor;
                 floorEntryTime[i] = entryTime;
+
+                // 长按格上球会沿一条滑移线走完整格，相机得跟着走。
+                // 见 EvaluateFollow 里那段说明。
+                holdFloor[i] = floor != null && floor.HoldLength > -1;
+                if (holdFloor[i])
+                {
+                    holdStartAtFloor[i] = ToVector2(context.ResolveBallCentre(i));
+                    holdEndAtFloor[i] = ResolveHoldEnd(context, i, ballAnchor);
+                }
+                else
+                {
+                    holdStartAtFloor[i] = ballAnchor;
+                    holdEndAtFloor[i] = ballAnchor;
+                }
 
                 float camspeed = GetCameraSpeed(context, floor);
                 floorCamspeed[i] = camspeed;
@@ -420,11 +480,39 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     float ratio = advanceSpeed <= 0.0001f
                         ? 1f
                         : Mathf.Clamp01(floorDuration / advanceSpeed);
-                    camera = Vector2.LerpUnclamped(cameraAtFloorEntry[i - 1],
-                        ballAtFloorEntry[i - 1], ratio);
+                    // 必须走和逐帧求值同一个采样函数。
+                    //
+                    // 以前这里直接朝 ballAtFloorEntry[i-1] 推进，也就是
+                    // "球进这一格时的位置"。长按格上那个目标已经改成时变的
+                    // 滑移线了，两处不一致的话，递推算出的"这一格结束时
+                    // 相机在哪"会停在格心附近，而求值那边已经跟着球滑出去
+                    // 5 格——落地下一格的那一帧相机就猛地跳回来。
+                    camera = SampleFollow(i - 1, floorDuration, ratio);
+                }
+
+                // freeroam 出场。原生那条是 scrController.MoveCameraToTile
+                // （29072）：建一个 Tile 模式的 ffxCameraPlus，把相机直接带到
+                // **下一格**，而且 `zoom` 参数传的是 `1f`——不是"保持当前"，
+                // 是明确设成 1。谱面默认 zoom 222 的关卡，出场后就变成 100。
+                //
+                // 出场发生在**上一格的末尾**，所以它决定的是**这一格**的起步
+                // 位置和 zoom 基准——判据要用 i-1，不是 i。写成 i 会把入口那格
+                // 自己的入口位置也改掉，表现就是"进自由段先跳一下、镜头被重置"。
+                //
+                // 只改逐帧求值不改这里的递推，就会反过来在落地下一格时跳回来
+                // （和长按滑移那次是同一个毛病）。两头都要算。
+                scrFloor previousBinding = i > 0 ? context.GetFloorBinding(i - 1) : null;
+                if (previousBinding != null && previousBinding.freeroam
+                    && previousBinding.moveCamAtFreeroamEnd && previousBinding.nextfloor != null)
+                {
+                    camera = new Vector2(
+                        previousBinding.nextfloor.transform.position.x,
+                        previousBinding.nextfloor.transform.position.y);
+                    zoomBase = 1f;
                 }
 
                 cameraAtFloorEntry[i] = camera;
+                zoomBaseAtFloor[i] = zoomBase;
             }
         }
 
@@ -445,6 +533,21 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // 原生模型里两份相机贡献是相加的：
             // camParent (MoveCamera) + camera.localPosition (球的跟随)。
             Vector2 follow = EvaluateFollow(floorIndex, frame.Time);
+
+            // freeroam 出场运镜。原生 MoveCameraToTile 建的是一个 **Tile 模式**的
+            // ffxCameraPlus——相机贴着那格平移到下一格，不是继续跟球。所以这里
+            // 直接把跟随分量整个换掉，而不是在它上面再叠一条。
+            //
+            // 起点/终点/进度由 FreeRoamPreviewDomain 算好（它先跑），用的是原生
+            // 那条 `duration = crotchet/speed * outTime * 0.5 / pitch` 加 outEase。
+            if (FreeRoamPreviewDomain.ExitCameraActive)
+            {
+                follow = Vector2.LerpUnclamped(
+                    FreeRoamPreviewDomain.ExitCameraFrom,
+                    FreeRoamPreviewDomain.ExitCameraTo,
+                    FreeRoamPreviewDomain.ExitCameraProgress);
+            }
+
             Vector2 resolved = follow;
 
             diagFollowCam = cameraAtFloorEntry[floorIndex];
@@ -457,8 +560,19 @@ namespace ADOFAIEditorStudio.Preview.Domains
             diagPrevEntryTime = floorIndex <= 0 ? 0f : floorEntryTime[floorIndex - 1];
 
             float rotation = defaultRotation;
-            float zoom = defaultZoom;
+            // zoom 的基准跟着递推走：freeroam 出场把它设成 1 之后就一直沿用。
+            float baseZoom = zoomBaseAtFloor.Length > floorIndex
+                ? zoomBaseAtFloor[floorIndex]
+                : defaultZoom;
+            float zoom = baseZoom;
             EvaluateChannels(floorIndex, frame.Time, follow, ref resolved, ref rotation, ref zoom);
+
+            // freeroam 出场期间 zoom 从基准平滑到 1（原生的 ffxCameraPlus 带
+            // zoom 目标，用的同一条 duration 和 outEase）。
+            if (FreeRoamPreviewDomain.ExitCameraActive)
+            {
+                zoom = Mathf.LerpUnclamped(baseZoom, 1f, FreeRoamPreviewDomain.ExitCameraProgress);
+            }
 
             if (float.IsNaN(resolved.x) || float.IsNaN(resolved.y)
                 || float.IsInfinity(resolved.x) || float.IsInfinity(resolved.y))
@@ -652,9 +766,9 @@ namespace ADOFAIEditorStudio.Preview.Domains
         }
 
         /// <summary>
-        /// 在当前格内部采样预计算的跟随轨道。相机会从上一格
-        /// 把它留在的位置，持续朝当前格的球锚点 lerp，
-        /// 这就是它落后而不是瞬间贴上的原因。
+        /// 在当前格内部采样预计算的跟随轨道。时间形式，给逐帧求值用。
+        /// 实现只有一份，见 SampleFollow——递推那边也必须走它，
+        /// 否则两处对"这一格结束时相机在哪"的答案会不一样。
         /// </summary>
         private Vector2 EvaluateFollow(int floorIndex, float time)
         {
@@ -663,18 +777,105 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 return Vector2.zero;
             }
 
-            Vector2 origin = cameraAtFloorEntry[floorIndex];
-            Vector2 target = ballAtFloorEntry[floorIndex];
-            float camspeed = floorCamspeed[floorIndex];
-            float elapsed = time - floorEntryTime[floorIndex];
+            return SampleFollow(floorIndex, time - floorEntryTime[floorIndex], float.NaN);
+        }
 
-            if (camspeed <= 0.0001f || elapsed <= 0f)
+        /// <summary>
+        /// 跟随采样的唯一实现。
+        ///
+        /// ratioOverride 为 NaN 时按 elapsed / camspeed 算；递推那边
+        /// 传它自己算好的比例（它要把落地那一帧的时长补上，见
+        /// BuildFollowTrack 里的说明），否则两条式子会不一致。
+        /// </summary>
+        private Vector2 SampleFollow(int floorIndex, float elapsed, float ratioOverride)
+        {
+            Vector2 origin = cameraAtFloorEntry[floorIndex];
+            if (elapsed <= 0f)
             {
                 return origin;
             }
 
-            float ratio = Mathf.Clamp01(elapsed / camspeed);
+            Vector2 target = FollowTargetAt(floorIndex, elapsed);
+
+            float ratio = ratioOverride;
+            if (float.IsNaN(ratio))
+            {
+                float camspeed = floorCamspeed[floorIndex];
+                ratio = camspeed <= 0.0001f ? 1f : Mathf.Clamp01(elapsed / camspeed);
+            }
+
             return Vector2.LerpUnclamped(origin, target, ratio);
+        }
+
+        /// <summary>
+        /// 这一格在 elapsed 时刻的跟随目标。
+        ///
+        /// **长按格上它是时变的。** 原生 scrCamera.Update：
+        ///
+        ///   pos = Vector2.Lerp(frompos, topos + offset + holdOffset, timer / camspeed);
+        ///
+        /// 其中 holdOffset 就是行星的 holdOffsetPos——scrPlanet.Update 的
+        /// 长按分支里每帧 `camy.SetHoldOffset(holdOffsetPos)`。topos 是落地
+        /// 那刻球的位置，加上这条滑移，正好是球此刻所在。所以相机是
+        /// **跟着球一起沿长按线滑**的。
+        ///
+        /// 以前这里恒用 ballAtFloorEntry——球进这一格时的位置。长按的
+        /// 滑移线长 5 格（`测试1` 第 25 格），于是整段里相机原地不动、
+        /// 球已经滑出画面。
+        ///
+        /// 非长按格 holdStart == holdEnd == ballAtFloorEntry，
+        /// 两条式子退化成同一条，行为不变。
+        /// </summary>
+        private Vector2 FollowTargetAt(int floorIndex, float elapsed)
+        {
+            if (!holdFloor[floorIndex])
+            {
+                return ballAtFloorEntry[floorIndex];
+            }
+
+            // 用和行星域同一条线性进度：滑移和角度共用它，
+            // 不然会出现"球在滑、相机按另一条曲线追"。
+            float duration = floorIndex + 1 < floorCount
+                ? floorEntryTime[floorIndex + 1] - floorEntryTime[floorIndex]
+                : 0f;
+            float progress = duration <= 0.0001f ? 1f : Mathf.Clamp01(elapsed / duration);
+            return Vector2.LerpUnclamped(
+                holdStartAtFloor[floorIndex], holdEndAtFloor[floorIndex], progress);
+        }
+
+        /// <summary>
+        /// 长按格上球滑到哪里。
+        ///
+        /// 原生 scrPlanet.Update 的长按分支：
+        ///
+        ///   targetPosition = currfloor.nextfloor.transform.position
+        ///                    - tileSize * nextfloor.radiusScale
+        ///                      * ClockwiseAngleToVector(currfloor.exitangle);
+        ///
+        /// 也就是"下一格的入口边缘"。和 PlanetPreviewDomain 里那条滑移
+        /// 是同一个式子——改一边记得改另一边。
+        /// </summary>
+        private static Vector2 ResolveHoldEnd(
+            PreviewTimelineContext context, int floorIndex, Vector2 fallback)
+        {
+            PreviewFloorSnapshot floor = context.GetFloor(floorIndex);
+            PreviewFloorSnapshot next = context.GetFloor(floorIndex + 1);
+            if (floor == null || next == null)
+            {
+                return fallback;
+            }
+
+            Vector3 centre = context.ResolveBallCentre(floorIndex + 1);
+            double exitAngle = floor.ExitAngle;
+            float edge = context.TileSize * next.RadiusScale;
+            return new Vector2(
+                centre.x - (float)Math.Sin(exitAngle) * edge,
+                centre.y - (float)Math.Cos(exitAngle) * edge);
+        }
+
+        private static Vector2 ToVector2(Vector3 value)
+        {
+            return new Vector2(value.x, value.y);
         }
 
         /// <summary>
@@ -698,7 +899,9 @@ namespace ADOFAIEditorStudio.Preview.Domains
         {
             CamMovementType mode = defaultMode;
             rotation = defaultRotation;
-            zoom = defaultZoom;
+            // zoom **不**在这里重置成 defaultZoom：调用方已经把"这一格的 zoom
+            // 基准"传进来了（freeroam 出场之后那个基准是 1，不是谱面的 zoom）。
+            // 事件链就从它开始接。
 
             // 这个通道在 camParent 空间里累积，ResolveWorld
             // 产出的目标也在这个空间。用世界空间的跟随位置
@@ -862,14 +1065,27 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     // 继续跑。在 NYA 第 167 格量到——两个零偏移的 LastPosition 事件——
                     // 原生视图一直跟着球走，而这个只为 Player 加跟随的
                     // 域把相机冻在了原地。
-                    bool nextFollow = mode == CamMovementType.Player
+                    // **本事件真正采用的位置语义。**
+                    //
+                    // 老格式谱 + 事件没写 relativeTo 时，原生走「相对
+                    // camParent 当前位置叠加偏移」，公式和 LastPosition 分支
+                    // 逐字相同、并且**同样不改跟随模式**。所以这里替换成
+                    // LastPosition，而不是去改 mode —— mode 还要继续充当
+                    // lastUsedMovementType 的角色：原生在 legacy 那一支里
+                    // 不会更新 lastUsedMovementType，本域靠 mode 跟踪它，
+                    // 把它改掉会把后面事件的继承基准弄错。
+                    CamMovementType resolveMode = legacyRelativeTo && !keyframe.ModeUsed
+                        ? CamMovementType.LastPosition
+                        : mode;
+
+                    bool nextFollow = resolveMode == CamMovementType.Player
                         ? true
-                        : (mode == CamMovementType.Tile || mode == CamMovementType.Global
+                        : (resolveMode == CamMovementType.Tile || resolveMode == CamMovementType.Global
                             ? false
                             : followMode);
 
                     bool previousCarries = CarriesFollow(activeMode, followMode);
-                    bool nextCarries = CarriesFollow(mode, nextFollow);
+                    bool nextCarries = CarriesFollow(resolveMode, nextFollow);
 
                     Vector2 previousOutput = previousCarries
                         ? followAtStart + eventCarry
@@ -923,8 +1139,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     followMode = nextFollow;
 
                     CamMovementType previousMode = activeMode;
-                    activeMode = mode;
-                    Vector2 resolved = ResolveWorld(mode, offset, keyframe.Floor,
+                    activeMode = resolveMode;
+                    Vector2 resolved = ResolveWorld(resolveMode, offset, keyframe.Floor,
                         ballAtFloorEntry[Mathf.Clamp(keyframe.Floor, 0, floorCount - 1)],
                         eventWorld);
 

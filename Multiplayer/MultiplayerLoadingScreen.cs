@@ -1,3 +1,4 @@
+using ADOFAIEditorStudio.Ui;
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
@@ -51,14 +52,14 @@ namespace ADOFAIEditorStudio.Multiplayer
             PlaceCentered(label.rectTransform, 640f, 40f, 0f, 26f);
             label.text = string.Empty;
             label.fontSize = 20f;
-            label.color = new Color(0.92f, 0.93f, 0.95f, 1f);
+            label.color = UiTheme.Current.TextPrimary;
             label.alignment = TextAlignmentOptions.Center;
 
             Image barBack = CreateImage("BarBack", root, new Color(1f, 1f, 1f, 0.12f));
             PlaceCentered(barBack.rectTransform, BarWidth, BarHeight, 0f, -22f);
             ApplyRounded(barBack, true);
 
-            barFill = CreateImage("BarFill", root, new Color(0.286f, 0.827f, 0.796f, 1f));
+            barFill = CreateImage("BarFill", root, UiTheme.Current.ActionPrimary);
             // 枢轴放左端，这样改宽度就是**从左往右**长，而不是两头一起长。
             PlaceCentered(barFill.rectTransform, BarWidth, BarHeight, 0f, -22f);
             barFill.rectTransform.pivot = new Vector2(0f, 0.5f);

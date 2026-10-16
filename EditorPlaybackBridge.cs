@@ -1,4 +1,4 @@
-﻿using System.Text;
+using System.Text;
 ﻿using System;
 using System.Collections.Generic;
 using System.Reflection;
@@ -729,6 +729,8 @@ namespace ADOFAIEditorStudio
             new List<scrPlanet>();
         private static readonly EvaluatorPreviewBackend evaluatorBackend = new EvaluatorPreviewBackend();
         private static int lastAudioSyncDiagnosticFrame = -100;
+        /// <summary>画面时钟领先阶梯读数多少的诊断日志节流。</summary>
+        private static int lastClockLeadLogFrame = -10000;
 
         // 预览自己拥有时钟。现在没有任何东西再用 Unity 的
         // 缩放时间驱动场景了，所以时钟按未缩放秒推进，
@@ -741,6 +743,24 @@ namespace ADOFAIEditorStudio
         /// 约 12ms；一次 seek 或重启移动的量远大于此。
         /// </summary>
         private const float MaxClockHoldSeconds = 0.05f;
+        /// <summary>
+        /// 画面时钟相对阶梯读数**最多能领先多少**。
+        ///
+        /// 时钟现在按帧时间累加、在阶梯跳跃时锐利对齐，所以两次跳跃之间
+        /// 它是领先的。但领先必须封顶：帧时间累加略快、或者卡一帧，
+        /// 领先量就会累积——实测尾部到过 48.6ms，等于把"落后一个缓冲区"
+        /// 换成了"领先一个缓冲区"。取 20ms（约一帧多一点）。
+        /// </summary>
+        private const float MaxClockLeadSeconds = 0.02f;
+        /// <summary>
+        /// 起播排程至少留多少余量。
+        ///
+        /// 不留余量（排到"就是现在"）时，音频**有一半概率整整晚一个缓冲区**
+        /// （48kHz × 2048 = 42.7ms）才开始——实测 `[ClipStart] actualSlip`
+        /// 在 0 / 0 / 42.7 / 42.7 之间跳。这正是"拖动后播放时好时坏、
+        /// 大约一半"的来源。取原版 `ScrubMusicToTime` 用的那个 0.1 秒。
+        /// </summary>
+        private const double MinSchedulingLeadSeconds = 0.1d;
         // 画面可以落后音频时钟多少，超过就硬贴上去，而不是
         // 缓动去追。一次 seek 或重启移动时钟的量远大于一个 DSP 缓冲区；
         // 这里实测的 2048 采样缓冲区是 0.0427s，所以这个值刚好在它之上，
@@ -2253,10 +2273,37 @@ namespace ADOFAIEditorStudio
 
             double pitch = Math.Max(0.001d, conductor.song.pitch);
             double scene = conductor.songposition_minusi;
+
+            // **只在歌真的在放的时候量。**
+            //
+            // 不设这道闸的话，暂停 / 场景重建那几帧里 `songTime` 是 0 而
+            // 场景时间还在别处，算出来是几百毫秒到几十秒的假"漂移"，
+            // 一下就把真正要看的几十毫秒淹掉（实测就是这么被淹没的：
+            // 四条分歧全是 playing=False）。
+            if (!conductor.song.isPlaying || !conductor.hasSongStarted)
+            {
+                return;
+            }
+
             double songTime = conductor.song.time;
             double countdown = GetSeparateCountdownTime(conductor);
-            double expectedClip = scene + conductor.addoffset - countdown;
-            double drift = songTime * pitch - expectedClip;
+            // **必须带上 `cal_i * pitch`。** AES 自己的推导（见 5267 行附近）：
+            //   clip = scene + addoffset - countdown + cal_i * pitch
+            // 少了最后一项时，量出来的"漂移"会正好等于校准值——
+            // 实测 cal_i=0.248 而 deltaMs=238~330ms，那个 248ms 全是这一项。
+            double expectedClip = scene + conductor.addoffset - countdown
+                + scrConductor.calibration_i * pitch;
+            // **不能乘 pitch。**
+            //
+            // `conductor.song.time` 已经是**片段位置**，而 AudioSource 在
+            // pitch=1.5 时片段位置本来就是按 1.5 倍速前进的——再乘一次
+            // pitch 等于把它按 pitch² 缩放，报出来的是假的漂移。
+            //
+            // 场景和片段是同一套单位（见 scrConductor 的
+            // `scene = (dsp - dspTimeSong - cal) * pitch - addoffset`，
+            // 而那个 `* pitch` 正是片段位置），所以直接相减。
+            // pitch=100 时两式等价，所以这个错误只在 pitch≠100 时显形。
+            double drift = songTime - expectedClip;
 
             string row = "f" + Time.frameCount
                 + " scene=" + scene.ToString("0.000")
@@ -5138,7 +5185,7 @@ namespace ADOFAIEditorStudio
             double currentDspTime = AudioSettings.dspTime;
             conductor.dspTime = currentDspTime;
 
-            double delay = 0d;
+            double startLead = 0d;
             if (conductor.song != null && conductor.song.clip != null)
             {
                 if (AudioManager.Instance != null)
@@ -5146,38 +5193,71 @@ namespace ADOFAIEditorStudio
                     AudioManager.Instance.StopAllSounds();
                 }
 
-                // 场景时钟从歌曲推导，并去掉一个校准项：
-                // removed:
-                //   scene = (dsp - dspTimeSong - calibration_i) * pitch - addoffset
-                // 所以片段位置必须把该项补回去，否则音频会
-                // 落后球 calibration_i。
-                double clipTime = targetTime + conductor.addoffset - countdownTime
-                    + scrConductor.calibration_i;
-                if (clipTime < 0d)
-                {
-                    delay = -clipTime / pitch;
-                }
+                // **`calibration_i` 要乘 pitch。**
+                //
+                // 从游戏源码推出来的关系是——`scrConductor.Update` 里
+                //   scene = (dsp - dspTimeSong - cal_i) * pitch - addoffset
+                // 而 `(dsp - dspTimeSong) * pitch` 正是片段位置，所以
+                //   clip = scene + addoffset + cal_i * pitch - countdownTime
+                //
+                // 这里原来写的是 `+ calibration_i`（不乘），于是音频整体
+                // 差了 `cal_i * (pitch - 1)`。pitch=100 时它恒为 0，
+                // **只有 pitch≠100 才会暴露**：实测 pitch=160、
+                // cal_i=0.248 时差 0.149 片段单位，用户用微调旋钮量到
+                // 90ms（×1.6 = 0.144），正好对上。
+                //
+                // 这条第一轮就推出来过，但当时拿「差 0.7 秒」去套、
+                // 觉得量级不对就否掉了——而 0.7 秒是个很粗的目测值。
+                // **排程必须留余量，否则音频会滑到下一个缓冲区边界。**
+                //
+                // 实测（同一台机器、同一次会话，`[ClipStart]` 那几行）：
+                //   scheduled=+0.0ms   → actualSlip = 0 / 0 / 42.7 / 42.7 ms
+                //   scheduled=+881.5ms（倒计时本身就是余量）→ actualSlip = 14.5ms
+                // 也就是"要求音频立刻开始"时，它有一半概率整整晚一个缓冲区
+                // （48kHz × 2048 = 42.7ms）。这正是"拖动后播放时好时坏、
+                // 大约一半"的来源。原版 `scrConductor.ScrubMusicToTime` 排到
+                // `dspTime + 0.1`，就是在留这段余量。
+                //
+                // 余量只加在**排程与片段位置**上，场景锚点（下面 dspTimeSong /
+                // songposition_minusi）不动：画面此刻仍在用户拖到的位置，
+                // 音频 0.1 秒后从"那一刻场景该在的地方"开始——两者一致，
+                // 只是开头多了一小段没有声音的等待（和倒计时的味道一样）。
+                double rawClipTime = targetTime + conductor.addoffset - countdownTime
+                    + scrConductor.calibration_i * pitch;
 
+                // 倒计时前奏（rawClipTime < 0）本身就是余量，不能再加一遍。
+                startLead = rawClipTime < 0d
+                    ? -rawClipTime / pitch
+                    : MinSchedulingLeadSeconds;
+
+                double clipTime = rawClipTime + startLead;
                 if (clipTime < conductor.song.clip.length)
                 {
-                    // 先排程，再设片段位置：AudioSource.time
-                    // 直接拒绝负值，所以前奏必须由
+                    // **排程无条件做，不再只在 startAudio 时做。**
+                    //
+                    // 原版 `scrConductor.ScrubMusicToTime` 是**只要定位就重新排程**
+                    // （固定排到 dsp+0.1，把余量加在排程上）。我们原来只在
+                    // startAudio 时排程，于是拖动/恢复
+                    // 那条路（startAudio=false）**只写 `.time`、不重新排程**——
+                    // 等于在一个还在播的源上裸 seek，落点最粗。
+                    // 实测那条路也确实比从-0 起播更容易出现偏移。
+                    //
+                    // AudioSource.time 直接拒绝负值，所以倒计时的前奏必须由
                     // 排程的起始来承载，而不是靠片段偏移。
+                    conductor.song.SetScheduledStartTime(currentDspTime + startLead);
+
                     if (startAudio)
                     {
-                        conductor.song.SetScheduledStartTime(currentDspTime + delay);
-                        // 记下来是为了让画面能等声音。歌曲被
-                        // 排到一个仍在未来的 dsp 时刻，而
-                        // StartMusicCo 已经对它跑过 PlayScheduled，所以
-                        // 音频要到设备时钟越过它才开始。
-                        // 场景时钟刚刚在上面被移到 targetTime，所以
-                        // 不等的话画面就会比音乐快出正好
-                        // 这么多——听起来就是声音晚到一拍。
-                        audioStartDsp = currentDspTime + delay;
+                        // audioStartDsp 是"等声音变可听"的门卫标记，**只在真正起播时设**
+                        // ——拖动定位时设它会让画面冻到排程时刻才动。
+                        // 歌曲被排到一个仍在未来的 dsp 时刻，而 StartMusicCo 已经对它
+                        // 跑过 PlayScheduled，所以音频要到设备时钟越过它才开始；
+                        // 场景时钟上面已经被移到 targetTime，不等的话画面就会比音乐
+                        // 快出正好这么多——听起来就是声音晚到一拍。
+                        audioStartDsp = currentDspTime + startLead;
                     }
+
                     conductor.song.time = (float)Math.Max(0d, clipTime);
-                    lastRequestedClipTime = conductor.song.time;
-                    lastRequestedClipDsp = currentDspTime;
 
                     // 压缩音频会量化 seek：Ogg Vorbis 片段没有采样
                 }
@@ -5196,7 +5276,7 @@ namespace ADOFAIEditorStudio
                 - scrConductor.calibration_i;
             conductor.songposition_minusi = targetTime;
             conductor.deltaSongPos = 0d;
-            conductor.hasSongStarted = true;
+
             if (startAudio)
             {
                 HandoffProbe.MarkAudio(targetTime);
@@ -5246,7 +5326,7 @@ namespace ADOFAIEditorStudio
                 Main.Logger.Log("[NativeAudio] target=" + FormatTimelineTime(targetTime)
                     + " clip=" + (targetTime + conductor.addoffset - countdownTime).ToString("0.000")
                     + " countdown=" + countdownTime.ToString("0.000")
-                    + " delay=" + delay.ToString("0.000")
+                    + " startLead=" + startLead.ToString("0.000")
                     + " offset=" + conductor.addoffset.ToString("0.000")
                     + " pitch=" + pitch.ToString("0.000") + ".");
             }
@@ -5421,6 +5501,7 @@ namespace ADOFAIEditorStudio
                 + ".");
         }
 
+
         /// <summary>
         /// 只读诊断。原生播放期间它周期性比较
         /// 场景时钟和音频片段位置，这样音画漂移能
@@ -5448,7 +5529,8 @@ namespace ADOFAIEditorStudio
             // 当前场景时间下歌曲应该在哪，用的是
             // 和原生 conductor 相同的片段时间轴。
             double expectedClip = sceneTime + conductor.addoffset - countdownTime;
-            double drift = songTime * pitch - expectedClip;
+            // 同上：`song.time` 已是片段位置，乘 pitch 会得到 pitch² 的假漂移。
+            double drift = songTime - expectedClip;
 
             Main.Logger.Log("[AudioSync] scene=" + sceneTime.ToString("0.000")
                 + " songTime=" + songTime.ToString("0.000")
@@ -5879,6 +5961,7 @@ namespace ADOFAIEditorStudio
             return Math.Max(0d,
                 conductor.crotchetAtStart * (double)conductor.adjustedCountdownTicks);
         }
+
 
         private static void AlignConductorBeatCursor(scrConductor conductor, float targetTime)
         {
@@ -6612,28 +6695,6 @@ namespace ADOFAIEditorStudio
             {
                 scrConductor conductor = scrConductor.instance;
 
-                // 先稳定，再按片段实际落点做修正。见
-                // StartEvaluatorPreviewAudio 回调里的排队点。
-                if (conductor != null && desyncFixFramesRemaining > 0)
-                {
-                    desyncFixFramesRemaining--;
-                    if (desyncFixFramesRemaining == 0)
-                    {
-                        ApplyClipSeekCorrection(conductor);
-                    }
-                }
-
-                // 刻意不重复。ApplyClipSeekCorrection 测量片段与
-                // 场景时钟之间的差，而它的修正会移动 dspTimeSong——片段
-                // 对此一无所知，所以测到的差不会因这次修正而改变。
-                // 周期性运行它，于是每次都重新套用同一个偏移，把
-                // 场景时钟带离音频：让修正变成连续的那次尝试
-                // 正是这么做的，结果画面冻住而音乐继续播。
-                //
-                // 要做成连续，就必须在每次套用之后重新锚定测量
-                // （对比上一次修正所确立的状态，而不是对比
-                // 最初的请求），这样它才能是反馈环而不是重复。
-
                 if (conductor != null && audioStartPending)
                 {
                     // StartMusicCo 会把 dspTimeSong 回绕到 0，只有它的排程回调
@@ -6732,23 +6793,68 @@ namespace ADOFAIEditorStudio
                     }
                     else
                     {
-                    float audio = Mathf.Max(0f, Convert.ToSingle(conductor.songposition_minusi));
-
-                    // 每当音频设备时钟被重读，它就会往回走最多一个
-                    // DSP 缓冲区——这里 48kHz 下 2048 采样是 42.7ms。把这种
-                    // 回退带进去，会把画面拖回它已经经过的砖块上，
-                    // 于是游标会读成 59、60、58，打击落在错的
-                    // 拍上。原生从来看不到这个，因为 scrCamera.Update 累加帧
-                    // 时间，是单调的。在这些小步上把时钟保持
-                    // 不回退就能重现那一点，又不重新引入滞后；
-                    // 更大的变化就是真重定位，直接放行。
-                    if (audio < previewClockTime
-                        && previewClockTime - audio < MaxClockHoldSeconds)
+                    // **累加帧时间 + 锐利重锚。**
+                    //
+                    // 这一段的历史是两次各错一边：
+                    //   · 纯赋值（上一版）：画面时钟 = songposition_minusi 那条
+                    //     阶梯的最大值，于是永远落后真实音频 0~一个缓冲区
+                    //     （实测 48kHz × 2048 = 42.7ms），而且落后多少取决于
+                    //     正好停在阶梯的哪一段——表现就是"每五次有一次的音画
+                    //     偏移"。原生没有这个，因为 scrCamera.Update 累加帧时间、
+                    //     是连续的。
+                    //   · 累加 + 每帧朝音频拉 8%（更早的一版）：一阶滞后，
+                    //     稳态误差 = 帧时间 / 0.08 ≈ 75ms，所以被改回赋值。
+                    //
+                    // 对的解法是两者都取：**按帧时间连续推进**，并在阶梯读数
+                    // 跑到我们前面时**锐利地对齐过去**。锐利（而不是比例增益）
+                    // 是关键——它不会引入 1/增益 的稳态滞后，那正是 8% 那版
+                    // 失败的原因。稳态下误差 ≤ 一帧，且连续无阶梯。
+                    float now = Time.unscaledTime;
+                    float delta = now - previewClockLastUnscaledTime;
+                    previewClockLastUnscaledTime = now;
+                    if (delta > 0f)
                     {
-                        audio = previewClockTime;
+                        // 与无歌曲那条分支同一道限幅：一帧最多吃 0.05 秒。
+                        // 正常一帧约 6ms，卡一下也不会超；而"暂停后基准没重置"
+                        // 那种整段暂停时长会被限住，时钟不会一帧弹出去。
+                        previewClockTime += Mathf.Min(delta, 0.05f);
                     }
 
-                    previewClockTime = audio;
+                    float audio = Mathf.Max(0f, Convert.ToSingle(conductor.songposition_minusi));
+                    if (audio > previewClockTime)
+                    {
+                        // 阶梯跑到我们前面：说明我们累加得慢了，它才是真位置。
+                        previewClockTime = audio;
+                    }
+                    else if (previewClockTime - audio > MaxClockHoldSeconds)
+                    {
+                        // 落后超过一个缓冲区的量级：不是阶梯抖动，是真重定位
+                        // （seek / 重启 / 拖播放头），必须放行回退。
+                        previewClockTime = audio;
+                    }
+                    else if (previewClockTime - audio > MaxClockLeadSeconds)
+                    {
+                        // **领先也要封顶。** 两次阶梯跳跃之间，如果帧时间累加
+                        // 略快（或者卡了一帧），领先量会一路长起来——实测尾部
+                        // 到过 48.6ms，等于把"落后一个缓冲区"换成了"领先一个
+                        // 缓冲区"，白改。这里硬收回上限值：是**截断**，不是
+                        // 比例增益，所以不会引入 1/增益 的稳态滞后。
+                        previewClockTime = audio + MaxClockLeadSeconds;
+                    }
+                    // 其余（0 ≤ 领先 ≤ 上限）什么都不做：那正是「阶梯还没跳、
+                    // 我们已经推进到真实位置」的正常状态，也正是要保留的。
+
+                    // 画面时钟相对阶梯读数的领先量。这一条是"时钟重建是否跟得住"
+                    // 的客观指标 —— 期望始终非负、且不超过 MaxClockLeadSeconds
+                    // （改之前它是阶梯、后面还藏着最多一个缓冲区）。
+                    // 走 VerboseDiagnostics 门后：每秒两条，属于诊断噪声。
+                    if (Main.Settings != null && Main.Settings.VerboseDiagnostics
+                        && Time.frameCount - lastClockLeadLogFrame >= 30)
+                    {
+                        lastClockLeadLogFrame = Time.frameCount;
+                        Main.Logger.Log("[ClockLead] "
+                            + ((previewClockTime - audio) * 1000f).ToString("0.0") + "ms");
+                    }
                     }
 
                 }
@@ -7046,13 +7152,17 @@ namespace ADOFAIEditorStudio
                     // 另一些永远对不上，也是为什么最开始总是对的：那里
                     // 前奏把片段放在零，而零不需要 seek。
                     //
-                    // scnConductor.DesyncFix 正是为此存在，但在这个构建里是惰性的
-                    // （它的重试循环以 numberOfAttempts = 0 编译），所以
-                    // 改在这里做测量：让解码器稳定，读它
-                    // 实际在哪，然后把场景时钟移过去。打击音
-                    // 是按 dspTimeSong 排队的，所以之后必须重建，
-                    // 否则它们还留着旧锚点。
-                    desyncFixFramesRemaining = DesyncFixSettleFrames;
+                    // **这里曾经做"读回片段落点、把场景时钟移过去"的校正，
+                    // 已整个删掉。** 原因是读数本身不可用：`song.time` 报的是
+                    // "已经交给声卡的位置"，天生比排定的时刻滞后约一个音频缓冲区
+                    // （48kHz × 2048 = 42.7ms）。实测连跑八次的逐帧平均值全是
+                    // −18 ~ −104ms，全部落在那条滞后带里——真实的 seek 落点误差
+                    // 被这个恒定偏置淹没，照它去推时钟只会把画面推偏
+                    // （调阈值、加样本、换中位数都试过，都改变不了这一点）。
+                    //
+                    // 原版**从不回头读**这个量，对齐纯靠"用同一个
+                    // 目标时刻一次性摆好时钟与片段位置"——那就在上面的
+                    // SetExactConductorTime 里做完了。跟着它。
                 });
             }
             finally
@@ -7061,78 +7171,6 @@ namespace ADOFAIEditorStudio
             }
         }
 
-        /// <summary>
-        /// 一次 seek 之后把场景时钟移到片段实际落点的位置上。
-        ///
-        /// AudioSource.time 是请求，不是命令：Ogg Vorbis 片段没有采样
-        /// 索引，所以解码器 seek 到最近的块，读回来的位置
-        /// 与写入的那个相差那个块有多远。画面是按
-        /// 请求时间摆放的，所以没有这一步，整场运行它都会离音乐
-        /// 那么远——而且因为误差只是目标的函数，
-        /// 某些播放头位置总是一致，另一些永远不一致。
-        ///
-        /// scnConductor.DesyncFix 是游戏自己的答案，在这个
-        /// 构建里是惰性的。这里套用同样的修正：推导出片段
-        /// 真正所在的场景时间，移动 dspTimeSong 让 conductor 同意，
-        /// 然后重建打击音队列——它是按 dspTimeSong 排程的，否则会
-        /// 留着旧锚点。
-        /// </summary>
-        private static void ApplyClipSeekCorrection(scrConductor conductor)
-        {
-            try
-            {
-                if (conductor == null || conductor.song == null || !conductor.song.isPlaying
-                    || double.IsNaN(lastRequestedClipTime))
-                {
-                    return;
-                }
-
-                double pitch = Math.Max(0.001d, conductor.song.pitch);
-                // 片段从 seek 起就一直在播，所以它现在应该处在的位置
-                // 是请求值加上已经过去的设备时间。拿原始请求去比，
-                // 会把那些帧折进误差里。
-                double elapsed = (AudioSettings.dspTime - lastRequestedClipDsp) * pitch;
-                double expectedClip = lastRequestedClipTime + elapsed;
-                double clipError = (double)conductor.song.time - expectedClip;
-                double sceneError = clipError / pitch;
-
-                // 20ms。只做一次的修正用的是 0.5ms，那在读数已知可靠时是对的；
-                // 周期性复查需要一条足够宽的带，让音频缓冲区
-                // 重新填充时 song.time 的常规跳变不会触发一次修正和
-                // 一次打击音重建。
-                if (Math.Abs(sceneError) < 0.02d)
-                {
-                    return;
-                }
-
-                // songposition_minusi = (dspTime - dspTimeSong - calibration_i) * pitch
-                // - addoffset，所以它相对 dspTimeSong 的变化率是 -pitch；把 dspTimeSong
-                // 下调 sceneError/pitch 就能让场景前进 sceneError。片段是
-                // 玩家听到的东西，重新 seek 它会落到另一个
-                // 块边界上，所以让位的是场景这一侧。
-                conductor.dspTimeSong -= sceneError / pitch;
-
-                // 队列是按旧 dspTimeSong 建的，所以现在每条都
-                // 错了同样的量。重建是安全的：PlayHitTimes 会停掉所有
-                // 声音并从头重建。
-                conductor.PlayHitTimes();
-            }
-            catch (Exception exception)
-            {
-                ReportError("Failed to correct the clip seek position", exception);
-            }
-        }
-
-        // 上一次 seek 请求的片段位置，以及请求时的设备时间。
-        // 留着是为了让修正能分辨解码器该在哪、实际在哪。
-        private static double lastRequestedClipTime = double.NaN;
-        private static double lastRequestedClipDsp = double.NaN;
-
-        // 让解码器稳定多少帧，再读片段实际落在哪里。
-        // 在回调自己那一帧读会返回请求值，因为
-        // seek 已提交但尚未执行。
-        private const int DesyncFixSettleFrames = 4;
-        private static int desyncFixFramesRemaining;
 
         // 周期性复查按这个节奏跑。足够频繁，让一次错误修正能在
         // 零点几秒内被撤掉；又足够稀疏，不会每帧都重建打击音队列。
@@ -7329,6 +7367,30 @@ namespace ADOFAIEditorStudio
 
     internal static class EditorUpdateInputPatch
     {
+        /// <summary>
+        /// 清除所有选中：游戏侧的格与装饰物，以及工作台自己维护的
+        /// 时间轴事件和媒体卡片。
+        ///
+        /// 游戏那两个 API 正是它自己「点空白处」时走的一对
+        /// （scnEditor.CycleObjectSelection），所以清完的状态和
+        /// 原生的「什么都没选中」完全一致，不会留下半清半不清的中间态。
+        /// </summary>
+        private static void ClearEditorSelection()
+        {
+            scnEditor editor = scnEditor.instance;
+            if (editor != null)
+            {
+                editor.DeselectFloors();
+                editor.DeselectAllDecorations();
+            }
+
+            EditorStudioOverlay overlay = Main.Overlay;
+            if (overlay != null)
+            {
+                overlay.ClearSelection();
+            }
+        }
+
         private static bool Prefix()
         {
             EditorStudioOverlay overlay = Main.Overlay;
@@ -7341,13 +7403,53 @@ namespace ADOFAIEditorStudio
             bool controlHeld = Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl);
             bool altHeld = Input.GetKey(KeyCode.LeftAlt) || Input.GetKey(KeyCode.RightAlt);
             bool shiftHeld = Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift);
+
             bool undo = controlHeld && !shiftHeld && Input.GetKeyDown(KeyCode.Z);
+            // Shift+C：清除选中。
+            //
+            // 原生编辑器把 KeyCode.C 绑到了「用字符 C 创建一格」
+            // （KeyModifier.None 和 Shift 都注册了同一个动作）。我们只在
+            // 工作台可见时抢——这种帧 Prefix 会返回 false、原生输入循环
+            // 整帧被跳过，和 Space、Ctrl+Z 是同一套做法。工作台关掉时
+            // Shift+C 仍然是原生的「建格」。
+            bool clearSelection = shiftHeld && !controlHeld && !altHeld
+                && Input.GetKeyDown(KeyCode.C);
+            // Ctrl+S：保存。
+            //
+            // 原生编辑器本来就把 Ctrl+S 绑在 `SaveLevelEditorAction` 上，
+            // 工作台不认的键也一律放行给原生 —— 但它显然没跑到，所以这里
+            // 显式接住。**走的是原生那同一个 `scnEditor.SaveLevel()`**，
+            // 也就是 `levelData.Encode()` + `RDFile.WriteAllText`，存出来的
+            // 内容跟原版逐字节一样。绝不自己拼 JSON —— 那会把尾逗号、
+            // `3.201651E-06` 这类格式改坏（这是本项目最早踩到的坑）。
+            bool save = controlHeld && !shiftHeld && !altHeld
+                && Input.GetKeyDown(KeyCode.S);
+            // 时间轴选区的 复制 / 剪切 / 粘贴 / 删除。
+            //
+            // Ctrl+C 是空的（Shift+C 才是"清除选中"，见上面），所以不冲突。
+            // 删除同时认 Delete 和 Backspace：前者是 Windows 的键，后者是
+            // Mac 的；文本输入框里的那两种由 IsTextInputFocused 挡在前面。
+            bool copySelection = controlHeld && !shiftHeld && !altHeld
+                && Input.GetKeyDown(KeyCode.C);
+            bool cutSelection = controlHeld && !shiftHeld && !altHeld
+                && Input.GetKeyDown(KeyCode.X);
+            bool pasteSelection = controlHeld && !shiftHeld && !altHeld
+                && Input.GetKeyDown(KeyCode.V);
+            // **只有 Delete 删块，退格不删。**
+            //
+            // 原来两个都认（Windows 用 Delete、Mac 用退格）。但 ImGui 那边的
+            // 输入框**不在 `IsTextInputFocused` 的覆盖范围里**（那只认 uGUI），
+            // 所以在一个 ImGui 框里按退格改字，会顺手把选中的事件块删掉。
+            // 退格是打字时最常用的键，留着这个口子太容易误伤。
+            bool deleteSelection = !controlHeld && !altHeld
+                && Input.GetKeyDown(KeyCode.Delete);
+            bool selectionShortcut = copySelection || cutSelection || pasteSelection
+                || deleteSelection;
             // Ctrl+Y 和 Ctrl+Shift+Z，与 scnEditor 原生注册的快捷键一致。
             bool redo = controlHeld
                 && ((!shiftHeld && Input.GetKeyDown(KeyCode.Y))
                     || (shiftHeld && Input.GetKeyDown(KeyCode.Z)));
-            bool timelinePlus = Input.GetKeyDown(KeyCode.Equals) || Input.GetKeyDown(KeyCode.KeypadPlus);
-            bool timelineMinus = Input.GetKeyDown(KeyCode.Minus) || Input.GetKeyDown(KeyCode.KeypadMinus);
+            bool timelinePlus = Input.GetKeyDown(KeyCode.Equals) || Input.GetKeyDown(KeyCode.KeypadPlus);            bool timelineMinus = Input.GetKeyDown(KeyCode.Minus) || Input.GetKeyDown(KeyCode.KeypadMinus);
             bool timelineReset = Input.GetKeyDown(KeyCode.Alpha0) || Input.GetKeyDown(KeyCode.Keypad0);
 
             bool timelineShortcut = (controlHeld && (timelinePlus || timelineMinus || timelineReset))
@@ -7374,14 +7476,122 @@ namespace ADOFAIEditorStudio
             bool nativeUndo = undo && !workbenchUndo;
             bool nativeRedo = redo && !workbenchRedo;
 
-            if (!togglePlayback && !workbenchUndo && !workbenchRedo && !nativeUndo && !nativeRedo)
+            if (!togglePlayback && !workbenchUndo && !workbenchRedo && !nativeUndo && !nativeRedo
+                && !clearSelection && !save && !selectionShortcut)
+            {
+                return true;
+            }
+
+            // **ImGui 的输入框也要让开。**
+            //
+            // `IsTextInputFocused` 只认 uGUI 的 TMP 输入框，而工作台里绝大多数
+            // 输入框现在是 ImGui 的 —— 在那些框里打字，Delete、Space、Ctrl+S
+            // 这些会一并落到谱面上。`WantTextInput` 是 ImGui 自己报的
+            // "这会儿有人在打字"。
+            if (EditorImGuiBridge.WantsTextInput)
             {
                 return true;
             }
 
             if (overlay.IsTextInputFocused())
             {
+                // 走到这儿说明**已经按下了**一个该生效的快捷键，却被焦点挡掉了。
+                // 这种情况以前只会静默地"没反应"，查起来毫无线索 —— 打一行
+                // 出来，下次再出现直接能看到是哪个物体占着焦点。
+                UnityEngine.EventSystems.EventSystem events
+                    = UnityEngine.EventSystems.EventSystem.current;
+                UnityEngine.GameObject focused = events == null
+                    ? null : events.currentSelectedGameObject;
+                Main.Logger.Log("[Keys] 快捷键被输入框焦点挡掉："
+                    + (focused == null ? "(空)" : focused.name));
                 return true;
+            }
+
+            if (clearSelection)
+            {
+                ClearEditorSelection();
+                return false;
+            }
+
+            if (save)
+            {
+                scnEditor saveEditor = scnEditor.instance;
+                if (saveEditor != null)
+                {
+                    try
+                    {
+                        // 原生那条 `ShowNotification(levelSaved)` 其实弹了，
+                        // 但它画在游戏自己的 UI 上、被工作台这块全屏面板整个
+                        // 盖住 —— 实测用户完全看不见。所以结果要报进工作台
+                        // 自己的顶栏读数。
+                        bool hadPath = !string.IsNullOrEmpty(ADOBase.levelPath);
+                        saveEditor.SaveLevel();
+                        if (Main.Overlay != null)
+                        {
+                            Main.Overlay.SetTransientStatus(hadPath
+                                ? "已保存  " + System.IO.Path.GetFileName(ADOBase.levelPath)
+                                : "另存为…（在弹出的对话框里选位置）", 5f);
+                        }
+                    }
+                    catch (Exception exception)
+                    {
+                        Main.Logger.Error("[Save] SaveLevel 失败：" + exception);
+                        if (Main.Overlay != null)
+                        {
+                            Main.Overlay.SetTransientStatus("保存失败，见日志", 6f);
+                        }
+                    }
+                }
+                return false;
+            }
+
+            // 时间轴选区的 复制 / 剪切 / 粘贴 / 删除。
+            //
+            // 工作台能处理就自己处理掉（返回 false，跳过原生）；处理不了
+            // （没选中东西、剪贴板是空的）就**放行给原生** —— 比如原生编辑器
+            // 自己也有一个删除选中事件的键，那种情况下该由它来。
+            if (selectionShortcut)
+            {
+                EditorTimelineView selectionTimeline =
+                    Main.Overlay == null ? null : Main.Overlay.Timeline;
+                string selectionStatus = null;
+                bool handled = false;
+
+                if (selectionTimeline != null)
+                {
+                    if (deleteSelection)
+                    {
+                        handled = selectionTimeline.DeleteSelection(out selectionStatus);
+                    }
+                    else if (copySelection)
+                    {
+                        int copied = selectionTimeline.CopySelection();
+                        if (copied > 0)
+                        {
+                            selectionStatus = "已复制 " + copied + " 个事件";
+                            handled = true;
+                        }
+                    }
+                    else if (cutSelection)
+                    {
+                        handled = selectionTimeline.CutSelection(out selectionStatus);
+                    }
+                    else if (pasteSelection)
+                    {
+                        handled = selectionTimeline.PasteAtPlayhead(out selectionStatus);
+                    }
+                }
+
+                if (!handled)
+                {
+                    return true;
+                }
+
+                if (Main.Overlay != null)
+                {
+                    Main.Overlay.SetTransientStatus(selectionStatus, 3f);
+                }
+                return false;
             }
 
             if (togglePlayback)
@@ -7404,16 +7614,12 @@ namespace ADOFAIEditorStudio
 
                 if (!wasPlaying || pausedForHistory)
                 {
+                    bool historyApplied;
                     try
                     {
-                        if (workbenchRedo)
-                        {
-                            EditorCommandHistory.TryRedo(out historyStatus);
-                        }
-                        else
-                        {
-                            EditorCommandHistory.TryUndo(out historyStatus);
-                        }
+                        historyApplied = workbenchRedo
+                            ? EditorCommandHistory.TryRedo(out historyStatus)
+                            : EditorCommandHistory.TryUndo(out historyStatus);
 
                         // 装饰物集合变了，所以求值器缓存的引用
                         // 过期了。它会在下次求值时自愈，但现在就问
@@ -7426,6 +7632,14 @@ namespace ADOFAIEditorStudio
                         {
                             EditorPlaybackBridge.TrySetPaused(false, out _);
                         }
+                    }
+
+                    // 工作台的撤回 / 重做是**直接写字段**，不换 levelData ——
+                    // 面板拿不到任何「选中项变了」的信号，会一直显示撤回前的
+                    // 数字。看起来就是「撤了但参数没变」。这里必须主动叫它重画。
+                    if (historyApplied && Main.Overlay != null)
+                    {
+                        Main.Overlay.RefreshPropertyPanel();
                     }
                 }
 
@@ -7530,8 +7744,24 @@ namespace ADOFAIEditorStudio
         private static bool Prefix()
         {
             EditorStudioOverlay overlay = Main.Overlay;
+            if (overlay == null || !overlay.IsVisible || Input.mouseScrollDelta.y == 0f)
+            {
+                return true;
+            }
+
+            // **正在调装饰物时，滚轮归装饰物。**
+            //
+            // 原生这几档里 Ctrl 是直接放行的（下面那个 controlHeld 分支），
+            // 所以拖着装饰物滚轮时：Alt / Ctrl 那几档被装饰物拿走、看着正常，
+            // 而**纯滚轮**会漏到原生这里、变成缩放画面 —— 实测就是这个现象。
+            // 调装饰物期间一律拦掉原生缩放。
+            if (EditorSceneInteraction.IsAdjustingDecoration)
+            {
+                return false;
+            }
+
             bool controlHeld = Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl);
-            if (overlay == null || !overlay.IsVisible || controlHeld || Input.mouseScrollDelta.y == 0f)
+            if (controlHeld)
             {
                 return true;
             }

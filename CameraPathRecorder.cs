@@ -25,7 +25,8 @@ namespace ADOFAIEditorStudio
 /// </summary>
     internal sealed class CameraPathRecorder : MonoBehaviour
     {
-        private const string FileName = "camera-path.csv";
+        private const string FileNamePrefix = "camera-path-";
+
         private static CameraPathRecorder instance;
         private static StreamWriter writer;
         private static int framesUntilFlush;
@@ -35,6 +36,22 @@ namespace ADOFAIEditorStudio
         private static int maxFloorSeen = int.MinValue;
         private static string startSummary = "-";
 
+        /// <summary>本次录制的文件路径。**路径只算一次**：带时间戳的名字
+        /// 每次调用都会变，算两次就会出现「写进 A、日志里报 B」。</summary>
+        private static string lastPath = "-";
+
+        /// <summary>
+        /// 输出文件名带**启动时刻**，所以两次运行各留一份、互不覆盖 ——
+        /// 一次原生播放、一次工作台拖动，两份并排比。
+        ///
+        /// 原来是个固定名 `camera-path.csv`，第二次 Start 会把它清掉，
+        /// 而对比恰恰需要两份同时在。
+        /// </summary>
+        private static string BuildFileName()
+        {
+            return FileNamePrefix + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".csv";
+        }
+
         internal static bool Recording
         {
             get { return writer != null; }
@@ -42,7 +59,7 @@ namespace ADOFAIEditorStudio
 
         internal static string OutputPath
         {
-            get { return Path.Combine(ResolveDirectory(), FileName); }
+            get { return Path.Combine(ResolveDirectory(), BuildFileName()); }
         }
 
         private static string ResolveDirectory()
@@ -199,7 +216,10 @@ namespace ADOFAIEditorStudio
 
             try
             {
-                writer = new StreamWriter(OutputPath, false, Encoding.UTF8);
+                // 路径只算一次：带时间戳的名字每次调用都会变，
+                // 算两次就会「写进一个文件、日志里报另一个」。
+                lastPath = OutputPath;
+                writer = new StreamWriter(lastPath, false, Encoding.UTF8);
                 writer.WriteLine(
                     "mode,time,frame,floor,worldX,worldY,worldZ,localX,localY,parentX,parentY,"
                     + "zoom,rot,shakeX,shakeY,followMode,camEnabled,"
@@ -231,7 +251,7 @@ namespace ADOFAIEditorStudio
                     ? controller.chosenPlanet.currfloor.seqID
                     : -1;
                 startSummary = startFloor.ToString();
-                Main.Logger.Log("[CameraRecorder] recording to " + OutputPath
+                Main.Logger.Log("[CameraRecorder] recording to " + lastPath
                     + " -- started at floor " + startSummary
                     + ". The level must actually be playing: record the native pass and the"
                     + " workbench scrub separately, and note that native playback resumes from"
@@ -275,6 +295,10 @@ namespace ADOFAIEditorStudio
                 && Input.GetKeyDown(KeyCode.C))
             {
                 Toggle();
+                // 把路径即时说出来：文件名带启动时刻，光看日志目录认不出哪份是哪次。
+                Main.Logger.Log("[CameraRecorder] "
+                    + (Recording ? "开始录制（再按一次 Ctrl+Shift+C 停止）" : "停止录制")
+                    + " → " + lastPath);
             }
 
             if (writer == null)

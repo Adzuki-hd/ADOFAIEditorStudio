@@ -151,9 +151,57 @@ namespace ADOFAIEditorStudio
             private ModEntry mod;
             private bool downloading;
 
+            // ── UMM 里的更新状态 ─────────────────────────────────────────
+            //
+            // 写在 modEntry.CustomRequirements 上：UMM 的 mod 列表专门
+            // 渲染这个字段（它本来用于「自定义游戏版本要求」），支持
+            // <color> 富文本。AES 没有 GameVersion、也没有依赖，
+            // 那三档前置判断都不命中，所以这列平时显示 "-"，正好拿来报状态。
+            // （Status 列是个 Texture 图标，放不了文字。）
+            //
+            // 玩家只有打开 UMM 窗口才看得到，而检查是在游戏启动早期跑的，
+            // 那时窗口还没开——文字留在那里，等玩家打开就在。
+            //
+            // 「一闪而过」那条要留够时间：启动到玩家按 Ctrl+F10 之间通常
+            // 隔着几十秒，6 秒这种量级等于永远看不到。
+            private const float TransientStatusSeconds = 30f;
+
+            private const string StatusChecking = "<color=#B0B0B0>检查更新中…</color>";
+            private const string StatusUpToDate = "<color=#7FBF7F>已是最新版</color>";
+            private const string StatusUnreachable = "<color=#CCAA00>检查失败，已跳过</color>";
+            private const string StatusFailed = "<color=#CD5C5C>更新失败</color>";
+
+            /// <summary>到点把状态清回 "-"。&lt;= 0 表示当前这条要留着。</summary>
+            private float statusClearAt = -1f;
+            /// <summary>Finish 时若还有状态没展示够，推迟到这个时刻再自毁。</summary>
+            private float destroyAt = -1f;
+
+            private void SetStatus(string text)
+            {
+                if (mod != null)
+                {
+                    mod.CustomRequirements = text;
+                }
+            }
+
+            /// <summary>一闪而过的状态：几秒后清掉，不留着占那一列。</summary>
+            private void SetTransientStatus(string text)
+            {
+                SetStatus(text);
+                statusClearAt = Time.unscaledTime + TransientStatusSeconds;
+            }
+
+            /// <summary>要用户采取行动的状态（更新失败、等重启），一直留着。</summary>
+            private void SetStickyStatus(string text)
+            {
+                SetStatus(text);
+                statusClearAt = -1f;
+            }
+
             internal void Begin(ModEntry entry)
             {
                 mod = entry;
+                SetTransientStatus(StatusChecking);
                 var thread = new Thread(FetchManifestThread) { IsBackground = true };
                 thread.Start();
             }
@@ -280,6 +328,19 @@ namespace ADOFAIEditorStudio
 
             private void Update()
             {
+                // 清状态和自毁都必须排在 workDone 判断之前：检查跑完之后
+                // workDone 一直是 false，跟在后面的话这两件事再也不会发生。
+                if (destroyAt > 0f && Time.unscaledTime >= destroyAt)
+                {
+                    Destroy(gameObject);
+                    return;
+                }
+                if (statusClearAt > 0f && Time.unscaledTime >= statusClearAt)
+                {
+                    statusClearAt = -1f;
+                    SetStatus(string.Empty);
+                }
+
                 if (!workDone)
                 {
                     return;
@@ -297,6 +358,7 @@ namespace ADOFAIEditorStudio
                     // 查不到。放行——源挂一天就全员锁死的话，
                     // 用户没有任何自救手段，而他们只会认为 mod 坏了。
                     Main.Logger.Log("[Update] 清单不可达，跳过版本检查。");
+                    SetTransientStatus(StatusUnreachable);
                     Finish();
                     return;
                 }
@@ -309,6 +371,7 @@ namespace ADOFAIEditorStudio
                 catch (Exception exception)
                 {
                     Main.Logger.Error("[Update] 清单格式错误: " + exception.Message);
+                    SetTransientStatus(StatusUnreachable);
                     Finish();
                     return;
                 }
@@ -322,6 +385,7 @@ namespace ADOFAIEditorStudio
                 {
                     Main.Logger.Log("[Update] 版本正常（" + current
                         + "，要求不低于 " + min + "）。");
+                    SetTransientStatus(StatusUpToDate);
                     Finish();
                     return;
                 }
@@ -334,6 +398,8 @@ namespace ADOFAIEditorStudio
                 {
                     Main.Logger.Error("[Update] 已经装过 " + latest
                         + "，但当前仍是 " + current + "；不再重试，以免反复重启。");
+                    SetStickyStatus("<color=#CD5C5C>已装过 " + latest + " 仍是 " + current
+                        + "</color>\n<color=#CD5C5C>需手动重装</color>");
                     Finish();
                     return;
                 }
@@ -355,12 +421,16 @@ namespace ADOFAIEditorStudio
                 if (string.IsNullOrEmpty(zipUrl))
                 {
                     Main.Logger.Error("[Update] 需要更新到 " + latest + "，但清单没给下载地址。");
+                    SetStickyStatus(StatusFailed);
                     Finish();
                     return;
                 }
 
                 Main.Logger.Log("[Update] 当前 " + current + " 低于 " + min
                     + "，开始更新到 " + latest + "。");
+
+                SetStickyStatus("<color=#FFCC44>下载安装中…</color>\n<color=#FFCC44>目标 "
+                    + latest + "</color>");
 
                 downloading = true;
                 pendingZipUrl = zipUrl;
@@ -374,6 +444,7 @@ namespace ADOFAIEditorStudio
                 if (pendingZip == null || pendingZip.Length == 0)
                 {
                     Main.Logger.Error("[Update] 下载失败，保持当前版本。");
+                    SetStickyStatus(StatusFailed);
                     Finish();
                     return;
                 }
@@ -382,18 +453,31 @@ namespace ADOFAIEditorStudio
                 if (!Install(pendingZip, mod, out error))
                 {
                     Main.Logger.Error("[Update] 安装失败：" + error);
+                    SetStickyStatus(StatusFailed);
                     Finish();
                     return;
                 }
 
                 Main.Logger.Log("[Update] 已装好 " + pendingLatest
                     + "。请关闭并重新打开游戏以生效。");
+                SetStickyStatus("<color=#7FBF7F>已更新到 " + pendingLatest
+                    + "</color>\n<color=#CD5C5C>重启游戏生效</color>");
                 PlayerPrefs.SetString(LastInstalledKey, pendingLatest);
                 PlayerPrefs.Save();
+                Finish();
             }
 
             private void Finish()
             {
+                // 「一闪而过」的状态要先把它该显示的时间走完再自毁：
+                // 组件一销毁 Update 就停了，那条文字会永远留在 UMM 上。
+                if (statusClearAt > 0f)
+                {
+                    destroyAt = statusClearAt;
+                    statusClearAt = -1f;
+                    return;
+                }
+
                 Destroy(gameObject);
             }
 

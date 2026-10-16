@@ -12,6 +12,15 @@ namespace ADOFAIEditorStudio.Preview.Domains
             BindingFlags.Instance | BindingFlags.NonPublic);
         private int lastFloor = -1;
 
+        // 每格的球数（2 或 3）、活动列表的顺序、以及"这一格轮到列表里第几位"。
+        // 由 Analyze 预计算，见 BuildMultiPlanetTrack。
+        //
+        // activeOrderByFloor 是每格 3 个槽位 id 的定长记录（不足的填 0）：
+        // 0 = planetRed、1 = planetBlue、2 = planetGreen。
+        private static int[] planetCountByFloor = new int[0];
+        private static int[] chosenIndexByFloor = new int[0];
+        private static int[] activeOrderByFloor = new int[0];
+
         public string Name
         {
             get { return "Planet"; }
@@ -20,7 +29,234 @@ namespace ADOFAIEditorStudio.Preview.Domains
         public void Analyze(PreviewTimelineContext context)
         {
             lastFloor = -1;
+            BuildMultiPlanetTrack(context);
             Main.Logger.Log("[StaticPreview/Planet] ready for " + context.Floors.Count + " floors.");
+        }
+
+        /// <summary>
+        /// 预计算每格的球数、活动列表的顺序、以及"这一格轮到列表里第几位"。
+        ///
+        /// 原生编辑器定位走的是 PlanetarySystem.ScrubToFloorNumber：先把列表收成
+        /// 两颗，再逐格步进，遇到 numPlanets 变化就 SetNumPlanets 重排列表。
+        /// 收成两颗之后 next/prev 指向同一颗，所以步进就是按格数前进一位。
+        ///
+        /// 这里把整件事写成对一个小槽位列表的操作，**不去碰游戏的对象**：
+        ///   - 变多：新球插在**当前这颗**的位置上（SetNumPlanets 里的 Insert
+        ///     用的是 chosenPlanet.planetIndex），当前这颗被挤到右边
+        ///   - 变少：删掉的是当前这颗**前面**的那颗（GetMultiPlanet(idx, -1)）
+        ///   - 中途旋转格交接给另一颗，方向反过来
+        ///
+        /// 新球永远是 planetGreen：原生从 availablePlanets[0] 取，那串的顺序是
+        /// Green/Yellow/Purple/Pink/Orange/Cyan，而收缩时 Green 会被 Insert 回
+        /// 队首，所以反复进出三球段拿到的都是它。
+        ///
+        /// 已用探针数据（planet-trajectory-mp.csv，3-2-5 第 0~67 格）逐格核对，
+        /// 连列表顺序都对得上：第 54 格红、第 55 格进三球且当格蓝（此时列表是
+        /// [Green,Red,Blue]）、之后 Blue→Green→Red 循环、第 67 格回双球是蓝。
+        /// </summary>
+        private void BuildMultiPlanetTrack(PreviewTimelineContext context)
+        {
+            int floors = context.FloorCount;
+            planetCountByFloor = new int[floors];
+            chosenIndexByFloor = new int[floors];
+            activeOrderByFloor = new int[floors * 3];
+
+            int[] order = new int[3];
+            order[0] = 0;
+            order[1] = 1;
+            int size = 2;
+            int index = 0;
+
+            for (int i = 0; i < floors; i++)
+            {
+                PreviewFloorSnapshot snapshot = context.GetFloor(i);
+                int count = snapshot == null ? 2 : Mathf.Clamp(snapshot.PlanetCount, 2, 3);
+
+                if (i > 0 && count != size)
+                {
+                    if (count > size)
+                    {
+                        for (int k = size; k > index; k--)
+                        {
+                            order[k] = order[k - 1];
+                        }
+                        order[index] = 2;
+                        index++;
+                    }
+                    else
+                    {
+                        int remove = ((index - 1) % size + size) % size;
+                        for (int k = remove; k < size - 1; k++)
+                        {
+                            order[k] = order[k + 1];
+                        }
+                        index--;
+                    }
+                    size = count;
+                }
+
+                if (i > 0)
+                {
+                    index += snapshot != null && snapshot.MidSpin ? -1 : 1;
+                }
+                index = ((index % size) + size) % size;
+
+                planetCountByFloor[i] = count;
+                chosenIndexByFloor[i] = index;
+                for (int k = 0; k < count; k++)
+                {
+                    activeOrderByFloor[i * 3 + k] = order[k];
+                }
+            }
+        }
+
+        /// <summary>scrMisc.GetInverseAnglePerBeatMultiplanet：π(n-2)/n。双球是 0，三球是 π/3。</summary>
+        private static double InverseAnglePerBeatMultiplanet(int planets)
+        {
+            return Math.PI * (planets - 2.0) / planets;
+        }
+
+        private static int multiPlanetColoursAppliedFor = -1;
+
+        /// <summary>
+        /// 多出来的那几颗球的原生配色。
+        ///
+        /// 不能走 EnsureRendererColour：那条调的是 PlanetRenderer.LoadPlanetColor(bool)，
+        /// 只分得出红/蓝，而 planetGreen 的 isRed 是 false，会被刷成蓝色——
+        /// 这就是"第三颗颜色不对"。
+        ///
+        /// 原生给多出来的球上色走的是 PlanetarySystem.ApplyMultiplanetColors()：
+        /// 它按**对象名**上色（planetGreen 就是绿），也认得自定义预设。
+        ///
+        /// 球数回到 2 时把标记清掉，这样下一次再进三球段会重新上一次色。
+        /// </summary>
+        private static void ApplyMultiPlanetColours(PlanetarySystem system, int count)
+        {
+            if (system == null)
+            {
+                return;
+            }
+
+            if (count <= 2)
+            {
+                multiPlanetColoursAppliedFor = -1;
+                return;
+            }
+
+            if (multiPlanetColoursAppliedFor == count)
+            {
+                return;
+            }
+
+            multiPlanetColoursAppliedFor = count;
+            try
+            {
+                system.ApplyMultiplanetColors();
+            }
+            catch (Exception exception)
+            {
+                Main.Logger.Error("[StaticPreview/Planet] multi-planet colours failed: " + exception);
+            }
+        }
+
+        /// <summary>
+        /// 场上该显示哪几颗球，和原生保持同步。
+        ///
+        /// 球数变少时原生由 SetNumPlanets 对多出来的那颗调 PlanetRenderer.Destroy()：
+        /// 它不只关 sprite，还把 tailParticles / coreParticles / sparks 停掉、
+        /// glow 关掉——只关 sprite 的话尾焰会留在画面上（实测就是这个现象）。
+        /// 所以这里直接调它，别自己拼。
+        ///
+        /// 反过来，从隐藏切回显示时要走 Revive()，对应原生的 Rewind() → Revive()。
+        /// 不能只靠上面循环里的 EnsureRendererAwake：那是"每颗球只做一次"的，
+        /// 一颗球被收起来之后再放出来它就不会再唤醒了。
+        ///
+        /// 只看 red/blue/green 这三颗：它们才是求值器会摆上场的。
+        /// </summary>
+        private static void SyncPlanetVisibility(
+            PlanetarySystem system, scrPlanet a, scrPlanet b, scrPlanet c, int count)
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                scrPlanet planet = SlotPlanet(system, i);
+                if (planet == null)
+                {
+                    continue;
+                }
+
+                PlanetRenderer renderer = planet.planetRenderer;
+                if (renderer == null)
+                {
+                    continue;
+                }
+
+                bool active = (count > 0 && planet == a)
+                    || (count > 1 && planet == b)
+                    || (count > 2 && planet == c);
+
+                if (active)
+                {
+                    if (shownPlanets.Add(planet))
+                    {
+                        try
+                        {
+                            // 放回场上走原生的 Rewind()（SetNumPlanets 插球时就是
+                            // 调它）：它内部会 Revive()，把 scrPlanet.dead 清掉。
+                            // PlanetRenderer.Revive(lite) 只碰渲染器，清不掉那个
+                            // 旗标——而收起时 Die() 把它设成了 true，不清的话
+                            // 这颗球再摆出来也是"死的"。
+                            planet.Rewind();
+                        }
+                        catch (Exception exception)
+                        {
+                            Main.Logger.Error("[StaticPreview/Planet] revive failed: " + exception);
+                        }
+                    }
+
+                    if (renderer.sprite != null)
+                    {
+                        renderer.sprite.visible = true;
+                    }
+                }
+                else if (shownPlanets.Remove(planet))
+                {
+                    try
+                    {
+                        // 收起时照原生的**播放**路径走：scrPlanet.Die(0.3f)。
+                        // 它内部就是 planetRenderer.Explode(0.3f)——球是**爆炸**
+                        // 消失的，原版就是这样（实测确认：原版绿球爆炸消失，
+                        // 只关 sprite 会变成"直接消失"，少一记爆炸）。
+                        //
+                        // 原生只有编辑器定位那条路（SetNumPlanets 传了
+                        // scrubChosen）才用 Destroy() 绕开爆炸。预览要对齐的是
+                        // 播放，所以用 Die。
+                        planet.Die(0.3f);
+                    }
+                    catch (Exception exception)
+                    {
+                        Main.Logger.Error("[StaticPreview/Planet] hide failed: " + exception);
+                    }
+                }
+            }
+        }
+
+        /// <summary>槽位 id → 场上的球。0 = planetRed，1 = planetBlue，2 = planetGreen。</summary>
+        private static scrPlanet SlotPlanet(PlanetarySystem system, int slot)
+        {
+            if (system == null)
+            {
+                return null;
+            }
+
+            switch (slot)
+            {
+                case 1:
+                    return system.planetBlue;
+                case 2:
+                    return system.planetGreen;
+                default:
+                    return system.planetRed;
+            }
         }
 
         public void Evaluate(PreviewEvaluationFrame frame)
@@ -49,21 +285,23 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 // 球进入它的位置，所以球只是走得
                 // 更慢。这一点计时表本来就能推出来——NextEntryTime 就是
                 // 下一格真正的进入时间，所以角速度自己就降下来了。
-                bool complexFloor = floor.FreeRoam
-                    || floor.HoldLength > -1
-                    || floor.PlanetCount != 2
+                // 多行星格现在建模到 3 颗——原生自己也是把 numPlanets 夹在
+                // 2..3 之间（MultiPlanet 事件判定的分支里 `Math.Min(num7, 3)`），
+                // 所以 >3 这条其实走不到，留着是给将来放宽时当闸门用。
+                //
+                // **freeroam 也不在这里**：探针量到它和普通格只差"整段时长装在
+                // extraBeats 里"，角度照样每拍 π（见下面 sweep 那段）。
+                bool complexFloor = floor.PlanetCount > 3
                     || (frame.Context.GetFloor(floorIndex - 1) != null
-                        && frame.Context.GetFloor(floorIndex - 1).PlanetCount != 2)
+                        && frame.Context.GetFloor(floorIndex - 1).PlanetCount > 3)
                     || (frame.Context.GetFloor(floorIndex + 1) != null
-                        && frame.Context.GetFloor(floorIndex + 1).PlanetCount != 2);
+                        && frame.Context.GetFloor(floorIndex + 1).PlanetCount > 3);
 
                 if (complexFloor)
                 {
-                    // Freeroam、长按格和非双球格还没建模。旧的
-                    // 兜底调的是原生 ScrubToFloorNumber 检查点重生路径，
-                    // 那条路依赖游戏自己的模式机制，而求值器接管的
-                    // 预览刻意不进那套机制。把球留在原地，
-                    // 能保住预览其余部分正确。
+                    // 旧的兜底调的是原生 ScrubToFloorNumber 检查点重生路径，
+                    // 那条路依赖游戏自己的模式机制，而求值器接管的预览刻意
+                    // 不进那套机制。把球留在原地，能保住预览其余部分正确。
                     if (floorIndex != lastFloor)
                     {
                         Main.Logger.Log("[StaticPreview/Planet] complex floor f="
@@ -83,9 +321,11 @@ namespace ADOFAIEditorStudio.Preview.Domains
         {
             lastFloor = -1;
             lastLoggedFloor = -1;
+            multiPlanetColoursAppliedFor = -1;
             RestoreCosmeticAngles();
             AwakePlanets.Clear();
             ColouredPlanets.Clear();
+            shownPlanets.Clear();
             RestoreRings();
         }
 
@@ -187,22 +427,58 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 return;
             }
 
-            // 哪个球在轨道上，取决于这一格之前有多少个中途旋转格：
-            // 每个中途旋转都交接给另一个球。
-            scrPlanet chosen = planetarySystem.planetList[0];
-            for (int i = 1; i <= floorIndex; i++)
-            {
-                PreviewFloorSnapshot traversedFloor = context.GetFloor(i);
-                chosen = traversedFloor != null && traversedFloor.MidSpin
-                    ? chosen.prev
-                    : chosen.next;
-            }
-            if (chosen == null)
+            // 这一格场上有哪几颗球、轮到哪颗停在格上，都在 Analyze 里预计算好了
+            // （见 BuildMultiPlanetTrack）。这里只做查表。
+            //
+            // 为什么不直接对活的 planetList 步进：那个列表有 8 个元素——
+            // planetRed、planetBlue，外加 6 颗给多球格准备的克隆（全停在原点、
+            // currfloor 为空）。对 8 元环步进，第 N 格算出的是 planetList[N % 8]，
+            // 只有 N % 8 恰好是 0 或 1 时才对。
+            //
+            // 这个 bug 在长按上看得最清楚。探针实测「测试1」第 25 格：原生选中球
+            // 是 Blue，而按 N % 8 算出来 parked 也是 Blue（碰巧对），chosen 却取到
+            // planetList[2] = Cyan——一颗看不见的克隆。结果真球 Red 被摁在滑移线上
+            // 直着往前推，该绕转的那颗根本没在飞。
+            int count = planetCountByFloor[floorIndex];
+            int chosenSlot = chosenIndexByFloor[floorIndex];
+            int orderBase = floorIndex * 3;
+
+            scrPlanet parked = SlotPlanet(planetarySystem, activeOrderByFloor[orderBase + chosenSlot]);
+            // movingToNext：原生 Update_RefreshAngles 里 `movingToNext = next`，
+            // 也就是活动列表里排在当前这颗后面的那颗。
+            scrPlanet flying = count > 1
+                ? SlotPlanet(planetarySystem, activeOrderByFloor[orderBase + (chosenSlot + 1) % count])
+                : null;
+            // 多边形上那颗：原生那个 `for (i = 2; i < num2; i++)` 的循环，
+            // num2 = 3 时只有 i = 2 一个。
+            scrPlanet third = count > 2
+                ? SlotPlanet(planetarySystem, activeOrderByFloor[orderBase + (chosenSlot + 2) % count])
+                : null;
+
+            if (parked == null || flying == null)
             {
                 return;
             }
 
-            planetarySystem.chosenPlanet = chosen;
+            // 三球格上多出来的那颗的原生配色（红/蓝那两颗走下面循环里的
+            // EnsureRendererColour）。
+            ApplyMultiPlanetColours(planetarySystem, count);
+
+            // **原生里 isChosen 的是"停在格上"的那颗，不是飞的那颗。**
+            //
+            // scrPlanet.LateUpdate：
+            //   if (currfloor.stickToFloor && isChosen && ...)
+            //       transform.position = currfloor.transform.position + holdOffsetPos + addBob;
+            // 也就是说被"选中"的球停在格中心、戴着环；**在轨道上飞的是另一颗**。
+            // 探针也印证了：第 0 格 isChosen 是 PlanetRed，原版画面上正是红球戴环停在 0 号砖上；
+            // 三球段的每一帧也都量到"选中那颗离格心的距离恰好是 0"。
+            //
+            // 求值器以前把这两个角色用反了——让 isChosen 那颗去飞、另一颗停在中心，
+            // 于是屏幕上两颗球的角色整个对调，看起来就是"颜色反了"。
+            // 所以 `parked` 是游戏认定的 isChosen，`chosen` 是飞的那颗。
+            scrPlanet chosen = flying;
+
+            planetarySystem.chosenPlanet = parked;
             KillCosmeticAngleTween(chosen);
             chosen.cosmeticAngle = 0f;
 
@@ -212,6 +488,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 return;
             }
             chosen.currfloor = boundFloor;
+            parked.currfloor = boundFloor;
 
             double direction = floor.IsCounterClockwise ? -1d : 1d;
             planetarySystem.isCW = !floor.IsCounterClockwise;
@@ -242,9 +519,28 @@ namespace ADOFAIEditorStudio.Preview.Domains
             double snappedAngle = floorIndex == 0
                 ? Math.PI * (0.5d - context.AdjustedCountdownTicks)
                 : floor.EntryAngle;
+
+            // 多行星格起步角还多一项。原生落地时：
+            //
+            //   num3 = scrMisc.GetInverseAnglePerBeatMultiplanet(floor.numPlanets) * dir;
+            //   movingToNext.snappedLastAngle = mod(exitAngle + PI, 2π) + num3;
+            //
+            // 而 GetInverseAnglePerBeatMultiplanet(n) = π(n-2)/n，双球是 0（所以双球
+            // 一直看不出问题），三球是 π/3。
+            //
+            // 探针实测（3-2-5 第 55 格第一帧）：entry=4.7124、ang=5.7974，差 1.0850；
+            // 而 π/3 + 0.024×(π/2) = 1.0849 ✓。
+            if (count > 2)
+            {
+                snappedAngle += direction * InverseAnglePerBeatMultiplanet(count);
+            }
             double cosmeticAngle = 0d;
 
-            if (floorIndex > 0 && floor.ExtraBeats > 0f)
+            // **freeroam 不走这里**：它的 extraBeats 装的是整段时长，命中这个
+            // 条件会套上 Pause 事件的 snappedAngle 公式和 cosmetic 偏移，
+            // 而 freeroam 的起点角不是那么来的。实测（planet-trajectory-free.csv）
+            // freeroam 里球就是"从进入角起步、每拍 π"，和普通格一样。
+            if (floorIndex > 0 && floor.ExtraBeats > 0f && !floor.FreeRoam)
             {
                 // 暂停格是游戏唯一不按进入角进入的情况。
                 // 出自 scrPlanet.HandlePause，其中 num = direction：
@@ -286,7 +582,22 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 // -4.7124。漏掉这个因子会让两个方向表现一样。
                 double entryMod = Mod2Pi(floor.EntryAngle);
                 double startMod = Mod2Pi(nativeStart);
-                cosmeticAngle = -floor.AngleCorrectionType * Math.Abs(entryMod - startMod);
+                // **完整式子，不要化简成 `-type * |Δ|`。**
+                //
+                // 原生是：
+                //   num7 = angleCorrectionType * (num2 - num6) * direction
+                //          * (num6 < num2 ? 1 : -1);
+                //   TweenCosmeticAngle(-num7);
+                //
+                // 以前这里化简成了 `-type * |entryMod - startMod|`，把 direction 和
+                // 那个比较产生的符号一起丢掉了。NYA 那张谱两个方向恰好都对得上，
+                // 所以一直没暴露；Dream Flower 第 174 格（type=-1、dir=-1、
+                // startMod > entryMod）就露了：实测原生 cosmetic 是 **-π**，
+                // 化简式给的是 **+π**——两者差 2π 看着一样，但**衰减过程中的中间值
+                // 差半圈**，表现正是"飞行中角度不对、落地却对"（它一拍内衰减到 0）。
+                double correctionSign = startMod < entryMod ? 1d : -1d;
+                cosmeticAngle = -floor.AngleCorrectionType * (entryMod - startMod)
+                    * direction * correctionSign;
             }
 
             // 球在单拍内扫过它自己的 angleLength，而一格有多少拍
@@ -335,7 +646,24 @@ namespace ADOFAIEditorStudio.Preview.Domains
             }
             else if (floor.ExtraBeats > 0f)
             {
-                sweep = Math.PI * (1d + floor.ExtraBeats);
+                // 暂停格和 freeroam 共用这条，但**扫角不能按 (1+extraBeats) 拍算**。
+                //
+                // 原生这一段时长是「走完该格角度的时间 + extraBeats 拍」
+                // （CalculateFloorEntryTimes：num4 = GetTimeBetweenAngles(entry, exit)，
+                // 再加 extraBeats * 一拍），而球每拍推进 π。
+                // 以前写成 π*(1+extraBeats)，等于假设该格的角度时间恰好是 1 拍——
+                // 180° 的暂停格确实如此（NYA 161 格就是，所以这个错一直没暴露），
+                // 但 270° 的格（angleLength 1.5π）就差半圈。
+                //
+                // 实测 AnRain 第 10 格：原生从 −4.7124 扫到 +1.5708（=2π），
+                // AES 只扫到 0（=1.5π），表现就是球"还差一点角度就突然落地"。
+                //
+                // context 里现成的 floorTravelAngle 就是这一段该扫的角度
+                // （单位是度，每拍 180 度），用它可以自动对上真实拍数。
+                sweep = context.GetFloorTravelAngle(floor) * Math.PI / 180d;
+                // 一拍多长也跟着它走：球每拍扫 π，所以拍数 = sweep/π。
+                // 暂停格的 cosmetic 衰减是按拍算的，用错会让它慢下来。
+                beatSeconds = sweep <= 1e-6d ? beatSeconds : tileDuration * Math.PI / sweep;
             }
             else
             {
@@ -346,6 +674,67 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 ? 0d
                 : Math.Min(1d, elapsed / tileDuration);
             double angle = snappedAngle + progress * sweep * direction;
+
+            // freeroam 出场那条 cosmetic（下面算完 renderedAngle 之后叠上去）。
+            //
+            // 原生在出场那一刻把球的角度**重设**了一次：
+            //
+            //   num3 = nextfloor.isCCW ? -1 : 1;
+            //   num4 = nextfloor.entryangle - π * num3;
+            //   snappedLastAngle = num4 - π * outBeats * num3;
+            //   ...
+            //   num5 = mod(angle);  TweenCosmeticAngle(-(num5 - num2));   // num2 = 重设前的 mod
+            //
+            // 那一项只是把这次重设造成的**视觉跳变**抹平：TweenCosmeticAngle 把
+            // cosmeticAngle 设成那个偏移、再在一拍内 OutSine 衰减到 0。
+            //
+            // 这里**不重设硬值**——两边角速度一样（都是每拍 π），所以"重设硬值 +
+            // 叠 cosmetic"和"保留原角 + 叠同一个 cosmetic"逐帧完全等价，后者改动
+            // 小得多。硬值这边原生落地时会再写一次（`mod(exit+π) + IAPB(n)·dir`），
+            // 实测 f=33 的 snappedLastAngle 正好等于该格 entryangle，没有半圈差。
+            double freeExitCosmetic = 0d;
+            double freeExitStart = 0d;
+            double freeExitSnapped = 0d;
+            int freeExitDirection = (int)direction;
+            bool freeExitActive = false;
+            if (floor.FreeRoam && floorIndex + 1 < context.FloorCount)
+            {
+                scrFloor entryBinding = context.GetFloorBinding(floorIndex);
+                PreviewFloorSnapshot nextFloor = context.GetFloor(floorIndex + 1);
+                if (entryBinding != null && nextFloor != null
+                    && entryBinding.freeroamEndEarlyBeats > 0
+                    && beatSeconds > 1e-6d)
+                {
+                    double outBeats = entryBinding.freeroamEndEarlyBeats;
+                    freeExitStart = floor.NextEntryTime - beatSeconds * outBeats;
+                    if (frame.Time >= freeExitStart)
+                    {
+                        // 出场把硬值重设成这条（num4 - π*outBeats*num3），方向随
+                        // 下一格（原生先 `item.isCCW = item.nextfloor.isCCW`）。
+                        int exitDirection = nextFloor.IsCounterClockwise ? -1 : 1;
+                        freeExitDirection = exitDirection;
+                        freeExitSnapped = nextFloor.EntryAngle
+                            - Math.PI * exitDirection
+                            - Math.PI * outBeats * exitDirection;
+                        freeExitActive = true;
+
+                        // cosmetic 的起始值：把重设那一瞬的视觉接过去。**必须和
+                        // 硬值的重设一起用**——只加 cosmetic 不重设硬值的话，
+                        // 渲染角会当场跳掉这一整份（实测就是"进倒计时突然差 180°"）。
+                        double beforeRaw = snappedAngle
+                            + ((freeExitStart - floor.EntryTime) / tileDuration) * sweep * direction;
+                        double afterRaw = freeExitSnapped;
+                        freeExitCosmetic = Mod2Pi(beforeRaw) - Mod2Pi(afterRaw);
+                    }
+                }
+            }
+
+            // 出场开始后硬值换成重设那条（角速度不变，起点变了）。
+            if (freeExitActive)
+            {
+                angle = freeExitSnapped
+                    + (frame.Time - freeExitStart) / beatSeconds * Math.PI * freeExitDirection;
+            }
 
             // cosmetic 偏移只影响画出来的样子，从不影响球落在哪里：
             // 原生在算渲染位置时把它加到角度上，`angle` 本身
@@ -362,6 +751,14 @@ namespace ADOFAIEditorStudio.Preview.Domains
             {
                 double f = Math.Min(1d, elapsed / beatSeconds);
                 renderedAngle = angle + cosmeticAngle * (1d - Math.Sin(f * Math.PI * 0.5d));
+            }
+
+            // freeroam 出场那条 cosmetic。和上面暂停格那条形状相同，但衰减是
+            // 从**出场时刻**起算的，不是从进格时刻。
+            if (freeExitCosmetic != 0d && beatSeconds > 1e-6d)
+            {
+                double f = Math.Min(1d, (frame.Time - freeExitStart) / beatSeconds);
+                renderedAngle += freeExitCosmetic * (1d - Math.Sin(f * Math.PI * 0.5d));
             }
 
             // 球绕着它脚下的格转，半径 = tileSize * radiusScale。
@@ -389,7 +786,87 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // 再判一次 stickToFloor —— 相机跟随也读同一个字段。
             // 这个 bug 最初就是"两个地方各算一遍、只改了一处"造成的，
             // 所以定义只留一份。
-            Vector3 centre = floor.BallPosition;
+            // 行星绕着的中心。走 context 的 ResolveBallCentre，定义只留一份。
+            // 它和快照的 BallPosition 有一处要紧的区别：粘住的格现读**活的**
+            // transform.position，因为 MoveTrack 是直接对那个字段起 tween 的
+            // （ffxMoveFloorPlus），位移不进 offsetPos——只读快照的话，
+            // 轨道动到哪球都还停在原处。
+            Vector3 centre = frame.Context.ResolveBallCentre(floorIndex);
+
+            // freeroam 段：圆心不是入口格，是**球所在的那颗网格格**。
+            //
+            // 原生里球的 currfloor 在 freeroam 期间换成了生成格（探针实测：
+            // f=32 那一段 gen=1、grid=(0,0)），而球是被 LateUpdate 钉在
+            // currfloor.position 上的。那颗格平时就摆在入口格的位置，所以两者
+            // 一开始是一样的；但出场动画会把它挪到下一格的入口边缘，球要跟着走
+            // （原生 stickToFloors 时不给球单独起 tween，就是靠这个）。
+            if (floor.FreeRoam && FreeRoamPreviewDomain.BallTileValid)
+            {
+                centre = FreeRoamPreviewDomain.BallTilePosition;
+            }
+
+            // 长按格的圆心还会**顺着轨道滑向下一格的入口边缘**，绕转是绕着
+            // 这个移动中的心做的；普通格的圆心就钉在格中心。
+            //
+            // 原生把那一步混在 holdOffsetPos 里（scrPlanet.Update 的长按分支），
+            // 最终位置是：
+            //   actualPos = 格中心 + holdOffsetPos + 绕转向量 * 半径
+            // 而 holdOffsetPos 里的 storedPosition 会和别处抵消掉，展开之后
+            // 滑移就是一个纯插值：
+            //
+            //   target = 下一格的中心
+            //            - tileSize * 下一格的 radiusScale
+            //              * ClockwiseAngleToVector(本格的 exitangle)
+            //
+            // 也就是「下一格的入口边缘」。
+            //
+            // progress 用和角度同一条线性进度：原生用的是带 rotationEase 的
+            // easedPerc，但本域算角度时本来就没走缓动（planetEase 还没建模），
+            // 两边用同一条才不会出现"转的是缓动、滑的是匀速"。
+            if (floor.HoldLength > -1)
+            {
+                PreviewFloorSnapshot nextFloor = frame.Context.GetFloor(floorIndex + 1);
+                if (nextFloor != null)
+                {
+                    Vector3 exitEdge = AngleToVector(floor.ExitAngle)
+                        * (float)(context.TileSize * nextFloor.RadiusScale);
+                    Vector3 holdTarget = frame.Context.ResolveBallCentre(floorIndex + 1) - exitEdge;
+                    centre = Vector3.LerpUnclamped(centre, holdTarget, (float)progress);
+                }
+
+                // 滑移上还叠了一层小幅摆动。原生 scrPlanet.Update 的长按分支：
+                //
+                //   addBob = tileSize * 0.1f * Vector2.one * sin(angle - exitangle)
+                //   transform.position = storedPosition + addBob + holdOffsetPos;
+                //
+                // 注意两个细节：它是 **Vector2.one**，也就是沿对角线摆、
+                // 不是垂直于长按线；幅度是 0.1 * tileSize。原版里那颗球
+                // 走出"波浪"就是它。
+                //
+                // 探针实测（测试1 第 25 格，tileSize=1.5）：t=11.332 那一帧
+                // ang=6.0892、exit=1.5708 → 0.15*sin(4.5184) = -0.1472，
+                // 而同帧「球位置 − 格心」的垂直分量正好是 -0.1472。
+                // 逐帧核过，四位小数都对得上。
+                //
+                // 加在 centre 上、而不是只加给停着的那颗：飞的那颗在原生的
+                // 锚点（tempTransPos）就是滑动那颗的位置，所以两边一起摆，
+                // 飞的那条的轨迹才是一圈绕着**正在摆动的**圆心。
+                if (floor.HoldDistance > 0f)
+                {
+                    float bob = (float)Math.Sin(angle - floor.ExitAngle) * 0.1f * context.TileSize;
+                    centre += new Vector3(bob, bob, 0f);
+                }
+
+                DriveHoldLine(frame, floorIndex, progress, chosen);
+            }
+            else
+            {
+                // 刚走过去的那条长按线要填满。原生在落到下一格时把
+                // holdCompletion 设成 1；求值器只碰当前格，不补这一步的话，
+                // 球走过去之后那条线会停在它离开时的进度上。
+                CompleteHoldLine(frame, floorIndex - 1);
+            }
+
             Vector3 offset = AngleToVector(renderedAngle) * (float)radius;
             Vector3 position = centre + offset;
 
@@ -399,42 +876,85 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // 时钟、不写 conductor，所以那个 helper 会读到陈旧的时间。
             // 墙钟字段仍然会设，这样其他读它们的家伙（比如跟随
             // 相机）跟屏上的东西保持一致。
-            chosen.angle = angle;
-            chosen.cosmeticAngle = (float)(renderedAngle - angle);
-            chosen.SetSnappedLastAngle(snappedAngle);
-            chosen.SetTargetExitAngle(floorIndex == 0
-                ? snappedAngle + floor.AngleLength
-                : snappedAngle + floor.AngleLength * direction);
+            // 飞的那颗**只写位置和半径，不写角度字段**——这是照原生的。
+            //
+            // 原生每帧推进角度的只有 isChosen 那颗（= 停着的那颗，Update_RefreshAngles
+            // 只对它跑）；飞的那颗自己的 angle / cosmeticAngle 是**旧值**，它只有
+            // 位置是被那句 `movingToNext.transform.position = actualPos` 算出来的。
+            // 渲染器仍然按各自的 angle 画朝向，所以原版里飞的那颗朝向就是陈旧的。
+            //
+            // 以前这里把角度写给了飞的那颗——角色正好反了，停着那颗于是留着上一格
+            // 的角（差半圈）。上一版改成两颗都写，把飞的那颗本应陈旧的朝向也写新了，
+            // 于是还剩一颗差半圈。现在是只写停着那颗。
             chosen.cosmeticRadius = (float)radius;
             chosen.transform.position = position;
 
-            // 双球关卡播放时两个球都在屏上：选中的那个
-            // 绕着它按的格转，另一个等在同一格
-            // 的中心。这里修掉了早先两个错误。以前只把选中的球
-            // 藏起来，于是玩家刚落地的那颗球在另一颗出现的同一刻
-            // 消失；而且空闲的那颗球根本没被摆过，就
-            // 停在它加载时被留在的地方。求值器接管预览期间
+            // 停着的那颗（游戏认定的 isChosen）写全套角度。
+            double ballCosmetic = renderedAngle - angle;
+            ApplyBallAngle(parked, angle, ballCosmetic, snappedAngle,
+                floorIndex == 0 ? snappedAngle + floor.AngleLength
+                    : snappedAngle + floor.AngleLength * direction, (float)radius);
+
+            // 三球格上还有第三颗。原生那个多边形循环
+            // （Update_RefreshAngles 里 `for (i = 2; i < num2; i++)`）在 num2=3 时
+            // 只跑 i=2，就是它。
+            //
+            // 位置不照抄那段公式，是**按探针数据定的**：三球段逐帧量到
+            //   - 选中那颗离格心 0（27126 帧全是 0.0）
+            //   - 另外两颗离格心都恰好是一个 cosmeticRadius，相对角 0 和 −π/3
+            // 也就是"以格心为一个顶点、边长 = R 的正三角形"——两两相距也正好是 R。
+            //
+            // （探针里 26922 帧量到相对角 0、1161 帧量到 −0.33π。后者帧数少
+            //   是因为原生那句 `if (!p.dead)` 会让第三颗在部分帧不摆、停在老位置，
+            //   那种帧量到的距离是 37.7 这种离群值。这里按"摆"的那一支做。）
+            //
+            // 原生那段多边形公式按着展开得到的是 1.38R 上的点，和实测形状对不上，
+            // 所以以实测为准。
+            if (third != null)
+            {
+                double thirdAngle = renderedAngle - direction * Math.PI / 3.0;
+                third.angle = thirdAngle;
+                third.cosmeticAngle = 0f;
+                third.cosmeticRadius = (float)radius;
+                third.transform.position = centre + AngleToVector(thirdAngle) * (float)radius;
+            }
+
+            // 场上的球都在屏上：停着的那颗在圆心，飞的那颗在圆上绕，
+            // 三球格上第三颗也在圆上（长按期间圆心会滑，几颗一起跟着挪）。
+            //
+            // 这里修掉了早先两个错误。以前只把选中的球藏起来，于是玩家刚
+            // 落地的那颗球在另一颗出现的同一刻消失；而且空闲的那颗球根本
+            // 没被摆过，就停在它加载时被留在的地方。求值器接管预览期间
             // 球自己的 Update 是关的，所以无论姿态还是 sprite 可见性
             // 都不会被别的东西还原。
-            // 另一颗球停在同一个位置——但要用**和选中球同一个基准**。
             //
             // 以前这里写的是 boundFloor.transform.position（实位），
             // 而这个开关关掉时选中球已经改用 startPos 了。两颗球于是
             // 被摆到两个不同的地方：日志里 f7 是
             //   选中球 (9.00,0.03) 按 layout 算，非选中球 (12.00,-1.50) 还在实位，
             // 差 2.12 —— 正是"黏性轨道没生效"看起来的样子。
-            Vector3 pivot = centre;
-            for (int i = 0; i < planetarySystem.planetList.Count; i++)
+            //
+            // 只摆场上这几颗。planetList 里另外那几颗是给多球格准备的克隆，
+            // 把它们的 sprite 打开、或者把它们也摆进来，画面上就会多出球来。
+            for (int i = 0; i < count; i++)
             {
-                scrPlanet planet = planetarySystem.planetList[i];
+                scrPlanet planet = i == 0 ? parked : (i == 1 ? flying : third);
                 if (planet == null)
                 {
                     continue;
                 }
 
-                if (planet != chosen)
+                if (planet == parked)
                 {
-                    planet.transform.position = pivot;
+                    // 停着的那颗 = 游戏认定的 isChosen。它在原生里的位置是
+                    // `currfloor.transform.position + holdOffsetPos + addBob`
+                    // （scrPlanet.LateUpdate），长按格上则由 Update 的长按分支
+                    // 换成滑移位置——两者都正好是圆心，所以摆在 centre 上。
+                    //
+                    // 以前这里存疑过"它到底该不该绕"，试过两次让它绕都坏了。
+                    // 探针给了答案：**该绕的是飞的那颗**，这颗就该停在圆心
+                    // （三球段逐帧量到它离格心恰好 0）。
+                    planet.transform.position = centre;
                 }
 
                 PlanetRenderer renderer = planet.planetRenderer;
@@ -453,10 +973,23 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 // 红/蓝以及任何自定义预设都会被尊重，而不是靠
                 // 猜。持久化读取很便宜；结果存下来，这样这段
                 // 每个球只跑一次，而不是每帧跑。
-                EnsureRendererColour(planet, renderer);
+                //
+                // **多出来的球不能走这里**：LoadPlanetColor 只认 isRed，
+                // planetGreen 会被刷成蓝色，它走 ApplyMultiPlanetColours。
+                //
+                // 判据必须是**球本身**，不能按"第几颗"——绿球在三球段里会
+                // 轮流当停着/飞的那颗，按位置排除会漏掉它转到别的位子的那些格。
+                if (planet == planetarySystem.planetRed || planet == planetarySystem.planetBlue)
+                {
+                    EnsureRendererColour(planet, renderer);
+                }
             }
 
-            DriveRings(planetarySystem, chosen, floorIndex, (float)elapsed, frame.Time, context.TileSize);
+            // 收缩时把多出来的那颗收起来（原生是在 SetNumPlanets 里 Destroy 的）。
+            SyncPlanetVisibility(planetarySystem, parked, flying, third, count);
+
+            DriveRings(planetarySystem, parked, chosen, third, floorIndex,
+                (float)elapsed, frame.Time, context.TileSize);
 
             if (floorIndex != lastLoggedFloor)
             {
@@ -497,7 +1030,9 @@ namespace ADOFAIEditorStudio.Preview.Domains
         /// 永远收敛不了。
         private static void DriveRings(
             PlanetarySystem planetarySystem,
+            scrPlanet parked,
             scrPlanet chosen,
+            scrPlanet third,
             int floorIndex,
             float floorElapsed,
             float playhead,
@@ -518,9 +1053,11 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 ? 1f
                 : Mathf.Clamp01(floorElapsed / RingFadeSeconds);
 
-            for (int i = 0; i < planetarySystem.planetList.Count; i++)
+            // 只驱动场上那几颗。planetList 里另外那些是给多球格准备的克隆，
+            // 它们不在场上，不该给它们开环。
+            for (int i = 0; i < 3; i++)
             {
-                scrPlanet planet = planetarySystem.planetList[i];
+                scrPlanet planet = i == 0 ? parked : (i == 1 ? chosen : third);
                 if (planet == null)
                 {
                     continue;
@@ -532,11 +1069,9 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     continue;
                 }
 
-                // 求值器停在格中心的那颗球戴着环；绕着转的那颗
-                // 不戴。`chosen` 是绕转的那颗——求值器把
-                // 另一颗放在轴心上，所以「没被选中」正好就是「停在格上」。
-                // 它就是刚落地的那颗，所以它淡入而另一颗淡出。
-                bool carriesRing = planet != chosen;
+                // 环只戴在"停在格上"的那颗（游戏认定的 isChosen）身上。
+                // 三球格上另外两颗都在飞/绕，都不戴。
+                bool carriesRing = planet == parked;
                 float percent = carriesRing ? fade : 1f - fade;
 
                 // 环的缩放归求值器管，所以 scrRing.Update 必须被压住。
@@ -585,6 +1120,13 @@ namespace ADOFAIEditorStudio.Preview.Domains
         private static readonly System.Collections.Generic.HashSet<scrPlanet> AwakePlanets =
             new System.Collections.Generic.HashSet<scrPlanet>();
         private static readonly System.Collections.Generic.HashSet<scrPlanet> ColouredPlanets =
+            new System.Collections.Generic.HashSet<scrPlanet>();
+
+        /// <summary>
+        /// 求值器此刻**显示着**的球。球数变化时用它判断谁需要 Destroy（收起）
+        /// 谁需要 Revive（重新唤醒），见 SyncPlanetVisibility。
+        /// </summary>
+        private static readonly System.Collections.Generic.HashSet<scrPlanet> shownPlanets =
             new System.Collections.Generic.HashSet<scrPlanet>();
 
         /// <summary>
@@ -827,6 +1369,30 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 + " off=" + (-num7).ToString("0.000");
         }
 
+        /// <summary>
+        /// 把一组角度写进一颗球。
+        ///
+        /// 只给**停着的那颗**（游戏认定的 isChosen）用。原生每帧推进角度的就是
+        /// 它——Update_RefreshAngles 只对 isChosen 跑；飞的那颗自己的 angle 是旧值，
+        /// 它只有位置是被算出来的（`movingToNext.transform.position = actualPos`）。
+        /// 详见调用处。
+        /// </summary>
+        private static void ApplyBallAngle(
+            scrPlanet planet, double angle, double cosmetic, double snapped,
+            double targetExit, float radius)
+        {
+            if (planet == null)
+            {
+                return;
+            }
+
+            planet.angle = angle;
+            planet.cosmeticAngle = (float)cosmetic;
+            planet.SetSnappedLastAngle(snapped);
+            planet.SetTargetExitAngle(targetExit);
+            planet.cosmeticRadius = radius;
+        }
+
         /// <summary>scrMisc.mod：在整圈上的正取模。</summary>
         private static double Mod2Pi(double value)
         {
@@ -852,6 +1418,77 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 delta += twoPi;
             }
             return delta;
+        }
+
+        /// <summary>
+        /// 长按那条线：球走过多少就填多少颜色。
+        ///
+        /// 原生在 hold 分支里每帧做两件事——把 touchColor 设成**当前这颗球**的
+        /// 颜色（红球走过去就填红、蓝球就填蓝），然后按进度填。
+        /// 求值器以前完全没碰它，所以那条线一路不变色。
+        ///
+        /// **两个字段都要写，只写 holdCompletion 是不够的。**
+        /// scrHoldRenderer 有**自己的 Update**，每帧最后一句是
+        ///
+        ///   UpdateColor(startFloor.holdCompletionEased);
+        ///
+        /// 读的是 `holdCompletionEased`，而不是 `holdCompletion`——原生在
+        /// scrPlanet.Update 的 hold 分支里两个都写
+        /// （`holdCompletion = perc; holdCompletionEased = easedPerc;`），
+        /// 而求值器期间那个组件是关掉的（FreezeStaticPreviewNativeUpdates），
+        /// 于是 `holdCompletionEased` 冻在关卡加载时的 0。
+        ///
+        /// 结果就是每帧两个写入者抢调色板上的 `_Completion`：原生写 0，
+        /// 这里写 progress。拖动时指针不动的帧求值器不重算，线被擦回 0，
+        /// 一动又填上——看起来就是**一直闪**；播放时求值器的写入总被
+        /// 原生那次覆盖，看起来就是**根本没变色**。
+        ///
+        /// 解法不是把 scrHoldRenderer 压住（它还得跑 UpdateMesh，移动轨道
+        /// 上的长按线要靠它跟位置），而是把状态补全到和原生一致：
+        /// 这样原生每帧那一下写的正好是我们想要的，谁先谁后都对。
+        /// </summary>
+        private static void DriveHoldLine(
+            PreviewEvaluationFrame frame, int floorIndex, double progress, scrPlanet chosen)
+        {
+            scrFloor holdFloor = frame.Context.GetFloorBinding(floorIndex);
+            if (holdFloor == null || holdFloor.holdRenderer == null)
+            {
+                return;
+            }
+
+            holdFloor.holdCompletion = (float)progress;
+            holdFloor.holdCompletionEased = (float)progress;
+            if (chosen != null && chosen.planetRenderer != null)
+            {
+                holdFloor.holdRenderer.touchColor =
+                    chosen.planetRenderer.planetColor.ToRealColor();
+            }
+            holdFloor.holdRenderer.UpdateColor((float)progress);
+        }
+
+        /// <summary>
+        /// 走过的那条长按线填满。
+        ///
+        /// 带变化检测：只有还没填满时才写，否则每一帧都会去动一次网格。
+        /// 两个进度字段都要补，理由见 DriveHoldLine。
+        /// </summary>
+        private static void CompleteHoldLine(PreviewEvaluationFrame frame, int floorIndex)
+        {
+            if (floorIndex < 0)
+            {
+                return;
+            }
+
+            scrFloor holdFloor = frame.Context.GetFloorBinding(floorIndex);
+            if (holdFloor == null || holdFloor.holdRenderer == null
+                || (holdFloor.holdCompletion >= 1f && holdFloor.holdCompletionEased >= 1f))
+            {
+                return;
+            }
+
+            holdFloor.holdCompletion = 1f;
+            holdFloor.holdCompletionEased = 1f;
+            holdFloor.holdRenderer.UpdateColor(1f);
         }
 
         private static Vector3 AngleToVector(double angleRadians)        {

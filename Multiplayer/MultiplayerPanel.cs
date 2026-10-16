@@ -1,4 +1,5 @@
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
+using ADOFAIEditorStudio.Ui;
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
@@ -87,7 +88,7 @@ namespace ADOFAIEditorStudio.Multiplayer
             contentRoot = panel.rectTransform;
 
             CreateText("Title", contentRoot, Pad, 14f, PanelWidth - Pad * 2f - 40f, 30f,
-                "联机做谱", 17f, Palette.TextPrimary, TextAlignmentOptions.MidlineLeft, true);
+                "联机做谱", 16f, Palette.TextPrimary, TextAlignmentOptions.MidlineLeft, true);
             CreateButton("Close", contentRoot, PanelWidth - Pad - 30f, 14f, 30f, 30f, "×",
                 delegate { SetVisible(false); });
 
@@ -116,11 +117,11 @@ namespace ADOFAIEditorStudio.Multiplayer
             // 拒绝提示、以及加入失败的原因，都要在这里看得见——memberGroup
             // 里的状态行此时整个是隐藏的，写进去等于没写。
             pickLabel = CreateText("Pick", hostGroup, Pad + 160f, 0f, PanelWidth - Pad * 2f - 160f, 38f,
-                string.Empty, 12f, new Color(0.95f, 0.55f, 0.45f, 1f),
+                string.Empty, 13f, UiTheme.Current.FeedbackDanger,
                 TextAlignmentOptions.MidlineLeft, false);
             pickLabel.textWrappingMode = TextWrappingModes.Normal;
             portLabel = CreateText("Port", hostGroup, Pad + 160f, 0f, PanelWidth - Pad * 2f - 160f, 38f,
-                string.Empty, 12f, Palette.TextMuted, TextAlignmentOptions.MidlineLeft, false);
+                string.Empty, 13f, Palette.TextMuted, TextAlignmentOptions.MidlineLeft, false);
 
             row += 50f;
             joinGroup = CreateRect("JoinGroup", contentRoot, 0f, row, PanelWidth, 46f);
@@ -133,7 +134,7 @@ namespace ADOFAIEditorStudio.Multiplayer
             row += 50f;
             memberGroup = CreateRect("MemberGroup", contentRoot, 0f, row, PanelWidth, PanelHeight - row - Pad);
             statusLabel = CreateText("Status", memberGroup, Pad, 0f, PanelWidth - Pad * 2f, 24f,
-                string.Empty, 12f, Palette.TextMuted, TextAlignmentOptions.MidlineLeft, false);
+                string.Empty, 13f, Palette.TextMuted, TextAlignmentOptions.MidlineLeft, false);
 
             float memberTop = 30f;
             for (int i = 0; i < 8; i++)
@@ -301,7 +302,7 @@ namespace ADOFAIEditorStudio.Multiplayer
                     statusLabel.text = string.IsNullOrEmpty(error) ? (status ?? string.Empty) : error;
                     statusLabel.color = string.IsNullOrEmpty(error)
                         ? Palette.TextMuted
-                        : new Color(0.95f, 0.55f, 0.45f, 1f);
+                        : UiTheme.Current.FeedbackDanger;
                 }
             }
 
@@ -500,7 +501,7 @@ namespace ADOFAIEditorStudio.Multiplayer
             holderRect.offsetMax = new Vector2(-8f, 0f);
             TextMeshProUGUI holder = holderObject.AddComponent<TextMeshProUGUI>();
             holder.font = font;
-            holder.fontSize = 12f;
+            holder.fontSize = 13f;
             holder.color = Palette.TextMuted;
             holder.alignment = TextAlignmentOptions.MidlineLeft;
             holder.text = placeholder;

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using ADOFAI;
 using DG.Tweening;
@@ -11,7 +11,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
     /// 都从捕获的格默认值起步，这样反向拖动
     /// 不会留下 tween 或 transform 残迹。
     /// </summary>
-    internal sealed class MoveTrackPreviewDomain : IPreviewDomain
+    internal sealed class MoveTrackPreviewDomain : IPreviewDomain, IHistoryResettable
     {
         private sealed class MoveEvent
         {
@@ -110,6 +110,19 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
         private readonly List<PendingWrite> pendingWrites = new List<PendingWrite>();
 
+        // 本帧被排了位置写入的格。AnimateTrack 每格都要问一次
+        // 「这一格的位置有没有人写」，线性扫队列会退化成 O(格数²)。
+        private readonly HashSet<scrFloor> positionWriteFloors = new HashSet<scrFloor>();
+
+        /// <summary>
+        /// 当前**不在烘焙状态**的格。它们必须每帧被求值，哪怕被摄像机甩到
+        /// 可见区块之外——否则播放头往回跳时没人把它们写回去。
+        /// 见 Evaluate 里那段说明。
+        /// </summary>
+        private readonly HashSet<int> dirtyFloors = new HashSet<int>();
+        /// <summary>求值顺序的临时集合（可见 ∪ 脏），复用以免每帧分配。</summary>
+        private readonly HashSet<int> evaluationScratch = new HashSet<int>();
+
         /// <summary>
         /// 交一笔延迟写入。AnimateTrack 用它排在自己那些格上，
         /// 排在 MoveTrack 之后，于是在帧末下发时仍然赢过 MoveTrack——
@@ -148,6 +161,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
         public void Analyze(PreviewTimelineContext context)
         {
             events.Clear();
+            // 会话重建：脏格集作废，全部按烘焙状态重新起步。
+            dirtyFloors.Clear();
             if (animateTrack != null)
             {
                 animateTrack.Analyze(context);
@@ -172,8 +187,18 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 int startFloor;
                 int endFloor;
                 ResolveRange(context, levelEvent, out startFloor, out endFloor);
-                Vector2 position = context.GetValue(levelEvent, "positionOffset", Vector2.zero);
-                Vector2 scale = context.GetValue(levelEvent, "scale", new Vector2(100f, 100f));
+                // 必须用带 NaN 语义的读法，不能用通用 GetValue<Vector2>。
+                //
+                // 后者对 List<object> 遇到数组里的 null 会抛异常、然后**整份**
+                // 回落到 fallback，于是 `positionOffset: [-1, null]` 变成 (0,0)——
+                // 那一格的轨道就完全不动（Dream Flower 第 174 格就是这个）。
+                //
+                // 原生里数组里的 null 含义是「这个轴别动」，下面消费的地方
+                // （写 target 那几行）早就按轴判 float.IsNaN 了，缺的只是
+                // 在这里把 NaN 读进来。相机域踩过同一个坑，注释见
+                // PreviewEventSnapshot.GetVector2WithNaN。
+                Vector2 position = context.GetVector2WithNaN(levelEvent, "positionOffset", Vector2.zero);
+                Vector2 scale = context.GetVector2WithNaN(levelEvent, "scale", new Vector2(100f, 100f));
                 events.Add(new MoveEvent
                 {
                     Start = context.GetEventStartTime(levelEvent),
@@ -314,10 +339,18 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 floor.transform.localScale = wantedScale;
             }
 
-            if (Mathf.Abs(floor.opacity - baseline.Opacity) > 0.002f)
-            {
-                floor.SetOpacity(baseline.Opacity);
-            }
+            // **不恢复 opacity。**
+            //
+            // 不透明度是 AnimateTrack 域的通道：全局 trackDisappearAnimation
+            // 正是靠它把每一格淡出的（原版给每一格都建
+            // ffxFloorDisappearPlus，没有 MoveTrack 事件的格同样会淡）。
+            //
+            // 这里再写一次基线会把它抵消掉，而且和 scrFloor.LateUpdate
+            // 抢同一个 LateUpdate 时段——实测 China E：淡出的格在播放头
+            // 走过之后又整片亮回来，就是这个顺序竞争。
+            //
+            // 原先的注释说「不还原的话格会一直保持淡出」，把正确行为
+            // 当成了 bug；本域只该恢复它自己管的位姿通道。
         }
 
         /// <summary>
@@ -450,12 +483,50 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // 上一帧的队列正常情况下已经被 ApplyPendingWrites 消费掉了；
             // 这里再清一次是防它没跑（比如工作台中途被关掉）。
             pendingWrites.Clear();
+            positionWriteFloors.Clear();
+
+            // **播放头跳转时把全部格子标脏一帧。**
+            //
+            // 由引擎在检测到跳转时通过 IHistoryResettable 通知（见
+            // ResetHistory）。脏格集有个自举缺陷：它是由 EvaluateFloor 填的，
+            // 而**被跳过的格子从来没被求值过**——所以它们连"变脏"的机会都没有。
+            // 跳转事件本身把全部格子塞进去，才不依赖任何单格的求值结果。
+            // 实测跳转那一帧会因此打出 changed=2003/2003。
+
             bool chunked = CollectVisibleFloors();
             if (chunked)
             {
+                // **可见区块 ∪ 脏格集。**
+                //
+                // 只求值可见区块的话，被摄像机甩到区块外的格子**再也不会被
+                // 求值**，于是永远停在上一次写入的状态。实测 Offshore（2003 格）
+                // 的覆盖只有 135~350 格：播放头瞬间跳到远处时中间的区块全被跳过，
+                // 那些格的位置/透明度/颜色就都停在被播放过的样子——而位置、
+                // 透明度、颜色分属三个域却一起失效，正说明是"没人求值"。
+                //
+                // 慢拖之所以正常：相机一格格挪过去，每个区块都轮到。
+                // 正常播放之所以正常：它没有瞬间跳转，唯一的瞬间动作
+                // （回开头）还是带动画的。
+                //
+                // 脏格集 = 当前不在烘焙状态的格。它必然只有正在动的那一带
+                // （实测远小于总格数），所以不牺牲这条优化本身。
+                evaluationScratch.Clear();
                 for (int i = 0; i < visibleFloors.Count; i++)
                 {
-                    EvaluateFloor(frame, visibleFloors[i]);
+                    evaluationScratch.Add(visibleFloors[i]);
+                }
+
+                if (dirtyFloors.Count > 0)
+                {
+                    foreach (int dirty in dirtyFloors)
+                    {
+                        evaluationScratch.Add(dirty);
+                    }
+                }
+
+                foreach (int floorIndex in evaluationScratch)
+                {
+                    EvaluateFloor(frame, floorIndex);
                 }
             }
             else
@@ -497,6 +568,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 // 所以不还原的话，没有一个自己的 MoveTrack 事件的格
                 // 会在整个会话余下时间里一直保持淡出和位移。
                 RestoreBaseline(floor, baseline);
+                dirtyFloors.Remove(floorIndex);
                 return;
             }
 
@@ -519,19 +591,39 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     : Mathf.Clamp01((frame.Time - (float)value.Start) / value.Duration);
                 float eased = PreviewEase.EasedValue(0f, 1f, ratio, value.Ease);
                 // 谱面里的 null 解出来是 float.NaN，在原生效果里意思是
-                // 「这个轴别动」。把 NaN 折进向量会
-                // 污染格的 transform，再传播到
-                // 行星和跟随相机，把画面弄黑。
+                // 「这个轴别动」。**target 的初值必须是当前运行值 position，
+                // 不能是 baseline**——这是 native 的逐轴语义：
+                // ffxMoveFloorPlus.StartEffect 里对 NaN 的轴**根本不建 tween**
+                // （if (!float.IsNaN(vector.x)) ...），那个轴保留上一条
+                // tween 留下的值。
+                //
+                // 取 baseline 的后果：一条 positionOffset:[null,null] 的事件
+                // （作者常用来只改透明度/缩放/旋转）会把同一桶里前面事件
+                // 刚推开的位移整条抹回去。duration 为 0 时 eased 恒为 1，
+                // 抹得干干净净——Dream Flower 第 390 格那条 range=0..389 的
+                // [null,null] 就是它：实测 t=120.8 一到，365 那一组的位移
+                // 集体弹回烘焙位置，看起来就是「球没粘在移动着的轨道上」。
+                //
+                // 反过来，作者**写了值**的轴仍然是绝对目标
+                // （原生 target.startPos + positionOffset），不是增量。
+                //
+                // 整条属性被禁用的（HasPosition 为假）跳过：原生这时
+                // positionUsed=false，一个轴的 tween 都不建，位置原样不动。
+                //
+                // 同一套逐轴语义在装饰物域和相机域早就写对了
+                // （DecorationCorePreviewDomain 的 target 从 position 播种、
+                // CameraPreviewDomain 的「NaN 轴保留携带值」），
+                // 只有这里一直从 baseline 播种。
                 if (value.HasPosition)
                 {
-                    Vector3 target = baseline.Position;
+                    Vector3 target = position;
                     if (!float.IsNaN(value.Position.x))
                     {
-                        target.x += value.Position.x * frame.Context.TileSize;
+                        target.x = baseline.Position.x + value.Position.x * frame.Context.TileSize;
                     }
                     if (!float.IsNaN(value.Position.y))
                     {
-                        target.y += value.Position.y * frame.Context.TileSize;
+                        target.y = baseline.Position.y + value.Position.y * frame.Context.TileSize;
                     }
                     position = Vector3.LerpUnclamped(position, target, eased);
                 }
@@ -554,6 +646,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
             // 只入队，不写。真正的写入在 ApplyPendingWrites（LateUpdate），
             // 因为原生组件会在本帧稍后把这些值重置回烘焙状态。
+
             Vector3 wantedPosition = new Vector3(position.x, position.y, floor.transform.position.z);
             Quaternion wantedRotation = Quaternion.Euler(0f, 0f, rotation);
             Vector3 wantedScale = new Vector3(scale.x / 100f, scale.y / 100f, baseline.Scale.z);
@@ -571,6 +664,71 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 Scale = wantedScale,
                 Opacity = wantedOpacity
             });
+            positionWriteFloors.Add(floor);
+
+            // **这一格偏离烘焙状态了吗？** 偏离的进"脏格集"，于是每帧都会被
+            // 求值——哪怕被摄像机甩到可见区块之外。播放头往回跳时（瞬间点击、
+            // 极快拖动），只有这样它才有人把它写回去。回到烘焙状态就移出，
+            // 所以这个集合的大小只跟"当前正在动的那一带"成正比。
+            bool deviated = (wantedPosition - baseline.Position).sqrMagnitude > 0.000001f
+                || Quaternion.Angle(
+                    wantedRotation,
+                    Quaternion.Euler(0f, 0f, baseline.Rotation.eulerAngles.z)) > 0.05f
+                || (wantedScale - baseline.Scale).sqrMagnitude > 0.000001f
+                || Mathf.Abs(wantedOpacity - baseline.Opacity) > 0.002f;
+            if (deviated)
+            {
+                dirtyFloors.Add(floorIndex);
+            }
+            else
+            {
+                dirtyFloors.Remove(floorIndex);
+            }
+        }
+
+        /// <summary>
+        /// 本帧已经算好、但还没写进格子的位置。
+        ///
+        /// **同帧内要问「这一格现在在哪」，必须走这里，不能读
+        /// transform.position。** 写入排在 LateUpdate（原因见 ApplyPendingWrites），
+        /// 而球和相机是在求值阶段跑的，比写入早——读 transform 拿到的是
+        /// **上一帧**的位置。轨道在动的时候，那一帧的差就是
+        /// 「球没粘在轨道上」看起来的样子。
+        /// </summary>
+        internal bool TryGetPendingPosition(scrFloor floor, out Vector3 position)
+        {
+            if (floor != null)
+            {
+                for (int i = 0; i < pendingWrites.Count; i++)
+                {
+                    PendingWrite write = pendingWrites[i];
+                    if (ReferenceEquals(write.Floor, floor))
+                    {
+                        position = write.Position;
+                        return true;
+                    }
+                }
+            }
+
+            position = Vector3.zero;
+            return false;
+        }
+
+        /// <summary>
+        /// 这一帧是否已经给这一格排了写入（**任何通道**）。
+        ///
+        /// 两个调用方，判据是同一个，只是用途不同：
+        ///   · AnimateTrack 判断"跑完的 appear 段还要不要继续主张位置"——
+        ///     原生那条 appear tween 跑完就释放了通道，后启动的 MoveTrack
+        ///     才接得了手；求值器里两域都每帧写，谁后写谁赢，所以跑完的段
+        ///     必须主动让位，否则它会把 MoveTrack 的位移抹回烘焙值。
+        ///   · AnimateTrack 判断"这一格的不透明度有没有别人在管"——有的话
+        ///     本域就不该替它写回 1，否则会把 `MoveTrack(opacity 0)` 那种
+        ///     隐藏又给撤销了。
+        /// </summary>
+        internal bool HasPendingWrite(scrFloor floor)
+        {
+            return floor != null && positionWriteFloors.Contains(floor);
         }
 
         /// <summary>
@@ -586,8 +744,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
         /// </summary>
         internal void ApplyPendingWrites()
         {
-            if (pendingWrites.Count == 0)
-            {
+            if (pendingWrites.Count == 0)            {
                 return;
             }
 
@@ -660,6 +817,18 @@ namespace ADOFAIEditorStudio.Preview.Domains
             if (animateTrack != null)
             {
                 animateTrack.EndSession();
+            }
+        }
+
+        /// <summary>
+        /// 播放头跳转：把全部格子标脏一帧，让它们下一帧全部重算一次。
+        /// 见 Evaluate 里那段说明——脏格集自己没法覆盖"从来没被求值过"的格。
+        /// </summary>
+        public void ResetHistory()
+        {
+            for (int i = 0; i < defaults.Length; i++)
+            {
+                dirtyFloors.Add(i);
             }
         }
 

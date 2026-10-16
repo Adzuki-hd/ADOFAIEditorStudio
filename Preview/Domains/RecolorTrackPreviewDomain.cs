@@ -10,7 +10,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
     /// RecolorTrack 的绝对时间求值。它刻意写回原来的 scrFloor
     /// renderer，而不是另画替代的格。
     /// </summary>
-    internal sealed class RecolorTrackPreviewDomain : IPreviewDomain
+    internal sealed class RecolorTrackPreviewDomain : IPreviewDomain, IHistoryResettable
     {
         private sealed class RecolorEvent : IPreviewTimedKeyframe
         {
@@ -365,6 +365,23 @@ namespace ADOFAIEditorStudio.Preview.Domains
         {
             events.Clear();
             appliedValid = new bool[0];
+        }
+
+        /// <summary>
+        /// 播放头跳转：把「已经应用过」的缓存全部作废，强制下一帧重写一遍
+        /// 颜色与辉度。
+        ///
+        /// 那个缓存的前提是**播放头连续移动**——格子的颜色如果被游戏自己
+        /// 的机制（或另一次求值）改过，而我们这边还记着"已应用"，就会一路
+        /// 跳过写入，格停在一个不对的颜色上。跳转正是这种情况最容易发生的
+        /// 时刻，而在此之前没有任何一处收到通知。
+        /// </summary>
+        public void ResetHistory()
+        {
+            for (int i = 0; i < appliedValid.Length; i++)
+            {
+                appliedValid[i] = false;
+            }
         }
 
         private void BuildFloorBuckets(int floorCount)

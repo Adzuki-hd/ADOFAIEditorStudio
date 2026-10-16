@@ -3,7 +3,7 @@ using UnityEngine.EventSystems;
 
 namespace ADOFAIEditorStudio
 {
-    internal sealed class TimelineResizeHandle : MonoBehaviour, IBeginDragHandler, IDragHandler, IEndDragHandler
+    internal sealed class TimelineResizeHandle : MonoBehaviour, IPointerDownHandler, IBeginDragHandler, IDragHandler, IEndDragHandler
     {
         private EditorStudioOverlay owner;
         private RectTransform timelinePanel;
@@ -17,6 +17,17 @@ namespace ADOFAIEditorStudio
             owner = overlay;
             timelinePanel = panel;
             designRoot = panel == null ? null : panel.parent as RectTransform;
+        }
+
+        public void OnPointerDown(PointerEventData eventData)
+        {
+            if (eventData.button == PointerEventData.InputButton.Left)
+            {
+                // 手柄是时间轴 root 的子物体。没有这句时，PointerDown 会继续冒泡到
+                // EditorTimelineView.OnPointerDown，被它当成"点空白处"而清空选中；
+                // BeginDrag 之后虽然进了这里，选中早就没了。
+                eventData.Use();
+            }
         }
 
         public void OnBeginDrag(PointerEventData eventData)

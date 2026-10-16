@@ -23,6 +23,9 @@ namespace ADOFAIEditorStudio.Preview
             // tween，在暂停格上把行星的入射角对齐回来。
             AngleCorrectionType = source == null ? -1f : source.angleCorrectionType;
             HoldLength = source == null ? -1 : source.holdLength;
+            // 长按的滑移长度（格数）。原生只在它 > 0 时才给行星加
+            // 那层小幅摆动（addBob），所以这个值既是几何也是开关。
+            HoldDistance = source == null ? 0f : source.holdDistance;
             PlanetCount = source == null ? 2 : Mathf.Max(2, source.numPlanets);
             RadiusScale = source == null ? 1f : source.radiusScale;
             PlanetEase = source == null ? Ease.Linear : source.planetEase;
@@ -69,6 +72,7 @@ namespace ADOFAIEditorStudio.Preview
         internal float AngleCorrectionType { get; private set; }
 
         internal int HoldLength { get; private set; }
+        internal float HoldDistance { get; private set; }
         internal int PlanetCount { get; private set; }
         internal float RadiusScale { get; private set; }
         internal Ease PlanetEase { get; private set; }
@@ -210,7 +214,28 @@ namespace ADOFAIEditorStudio.Preview
         internal Vector2 GetVector2WithNaN(string key, Vector2 fallback)
         {
             object raw = GetRawValue(key);
-            IList<object> list = raw as IList<object>;
+
+            // **解析器交出来的本身就是 `Vector2`。**
+            //
+            // 实测 `positionOffset: [-1, null]` 在运行时是
+            // `UnityEngine.Vector2 (-1.00, NaN)` —— 数组和 null 都已经在上游
+            // 处理完了，这里根本拿不到列表。以前只认 IList，于是整份回落到
+            // fallback：Dream Flower 第 174 格的 MoveTrack、以及相机那些单轴
+            // 事件（`position: [4, null]`）全都读成 (0,0)——「null 表示这个轴
+            // 别动」这条规则一次都没生效过。
+            if (raw is Vector2)
+            {
+                return (Vector2)raw;
+            }
+
+            //
+            // 游戏解析器交出来的是**强类型**列表（`List<double>` / `List<long>`
+            // 之类），它实现了非泛型 `IList`，但**不是** `IList<object>`——
+            // 写成 `raw as IList<object>` 会静默转失败、整份回落到 fallback，
+            // 于是所有单轴事件（`positionOffset: [-1, null]`、`[null, 2]`）
+            // 读出来都是 (0,0)，「null 表示这个轴别动」也从来没生效过。
+            // 实测 Dream Flower 第 174 格的 MoveTrack 就是这样读成 (0,0) 的。
+            System.Collections.IList list = raw as System.Collections.IList;
             if (list == null || list.Count < 2)
             {
                 return fallback;
