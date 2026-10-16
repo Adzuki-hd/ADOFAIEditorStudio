@@ -38,6 +38,31 @@ namespace ADOFAIEditorStudio
             internal float Duration;
             internal int FloorId;
             internal int SourceOrder;
+
+            /// <summary>
+            /// 事件身份：**类型 : 格 : 起点时间 : 参数哈希**（见 `EnsureEventKeys`）。
+            /// 工程文件就是按它存行号的。
+            ///
+            /// 要等全部事件到齐、时间也定下来才算得出，所以在 `EnsureEventKeys`
+            /// 里补算，`AddTimelineItem` 那会儿还轮不上。**算过就不再变** ——
+            /// `TimelineItem` 只在重新分析谱面时整个重建（换一批新对象），
+            /// 所以缓存安全。
+            /// </summary>
+            internal string Key;
+
+            /// <summary>
+            /// 下面三个是「算一次就够」的派生值。
+            ///
+            /// 它们只取决于事件自己的参数，而 `TimelineItem` 只在重新分析谱面时
+            /// 重建（同 `Key` 那段的理由），所以在这里存一份，别放进每帧的
+            /// `CollectBlocks` 里现算 —— 那三个函数每帧每块都要查一遍字典
+            /// （`duration` 属性 / 图标表 / `ease`），4237 个块就是每帧两万多次
+            /// 字符串哈希，实测占了「构建块视图」2.6ms 的大头。
+            /// </summary>
+            internal bool Resizable;
+            internal Sprite Icon;
+            internal Ease Ease;
+
             internal bool IsDecoration;
             internal bool Active;
             internal string Name;
@@ -589,10 +614,69 @@ namespace ADOFAIEditorStudio
         // 事件而不是整张谱面——时间轴是用来处理某一段的，
         // 全局概览交给标尺和滚动条。缩放读数的基准就是
         // 这个值，所以默认视图显示 100%。
-        private const float DefaultPixelsPerSecond = 192f;
-        // 默认值的一半：分类框能拉到的最远缩放，对应默认视图的 2 倍跨度。
-        private const float MinimumPixelsPerSecond = 96f;
-        private const float MaximumPixelsPerSecond = 640f;
+        // **缩放的三档（默认 / 上限 / 下限）全部按谱面 BPM 算** —— 见下面那组属性。
+        // 旧的是写死的 192 / 96 / 640：快谱缩到最长也看不清一拍，
+        // 慢谱缩到最挤又挤成一片。现在三档都换算成「一拍占多少像素」，
+        // 于是不同 BPM 的谱看起来是一致的。
+
+        /// <summary>
+        /// 默认缩放下，一拍占多少像素。**也是「100%」的基准。**
+        /// 96 这个数让 BPM 120 的谱算出来正好是旧的固定值 192，
+        /// 老谱子的手感不变。
+        /// </summary>
+        private const float DefaultPixelsPerBeat = 96f;
+
+        /// <summary>
+        /// 缩放到最长时，一拍占多少像素。
+        /// 取 320 是为了让 BPM 120 时正好等于旧的固定上限 640。
+        /// </summary>
+        private const float MaxPixelsPerBeat = 320f;
+
+        /// <summary>最挤能缩到上限的几分之一。</summary>
+        private const float MinZoomRatio = 0.25f;
+
+        /// <summary>
+        /// 谱面的基础 BPM。读不到就退回 120（最常见的值）。
+        ///
+        /// **只取 `levelData.bpm`，不乘每格的 `speed`** —— 变速段不该改变
+        /// 整张谱的缩放范围。
+        /// </summary>
+        private static float ChartBpm
+        {
+            get
+            {
+                scnEditor editor = scnEditor.instance;
+                if (editor == null || editor.levelData == null)
+                {
+                    return 120f;
+                }
+                return Mathf.Max(1f, editor.levelData.bpm);
+            }
+        }
+
+        /// <summary>打开谱面时的默认缩放，也是缩放读数里「100%」的基准。</summary>
+        private static float DefaultPixelsPerSecond
+        {
+            get { return DefaultPixelsPerBeat * ChartBpm / 60f; }
+        }
+
+        /// <summary>缩放上限：让「每拍像素」固定，所以快谱的上限更大。</summary>
+        private static float MaximumPixelsPerSecond
+        {
+            get { return MaxPixelsPerBeat * ChartBpm / 60f; }
+        }
+
+        /// <summary>
+        /// 缩放下限，取上限的一个固定比例。
+        ///
+        /// 块宽另有 `BlockMinWidth`（64 像素）兜底，所以这里管的不是「块别太窄」，
+        /// 而是「整条轴别挤成一片」—— 再小下去块虽然不会窄过 64 像素，
+        /// 但彼此贴到一起，名字和缓速曲线都读不出来。
+        /// </summary>
+        private static float MinimumPixelsPerSecond
+        {
+            get { return MaximumPixelsPerSecond * MinZoomRatio; }
+        }
         private const float DataRefreshInterval = 0.5f;
         private const float SelectionRefreshInterval = 0.12f;
         private const float EventGap = 3f;
@@ -1442,6 +1526,21 @@ namespace ADOFAIEditorStudio
         internal bool DeleteSelection(out string status)
         {
             status = null;
+
+            // **只读模式：删除也是改谱面，拦住。**
+            //
+            // 顺带说一声 —— 同"加事件"那条：工作台每次打开都回到只读（那个状态
+            // 没存进设置），静默拦住会让人以为"按钮坏了"。
+            // 剪切（`CutSelection`）走的就是这个入口，一并挡住。
+            if (owner != null && !owner.AllowEdit())
+            {
+                // 把原因回传（**文案取自同一处**）：热键处理要靠"有没有原因"决定
+                // 吃不吃掉这个键，见 `EditorPlaybackBridge` 里那段。
+                // 提示那边 `AllowEdit` 已经发过了。
+                status = EditorStudioOverlay.ReadOnlyEditMessage;
+                return false;
+            }
+
             scnEditor editor = scnEditor.instance;
             if (editor == null || editor.events == null)
             {
@@ -1521,6 +1620,14 @@ namespace ADOFAIEditorStudio
         internal bool PasteAtPlayhead(out string status)
         {
             status = null;
+
+            // 只读模式：粘贴会往谱面里加事件，拦住（原因回传，见删除那条的说明）。
+            if (owner != null && !owner.AllowEdit())
+            {
+                status = EditorStudioOverlay.ReadOnlyEditMessage;
+                return false;
+            }
+
             scnEditor editor = scnEditor.instance;
             if (editor == null || editor.events == null || editor.floors == null
                 || editor.floors.Count == 0 || !EditorTimelineClipboard.HasContent)
@@ -1746,24 +1853,36 @@ namespace ADOFAIEditorStudio
                 navigationDuration = Mathf.Max(navigationDuration, snapshot.CurrentTime + visibleDuration);
             }
 
-            // 切到「固定中间」的那一帧要立刻对齐，即使当前没在播放——
+            // 切到「固定中间」的那一帧要立刻居中，即使当前没在播放——
             // 否则用户点了按钮画面纹丝不动，看不出这个模式有什么不同。
+            // **这一帧必须用 SyncCenteredView**：FollowPlayback 只在指针贴近
+            // 边缘时才动，指针本来就在中间附近的话它什么也不做。
             if (centerViewOnNextFollow)
             {
                 centerViewOnNextFollow = false;
-                FollowPlayback(snapshot.CurrentTime);
+                if (followMode == TimelineFollowMode.CenteredPlayhead)
+                {
+                    SyncCenteredView(snapshot.CurrentTime);
+                }
+                else
+                {
+                    FollowPlayback(snapshot.CurrentTime);
+                }
             }
             else if (snapshot.State == EditorPlaybackState.Playing
                 && now >= manualNavigationUntil)
             {
                 FollowPlayback(snapshot.CurrentTime);
             }
-            // 居中模式下每帧把视图摆回中点，且不设任何例外。
+            // 居中模式：**每帧**把视图摆回中点，不设例外。
             //
-            // 这是「固定中间」的字面含义：那根竖线永远在正中不动，
-            // 是内容在它下面滑过去。所以不能让拖动、缩放锚点或任何
-            // 别的路径把视图挪走——只要挪了，竖线就离开中心，模式就
-            // 看起来失效了。
+            // 这是「固定中间」的字面含义 —— 那根竖线永远在正中，是内容在它
+            // 下面滑过去。所以这里不能放行任何「把视图挪走」的路径。
+            //
+            // 那拖动怎么办？**拖动改的不是视图，是时间**（见 PanBy 的居中分支）。
+            // 一开始我在 PanBy 里直接挪 viewStartTime，每一帧又被这里改回去，
+            // 表现出来就是「固定中间模式下时间轴拖不动」—— 病根在 PanBy 那边，
+            // 不是这一句。
             //
             // 纵向滚动不受影响：那是看更多行，与水平居中无关。
             if (followMode == TimelineFollowMode.CenteredPlayhead)
@@ -1835,12 +1954,115 @@ namespace ADOFAIEditorStudio
         ///
         /// 原来这里还有一支"在分类框盒子里滚"的分支，随分类卷帘模式一起删了。
         /// </summary>
-        internal void ScrollBy(float wheelDelta, bool control, bool alt, bool shift)
+        /// <summary>
+        /// 拖动中「贴边自动横滚」用：把一个像素位移加进视图起点。
+        ///
+        /// **刻意不走 `PanBy`** —— 那个在居中模式下会把横向平移翻译成
+        /// scrubbing（改当前时间）。这里只是想看看更远的地方，
+        /// 不该顺手把谱面的时间也改了。
+        /// </summary>
+        /// <summary>uGUI 那条路正在拖块吗（探针用）。</summary>
+        internal bool BlockDragActive
         {
-            if (blockDragActive || Mathf.Approximately(wheelDelta, 0f))
+            get { return blockDragActive; }
+        }
+
+        /// <summary>
+        /// 当前纵向滚动偏移（像素）。
+        ///
+        /// 拖动中要读它：行号是按「鼠标位移」算的，而滚动会把整块画布挪走 ——
+        /// 不把这个偏移补偿掉，鼠标原地不动、块也会越滚越偏。
+        /// </summary>
+        internal float VerticalScrollOffset
+        {
+            get { return verticalScrollOffset; }
+        }
+
+        /// <summary>纵向最多能滚多少（0 = 一屏放得下、没得滚）。探针用。</summary>
+        internal float MaxVerticalScroll
+        {
+            get { return GetMaximumVerticalScroll(); }
+        }
+
+        /// <summary>
+        /// 被拖那一批按下时的**时间**（取第一个 = 鼠标真正抓着的那块）。
+        ///
+        /// 拖动中在屏幕上竖一条线标出它：横向是按格吸附的，块和鼠标会一段一段
+        /// 错开，光看块本身分不清"离开原来的时间多远了"。
+        /// </summary>
+        internal float DraggedOriginTime
+        {
+            get
+            {
+                for (int i = 0; i < imBlockDragOrigins.Count; i++)
+                {
+                    if (imBlockDragOrigins[i].Item != null)
+                    {
+                        return imBlockDragOrigins[i].Start;
+                    }
+                }
+                return 0f;
+            }
+        }
+
+        /// <summary>
+        /// 被拖那一批按下时的行号（取第一个 = 鼠标真正抓着的那块）。
+        ///
+        /// 拖动时拿它和"鼠标现在指在第几行"作差 —— 比按鼠标位移算稳，
+        /// 因为滚动、缩放都会改视口，位移那个基准会跟着飘。
+        /// </summary>
+        internal int DraggedOriginRow
+        {
+            get
+            {
+                for (int i = 0; i < imBlockDragOrigins.Count; i++)
+                {
+                    if (imBlockDragOrigins[i].Item != null)
+                    {
+                        return imBlockDragOrigins[i].Row;
+                    }
+                }
+                return 0;
+            }
+        }
+
+        internal void AutoScrollHorizontally(float dxPixels)
+        {
+            if (Mathf.Approximately(dxPixels, 0f))
             {
                 return;
             }
+            viewStartTime += dxPixels / Mathf.Max(1f, pixelsPerSecond);
+            ClampViewStart();
+            visualsDirty = true;
+        }
+
+        internal void ScrollBy(float wheelDelta, bool control, bool alt, bool shift)
+        {
+            if (Mathf.Approximately(wheelDelta, 0f))
+            {
+                return;
+            }
+
+            // **拖动中只放开纵向滚动。**
+            //
+            // 长事件往右铺得远，拖的时候本来就要上下找行，一律禁掉太难用。
+            // 但缩放 / 行高 / 横向那三条**不能放开** —— 它们会改坐标的基准
+            // （每秒多少像素、行多高、视图起点），而拖动中的行号是拿
+            // 「起点 + 位移」现算的，基准一动，鼠标下的那块就跳。
+            // 纵向滚动只挪视口、不参与行号换算，所以它是安全的那个。
+            if (blockDragActive)
+            {
+                if (control || alt || shift)
+                {
+                    return;
+                }
+                verticalScrollOffset -= wheelDelta * rowHeight * 1.7f;
+                ClampVerticalScroll();
+                visualsDirty = true;
+                return;
+            }
+
             if (control)
             {
                 ZoomAt(wheelDelta > 0f ? 1.25f : 0.8f, bodyWidth * 0.5f);
@@ -2117,9 +2339,25 @@ namespace ADOFAIEditorStudio
 
             bool control = Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl);
             bool alt = Input.GetKey(KeyCode.LeftAlt) || Input.GetKey(KeyCode.RightAlt);
+            bool shift = Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift);
             bool plus = Input.GetKeyDown(KeyCode.Equals) || Input.GetKeyDown(KeyCode.KeypadPlus);
             bool minus = Input.GetKeyDown(KeyCode.Minus) || Input.GetKeyDown(KeyCode.KeypadMinus);
             bool zero = Input.GetKeyDown(KeyCode.Alpha0) || Input.GetKeyDown(KeyCode.Keypad0);
+            bool saveKey = Input.GetKeyDown(KeyCode.S);
+
+            // **开发期的工程保存入口：Ctrl+Alt+S。**
+            //
+            // 原来挂的是 `Ctrl+Shift+S`，但**那个被游戏原生占了** ——
+            // 反编译 `scnEditor` 里注册的是 `Ctrl+Shift+S → SaveLevelAs`
+            // （另存谱面），按下去会同时触发"另存谱面"和"存工程"两件事。
+            // `Ctrl+Alt+S` 原生没占。
+            //
+            // 发布前会并进 `Ctrl+S`（那时一下存两样：谱面转发游戏原生、工程写 aesprj）。
+            if (control && alt && saveKey)
+            {
+                SaveProjectInteractive();
+                return;
+            }
 
             if (control && zero)
             {
@@ -2610,10 +2848,25 @@ namespace ADOFAIEditorStudio
             get { return Mathf.Max(BlockMinHeight, rowHeight - BlockGap); }
         }
 
-        /// <summary>自由画布的内容总高。</summary>
+        /// <summary>画布末尾固定留出的空行数 —— 给「往下拖」留落点。</summary>
+        private const int ExtraRowsBelow = 10;
+
+        /// <summary>
+        /// 自由画布的内容总高。
+        ///
+        /// **末尾固定多留 `ExtraRowsBelow` 行**（10 行）。不留的话这个高度正好等于
+        /// "整张谱里堆得最高的那一处"—— 滚动到底时最后一行紧贴面板下沿，
+        /// 想把它往更下面拖根本没有落点（用户的原话就是"按最高的那一格定高度"）。
+        ///
+        /// 这些空行不占内存、也不画任何东西，纯粹是给拖拽留地方。
+        /// </summary>
         internal float BlockContentHeight
         {
-            get { return Mathf.Max(0, BlockRowCount) * BlockStridePixels + BlockStridePixels; }
+            get
+            {
+                return (Mathf.Max(0, BlockRowCount) + ExtraRowsBelow) * BlockStridePixels
+                    + BlockStridePixels;
+            }
         }
 
         /// <summary>垂直滚动位置（正数向下）。</summary>
@@ -2631,11 +2884,217 @@ namespace ADOFAIEditorStudio
         /// <summary>上次自动排列时用的是哪张谱面。**换谱面才重排，清单重建只重新绑定。**</summary>
         private object placementsChart;
 
+        /// <summary>
+        /// 当前工程里存的行号（事件身份 → 行号）。**null = 这张谱还没有工程**，
+        /// 那就整张走自动装箱。
+        ///
+        /// 只在初次排列（`AssignInitialRows`）里被读一次：有记录的块直接归位，
+        /// 没记录的（新加的事件、名册对不上的）才轮到贪心装箱。
+        /// </summary>
+        private Dictionary<string, int> projectRows;
+
+        /// <summary>
+        /// 上一次认的谱面路径。用来判断「换谱面了没有」—— 见 `EnsureBlockPlacements`。
+        /// </summary>
+        private string projectChartPath;
+
+        /// <summary>
+        /// 布局有没有**没写进工程**的改动。
+        ///
+        /// 只算布局（块的行号），不算谱面参数 —— 改透明度、改颜色那些属于
+        /// 谱面本身，归游戏自己的保存管，不该混进这个提示里。
+        /// </summary>
+        private bool projectDirty;
+
+        /// <summary>有没有未保存的布局改动（关工作台 / 切回只读时问它）。</summary>
+        internal bool ProjectDirty
+        {
+            get { return projectDirty; }
+        }
+
+        /// <summary>
+        /// 下一次 `EnsureBlockPlacements` **强制整张重排**，不许走"按事件搬旧位置"。
+        ///
+        /// 「重置时间轴排版」用它：那条路上谱面路径没有变，而判据是"按路径认
+        /// 还是不是同一张谱"，光清 `projectRows` 判不出来 —— 会走重绑、
+        /// 等于什么都没重置（实测症状：重置完位置原样不动）。
+        /// </summary>
+        private bool forcePlacementRebuild;
+
+        /// <summary>
+        /// 上次**自动**排列时用的 BPM。
+        ///
+        /// 用来发现「排得太早、参数还没定下来」：打开谱面的头几帧里
+        /// `levelData.bpm` 还是上一张谱的值，按它算出来的占位时长是错的
+        /// （见 `EnsureBlockPlacements` 里那段说明）。只对**还没有工程**的谱面
+        /// 生效 —— 有工程就说明位置是玩家的，一律不碰。
+        /// </summary>
+        private float autoArrangedBpm;
+
+        /// <summary>把布局标脏。拖块换行、重置排版这些会调。</summary>
+        internal void MarkProjectDirty()
+        {
+            projectDirty = true;
+        }
+
         /// <summary>自动排列跑过几次。用来抓"每帧重排把拖动冲掉"那类问题。</summary>
         private int placementArranges;
 
+        /// <summary>
+        /// 从工程文件加载位置表。**换谱面（或者第一次打开）时调一次。**
+        /// 找不到工程就把 `projectRows` 清成 null —— 整张自动装箱，
+        /// 这正是「只读模式打开一张没做过的谱」的正常路径。
+        /// </summary>
+        internal void LoadProjectRows(string chartPath)
+        {
+            projectRows = null;
+
+            // **不管有没有工程，都要先把「认过的谱面」清掉。**
+            //
+            // 这里原来是"载入成功才清 placementsChart"，于是换到一张**没有工程**
+            // 的新谱面时：两个 early return 之一直接出去、标记还留着旧的，
+            // `EnsureBlockPlacements` 就以为"还是同一张谱"，走按事件重绑那条路 ——
+            // 新谱的事件在旧表里一个都找不到，全被当成新事件逐个 `++maxRow`，
+            // 行号一路涨到几百。表现就是**换谱之后事件全没了**（全排到下面去了）。
+            placementsChart = null;
+
+            if (string.IsNullOrEmpty(chartPath))
+            {
+                return;
+            }
+
+            string path = EditorProjectFile.FindProjectFile(chartPath);
+            EditorProjectFile.Project project;
+            if (!EditorProjectFile.TryLoad(path, out project))
+            {
+                // **这张谱还没有工程 —— 首次打开，直接排一次干净的。**
+                //
+                // 位置是玩家的资产，但那要等**第一次存下来**之后才算数。没有工程
+                // 的时候，手上这份位置表要么是空的、要么是上一次会话的残留，照搬
+                // 毫无意义 —— 而"新谱一打开块就叠在一起、非得手动重置排版才好"
+                // 就是从这儿来的。
+                //
+                // 这里**显式**置一次重排标记，不再指望 `sameChart` 恰好为 false
+                // 那个副作用把流程带到初次排列上去：那是隐式的，中间任何一环
+                // 变了都会悄悄失效。
+                forcePlacementRebuild = true;
+                return;
+            }
+            projectRows = project.Rows;
+            Main.Logger.Log("[工程] 载入 " + project.Rows.Count + " 条位置记录：" + path);
+        }
+
+        /// <summary>
+        /// 把当前布局写进工程文件。返回空串表示成功，否则是失败原因（给弹窗用）。
+        /// 写之前先确保位置表是最新的 —— 拖动过但还没重排的那种情况。
+        /// </summary>
+        internal string SaveProjectRows(string projectPath, string chartName)
+        {
+            EnsureBlockPlacements();
+            var project = new EditorProjectFile.Project { Chart = chartName };
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                BlockPlacement placement = blockPlacements[i];
+                if (placement == null || placement.Item == null
+                    || string.IsNullOrEmpty(placement.Item.Key))
+                {
+                    continue;
+                }
+                project.Rows[placement.Item.Key] = placement.Row;
+            }
+            string error = EditorProjectFile.Save(projectPath, project);
+            if (string.IsNullOrEmpty(error))
+            {
+                // 存下去了，「未保存」的标记跟着清掉。
+                projectDirty = false;
+                Main.Logger.Log("[工程] 保存 " + project.Rows.Count + " 条位置记录：" + projectPath);
+            }
+            return error;
+        }
+
+        /// <summary>
+        /// 保存工程（开发期挂在 `Ctrl+Shift+S` 上）。
+        /// 路径按约定算：`<谱面目录>/<谱面名>_AES/<谱面名>.aesprj`。
+        ///
+        /// 现在只写一条日志 —— 保存成功的提示、未保存的拦截，那些跟菜单栏一起做。
+        /// </summary>
+        private void SaveProjectInteractive()
+        {
+            string chartPath = EditorProjectSession.GetCurrentLevelPath();
+            if (string.IsNullOrEmpty(chartPath))
+            {
+                Main.Logger.Warning("[工程] 拿不到谱面路径，没保存。");
+                return;
+            }
+            string directory = EditorProjectFile.GetProjectDirectory(chartPath);
+            string fileName = System.IO.Path.GetFileNameWithoutExtension(chartPath)
+                + EditorProjectFile.FileExtension;
+            string projectPath = System.IO.Path.Combine(directory, fileName);
+            string error = SaveProjectRows(projectPath, System.IO.Path.GetFileName(chartPath));
+            if (!string.IsNullOrEmpty(error))
+            {
+                Main.Logger.Warning("[工程] 保存失败：" + error);
+            }
+        }
+
+        /// <summary>
+        /// 丢掉工程里存的位置，强制整张**重新自动装箱**。
+        /// 「工程 → 重置时间轴排版」用它。
+        ///
+        /// 两个字段都要清：`projectRows` 是那份表，`placementsChart` 是
+        /// 「已经认过谱面了」的标记 —— 只清前者的话，下一次
+        /// `EnsureBlockPlacements` 会认为"还是同一张谱"、只按事件重绑旧位置，
+        /// 等于什么都没发生。
+        /// </summary>
+        internal void ResetPlacementsToAuto()
+        {
+            projectRows = null;
+            placementsChart = null;
+            // **必须强制走重排。**
+            //
+            // 判据是「按路径认还是不是同一张谱」，而重置排版时路径根本没变 ——
+            // 不清这个标志的话会走 `RebindBlockPlacements`（按事件搬旧位置），
+            // 等于什么都没重置，清掉 `projectRows` 也白搭。
+            forcePlacementRebuild = true;
+            blockPlacements.Clear();
+            EnsureBlockPlacements();
+            visualsDirty = true;
+            // 整张重排过了，这就是一份没存过的新布局。
+            projectDirty = true;
+        }
+
         private void EnsureBlockPlacements()
         {
+            // **谱面换了就重新认工程。**
+            //
+            // 这个方法是每帧都跑的，所以这里只能比路径、不能每次读盘。
+            // 路径变了（打开了别的谱面）才去工程目录找一次 —— 找到就把位置表装进来，
+            // 找不到就是「这张谱还没做过工程」，整张自动装箱。
+            //
+            // **空路径不算"变了"**：`GetCurrentLevelPath()` 在场景切换的中间态
+            // 会返回 null（它自己的注释就写着这事）。一旦让 null 覆盖掉记下的路径，
+            // 下一帧拿到真路径时又会被判成"换谱面了" → `placementsChart` 清掉 →
+            // 整张重新自动装箱，**玩家摆好的位置（含刚撤销回去的）当场没了**。
+            // 实测症状就是「拖到第 6 行、撤销回到第 1 行，一眨眼又跑到第 2 行」。
+            string chartPath = EditorProjectSession.GetCurrentLevelPath();
+            bool sameChart;
+            if (string.IsNullOrEmpty(chartPath))
+            {
+                // 场景切换的中间态拿不到路径 —— **当作还是同一张谱**，
+                // 别趁这一下重排（那会把玩家摆好的位置冲掉）。
+                sameChart = true;
+            }
+            else
+            {
+                sameChart = string.Equals(projectChartPath, chartPath,
+                    StringComparison.OrdinalIgnoreCase);
+                if (!sameChart)
+                {
+                    projectChartPath = chartPath;
+                    LoadProjectRows(chartPath);
+                }
+            }
+
             // **清单取自全部车道，不按车道可见性过滤。**
             //
             // 原来取的是 `layoutItems`，而它是"只拼可见车道"的。于是关掉一个车道，
@@ -2655,6 +3114,9 @@ namespace ADOFAIEditorStudio
                 return a.SourceOrder.CompareTo(b.SourceOrder);
             });
 
+            // 身份要在**按时间重排之前**算好 —— 再往下 `ordered` 就被按时间排序了。
+            EnsureEventKeys(ordered);
+
             scnEditor editor = scnEditor.instance;
             object chart = editor == null ? null : editor.levelData;
 
@@ -2670,11 +3132,42 @@ namespace ADOFAIEditorStudio
             // 每帧重建时偶尔差一个），那时按数量判就会**每跳一次重排一次** ——
             // 玩家摆好的布局被反复冲掉，还白跑几百次。
             // 现在不管数量变没变，都按事件把旧位置搬过去。
-            if (ReferenceEquals(chart, placementsChart) && blockPlacements.Count > 0)
+            // **按路径认「还是不是同一张谱」，不按 `levelData` 对象。**
+            //
+            // 撤销会把 `levelData` 换成新对象（它恢复的就是整套谱面状态），
+            // 按对象认的话每次撤销都被判成"换谱面"→ 下面整张重新装箱，
+            // 玩家摆好的位置**连同刚撤销回去的那个**当场被冲掉。
+            // 实测症状：拖到第 6 行、撤销回到第 1 行，一眨眼又跑到第 2 行
+            // （第 2 行正是自动装箱会给它的位置）。
+            // **排得太早、BPM 还没定下来的那一次，要跟着重排。**
+            //
+            // 装箱的「占位时长」= max(最小块宽, 事件时长) 换算成秒，而换算要除以 BPM
+            // —— 也就是占位固定从 0.8 拍起步。可打开谱面的头几帧里 `levelData.bpm`
+            // 还是**上一张谱残留的值**：实测这张谱真实 BPM 123.333，首次装箱读到的是
+            // 160。占位算错，行数和排布就跟着错 —— 同一张谱、同样的块和时间，
+            // 实测一次 90 行、一次 93 行，样子完全不同。
+            //
+            // 而且它**排完就再也不会自己纠正**，只能靠玩家手动重置排版 —— 那正是
+            // 「首次进去排版乱、重置一下就对了」的由来（玩家以为两条路不同，其实是
+            // 同一条路、只是喂进去的 BPM 一个有对一个错）。
+            //
+            // 所以：只要**还没有工程**（布局还是我们自动生成的、没被玩家的位置覆盖
+            // 过），发现 BPM 变了就重排一次。**有工程之后一律不碰** —— 位置是玩家的
+            // 资产，好坏都听文件里的（见 `LoadProjectRows` 那段）。
+            if (projectRows == null && autoArrangedBpm > 0f
+                && Mathf.Abs(ChartBpm - autoArrangedBpm) > 0.5f)
+            {
+                forcePlacementRebuild = true;
+            }
+
+            if (!forcePlacementRebuild && sameChart && blockPlacements.Count > 0)
             {
                 RebindBlockPlacements(ordered);
                 return;
             }
+            // 强制重排是一次性的：这次用掉就清掉，别让它一直生效
+            // （那样每帧都会重排，玩家拖好的位置会被反复冲掉）。
+            forcePlacementRebuild = false;
 
             placementsChart = chart;
             blockPlacements.Clear();
@@ -2695,8 +3188,51 @@ namespace ADOFAIEditorStudio
             ordered.Sort(CompareInitialPlacement);
             int rowCount = AssignInitialRows(ordered);
             placementArranges++;
+            // 记下这次用的是哪个 BPM —— 它要是和真实值不一样（谱面还没加载完就读了），
+            // 下一帧会被上面那段补一次重排。见 `autoArrangedBpm` 的说明。
+            autoArrangedBpm = ChartBpm;
+            // 临时探针（定位"首次打开与重排结果天差地别"）：装箱吃的是 `StartTime`，
+            // 而它在**首次打开**时可能还没算出来（谱面的格时间未就绪）——那样所有块
+            // 时间都是 0、彼此"完全重叠"，会被塞成一人一行。这里把装箱那一刻的时间
+            // 分布打出来，直接对照。定位完删。
+            int zeroTimes = 0;
+            float minStart = float.MaxValue;
+            float maxStart = float.MinValue;
+            for (int d = 0; d < ordered.Count; d++)
+            {
+                float st = ordered[d] == null ? 0f : ordered[d].StartTime;
+                if (st <= 0f)
+                {
+                    zeroTimes++;
+                }
+                if (st < minStart)
+                {
+                    minStart = st;
+                }
+                if (st > maxStart)
+                {
+                    maxStart = st;
+                }
+            }
             Main.Logger.Log("[Timeline] 自动排列画布：" + ordered.Count
-                + " 个块、" + rowCount + " 行（第 " + placementArranges + " 次）");
+                + " 个块、" + rowCount + " 行（第 " + placementArranges + " 次）"
+                + " ｜ 装箱时 StartTime：零值 " + zeroTimes + " 个，范围 "
+                + minStart.ToString("0.###") + " ~ " + maxStart.ToString("0.###")
+                // 装箱还吃另外两个变量：占位时长由 `MinimumPixelsPerSecond` 推出来
+                // （它依赖 BPM），以及 `ordered` 的顺序（贪心装箱对顺序敏感）。
+                // 两次输入相同、结果却不同（实测 182 vs 190 行），就得靠这两项分辨。
+                + " ｜ BPM=" + ChartBpm.ToString("0.###")
+                + " 每秒像素下限=" + MinimumPixelsPerSecond.ToString("0.#")
+                + " ｜ 前 6 块(格:时间:源序)=");
+            var head = new System.Text.StringBuilder();
+            for (int d = 0; d < 6 && d < ordered.Count; d++)
+            {
+                TimelineItem it = ordered[d];
+                head.Append(it == null ? "空" : (it.FloorId + ":" + it.StartTime.ToString("0.###")
+                    + ":" + it.SourceOrder));
+                head.Append(' ');
+            }
+            Main.Logger.Log("[Timeline] 装箱顺序：" + head.ToString());
         }
 
         /// <summary>
@@ -2716,16 +3252,22 @@ namespace ADOFAIEditorStudio
             // 所以"找第一个放得下的"天然就是"贴到最上面"。
             var rowEnds = new List<float>();
 
+            // 工程行号也按「一个身份只认领一次」用 —— 见下面读取行号那段的说明。
+            var claimedProjectKeys = new HashSet<string>();
+
             // **占位时间按画出来的宽度换算，不能用一个名义的常数。**
             //
             // 画的时候块有个最小宽度（`BlockMinWidth`，64 像素），零时长的事件
             // 也画这么宽。所以两个相距 0.1 秒的点事件要是放进同一行，画出来就是
             // 两个 64 像素的块叠在一起 —— 用户看到的就是"很多块重叠了"。
             //
-            // 换算用的是**加载那一刻的缩放**。排列只在加载谱面时跑一次，
-            // 之后跟着缩放重排会随手把玩家摆好的位置冲掉；代价是之后手动缩得
-            // 比这一刻还小的话，同一行里的块会重新开始叠。
-            float speed = Mathf.Max(1f, pixelsPerSecond);
+            // **按最小缩放（最挤的情况）算占位**，不是按当前缩放。
+            //
+            // 这样之后不管用户怎么缩，块之间的间距只会更大、不会更小 ——
+            // 永远不会叠。所以「缩放时重排」那条路就不需要了，
+            // 玩家摆好的位置从头到尾都是他自己的。
+            // 代价是行数按最坏情况给（缩放下限越大，这个数越小）。
+            float speed = MinimumPixelsPerSecond;
 
             for (int i = 0; i < ordered.Count; i++)
             {
@@ -2738,19 +3280,48 @@ namespace ADOFAIEditorStudio
                 float end = start + (drawnPixels + BlockGap) / speed;
 
                 int row = -1;
-                for (int r = 0; r < rowEnds.Count; r++)
+
+                // **工程里存了这一块的行号就用它。** 位置是玩家的资产 ——
+                // 只有他没摆过的（新加的事件、或者名册对不上的）才轮到自动装箱。
+                //
+                // （这里曾经试过"行号会撞就退到 first-fit"的避让，撤掉了：它没能消掉
+                // 工程里已有的重叠，还把行数从 300 撑到 764、被自动保存写回工程，
+                // 越修越坏。工程要是坏的，正路是让用户按「重置排版」重建。）
+                //
+                // **同一个身份只让认领一次**（同 `RebindBlockPlacements` 里那条）：
+                // 工程里存着两个一模一样的事件时，两条记录的身份键相同，照搬会叠在
+                // 同一行。第二个起改走下面的 first-fit。
+                int saved = -1;
+                bool savedUsable = projectRows != null && !string.IsNullOrEmpty(item.Key)
+                    && claimedProjectKeys.Add(item.Key)
+                    && projectRows.TryGetValue(item.Key, out saved) && saved >= 0;
+                if (savedUsable)
                 {
-                    if (rowEnds[r] <= start)
+                    row = saved;
+                    // 把这一行的「已占到哪」推到这一块之后，后面那些没存行号的块
+                    // 才不会撞进同一行。和已有值取 Max，是为了不把那一行更晚的占用拉回来。
+                    while (rowEnds.Count <= row)
                     {
-                        row = r;
-                        rowEnds[r] = end;
-                        break;
+                        rowEnds.Add(float.NegativeInfinity);
                     }
+                    rowEnds[row] = Mathf.Max(rowEnds[row], end);
                 }
-                if (row < 0)
+                else
                 {
-                    row = rowEnds.Count;
-                    rowEnds.Add(end);
+                    for (int r = 0; r < rowEnds.Count; r++)
+                    {
+                        if (rowEnds[r] <= start)
+                        {
+                            row = r;
+                            rowEnds[r] = end;
+                            break;
+                        }
+                    }
+                    if (row < 0)
+                    {
+                        row = rowEnds.Count;
+                        rowEnds.Add(end);
+                    }
                 }
 
                 blockPlacements.Add(new BlockPlacement
@@ -2789,18 +3360,58 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
-            var rows = new Dictionary<LevelEvent, int>();
-            var times = new Dictionary<LevelEvent, float>();
+            // **按事件身份（`Key`）搬位置，不是按 `LevelEvent` 对象。**
+            //
+            // 这里是"再打开事件全没了"的根因：谱面一重新分析，`LevelEvent` 就换成
+            // 一批新对象，按对象匹配**全部对不上**，于是每个块都被当成"新事件"、
+            // 逐个 `++maxRow` —— 行号一路涨到几百，块全被排到下面很远的行上。
+            // 而 `Ctrl+Shift+S` 存的就是这份被撑坏的表。
+            var times = new Dictionary<string, float>();
+            // **旧行号再按「位置」存一份**，给下面"键对不上"时兜底。
+            //
+            // 为什么要它：键里含参数（为了分开"同格、同类型、同时刻"的多个事件，
+            // 比如同一格上叠着的几个滤镜），而**改参数会让键变** —— 只按键找的话，
+            // 改一个透明度那一块就"找不到"、被补到最下面，看着就是"改个参数块就跑了"。
+            // 按位置兜底之后它保持原样，那个矛盾就不存在了。
+            // 旧表的行号按**身份键的前三段**（类型:格:时间）分组排队。
+            //
+            // **为什么不按键、也不按下标：**
+            //   · 只按键 —— 键的第四段是参数，一改参数键就变，"找不到"就被补到
+            //     最下面（用户看到的是"改个透明度块就跑了"）；
+            //   · 只按下标 —— 清单长度一变（加了事件）下标就整体错位，新加的块会
+            //     套用别人的行号、挤在同一行。实测就是这么叠的：
+            //     「行0 时间 3.84 vs 3.84 身份相同=否」——身份不同却撞在一行。
+            //
+            // 按**前三段**排队，三种情况一次都照顾到：
+            //   · 改过参数的块，前三段没变 → 照样认得出，位置保住；
+            //   · 真·新事件的前缀在旧表里没有 → 补到最下面；
+            //   · 一模一样的那对（前三段当然也一样）→ 一人领一个旧行号，
+            //     旧表里只有一个的话，第二个自然去补 → 不会再叠。
+            var oldRowsByPrefix = new Dictionary<string, Queue<int>>();
             int maxRow = -1;
             for (int i = 0; i < blockPlacements.Count; i++)
             {
                 BlockPlacement placement = blockPlacements[i];
-                if (placement.Item == null || placement.Item.Event == null)
+                if (placement == null || placement.Item == null)
                 {
                     continue;
                 }
-                rows[placement.Item.Event] = placement.Row;
-                times[placement.Item.Event] = placement.Time;
+                string oldKey = placement.Item.Key;
+                if (string.IsNullOrEmpty(oldKey))
+                {
+                    continue;
+                }
+                times[oldKey] = placement.Time;
+
+                string prefix = KeyPrefix(oldKey);
+                Queue<int> queue;
+                if (!oldRowsByPrefix.TryGetValue(prefix, out queue))
+                {
+                    queue = new Queue<int>();
+                    oldRowsByPrefix[prefix] = queue;
+                }
+                queue.Enqueue(placement.Row);
+
                 if (placement.Row > maxRow)
                 {
                     maxRow = placement.Row;
@@ -2811,19 +3422,64 @@ namespace ADOFAIEditorStudio
             for (int i = 0; i < ordered.Count; i++)
             {
                 TimelineItem item = ordered[i];
-                int row;
-                float time;
-                if (item.Event != null && rows.TryGetValue(item.Event, out row))
+                int row = -1;
+                float time = item.StartTime;
+
+                if (!string.IsNullOrEmpty(item.Key))
                 {
-                    times.TryGetValue(item.Event, out time);
+                    Queue<int> queue;
+                    if (oldRowsByPrefix.TryGetValue(KeyPrefix(item.Key), out queue)
+                        && queue.Count > 0)
+                    {
+                        row = queue.Dequeue();
+                        // 时间只认**同一个身份**记下的那个；前缀对上但身份变了
+                        // （改过参数）就用它这次算出来的起点。
+                        float savedTime;
+                        if (times.TryGetValue(item.Key, out savedTime))
+                        {
+                            time = savedTime;
+                        }
+                    }
                 }
-                else
+
+                if (row < 0)
                 {
+                    // 前缀在旧表里没有（真·新事件），或者那一组已经分完了：
+                    // 补到最下面一行。
                     row = ++maxRow;
-                    time = item.StartTime;
                 }
+
                 blockPlacements.Add(new BlockPlacement { Item = item, Row = row, Time = time });
             }
+        }
+
+        /// <summary>
+        /// 身份键的「前三段」：`类型:格:时间`。
+        ///
+        /// 第四段是参数哈希 —— 改参数会让整个键变掉，但前三段不变，所以拿它认
+        /// 「还是不是同一个块」（见 `RebindBlockPlacements` 里那段说明）。
+        /// 前三段里不会有冒号（两个整数 + 一个定点小数），数到第三个冒号就够了。
+        /// </summary>
+        private static string KeyPrefix(string key)
+        {
+            if (string.IsNullOrEmpty(key))
+            {
+                return key;
+            }
+            int seen = 0;
+            for (int i = 0; i < key.Length; i++)
+            {
+                if (key[i] != ':')
+                {
+                    continue;
+                }
+                seen++;
+                if (seen == 3)
+                {
+                    return key.Substring(0, i);
+                }
+            }
+            return key;
         }
 
         /// <summary>
@@ -2897,6 +3553,12 @@ namespace ADOFAIEditorStudio
             EnsureBlockPlacements();
             blockViews.Clear();
             int rows = 0;
+            // **提到循环外。** `scnEditor.instance` 是属性，每访问一次都要查一遍，
+            // 而它在一帧里不会变 —— 4237 个块就是白查 4237 次。`imBlockDrag` 同理
+            // （循环里没有改它的地方）。
+            scnEditor chartEditor = scnEditor.instance;
+            bool liveTimeBase = !imBlockDrag && chartEditor != null
+                && chartEditor.floors != null && chartEditor.floors.Count > 0;
             for (int i = 0; i < blockPlacements.Count; i++)
             {
                 BlockPlacement placement = blockPlacements[i];
@@ -2924,10 +3586,7 @@ namespace ADOFAIEditorStudio
                 // 块和参数栏的数值因此严丝合缝，不会一个在这个位置、一个写另一个值。
                 //
                 // 拖动中例外：那时位置表就是"手底下这一份"，必须听它的。
-                scnEditor chartEditor = scnEditor.instance;
-                bool liveTime = !imBlockDrag && item != null && item.Event != null
-                    && chartEditor != null && chartEditor.floors != null
-                    && chartEditor.floors.Count > 0;
+                bool liveTime = liveTimeBase && item != null && item.Event != null;
                 if (liveTime)
                 {
                     // 写回位置表，不只是给这一帧画 —— `TryGetBlockPlacement` 也是
@@ -2943,7 +3602,9 @@ namespace ADOFAIEditorStudio
                 {
                     Id = i,
                     Row = placement.Row,
-                    Resizable = CanResizeItem(item),
+                    // 这三个改用 item 上现成的（建 item 时就算好了，见那边的说明）——
+                    // 原来是每帧每块现查字典，4237 个块就是每帧两万多次字符串哈希。
+                    Resizable = item.Resizable,
                     Time = placement.Time,
                     Duration = float.IsNaN(placement.PreviewDuration)
                         // 时长同理：拖右边缘改的就是 `duration`，撤销时同一类过期。
@@ -2955,17 +3616,24 @@ namespace ADOFAIEditorStudio
                     Active = item.Active,
                     Selected = IsBlockSelected(item),
                     Event = item.Event,
-                    Icon = GetEventIcon(item.Event),
+                    Icon = item.Icon,
                     Curve = item.Event != null && item.Duration > 0.01f
-                        ? GetEaseCurveValues(GetTimelineEase(item.Event))
+                        ? GetEaseCurveValues(item.Ease)
                         : null
                 });
             }
             BlockRowCount = rows;
-            blockViews.Sort(delegate(BlockView a, BlockView b)
-            {
-                return a.Row != b.Row ? a.Row.CompareTo(b.Row) : a.Id.CompareTo(b.Id);
-            });
+            // **这里原来要把 blockViews 按（行号, Id）排一遍，去掉了。**
+            //
+            // 排序唯一的用途，是让绘制那边能「画到屏幕底下就 break」提前收工。
+            // 代价却是每帧对 4237 个 struct 跑一整趟内省排序 —— 实测 1.4ms，而且
+            // `blockPlacements` 是按事件源序存的、不是按行，所以顺序每帧都是乱的，
+            // "缓存顺序"那条路走不通，只能每次真排。
+            //
+            // 改成让绘制那边遍历到底、靠它本来就有的两个 `continue` 跳过看不见的
+            // 块：多空转 4000 次约 0.2ms，比排序便宜一个数量级。
+            //
+            // **顺序从此没有意义 —— 谁都不能再假设 `BlockViews` 是按行号有序的。**
         }
 
         // -------------------------------- ImGui 版块拖动：**这条是改谱面的**
@@ -2997,6 +3665,12 @@ namespace ADOFAIEditorStudio
         internal const float BlockEdgeZone = 6f;
 
         /// <summary>
+        /// 拖动时「回到原位」的吸附半径（像素），和屏幕上那条竖线配套。
+        /// 比格吸附优先：看得见原点的线，就该吸得回原点。
+        /// </summary>
+        private const float OriginSnapPixels = 14f;
+
+        /// <summary>
         /// 开始拖一个块。
         ///
         /// **横向拖和拖边缘是"改谱面"**：它们走的是和 uGUI 那版**同一套**
@@ -3007,6 +3681,13 @@ namespace ADOFAIEditorStudio
         internal bool BeginBlockDrag(LevelEvent target, BlockDragMode mode, float pointerTime)
         {
             imBlockDrag = false;
+
+            // 只读模式：块拖不动 —— 拖块会改谱面里的时间（提示统一由 AllowEdit 发）。
+            if (owner != null && !owner.AllowEdit())
+            {
+                return false;
+            }
+
             if (target == null)
             {
                 return false;
@@ -3066,7 +3747,21 @@ namespace ADOFAIEditorStudio
             switch (imBlockDragMode)
             {
                 case BlockDragMode.Move:
-                    start = SnapBlockTime(start + delta);
+                    // **先看有没有回到原位。** 屏幕上那条竖线标的就是它 ——
+                    // 看得见就该吸得上。
+                    //
+                    // 只按格边界吸的话，拖回来会停在"最近的格"，未必是出发那一格：
+                    // 块的起点本来就不一定压在格边界上（角度偏移、变速都会让它偏），
+                    // 于是"拖回原来的地方"变成了"拖回附近的某个格"。
+                    if (Mathf.Abs(start + delta - imBlockDragOrigin.Start)
+                        <= OriginSnapPixels / Mathf.Max(1f, pixelsPerSecond))
+                    {
+                        start = imBlockDragOrigin.Start;
+                    }
+                    else
+                    {
+                        start = SnapBlockTime(start + delta);
+                    }
                     break;
                 case BlockDragMode.ResizeRight:
                 {
@@ -3208,6 +3903,15 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
+            // 只读模式：布局也不动 ——「只读」是什么都不改，不只是不改谱面。
+            if (owner != null && !owner.AllowEdit())
+            {
+                return;
+            }
+
+            // 拖块换行 = 布局变了，关工作台时要提示保存。
+            projectDirty = true;
+
             // **只有"整体移动"才动纵向。**
             //
             // 拉两端是在改时长 —— 纵向跟着鼠标跑的话，手稍微一斜就顺手把行号
@@ -3264,6 +3968,112 @@ namespace ADOFAIEditorStudio
                 }
             }
             return null;
+        }
+
+        /// <summary>
+        /// 拖完如果还跟别的块叠着，就**整批退回起点行**。
+        ///
+        /// 返回 true 表示作废了。**必须在 `RecordDragRowMove` 之前调** ——
+        /// 退回之后每块的行号都等于起点行，那一步自然会认为"一个都没动"、
+        /// 不记撤销，也就不会出现"撤销之后位置不对"。
+        ///
+        /// 为什么要作废而不是放任：块的**最小宽度**（`BlockMinWidth`）让两个
+        /// 时间上并不重叠的事件画出来也会叠；叠在一起之后，用户既看不出谁压着谁，
+        /// 撤销也会看着像"跳错地方"。
+        /// </summary>
+        internal bool RevertDragIfOverlapping()
+        {
+            bool overlapping = false;
+            for (int i = 0; i < imBlockDragOrigins.Count; i++)
+            {
+                DragOrigin origin = imBlockDragOrigins[i];
+                if (origin.Item == null || origin.Item.Event == null)
+                {
+                    continue;
+                }
+                if (BlockOverlapsOthers(origin.Item.Event))
+                {
+                    overlapping = true;
+                    break;
+                }
+            }
+            if (!overlapping)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < imBlockDragOrigins.Count; i++)
+            {
+                DragOrigin origin = imBlockDragOrigins[i];
+                if (origin.Item == null || origin.Item.Event == null)
+                {
+                    continue;
+                }
+                BlockPlacement placement = FindPlacementForEvent(origin.Item.Event);
+                if (placement != null)
+                {
+                    placement.Row = origin.Row;
+                    // **横向要退在 `placement.Time` 上，不是 `item.StartTime`。**
+                    //
+                    // 拖动中的横纵预览都写在位置表里（见 `DragBlockTo` 收尾那句
+                    // "预览直接写在位置表上"），画布每帧取的就是它；`item.StartTime`
+                    // 是"不在拖动时"才被现算覆盖的缓存。退错了字段等于没退 ——
+                    // 纵向退了、横向纹丝不动，看起来就是"作废没生效"。
+                    // 而且 `EndBlockDrag` 也读这个值去提交，不退就会把横向写进谱面。
+                    placement.Time = origin.Start;
+                    placement.PreviewDuration = float.NaN;   // 清掉拖动时的临时时长
+                }
+                origin.Item.StartTime = origin.Start;
+                origin.Item.Duration = origin.StartDuration;
+            }
+
+            // 起点表清掉：横纵都不再提交（`EndBlockDrag` 的跟随者循环也一并跳过）。
+            imBlockDragOrigins.Clear();
+
+            visualsDirty = true;
+            return true;
+        }
+
+        /// <summary>
+        /// 这个块按它**当前的行号和时间**，会不会跟别的块撞上。
+        ///
+        /// 判据和画的时候一致：**同一行 + 画出来的像素区间相交**。
+        /// 不能拿"名义时长"比 —— 块有最小宽度（`BlockMinWidth`），
+        /// 两个点事件时间上不重叠、画出来却是叠着的。
+        ///
+        /// 拖动中拿它做「这一下能不能放下」的判据，也用来决定要不要描红。
+        /// 只查这一块（不两两比），所以代价是 O(块数)，拖动时每帧调得起。
+        /// </summary>
+        internal bool BlockOverlapsOthers(LevelEvent target)
+        {
+            BlockPlacement self = FindPlacementForEvent(target);
+            if (self == null || self.Item == null)
+            {
+                return false;
+            }
+            float speed = Mathf.Max(1f, pixelsPerSecond);
+            float selfLeft = self.Time * speed;
+            float selfWidth = Mathf.Max(BlockMinWidth,
+                self.Item.Duration * speed - BlockGap);
+            float selfRight = selfLeft + selfWidth;
+
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                BlockPlacement other = blockPlacements[i];
+                if (other == self || other.Item == null || other.Row != self.Row)
+                {
+                    continue;
+                }
+                float otherLeft = other.Time * speed;
+                float otherWidth = Mathf.Max(BlockMinWidth,
+                    other.Item.Duration * speed - BlockGap);
+                // 区间相交：左端在对方右端之前，且右端在对方左端之后。
+                if (selfLeft < otherLeft + otherWidth && otherLeft < selfRight)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         /// <summary>
@@ -3349,6 +4159,79 @@ namespace ADOFAIEditorStudio
             ClampViewStart();
             MarkManualNavigation();
             visualsDirty = true;
+        }
+
+        /// <summary>
+        /// 居中模式下的「拖动时间轴」—— 开始。
+        ///
+        /// 那个模式里播放头钉在屏幕上，**拖动改的是它指向的时间，不是视图起点**：
+        /// 直接挪 viewStartTime 会被 SyncCenteredView 每帧摆回去，看起来就是拖不动。
+        ///
+        /// **这一步不能省。** TryScrubTimelineToTime 开头就检查 timelineScrubActive，
+        /// 没进状态的话每次提交都被静默拒绝 —— 表现同样是「拖不动」。
+        /// 返回 false 表示这会儿进不去（播放中之类），那就别往下走。
+        /// </summary>
+        internal bool BeginCenteredBrowse()
+        {
+            if (!IsCenteredPlayhead)
+            {
+                return false;
+            }
+            string status;
+            if (!EditorPlaybackBridge.TryBeginTimelineScrub(out status))
+            {
+                return false;
+            }
+            centerBrowseScrubbing = true;
+            centerBrowseStartTime = EditorPlaybackBridge.ReadSnapshot().CurrentTime;
+            centerBrowseAccum = 0f;
+            return true;
+        }
+
+        /// <summary>居中浏览是否在进行中（ImGui 那边靠它决定要不要收尾）。</summary>
+        internal bool CenteredBrowsing
+        {
+            get { return centerBrowseScrubbing; }
+        }
+
+        /// <summary>
+        /// 居中浏览推进一段像素。**往右拖 = 时间倒退** —— 那是「抓住内容拖」的手感
+        /// （跟 uGUI 那条路、跟剪辑软件里拖时间轴一致）。
+        ///
+        /// 累积量是从 Begin 时记下的时间往上加的，**不在拖动中读当前时间**：
+        /// 提交有节流，读回来可能还是旧值，那样每帧都会把上一步的增量丢掉。
+        /// </summary>
+        internal void BrowseCenteredBy(float deltaXPixels)
+        {
+            if (!centerBrowseScrubbing)
+            {
+                return;
+            }
+            centerBrowseAccum -= deltaXPixels / Mathf.Max(1f, pixelsPerSecond);
+            pendingScrubTime = Mathf.Clamp(
+                centerBrowseStartTime + centerBrowseAccum,
+                0f,
+                Mathf.Max(0f, navigationDuration));
+            scrubPending = true;
+            // 清冷却并要求立刻提交：拖动要跟手，不能等节流窗口。
+            manualNavigationUntil = 0f;
+            nextScrubSubmitTime = 0f;
+            visualsDirty = true;
+        }
+
+        /// <summary>
+        /// 居中浏览收尾：提交最后一次定位并退出状态。
+        /// 不退的话 timelineScrubActive 会一直挂着，之后所有定位都被拒。
+        /// </summary>
+        internal void EndCenteredBrowse()
+        {
+            if (!centerBrowseScrubbing)
+            {
+                return;
+            }
+            centerBrowseScrubbing = false;
+            SubmitPendingScrub(true);
+            EditorPlaybackBridge.EndTimelineScrub();
         }
 
         /// <summary>纵向平移（中键上下拖用的）。规则同 PanBy。</summary>
@@ -4042,10 +4925,123 @@ namespace ADOFAIEditorStudio
                 Active = levelEvent.active,
                 Name = GetTimelineItemName(levelEvent, lane),
                 BlockColor = GetEventTypeColor(levelEvent.eventType, lane),
-                LabelColor = GetEventLabelColor(levelEvent.eventType, lane)
+                LabelColor = GetEventLabelColor(levelEvent.eventType, lane),
+                // 这三个每帧每块都要用 —— 在这里算一次，别留到 CollectBlocks。
+                Resizable = GetCanResize(levelEvent),
+                Icon = GetEventIcon(levelEvent),
+                Ease = GetTimelineEase(levelEvent)
             };
             laneItems[(int)lane].Add(item);
             totalDuration = Mathf.Max(totalDuration, startTime + duration);
+        }
+
+        /// <summary>
+        /// 这个事件能不能拉时长 —— 判据和 `CanResizeItem` 完全一样，只是按事件问。
+        /// 建 `TimelineItem` 那一步要用这个答案，那时 item 还没造出来。
+        /// </summary>
+        private static bool GetCanResize(LevelEvent levelEvent)
+        {
+            if (levelEvent == null || levelEvent.info == null)
+            {
+                return false;
+            }
+            Dictionary<string, ADOFAI.PropertyInfo> properties = levelEvent.info.propertiesInfo;
+            return properties != null && properties.ContainsKey("duration");
+        }
+
+
+        /// <summary>
+        /// 给每个事件补算身份（`Key`）：**类型 + 格 + 同类型同格里的序号**。
+        ///
+        /// **为什么序号要按「同类型同格」分组数**：只用「类型 + 格」的话，
+        /// 同一格上的两个 MoveCamera 会算出同一个身份、在工程表里互相覆盖，
+        /// 布局就串了。加了组内序号才分得开。
+        ///
+        /// **组内按文件序数**（调用方给的清单已经按 `SourceOrder` 排好），
+        /// 所以稳定性来自「在谱面文件里的先后」，而不是会被外部编辑搅乱的数组下标。
+        ///
+        /// 什么会改这个身份：在 AES **之外**往同一格插/删同类型事件 ——
+        /// 那之后的序号整体挪一位，就是约定的「名册对不上」。
+        /// 改参数、改别的格、加别的类型，都不动它。
+        /// </summary>
+        private void EnsureEventKeys(List<TimelineItem> ordered)
+        {
+            if (ordered == null)
+            {
+                return;
+            }
+
+            // **身份 = `类型 : 格 : 起点时间 : 参数`**（不碰谱面，不写任何字段）。
+            //
+            // 为什么这个组合在这一版是稳的：
+            //   · **改参数**（透明度、颜色、缓速…）→ 键确实会变，但重绑那边
+            //     有"按位置兜底"（见 `RebindBlockPlacements`），改完块**留在原地**；
+            //   · **拖动** → `DragBlockTo` 只写 `placement`（画布预览），
+            //     事件数据要等 `EndBlockDrag` 才提交 —— 拖动全程键不变；
+            //   · **撤销 / 重做** → 事件回到哪个状态，键就是那个状态的键；
+            //   · **加 / 删事件** → 只有那一个的键消失，别的照旧。
+            //
+            // **第四段（参数）是不能省的**：同一格上可以叠着好几个同类型、
+            // 同时刻的事件 —— 最常见的是一格挂三个 SetFilter。前三段对它们
+            // 完全一样，不靠参数就分不开，保存时互相覆盖、重绑时全挤回同一行。
+            // 实测症状：「三个滤镜叠在一起，手动分开又自动叠回去」。
+            for (int i = 0; i < ordered.Count; i++)
+            {
+                TimelineItem item = ordered[i];
+                if (item == null)
+                {
+                    continue;
+                }
+                if (item.Event == null)
+                {
+                    item.Key = null;
+                    continue;
+                }
+                // **算过一次就别再算。**
+                //
+                // 这个方法挂在每帧都会跑的 `EnsureBlockPlacements` 上，而 `item`
+                // 只在**重新分析谱面**时才重建（见那边的注释：换一批新对象），
+                // 不是每帧新造的 —— 所以重复计算纯属浪费。偏偏它一点都不便宜：
+                // 每个事件都要取一遍参数字典、把 `键=值` 拼成字符串、**再对这些
+                // 字符串排序**、最后 join 起来。
+                //
+                // 大规模实测（2286 个块）：`CollectBlocks` 一共 37.5ms，而真正的
+                // 绘制只占 0.1ms —— 钱基本都花在这儿。加上这一句，它只在必要时算。
+                if (item.Key != null)
+                {
+                    continue;
+                }
+                item.Key = (int)item.Event.eventType + ":" + item.FloorId
+                    + ":" + item.StartTime.ToString("F4")
+                    + ":" + HashEventData(item.Event);
+            }
+        }
+
+        /// <summary>
+        /// 把一个事件的参数拼成一个可用于比较的字符串。
+        ///
+        /// **按键排序之后再拼**：字典的遍历顺序不保证，不排序的话同一个事件
+        /// 两次算出来的串可能不同，键就会自己抖。
+        ///
+        /// 只用来**区分同一批里的事件**，不要求它完美 —— 值里的复合类型
+        /// （数组之类）`ToString()` 出来是一样的，那种情况下两个事件会被当成
+        /// 同一个键、互相覆盖。实测那不影响：位置一样、它们本来就该在同一行。
+        /// </summary>
+        private static string HashEventData(LevelEvent levelEvent)
+        {
+            Dictionary<string, object> data = levelEvent.GetData();
+            if (data == null || data.Count == 0)
+            {
+                return "";
+            }
+            var parts = new List<string>(data.Count);
+            foreach (KeyValuePair<string, object> pair in data)
+            {
+                parts.Add(pair.Key + "="
+                    + (pair.Value == null ? "null" : pair.Value.ToString()));
+            }
+            parts.Sort(StringComparer.Ordinal);
+            return string.Join("|", parts);
         }
 
 
@@ -5022,7 +6018,13 @@ namespace ADOFAIEditorStudio
             {
                 Item = item,
                 Row = row,
-                Start = item.StartTime,
+                // **起点要现算，不能抄 `item.StartTime`。**
+                //
+                // `StartTime` 是上次重新分析谱面时的快照，而块**画出来**的位置
+                // 是每帧现算的（见 `CollectBlocks` 那条注释）—— 两者会差一截，
+                // 于是拖动时那条标原位的竖线画在过期位置、看着像"跑到别处"。
+                // 这里必须和画的时候用同一个来源。
+                Start = GetEventStartTime(scnEditor.instance, item.Event),
                 StartDuration = item.Duration,
                 // 和原来的单例字段 blockDragOriginalDuration 取的是同一个东西：
                 // **事件数据里的拍数**，撤销要还原的就是它。
@@ -5944,6 +6946,18 @@ namespace ADOFAIEditorStudio
 
         private void UpdatePlayhead(EditorPlaybackSnapshot snapshot)
         {
+            // **时间读数先更新，别受下面那个提前返回影响。**
+            //
+            // ImGui 版接管之后这个方法在开头就 `return` 了（uGUI 那条播放头不摆，
+            // 免得和 ImGui 画的叠成两条）—— 而 `timeText` 的赋值原来落在它后面，
+            // 于是读数永远停在初始的 "00:00.000 / 00:00.000"，一动不动。
+            //
+            // 这个文本对象现在只是**数据的载体**（ImGui 那边读它的 `.text` 去画），
+            // 和"摆不摆 uGUI 播放头"是两件不相干的事。
+            float current = Mathf.Max(0f, snapshot.CurrentTime);
+            timeText.text = FormatTime(current) + " / "
+                + FormatTime(Mathf.Max(totalDuration, snapshot.Duration, current));
+
             // ImGui 版接管了就整个不摆 —— 不藏的话会和它画的那条**重叠成两条**。
             if (blocksTakenOver)
             {
@@ -5954,7 +6968,6 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
-            float current = Mathf.Max(0f, snapshot.CurrentTime);
             float x = (current - viewStartTime) * pixelsPerSecond;
             bool inside = viewInitialized && x >= 0f && x <= bodyWidth;
             playhead.gameObject.SetActive(inside);
@@ -5963,7 +6976,6 @@ namespace ADOFAIEditorStudio
                 SetTopLeft(playhead, x, 0f, 2f, bodyHeight);
                 SyncPlayheadHeight();
             }
-            timeText.text = FormatTime(current) + " / " + FormatTime(Mathf.Max(totalDuration, snapshot.Duration, current));
         }
 
 
@@ -7393,6 +8405,103 @@ namespace ADOFAIEditorStudio
         private readonly List<LevelEventType> paletteTypes = new List<LevelEventType>();
         private bool paletteBuilt;
 
+        // ------------------------------------------------- ImGui 版那排按钮要用的快照
+        //
+        // **几何和行为的唯一来源仍是上面那套 uGUI 布局**（`LayoutPaletteRows` 摆到
+        // 哪儿、`ActivatePaletteEvent` 点了干什么），ImGui 只按这份快照画和转发。
+        // 各算一份的话，换行规则一改两边就会错位 —— 今天已经栽过一次
+        // （时间读数和筛选按钮各自硬算位置、互相压）。
+        //
+        // 位置是**相对面板原点**的，和 `SetTopLeft` 用的是同一套坐标；ImGui 那边
+        // 把窗口放在面板原点 + `PaletteRowY` 处，所以本地 y 要再减掉 `PaletteRowY`。
+        private readonly List<Vector2> paletteSlotPositions = new List<Vector2>();
+        private int paletteRowCount;
+        private bool paletteSuppressed;
+
+        /// <summary>事件面板那一行的顶端相对面板顶端的偏移（ImGui 版要照这个放窗口）。</summary>
+        internal const float PaletteRowYOffset = PaletteRowY;
+
+        /// <summary>槽位数（没建、或者谱面没加载时是 0）。</summary>
+        internal int PaletteSlotCount
+        {
+            get { return paletteBuilt ? paletteEntries.Count : 0; }
+        }
+
+        internal Vector2 PaletteSlotPosition(int index)
+        {
+            return index >= 0 && index < paletteSlotPositions.Count
+                ? paletteSlotPositions[index]
+                : new Vector2(PaletteMargin, PaletteRowY);
+        }
+
+        internal LevelEventType PaletteSlotType(int index)
+        {
+            return index >= 0 && index < paletteEntries.Count
+                ? paletteEntries[index]
+                : LevelEventType.None;
+        }
+
+        internal float PaletteSlotSize { get { return PaletteMaxButtonSize; } }
+
+        /// <summary>时间轴当前的位置表条数（探针和"新建之后进没进"比对用）。</summary>
+        internal int PlacementCount
+        {
+            get { return blockPlacements.Count; }
+        }
+
+        /// <summary>槽位对应的中文事件名（ImGui 版拿它做悬停提示）。</summary>
+        internal string PaletteSlotName(int index)
+        {
+            LevelEventType type = PaletteSlotType(index);
+            return type == LevelEventType.None ? null : GetEventName(type);
+        }
+
+        /// <summary>那排按钮一共占多高（ImGui 版窗口的高度）。</summary>
+        internal float PaletteBandHeight
+        {
+            get
+            {
+                int rows = paletteRowCount > 0 ? paletteRowCount : 1;
+                return rows * (PaletteMaxButtonSize + PaletteGap) + 6f;
+            }
+        }
+
+        /// <summary>某个事件类型的原版图标（图谱面加载后才有）。</summary>
+        internal Sprite GetPaletteIcon(LevelEventType type)
+        {
+            Sprite sprite = null;
+            if (GCS.levelEventIcons != null)
+            {
+                GCS.levelEventIcons.TryGetValue(type, out sprite);
+            }
+            return sprite;
+        }
+
+        /// <summary>点第几个按钮 —— 和 uGUI 那边**同一个入口**（含只读判断）。</summary>
+        internal void ActivatePaletteSlot(int index)
+        {
+            ActivatePaletteEvent(index);
+        }
+
+        /// <summary>
+        /// 把 uGUI 那排按钮藏起来（ImGui 版接管时）。
+        ///
+        /// **只藏不拆** —— 布局、图标、点击都还是它们算的，拆了就得把那一整套
+        /// 搬进 ImGui 重写一遍，那正是这次要避免的。
+        /// </summary>
+        internal void SuppressPalette(bool suppressed)
+        {
+            paletteSuppressed = suppressed;
+            for (int i = 0; i < paletteButtons.Count; i++)
+            {
+                if (paletteButtons[i] != null
+                    && paletteButtons[i].gameObject.activeSelf == suppressed)
+                {
+                    paletteButtons[i].gameObject.SetActive(!suppressed);
+                }
+            }
+        }
+
         /// <summary>
         /// 第二行的放置事件面板：按分类分组，所有可用事件平铺在一行里。
         ///
@@ -7523,6 +8632,9 @@ namespace ADOFAIEditorStudio
             float y = PaletteRowY;
             int rows = 1;
 
+            // 这一趟同时把每个槽位的位置记下来给 ImGui 版用（见上面那段说明）。
+            paletteSlotPositions.Clear();
+
             for (int i = 0; i < paletteEntries.Count; i++)
             {
                 bool groupStart = i > 0 && paletteGroupStart[i];
@@ -7546,8 +8658,11 @@ namespace ADOFAIEditorStudio
                 Button button = paletteButtons[i];
                 LevelEventType type = paletteEntries[i];
                 paletteTypes[i] = type;
-                button.gameObject.SetActive(true);
+                // 被 ImGui 版接管时这里也别点亮 —— 否则每次刷新又会把那排 uGUI
+                // 按钮显出来，和 ImGui 画的重叠成两排。
+                button.gameObject.SetActive(!paletteSuppressed);
                 SetTopLeft(button.GetComponent<RectTransform>(), x, y, size, size);
+                paletteSlotPositions.Add(new Vector2(x, y));
 
                 Image icon = paletteIcons[i];
                 if (icon != null)
@@ -7588,6 +8703,7 @@ namespace ADOFAIEditorStudio
                     SetTopLeft(viewport, GutterWidth + ContentShift, headerHeight, bodyWidth, bodyHeight);
                 }
             }
+            paletteRowCount = rows;
             return rows;
         }
 
@@ -7623,6 +8739,16 @@ namespace ADOFAIEditorStudio
             {
                 return;
             }
+
+            // 只读模式：点面板图标是**新建事件**（底下转的
+            // `scnEditor.AddEventAtSelected`），会往谱面里加东西 —— 拦住。
+            // 提示由 `AllowEdit` 统一发（工作台每次打开都回到只读，静默拦住
+            // 会让人以为"按钮坏了"—— 这个误会已经骗了我们两回）。
+            if (owner != null && !owner.AllowEdit())
+            {
+                return;
+            }
+
             LevelEventType type = paletteTypes[slot];
             if (type == LevelEventType.None)
             {
@@ -7664,6 +8790,69 @@ namespace ADOFAIEditorStudio
             // 重建是必然要做的，比对只会多花一次哈希。
             RefreshData(true);
             nextDataRefresh = Time.unscaledTime + DataRefreshInterval;
+
+            // **纵向滚到刚加的那个块那儿。**
+            //
+            // 新事件是补到最下面一行的（见 `RebindBlockPlacements`），而时间轴一屏
+            // 只显示十来行 —— 不滚的话用户点完按钮什么也看不到，以为没加上。
+            ScrollToNewestBlock();
+        }
+
+        /// <summary>
+        /// 让时间轴**立刻**重读谱面，不等轮询。
+        ///
+        /// 给"从别的模块改了谱面"的入口用（装饰物列表那四个新建按钮就是）——
+        /// 时间线自己那条路本来就会调 `RefreshData`，不用重复。轮询虽然也会发现，
+        /// 但最坏要等半个周期，用户点完按钮盯着屏幕会以为没生效。
+        /// </summary>
+        internal void RefreshDataNow()
+        {
+            RefreshData(true);
+            nextDataRefresh = Time.unscaledTime + DataRefreshInterval;
+        }
+
+        /// <summary>
+        /// 纵向滚到"最下面那一行"，也就是刚加的东西落在的地方。
+        ///
+        /// **所有"新建"入口都要调它** —— 事件面板加事件、装饰物列表那四个新建
+        /// 按钮（文本/粒子/对象/图片）走的是两条不同的路，少调一处，那一条就会
+        /// 表现得像"加不进去"（其实只是补在最下面、在屏幕外）。
+        /// 横向一个字都不碰，理由见 `ScrollVerticallyToRow`。
+        /// </summary>
+        internal void ScrollToNewestBlock()
+        {
+            EnsureBlockPlacements();
+            int lastRow = -1;
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                BlockPlacement placement = blockPlacements[i];
+                if (placement != null && placement.Row > lastRow)
+                {
+                    lastRow = placement.Row;
+                }
+            }
+            ScrollVerticallyToRow(lastRow);
+        }
+
+        /// <summary>
+        /// 把时间轴**纵向**滚到某一行，让它落在可视区**正中**（横向一个字都不碰）。
+        ///
+        /// 贴顶的话它上下都看不到东西 —— 而这个入口的用途就是"我新加的那个块
+        /// 在哪儿"，要看的正是它周围那一片。可用高度＝内容区高减去标尺那一条，
+        /// 再减掉块自身高度的一半，就是居中所需的偏移。
+        ///
+        /// 夹取交给 `ClampVerticalScroll` —— 别在这儿另算上下边界。
+        /// </summary>
+        internal void ScrollVerticallyToRow(int row)
+        {
+            if (row < 0)
+            {
+                return;
+            }
+            float visible = Mathf.Max(1f, bodyHeight - RulerHeight);
+            verticalScrollOffset = row * BlockStridePixels
+                - (visible - BlockHeightPixels) * 0.5f;
+            ClampVerticalScroll();
         }
 
         /// <summary>
@@ -7671,8 +8860,13 @@ namespace ADOFAIEditorStudio
         ///
         /// LowerBoundFloors 给的是第一个 entryTime &gt;= time 的下标，
         /// 所以所在格要减一。
+        ///
+        /// **新建事件的入口都要先拿它把选中挪过去** —— 原版 `AddEventAtSelected` /
+        /// `AddDecoration` 建在"游戏当前选中的格"上，而那个选中只在点事件块时
+        /// 同步过；不挪的话新建的东西会落在上次点过的格（多半是 0）上，
+        /// 而不是用户正看着的那一格。
         /// </summary>
-        private int PlayheadFloorIndex()
+        internal int PlayheadFloorIndex()
         {
             scnEditor editor = scnEditor.instance;
             if (editor == null || editor.floors == null || editor.floors.Count == 0)

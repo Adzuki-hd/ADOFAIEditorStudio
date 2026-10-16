@@ -33,9 +33,6 @@ namespace ADOFAIEditorStudio
         private const float RuleX = 24f;
         private const float RuleWidth = 3f;
         private const float RuleHeight = 12f;
-        /// <summary>状态读数的左缘。**钉死不动** —— 它是会变长变短的，</summary>
-        /// <summary>跟着前面的字流过去的话，读一次滚轮值整条就会左右跳。</summary>
-        private const float StatusX = 620f;
         /// <summary>右侧两颗按钮的尺寸。</summary>
         private const float MultiplayerWidth = 96f;
         private const float ActionHeight = 32f;
@@ -112,7 +109,12 @@ namespace ADOFAIEditorStudio
             draw.AddText(new NVec2(cursor, textY),
                 ImGui.GetColorU32(ToVec4(Palette.TextMuted)), subtitle);
 
-            DrawStatus(overlay, draw, x, middle, textY);
+            // 状态读数**不再画在这儿**。它原先钉在顶栏中段（StatusX），而中段
+            // 正中被模式切换按钮占着 —— 状态文本一长就被压掉半截。现在挪到
+            // 预览标题行里画，见 `EditorImGuiPreviewPanel`。
+
+            // 正中：只读 / 编辑。
+            DrawModeSwitch(overlay, x, width, y, height);
 
             // 右侧从右往左摆：帮助 → 联机 → 快捷键提示。
             float helpX = x + width - SidePadding - HelpSize;
@@ -193,24 +195,95 @@ namespace ADOFAIEditorStudio
         /// 就是每滚一格整条左右跳一下。底衬按**文字实际宽度**贴 ——
         /// 用固定宽度会得到一条横贯顶栏的长条。
         /// </summary>
-        private static void DrawStatus(EditorStudioOverlay overlay,
-            ImDrawListPtr draw, float x, float middle, float textY)
+        /// <summary>模式按钮的尺寸。</summary>
+        private const float ModeSwitchHeight = 32f;
+        private const float ModeSwitchPadding = 20f;
+        /// <summary>下边每侧内缩多少 —— 做出上宽下窄的倒梯形。</summary>
+        private const float ModeSwitchSlant = 9f;
+        private const float ModeArrowWidth = 11f;
+        private const float ModeArrowHeight = 6f;
+
+        /// <summary>
+        /// 顶栏正中的模式切换：**一颗倒梯形按钮，只显示当前状态**。
+        ///
+        /// 点一下在两档之间来回切，所以文字写的是「现在是什么」，旁边那对箭头
+        /// 才是「这里能点」的提示 —— 状态和入口合成一个东西，比并排两颗按钮
+        /// 省一半横向空间，也不会让人猜「哪颗才是当前的」。
+        ///
+        /// 形状是自绘的：ImGui 的 `Button` 只能画矩形，而这里要的是倒梯形。
+        /// 点击用一颗透明的 `InvisibleButton` 盖在上面 —— 形状归形状、命中归命中。
+        /// </summary>
+        private static void DrawModeSwitch(EditorStudioOverlay overlay,
+            float x, float width, float y, float height)
         {
-            string status = overlay.StatusText;
-            if (string.IsNullOrEmpty(status))
+            bool edit = overlay.IsEditMode;
+            string label = edit ? "编辑模式" : "只读模式";
+
+            NVec2 textSize = ImGui.CalcTextSize(label);
+            float buttonWidth = textSize.X + ModeSwitchPadding * 2f + ModeArrowWidth + 6f;
+            float left = x + (width - buttonWidth) * 0.5f;
+            float top = y + (height - ModeSwitchHeight) * 0.5f;
+            float bottom = top + ModeSwitchHeight;
+            float right = left + buttonWidth;
+            float slant = ModeSwitchSlant;
+
+            ImGui.SetCursorScreenPos(new NVec2(left, top));
+            bool clicked = ImGui.InvisibleButton("##modeSwitch",
+                new NVec2(buttonWidth, ModeSwitchHeight));
+            bool hovered = ImGui.IsItemHovered();
+            if (clicked)
             {
-                return;
+                overlay.SetEditMode(!edit);
             }
 
-            float left = x + StatusX;
-            NVec2 size = ImGui.CalcTextSize(status);
-            float top = middle - ActionHeight * 0.5f;
-            draw.AddRectFilled(new NVec2(left - 10f, top),
-                new NVec2(left + size.X + 10f, top + ActionHeight),
-                ImGui.GetColorU32(ToVec4(overlay.StatusPillColor)),
-                EditorStudioOverlay.CornerSmall);
-            draw.AddText(new NVec2(left, textY),
-                ImGui.GetColorU32(ToVec4(Palette.Accent)), status);
+            ImDrawListPtr draw = ImGui.GetWindowDrawList();
+
+            // 倒梯形：上宽下窄，四角顺时针。
+            NVec4 fill = ToVec4(hovered ? Palette.ButtonHover : Palette.ButtonNormal);
+            if (edit)
+            {
+                // 编辑模式底下换成强调色 —— 扫一眼就知道现在处在「能改」的状态。
+                fill = ToVec4(hovered ? Palette.SelectedHover : Palette.Selected);
+            }
+            draw.AddQuadFilled(
+                new NVec2(left, top),
+                new NVec2(right, top),
+                new NVec2(right - slant, bottom),
+                new NVec2(left + slant, bottom),
+                ImGui.GetColorU32(fill));
+
+            // **两档各给一个鲜艳的颜色**，一眼分得开：编辑用次色、只读用主色。
+            // 悬停时**不换成白色** —— 那反而把颜色洗掉了，只把底衬提亮（见上）。
+            NVec4 textColor = ToVec4(edit ? Palette.AccentSecondary : Palette.Accent);
+            draw.AddText(
+                new NVec2(left + ModeSwitchPadding,
+                    top + (ModeSwitchHeight - textSize.Y) * 0.5f),
+                ImGui.GetColorU32(textColor), label);
+
+            // 右侧那对箭头：上下各一个三角，表示「这里能切」。
+            float arrowX = right - slant - ModeSwitchPadding + 2f;
+            float midY = (top + bottom) * 0.5f;
+            float half = ModeArrowHeight * 0.5f;
+            const float gap = 1.5f;
+            // 箭头跟文字同色；悬停时提亮一档，表示"这里能点"。
+            NVec4 arrowVec = hovered ? ToVec4(Palette.TextPrimary) : textColor;
+            uint arrowColor = ImGui.GetColorU32(arrowVec);
+            draw.AddTriangleFilled(
+                new NVec2(arrowX - ModeArrowWidth * 0.5f, midY - gap),
+                new NVec2(arrowX + ModeArrowWidth * 0.5f, midY - gap),
+                new NVec2(arrowX, midY - gap - half), arrowColor);
+            draw.AddTriangleFilled(
+                new NVec2(arrowX - ModeArrowWidth * 0.5f, midY + gap),
+                new NVec2(arrowX + ModeArrowWidth * 0.5f, midY + gap),
+                new NVec2(arrowX, midY + gap + half), arrowColor);
+
+            if (hovered)
+            {
+                ImGui.SetTooltip(edit
+                    ? "现在是编辑模式 —— 点一下切回只读"
+                    : "现在是只读 —— 点一下切到编辑");
+            }
         }
+
     }
 }

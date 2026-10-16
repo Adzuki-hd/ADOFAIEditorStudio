@@ -28,13 +28,28 @@ namespace ADOFAIEditorStudio
         private const float HeadingBarHeight = 16f;
         /// <summary>"预览"两个字的左缘：竖条之后。</summary>
         private const float HeadingTextX = HeadingBarX + HeadingBarWidth + 8f;
-        /// <summary>车道按钮那排：起点、边长、间距、图标内缩。</summary>
-        private const float LaneButtonX = 96f;
+        /// <summary>
+        /// 标题行里"标题之后"那一段的左缘。现在是**状态读数**的起点；
+        /// 车道筛选按钮原本也起在这儿，它们已经搬去时间轴第一行了。
+        /// </summary>
+        private const float TitleRowContentX = 96f;
         private const float LaneButtonSize = 26f;
         private const float LaneButtonGap = 4f;
         private const float LaneIconInset = 4f;
         /// <summary>隐藏的车道，图标压到这个透明度 —— 和 uGUI 那条一致。</summary>
         private const float LaneHiddenIconAlpha = 0.28f;
+
+        /// <summary>
+        /// 那排车道按钮占多宽 —— 时间轴第一行要用它算右对齐的位置。
+        /// </summary>
+        internal static float LaneButtonsWidth
+        {
+            get
+            {
+                int count = EditorTimelineView.LaneCount;
+                return count * LaneButtonSize + (count - 1) * LaneButtonGap;
+            }
+        }
 
         internal Rect Rect { get { return _rect; } }
 
@@ -93,7 +108,12 @@ namespace ADOFAIEditorStudio
             draw.AddText(new NVec2(x + HeadingTextX, y + (height - ImGui.GetTextLineHeight()) * 0.5f),
                 ImGui.GetColorU32(ToVec4(Palette.AccentSecondary)), "预览");
 
-            DrawLaneButtons(overlay, draw, x, y, height);
+            // **状态读数挪到这儿画。**
+            //
+            // 它原来在顶栏中段，而中段正中被模式切换按钮占着 —— 状态文本一长
+            // 就被压掉半截（"只读模式不能修改谱面，先切到编辑"只剩前半句）。
+            // 预览标题行这会儿正好空出来：车道筛选按钮刚搬去时间轴第一行。
+            DrawStatus(overlay, draw, x, y, height);
 
             // 分隔线落在工具栏下沿（不是面板通用的标题高度）—— 那条会被画进
             // 工具栏内部，读起来是横穿它的一条杂线。
@@ -101,8 +121,44 @@ namespace ADOFAIEditorStudio
                 ImGui.GetColorU32(ToVec4(Palette.PanelRule)), 1f);
         }
 
-        private static void DrawLaneButtons(EditorStudioOverlay overlay,
-            ImDrawListPtr draw, float x, float y, float height)
+        /// <summary>
+        /// 状态读数（滚轮微调、存档提示、报错、只读提示都走它）。
+        ///
+        /// 底色用的是 `StatusPillColor`，和顶栏那版一模一样 —— 只是换了地方，
+        /// 在预览标题行里、标题之后那片空位上。
+        /// </summary>
+        private static void DrawStatus(EditorStudioOverlay overlay, ImDrawListPtr draw,
+            float x, float y, float height)
+        {
+            string status = overlay.StatusText;
+            if (string.IsNullOrEmpty(status))
+            {
+                return;
+            }
+
+            float left = x + TitleRowContentX;
+            float middle = y + height * 0.5f;
+            NVec2 size = ImGui.CalcTextSize(status);
+
+            draw.AddRectFilled(
+                new NVec2(left - 10f, middle - LaneButtonSize * 0.5f),
+                new NVec2(left + size.X + 10f, middle + LaneButtonSize * 0.5f),
+                ImGui.GetColorU32(ToVec4(overlay.StatusPillColor)),
+                EditorStudioOverlay.CornerSmall);
+            draw.AddText(new NVec2(left, middle - size.Y * 0.5f),
+                ImGui.GetColorU32(ToVec4(Palette.Accent)), status);
+        }
+
+        /// <summary>
+        /// 那排车道筛选按钮。
+        ///
+        /// **现在画在时间轴的第一行右边** —— 原来它在预览标题行里，而那个位置
+        /// 要让给状态读数（状态文本一长就被顶栏中间的模式切换按钮压住）。
+        /// 所以这里不再自己算位置：`startX` 是第一颗按钮的左缘，由调用方按自己
+        /// 那行的排布给。
+        /// </summary>
+        internal static void DrawLaneButtons(EditorStudioOverlay overlay,
+            ImDrawListPtr draw, float startX, float y, float height)
         {
             EditorTimelineView lanes = overlay.Timeline;
             if (lanes == null)
@@ -115,7 +171,7 @@ namespace ADOFAIEditorStudio
 
             for (int lane = 0; lane < EditorTimelineView.LaneCount; lane++)
             {
-                float buttonX = x + LaneButtonX + lane * (LaneButtonSize + LaneButtonGap);
+                float buttonX = startX + lane * (LaneButtonSize + LaneButtonGap);
                 ImGui.PushID(lane);
                 ImGui.SetCursorScreenPos(new NVec2(buttonX, buttonY));
 

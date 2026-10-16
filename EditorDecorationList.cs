@@ -1274,10 +1274,27 @@ namespace ADOFAIEditorStudio
             UpdateRows();
         }
 
+        /// <summary>
+        /// 这次编辑允许吗？
+        ///
+        /// **提示由 `EditorStudioOverlay.AllowEdit` 统一发** —— 这里只委托，不再自己
+        /// 写一句。调用方只管 `return`，不用再报一遍原因（也就不会再漏报）。
+        /// </summary>
+        private static bool EditAllowed()
+        {
+            EditorStudioOverlay overlay = Main.Overlay;
+            return overlay == null || overlay.AllowEdit();
+        }
+
         internal void ToggleVisibleEntry(DecoEntry entry)
         {
             scnEditor editor = Editor;
             if (entry == null || editor == null)
+            {
+                return;
+            }
+
+            if (!EditAllowed())
             {
                 return;
             }
@@ -1306,6 +1323,10 @@ namespace ADOFAIEditorStudio
             {
                 return;
             }
+            if (!EditAllowed())
+            {
+                return;
+            }
 
             bool next = !entry.Locked;
             using (new SaveStateScope(editor))
@@ -1323,6 +1344,10 @@ namespace ADOFAIEditorStudio
         {
             scnEditor editor = Editor;
             if (entry == null || editor == null || editor.decorations == null)
+            {
+                return;
+            }
+            if (!EditAllowed())
             {
                 return;
             }
@@ -1459,6 +1484,28 @@ namespace ADOFAIEditorStudio
             {
                 return;
             }
+            // **只读挡下要说一声。** 这条最要紧：新建那四个按钮点了没反应，
+            // 看起来就是"添加不进去"。实测就因为这个排查了半天。
+            if (!EditAllowed())
+            {
+                return;
+            }
+
+            // **先跳到播放头那一格再建。**
+            //
+            // 原版 `AddDecoration` 建在"游戏当前选中的格"上，而那个选中只在点事件块
+            // 时同步过 —— 不挪的话新建的东西落在上次点过的格（多半还停在 0 格），
+            // 而不是用户正看着的那一格。事件面板那条路早就这么做了，这里补上。
+            EditorStudioOverlay overlay = Main.Overlay;
+            EditorTimelineView timeline = overlay == null ? null : overlay.Timeline;
+            if (timeline != null && editor.floors != null)
+            {
+                int playheadFloor = timeline.PlayheadFloorIndex();
+                if (playheadFloor >= 0 && playheadFloor < editor.floors.Count)
+                {
+                    editor.SelectFloor(editor.floors[playheadFloor], cameraJump: false);
+                }
+            }
 
             LevelEvent created = editor.AddDecoration(type);
             if (created != null)
@@ -1475,6 +1522,17 @@ namespace ADOFAIEditorStudio
             {
                 editor.SelectDecoration(created, jumpToDecoration: false, showPanel: false,
                     ignoreDeselection: true, ignoreAdjustRect: true);
+
+                // **让时间轴立刻收下新块、并滚到它那儿。**
+                //
+                // 时间轴本来靠轮询＋指纹比对刷新（最坏等半个周期），而且新块是补到
+                // **最下面一行**的 —— 不催不滚的话，用户点完按钮在时间轴上什么也
+                // 看不到，表现就是"文本 / 粒子 / 对象 / 图片都添加不进时间轴"。
+                if (timeline != null)
+                {
+                    timeline.RefreshDataNow();
+                    timeline.ScrollToNewestBlock();
+                }
             }
         }
 

@@ -291,8 +291,35 @@ namespace ADOFAIEditorStudio
             float cardH = CardPad * 2f + contentH;
             float buttonArea = 3f * buttonSize + 2f * buttonGap;
 
+            // **只画看得见的那些卡。**
+            //
+            // 大谱面上装饰物成百上千，而每一项都要 `ChannelsSplit` 一次、
+            // `PushClipRect` 一次 —— 这两下都会让 ImGui 拆一条绘制命令，而每条
+            // 命令在 Unity 侧都要一个 Mesh + CanvasRenderer。实测一张 2286 块的
+            // 谱面上，光这一个面板就切出 **3092 条命令**（界面上别的窗口加起来
+            // 才 60 条），搬运要 6.9ms/帧。
+            //
+            // 跳过的卡仍然要推进光标：ImGui 靠 `CursorMaxPos` 算内容高度，
+            // 不推的话滚动条会缩水、滚不到底。
+            NVec2 clipMin = draw.GetClipRectMin();
+            NVec2 clipMax = draw.GetClipRectMax();
+
             for (int i = 0; i < _entries.Count; i++)
             {
+                // 这一行整个在视口外 —— 推一下光标就走，别画。
+                if (rowY + cardH < clipMin.Y || rowY > clipMax.Y)
+                {
+                    rowY = rowY + cardH + CardGap;
+                    ImGui.SetCursorScreenPos(new NVec2(contentLeft, rowY));
+                    // **`Dummy` 不能省。** 光用 `SetCursorScreenPos` 挪光标、不提交
+                    // 任何 item，ImGui 会直接弹断言（"Code uses SetCursorPos() to
+                    // extend window boundaries. Please submit an item e.g. Dummy()
+                    // to validate extent."）—— 内容范围只能由 item 确认，移光标不算。
+                    // 原来循环尾也是这么写的。
+                    ImGui.Dummy(new NVec2(0f, 0f));
+                    continue;
+                }
+
                 ImGuiDecorationEntry entry = _entries[i];
                 ImGui.PushID(i);
                 NVec2 card = new NVec2(contentLeft, rowY);

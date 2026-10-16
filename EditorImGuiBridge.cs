@@ -72,6 +72,9 @@ namespace ADOFAIEditorStudio
         // ---------------------------------------------------------------- 状态
 
         private IntPtr _context = IntPtr.Zero;
+        /// <summary>ImGui 这层的排序号：short 的上限，不能再高。</summary>
+        private const int OverlaySortingOrder = 32767;
+
         private Canvas _canvas;
         private Material _material;
         private Texture2D _fontTexture;
@@ -98,14 +101,24 @@ namespace ADOFAIEditorStudio
         private Image _previewBlocker;
         /// <summary>时间轴标题行那一条的挡点击层。</summary>
         private Image _timelineHeaderBlocker;
+        /// <summary>
+        /// 事件面板那排的挡点击层。
+        ///
+        /// **必须单独有一份**：那排按钮原来是 uGUI，点击由按钮自己吃掉；改成
+        /// ImGui 画之后，点在按钮上的那一下会**穿到下面的游戏编辑器**去
+        /// （顺手选中了格子、或者触发了原版自己的东西）。
+        /// </summary>
+        private Image _eventPaletteBlocker;
         /// <summary>时间轴内容区的挡点击层 —— 块归 ImGui 管了，得把 uGUI 那条路挡掉。</summary>
         private Image _timelineBodyBlocker;
         /// <summary>顶栏（ImGui 版）。常驻，永远在工作台最上面那一条。</summary>
         private EditorImGuiHeader _header;
+        private EditorImGuiMenuBar _menuBar;
         /// <summary>预览面板的页眉那一条（ImGui 版）。只接管工具栏，不碰舞台。</summary>
         private EditorImGuiPreviewPanel _previewPanel;
         /// <summary>时间轴标题行（ImGui 版）。只接管最上面那 42 像素。</summary>
         private EditorImGuiTimelineHeader _timelineHeader;
+        private EditorImGuiEventPalette _eventPalette;
         /// <summary>时间轴内容区（ImGui 版）。目前只有标尺。</summary>
         private EditorImGuiTimelineBody _timelineBody;
         /// <summary>参数栏（ImGui 版）。常驻面板，不是模态窗口。</summary>
@@ -121,6 +134,36 @@ namespace ADOFAIEditorStudio
         private EditorImGuiMediaPanel _mediaPanel;
         private bool _helpOpen;
         private bool _versionOpen;
+
+        /// <summary>
+        /// 「创建工程」那一屏开着没有。
+        ///
+        /// 它和别的窗口不一样：**不是随时能开的**，只在「切到编辑模式、而这张谱
+        /// 还没有工程」那一下被工作台推开，答完就关。
+        /// </summary>
+        private bool _projectCreateOpen;
+
+        /// <summary>工程名输入框的内容。开窗时由工作台填上默认名。</summary>
+        private string _projectName = "";
+
+        /// <summary>会建到哪儿 —— 只读展示，让用户知道东西放哪。</summary>
+        private string _projectPath = "";
+
+        /// <summary>用户按了「建工程」。工作台取走之后自己动手建。</summary>
+        private bool _projectCreateConfirmed;
+
+        /// <summary>用户按了「取消」或者把窗口关了。工作台取走之后退回只读。</summary>
+        private bool _projectCreateCancelled;
+
+        /// <summary>「布局还没存」那扇窗开着没有。</summary>
+        private bool _confirmSaveOpen;
+
+        /// <summary>
+        /// 用户在那扇窗上的答复。0 = 还没答，1 = 保存，2 = 不保存，3 = 取消。
+        /// 用数字而不是三个布尔：它们是互斥的，三个布尔能凑出"同时选了保存和取消"
+        /// 这种不存在的状态。
+        /// </summary>
+        private int _confirmSaveAnswer;
         /// <summary>
         /// 版本说明窗口被**用户自己**关掉了（× 或 Esc），等着工作台来收这个信号。
         ///
@@ -341,8 +384,14 @@ namespace ADOFAIEditorStudio
         /// <summary>窗口标题兼"加群"那一行 —— 和 uGUI 那扇一模一样。</summary>
         private const string HelpTitle = "加入 Q 交流群 " + EditorStudioOverlay.QqGroupNumber;
 
-        /// <summary>版本说明窗口的标题。</summary>
-        private const string VersionTitle = "v" + EditorStudioOverlay.ModVersion + " 更新内容";
+        /// <summary>
+        /// 版本说明窗口的标题。**不能写成 `const`** —— 版本号现在是从 UMM 读的
+        /// 属性（见 `EditorStudioOverlay.ModVersion`），编译期定不下来。
+        /// </summary>
+        private static string VersionTitle
+        {
+            get { return "v" + EditorStudioOverlay.ModVersion + " 更新内容"; }
+        }
 
         /// <summary>版本说明窗口（以及以后别的窗口）底部那条可点的加群链接。</summary>
         private const string HelpFooter = "点这里进 Q 群交流：" + EditorStudioOverlay.QqGroupNumber;
@@ -358,24 +407,25 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private static readonly string[] VersionLines =
         {
-            "*设置页：左栏顶部那排多了「歌曲设置 / 关卡设置 / 轨道设置 / 背景设置 /",
-            "   摄像头设置 / 杂项设置」，点开就是原版那几页设置，但用工作台自己的控件画，",
-            "   改完立刻生效。",
-            "*调色盘：颜色属性不再只能手打 HEX。点色块开调色盘 ——",
-            "   饱和 / 明度方块 + 色相条 + 透明度条 + HEX + RGBA。",
-            "   拖动时画面不跟着变，松手才写进谱面（一次拖动只落一次数据，不卡）。",
-            "*多选加强：Ctrl+左键点选加选；Ctrl 从块上按住也能拉框；",
-            "   点空白处取消全部选中。",
-            "*批量改参：多选之后参数栏只列公共属性，改一次落到整批，只记一步撤销。",
-            "*说明窗口：右上角那颗「?」—— 这个 MOD 是什么、全部快捷键、全部新功能。",
+            "*卡顿：事件多的谱面不再掉帧。时间轴不再每帧重算事件的「身份键」，",
+            "   装饰物列表按可见区域跳过，又去掉了每帧一次的全量排序，",
+            "   上千个事件的重谱依旧跟手。",
+            "*崩溃：缓速曲线的段数以前没有上限，事件一多就撞上绘制层的顶点数上限、",
+            "   把游戏打崩，现在按总量预算来画。",
+            "*共存：和 CheryTools 同时开时，工作台的文字不会再乱码。",
+            "*加载页：切谱 / 联机时的加载画面不再被工作台盖住。",
+            "*事件面板和顶部菜单栏换到新渲染层，外观跟别处统一了。",
             "",
             "#修好的",
-            "*参数标签：按原版那套三段式本地化，以前一部分参数显示成英文键名。",
-            "*多选拖动：整组按同一个吸附后的位移走，各自的偏移不再被抹平。",
-            "*撤销：撤回之后参数栏会跟着重画（以前数字停在撤回前）。",
-            "*输入框：点进去又原样出来不再算一次修改，也不再抹平批量里不同的值。",
-            "*Ctrl+点击：块身上挂着 Button，事件被它吃掉，以前点了没反应。",
-            "*缓速曲线：粗细与高度对齐原版。",
+            "*事件块重叠：同一批事件在时间轴上叠成一坨，现在正常排开。",
+            "*首次排版：第一次打开工程和之后重排的结果天差地别，现在一致了。",
+            "*添加不生效：文本 / 粒子 / 对象 / 图片加完不在时间轴上出现，",
+            "   现在加完会滚到它那儿。",
+            "*新建落点：新对象落在第 0 格而不是播放头那格，已修正。",
+            "*回到开头：按钮图标显示不对、按下之后画面里的元素没复原，都修好了。",
+            "*媒体数量：媒体很多的谱面，加载数量会少算，已修正。",
+            "*只读模式：一批能改到谱面的入口（拖图片进预览、删除、改参数…）以前没拦住，",
+            "   现在统一提示「先切到编辑模式」。",
         };
         /// <summary>
         /// 说明窗口的正文。一项一行，**行首那个记号决定怎么画**：
@@ -553,6 +603,15 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
+            // **全局上下文是借来的，建完要还。**
+            //
+            // ImGui 是进程级的全局状态机，同一个进程里可能还有别的 mod 也在用
+            // （CheryTools 就是）。`CreateContext()` 会把新上下文直接设成"当前"，
+            // 我们建字体图集必须跑在自己的上下文里 —— 但建完不退回去的话，
+            // 别人的上下文就被我们永久顶掉：它后面每一帧的 NewFrame / GetDrawData
+            // 都跑在我们的上下文上，文字拿着我们的字体图集 UV 去采样，画出来
+            // 整片乱码（社区反馈的就是这个）。
+            IntPtr previousContext = ImGui.GetCurrentContext();
             try
             {
                 BuildImGui();
@@ -563,6 +622,15 @@ namespace ADOFAIEditorStudio
             {
                 Main.Logger.Error("[ImGui] 初始化失败：" + exception);
                 enabled = false;
+            }
+            finally
+            {
+                // 拿到的如果是空，说明没别人在用，那就留着自己这份 ——
+                // 空上下文会让任何一次 GetIO 直接踩空指针。
+                if (previousContext != IntPtr.Zero)
+                {
+                    ImGui.SetCurrentContext(previousContext);
+                }
             }
         }
 
@@ -586,8 +654,10 @@ namespace ADOFAIEditorStudio
             _helpRows = BuildRows(HelpLines);
             _versionRows = BuildRows(VersionLines);
             _header = new EditorImGuiHeader();
+            _menuBar = new EditorImGuiMenuBar();
             _previewPanel = new EditorImGuiPreviewPanel();
             _timelineHeader = new EditorImGuiTimelineHeader();
+            _eventPalette = new EditorImGuiEventPalette();
             _timelineBody = new EditorImGuiTimelineBody();
             _inspector = new EditorImGuiInspector(false);
             _settingsInspector = new EditorImGuiInspector(true);
@@ -596,12 +666,17 @@ namespace ADOFAIEditorStudio
             ApplyTheme();
             // 画布：屏幕覆盖层，排在最上面。sortingOrder 给到 short 的最大值，
             // 免得被游戏自己的界面（包括我们现有的 uGUI 工作台）盖住。
+            //
+            // **不要再往上加**：Unity 排画布用的是 short，超过 32767 会翻成负数
+            // 沉到最底 —— 加载页踩过这个坑（黑屏整个被工作台盖住，看着像"没覆盖全"）。
+            // 加载页要盖住这一层的时候，是**把这一层临时压下去**，不是把那边抬上来，
+            // 见 `SetOverlaySuppressed`。
             // 不挂 CanvasScaler —— ScreenSpaceOverlay 默认就是恒定像素，够了。
             GameObject host = new GameObject("ADOFAIEditorStudio.ImGui");
             UnityEngine.Object.DontDestroyOnLoad(host);
             _canvas = host.AddComponent<Canvas>();
             _canvas.renderMode = RenderMode.ScreenSpaceOverlay;
-            _canvas.sortingOrder = 32767;
+            _canvas.sortingOrder = OverlaySortingOrder;
 
             // ImGui 画的是带顶点色的三角形，Unity 自带的 UI/Default 正好吃这一套
             // （它的顶点格式就是 位置 + 颜色 + UV）。
@@ -690,6 +765,7 @@ namespace ADOFAIEditorStudio
             _headerBlocker = CreateBlocker("ImGuiHeaderBlocker");
             _previewBlocker = CreateBlocker("ImGuiPreviewBlocker");
             _timelineHeaderBlocker = CreateBlocker("ImGuiTimelineHeaderBlocker");
+            _eventPaletteBlocker = CreateBlocker("ImGuiEventPaletteBlocker");
             _timelineBodyBlocker = CreateBlocker("ImGuiTimelineBodyBlocker");
         }
 
@@ -708,6 +784,32 @@ namespace ADOFAIEditorStudio
             return image;
         }
 
+        /// <summary>
+        /// 加载页要显示时，把 ImGui 这一层临时压到底。
+        ///
+        /// **为什么不干脆让加载页排得更高**：`sortingOrder` 是 short，32767 就是顶，
+        /// 两边都已经贴着上限，谁也高不过谁（加载页写 32768 会翻成负数沉底，这个坑
+        /// 刚踩过）。所以反过来做 —— 加载期间把工作台整层压到 0，加载页占住 32767，
+        /// 天然就在最上面。
+        ///
+        /// 反正加载页存在的意义就是「别让用户看见中间那些半成品状态」，工作台本来
+        /// 也不该在这时候露出来。加载完自动抬回原值。
+        ///
+        /// 挡点击的那几层 blocker 是这块画布的子物体，会跟着一起沉，不用单独管。
+        /// </summary>
+        internal void SetOverlaySuppressed(bool suppressed)
+        {
+            if (_canvas == null)
+            {
+                return;
+            }
+            int wanted = suppressed ? 0 : OverlaySortingOrder;
+            if (_canvas.sortingOrder != wanted)
+            {
+                _canvas.sortingOrder = wanted;
+            }
+        }
+
         private void OnDestroy()
         {
             if (Instance == this)
@@ -716,9 +818,19 @@ namespace ADOFAIEditorStudio
             }
             if (_context != IntPtr.Zero)
             {
-                ImGui.SetCurrentContext(_context);
-                ImGui.DestroyContext(_context);
+                // 销毁前先记下别人是谁：`DestroyContext` 会把"当前上下文"清成空，
+                // 不退回去的话，同在进程里的 CheryTools 下一次 NewFrame 就没上下文了。
+                IntPtr dyingContext = _context;
+                IntPtr previousContext = ImGui.GetCurrentContext();
+                ImGui.SetCurrentContext(dyingContext);
+                ImGui.DestroyContext(dyingContext);
                 _context = IntPtr.Zero;
+                // 拿到的如果是空、或者就是我们自己（刚销毁），都别再设回去 ——
+                // 那是悬空指针。
+                if (previousContext != IntPtr.Zero && previousContext != dyingContext)
+                {
+                    ImGui.SetCurrentContext(previousContext);
+                }
             }
             for (int i = 0; i < _meshes.Count; i++)
             {
@@ -1023,7 +1135,18 @@ namespace ADOFAIEditorStudio
 
             // Unity 这边用 InstanceID 当纹理 ID —— 顶点里那个 TextureId 只有我们
             // 自己看得懂，绘制时靠它反查回 Texture 对象。
-            io.Fonts.SetTexID((IntPtr)_fontTexture.GetInstanceID());
+            // **字体图集的 ID 故意设成 0。**
+            //
+            // ImGui 里「没有显式指定纹理」的纯色几何（矩形、线条）用的就是 0，
+            // 而文字用的是字体图集的 ID。两者不相等 → ImGui 在**每次矩形和文字
+            // 交替**时都要拆一条绘制命令。时间轴上每个块都是「矩形 + 文字」，
+            // 2286 个块就拆出好几千条；而每一条在 Unity 侧都要一个 Mesh +
+            // CanvasRenderer，实测 3150 条命令、搬运 6.9ms/帧。
+            //
+            // 把字体图集也设成 0，两者就是同一个纹理，ImGui 不再拆。
+            // 桥那边本来就有「纹理 ID 认不出来就一律退回字体图集」的兜底
+            // （见 PushToCanvas），所以 0 会被正确解析成字体图集，不用另注册。
+            io.Fonts.SetTexID(IntPtr.Zero);
             io.Fonts.ClearTexData();
 
             Main.Logger.Log("[ImGui] 图集 " + width + "x" + height
@@ -1078,6 +1201,94 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>
+        /// 推开「创建工程」那一屏。默认名和路径都由工作台算好传进来 ——
+        /// 只有它知道谱面在哪、目录按哪套约定拼。
+        /// </summary>
+        internal void OpenProjectCreate(string defaultName, string path)
+        {
+            if (!_ready)
+            {
+                return;
+            }
+            _projectName = defaultName ?? "";
+            _projectPath = path ?? "";
+            _projectCreateConfirmed = false;
+            _projectCreateCancelled = false;
+            _projectCreateOpen = true;
+        }
+
+        /// <summary>创建工程那一屏开着没有（工作台用它决定要不要挡别的输入）。</summary>
+        internal bool ProjectCreateVisible
+        {
+            get { return _projectCreateOpen; }
+        }
+
+        /// <summary>
+        /// 把这一屏当「取消」关掉。Esc 和标题栏那个 × 都走这条 ——
+        /// 它是个**要答复的问题**，关掉就等于回答"不建"。
+        /// </summary>
+        internal void CancelProjectCreate()
+        {
+            if (!_projectCreateOpen)
+            {
+                return;
+            }
+            _projectCreateCancelled = true;
+            _projectCreateOpen = false;
+        }
+
+        /// <summary>
+        /// 取一次用户在这一屏上的答复（取完就清）。返回 true 表示确实有答复：
+        /// `confirmed` 为真 = 建（`name` 是他填的名字），为假 = 取消。
+        ///
+        /// 和 `TakeVersionClosed` 同一个套路：窗口是被自己的 × 关掉的，
+        /// 工作台收不到通知，只能这样回报。
+        /// </summary>
+        internal bool TakeProjectCreateResult(out string name, out bool confirmed)
+        {
+            name = _projectName;
+            confirmed = _projectCreateConfirmed;
+            if (!_projectCreateConfirmed && !_projectCreateCancelled)
+            {
+                return false;
+            }
+            _projectCreateConfirmed = false;
+            _projectCreateCancelled = false;
+            return true;
+        }
+
+        /// <summary>推开「布局还没存」那扇窗。</summary>
+        internal void OpenConfirmSave()
+        {
+            if (!_ready)
+            {
+                return;
+            }
+            _confirmSaveAnswer = 0;
+            _confirmSaveOpen = true;
+        }
+
+        internal bool ConfirmSaveVisible
+        {
+            get { return _confirmSaveOpen; }
+        }
+
+        /// <summary>
+        /// 取一次那扇窗的答复（取完就清）。返回 true 表示确实答了：
+        /// 1 = 保存，2 = 不保存，3 = 取消。
+        /// </summary>
+        internal bool TakeConfirmSaveAnswer(out int answer)
+        {
+            answer = _confirmSaveAnswer;
+            if (_confirmSaveAnswer == 0)
+            {
+                return false;
+            }
+            _confirmSaveAnswer = 0;
+            return true;
+        }
+
+        /// <summary>
         /// 取一次「用户刚把版本说明关掉了」这个信号（取完就清）。
         ///
         /// 用"取一次"的写法是因为**关整个工作台顺手关掉它不算看过** ——
@@ -1099,15 +1310,19 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
-            // **每帧开头都要把当前上下文抢回来。**
+            // **每帧借一下全局上下文，走完还回去。**
             //
             // ImGui 是全局状态机：GetIO / NewFrame / GetFont / GetDrawData
-            // 全都作用于「当前上下文」。只在初始化时 SetCurrentContext 一次是不够的
-            // —— 同一个进程里如果还有别的 mod 也在用 ImGui（比如 CheryTools），
-            // 它每帧也会把当前上下文切成它自己的，于是我们这一帧就跑在**它的**上下文里：
-            // 文字用它的字体、UV 指向它的图集，再画到我们的画布上，字形自然全错。
+            // 全都作用于「当前上下文」，而它是**进程级**的，别的 mod 也在用。
             //
-            // 症状很好认：几何是对的（顶点是我们自己算的），但字体度量读出别人的字号。
+            // 关键是 CheryTools 只在初始化时 SetCurrentContext 一次，绘制时不再设
+            // —— 也就是说「谁最后 Set，谁的上下文就是全局的」。我们原来每帧抢过来
+            // 就不还，它随后 NewFrame / GetDrawData 全跑在我们的上下文上：文字拿
+            // 我们的字体图集 UV 去采样，画出来整片乱码（社区反馈的正是这个）。
+            //
+            // 存下进来时别人是谁、走完放回去，两边各画各的就互不干扰了。
+            // 拿到的如果是空，说明没别人在用，那留着自己这份 —— 空上下文一 GetIO 就崩。
+            IntPtr previousContext = ImGui.GetCurrentContext();
             ImGui.SetCurrentContext(_context);
 
             // ImGui 的坐标系按 1920x1080 排，和现有 uGUI 界面用同一把尺子 ——
@@ -1155,12 +1370,53 @@ namespace ADOFAIEditorStudio
                 _versionClosed = false;
             }
 
+            // 性能探针：把这一帧拆成「构建 UI / Render / 搬进 Unity」三段，再带上
+            // 帧间隔 —— 光知道总帧率没用，得知道钱花在哪一段才能对着优化。
+            // 跟 VerboseDiagnostics 走，和 [TickCost] / [时间轴] / [ImGui桥] 同一个开关。
+            bool profileFrame = Main.Settings != null && Main.Settings.VerboseDiagnostics;
+            long profileStart = profileFrame
+                ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+
             ImGui.NewFrame();
             // 常驻面板先画，模态的文字窗口后画 —— 后者必须压在它上面。
             DrawPanels();
             DrawWindows();
+            long profileBuild = profileFrame
+                ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+
             ImGui.Render();
+            long profileRender = profileFrame
+                ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+
             PushToCanvas();
+            long profilePush = profileFrame
+                ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+
+            if (profileFrame)
+            {
+                probeBuildTicks += profileBuild - profileStart;
+                probeRenderTicks += profileRender - profileBuild;
+                probePushTicks += profilePush - profileRender;
+                probeDeltaSum += Time.unscaledDeltaTime * 1000.0;
+                probeSegFrames++;
+                if (probeSegFrames >= 60)
+                {
+                    double perMs = System.Diagnostics.Stopwatch.Frequency / 1000.0;
+                    double avgDelta = probeDeltaSum / probeSegFrames;
+                    Main.Logger.Log("[ImGui帧] 60 帧均值：构建 "
+                        + (probeBuildTicks / perMs).ToString("0.0") + " ms / Render "
+                        + (probeRenderTicks / perMs).ToString("0.0") + " ms / 搬运 "
+                        + (probePushTicks / perMs).ToString("0.0") + " ms ｜ 帧间隔 "
+                        + avgDelta.ToString("0.0") + " ms（约 "
+                        + (1000.0 / Mathf.Max((float)avgDelta, 0.001f)).ToString("0")
+                        + " 帧）");
+                    probeBuildTicks = 0L;
+                    probeRenderTicks = 0L;
+                    probePushTicks = 0L;
+                    probeDeltaSum = 0.0;
+                    probeSegFrames = 0;
+                }
+            }
 
             // 帧画完了才做副作用 —— 理由见 DrawHelpBody 里那段说明。
             if (_qqLinkClicked)
@@ -1204,8 +1460,22 @@ namespace ADOFAIEditorStudio
             headerBlocker.height = Mathf.Max(0f, headerBlocker.height - handleInset);
             SyncBlocker(_timelineHeaderBlocker, headerBlocker,
                 panelOn && headerBlocker.width > 0f && headerBlocker.height > 0f);
+            // 事件面板那排也要一份：它原来是 uGUI 按钮、自己吃点击，换成 ImGui
+            // 画之后不挡的话，点击会穿到下面的游戏编辑器去（见字段那段的说明）。
+            SyncBlocker(_eventPaletteBlocker, _eventPalette.Rect,
+                panelOn && _eventPalette.Rect.width > 0f && _eventPalette.Rect.height > 1f);
             SyncBlocker(_timelineBodyBlocker, _timelineBody.Rect,
                 panelOn && _timelineBody.Rect.width > 0f);
+
+            // **上下文还回去** —— 见方法开头那段说明。
+            //
+            // 放在这里是因为 ImGui 的活到上面就全干完了（NewFrame / Render /
+            // PushToCanvas 都在里面），下面这些 SyncBlocker 只是 uGUI 的收尾，
+            // 不碰 ImGui。
+            if (previousContext != IntPtr.Zero)
+            {
+                ImGui.SetCurrentContext(previousContext);
+            }
         }
 
         private static void AddKeys(ImGuiIOPtr io)
@@ -1258,6 +1528,7 @@ namespace ADOFAIEditorStudio
                 SyncBlocker(_headerBlocker, new Rect(0f, 0f, 0f, 0f), false);
                 SyncBlocker(_previewBlocker, new Rect(0f, 0f, 0f, 0f), false);
                 SyncBlocker(_timelineHeaderBlocker, new Rect(0f, 0f, 0f, 0f), false);
+                SyncBlocker(_eventPaletteBlocker, new Rect(0f, 0f, 0f, 0f), false);
                 SyncBlocker(_timelineBodyBlocker, new Rect(0f, 0f, 0f, 0f), false);
                 if (overlay != null)
                 {
@@ -1268,6 +1539,7 @@ namespace ADOFAIEditorStudio
                     overlay.SuppressHeader(false);
                     overlay.SuppressPreviewChrome(false);
                     overlay.SuppressTimelineTitleRow(false);
+                    overlay.SuppressTimelinePalette(false);
                     overlay.SuppressTimelineRuler(false);
                     overlay.SuppressTimelineBlocks(false);
                 }
@@ -1275,8 +1547,10 @@ namespace ADOFAIEditorStudio
             }
 
             _header.Draw();
+            _menuBar.Draw();
             _previewPanel.Draw();
             _timelineHeader.Draw();
+            _eventPalette.Draw();
             _timelineBody.Draw();
             _inspector.Draw();
             _decorationList.Draw();
@@ -1292,6 +1566,7 @@ namespace ADOFAIEditorStudio
             overlay.SuppressHeader(true);
             overlay.SuppressPreviewChrome(true);
             overlay.SuppressTimelineTitleRow(true);
+            overlay.SuppressTimelinePalette(true);
             overlay.SuppressTimelineRuler(true);
             overlay.SuppressTimelineBlocks(true);
         }
@@ -1344,6 +1619,9 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private void DrawWindows()
         {
+            DrawProjectCreateWindow();
+            DrawConfirmSaveWindow();
+
             DrawTextWindow(ref _helpOpen, HelpTitle, _helpRows, false);
 
             // 版本说明窗口：它是被自己的标题栏 × 关掉的，工作台那边收不到通知，
@@ -1353,6 +1631,165 @@ namespace ADOFAIEditorStudio
             if (wasOpen && !_versionOpen)
             {
                 _versionClosed = true;
+            }
+        }
+
+        /// <summary>
+        /// 「时间轴布局还没保存」那扇窗：三个答案，保存 / 不保存 / 取消。
+        ///
+        /// **取消是默认语义**（连标题栏那个 × 也算取消）—— 关窗户不该等于
+        /// 悄悄丢掉用户摆好的位置。
+        /// </summary>
+        private void DrawConfirmSaveWindow()
+        {
+            if (!_confirmSaveOpen)
+            {
+                return;
+            }
+
+            const float width = 560f;
+            NVec2 display = ImGui.GetIO().DisplaySize;
+            float height = Mathf.Max(230f, display.Y * 0.28f);
+            ImGui.SetNextWindowSize(new NVec2(width, height), ImGuiCond.Appearing);
+            ImGui.SetNextWindowPos(
+                new NVec2((display.X - width) * 0.5f, (display.Y - height) * 0.5f),
+                ImGuiCond.Appearing);
+
+            bool visible = true;
+            if (ImGui.Begin("时间轴布局还没保存", ref visible, WindowFlags))
+            {
+                ImGui.Spacing();
+                ImGui.TextWrapped("你在时间轴上摆的位置还没写进工程，要保存吗？");
+                ImGui.Spacing();
+                ImGui.TextDisabled("选「不保存」的话，这些位置下次打开就没了。");
+
+                float footer = ImGui.GetWindowHeight() - 64f;
+                if (footer > ImGui.GetCursorPosY())
+                {
+                    ImGui.SetCursorPosY(footer);
+                }
+                ImGui.Separator();
+                ImGui.Spacing();
+
+                if (ImGui.Button("保存", new NVec2(140f, 40f)))
+                {
+                    _confirmSaveAnswer = 1;
+                    _confirmSaveOpen = false;
+                }
+                ImGui.SameLine();
+                if (ImGui.Button("不保存", new NVec2(140f, 40f)))
+                {
+                    _confirmSaveAnswer = 2;
+                    _confirmSaveOpen = false;
+                }
+                ImGui.SameLine();
+                if (ImGui.Button("取消", new NVec2(140f, 40f)))
+                {
+                    _confirmSaveAnswer = 3;
+                    _confirmSaveOpen = false;
+                }
+            }
+            ImGui.End();
+
+            if (!visible && _confirmSaveOpen)
+            {
+                // 被标题栏的 × 关掉 —— 等同于「取消」，别把布局悄悄丢掉。
+                _confirmSaveAnswer = 3;
+                _confirmSaveOpen = false;
+            }
+        }
+
+        /// <summary>
+        /// 「创建工程」那一屏：给这张谱起个名，AES 才会开始记布局。
+        ///
+        /// **没有目录选择框** —— 目录跟谱面绑死（`<谱面目录>/<谱面名>_AES/`）。
+        /// 开放自定义的话，下次打开这张谱就找不回来了。能改的只有工程名。
+        ///
+        /// 尺寸按屏幕比例给（大半屏），**不能用 `AlwaysAutoResize`** ——
+        /// 那会把窗口收缩到内容大小，两个输入框一挤就没法看了。
+        /// </summary>
+        private void DrawProjectCreateWindow()
+        {
+            if (!_projectCreateOpen)
+            {
+                return;
+            }
+
+            NVec2 display = ImGui.GetIO().DisplaySize;
+            float width = Math.Max(620f, display.X * 0.64f);
+            float height = Math.Max(400f, display.Y * 0.64f);
+            ImGui.SetNextWindowSize(new NVec2(width, height), ImGuiCond.Appearing);
+            ImGui.SetNextWindowPos(
+                new NVec2((display.X - width) * 0.5f, (display.Y - height) * 0.5f),
+                ImGuiCond.Appearing);
+
+            bool visible = true;
+            if (ImGui.Begin("创建工程", ref visible, WindowFlags))
+            {
+                ImGui.Spacing();
+                ImGui.TextWrapped(
+                    "这张谱还没有工程。新建之后，你在时间轴上的排列会保存在这里。");
+                ImGui.Spacing();
+                ImGui.Spacing();
+
+                ImGui.SeparatorText("工程名");
+                ImGui.Spacing();
+                ImGui.SetNextItemWidth(-1f);
+                string typed = _projectName;
+                if (ImGui.InputText("##projectName", ref typed, 120))
+                {
+                    _projectName = typed;
+                }
+
+                ImGui.Spacing();
+                ImGui.Spacing();
+                ImGui.SeparatorText("保存位置");
+                ImGui.Spacing();
+                ImGui.TextWrapped(_projectPath);
+                ImGui.Spacing();
+                ImGui.TextDisabled(
+                    "工程存放于谱面目录下的子文件夹，分享谱面时是否一并分发由你决定。");
+
+                // 按钮推到窗口底部 —— 上面那些说明和输入框占满大半屏之后，
+                // 按钮要是紧跟着文字飘在中间，读起来像还没写完。
+                float footer = ImGui.GetWindowHeight() - 64f;
+                if (footer > ImGui.GetCursorPosY())
+                {
+                    ImGui.SetCursorPosY(footer);
+                }
+                ImGui.Separator();
+                ImGui.Spacing();
+
+                // 名字空着就建不了 —— 建出来会是个没有文件名的路径。
+                bool canCreate = !string.IsNullOrWhiteSpace(_projectName);
+                if (!canCreate)
+                {
+                    ImGui.BeginDisabled();
+                }
+                if (ImGui.Button("新建工程", new NVec2(180f, 40f)))
+                {
+                    _projectCreateConfirmed = true;
+                    _projectCreateOpen = false;
+                }
+                if (!canCreate)
+                {
+                    ImGui.EndDisabled();
+                }
+
+                ImGui.SameLine();
+                if (ImGui.Button("取消", new NVec2(120f, 40f)))
+                {
+                    _projectCreateCancelled = true;
+                    _projectCreateOpen = false;
+                }
+            }
+            ImGui.End();
+
+            // 被标题栏那个 × 关掉的，等同于取消。
+            if (!visible && _projectCreateOpen)
+            {
+                _projectCreateCancelled = true;
+                _projectCreateOpen = false;
             }
         }
 
@@ -1557,6 +1994,24 @@ namespace ADOFAIEditorStudio
 
         // ---------------------------------------------------------------- 画到 Unity
 
+        /// <summary>帧构建分段探针的累计值（见 Update）。定位完删。</summary>
+        private static long probeBuildTicks;
+        private static long probeRenderTicks;
+        private static long probePushTicks;
+        private static double probeDeltaSum;
+        private static int probeSegFrames;
+
+        /// <summary>按窗口数命令的探针打到第几帧了（定位完删）。</summary>
+        private static int probeListFrames;
+
+        /// <summary>桥的搬运探针累计值（见 PushToCanvas）。定位完删。</summary>
+        private static int probeFrames;
+        private static long probeVtxTotal;
+        private static long probeCmdTotal;
+        private static double probePushMsTotal;
+        private static readonly System.Diagnostics.Stopwatch ProbePushWatch =
+            new System.Diagnostics.Stopwatch();
+
         /// <summary>
         /// 把 ImGui 这一帧的绘制数据搬进 Unity。
         ///
@@ -1566,6 +2021,38 @@ namespace ADOFAIEditorStudio
         private unsafe void PushToCanvas()
         {
             ImDrawDataPtr drawData = ImGui.GetDrawData();
+
+            // 探针跟着 VerboseDiagnostics 走（开发者设置里开）：这一帧搬多少顶点、
+            // 多少命令、整段搬运花多少毫秒，打上一个 60 帧窗口的均值。
+            if (Main.Settings != null && Main.Settings.VerboseDiagnostics)
+            {
+                if (ProbePushWatch.IsRunning)
+                {
+                    ProbePushWatch.Stop();
+                    probePushMsTotal += ProbePushWatch.Elapsed.TotalMilliseconds;
+                }
+                ProbePushWatch.Restart();
+                int commands = 0;
+                for (int i = 0; i < drawData.CmdListsCount; i++)
+                {
+                    commands += (int)drawData.CmdLists[i].CmdBuffer.Size;
+                }
+                probeVtxTotal += drawData.TotalVtxCount;
+                probeCmdTotal += commands;
+                probeFrames++;
+                if (probeFrames >= 60)
+                {
+                    Main.Logger.Log("[ImGui桥] 60 帧均值：PushToCanvas "
+                        + (probePushMsTotal / probeFrames).ToString("0.0") + " ms，顶点 "
+                        + (probeVtxTotal / probeFrames) + " 个，绘制命令 "
+                        + (probeCmdTotal / probeFrames) + " 条");
+                    probeFrames = 0;
+                    probeVtxTotal = 0;
+                    probeCmdTotal = 0;
+                    probePushMsTotal = 0.0;
+                }
+            }
+
             if (drawData.CmdListsCount == 0)
             {
                 ClearCanvas();
@@ -1583,6 +2070,18 @@ namespace ADOFAIEditorStudio
                 int vertexCount = list.VtxBuffer.Size;
                 int indexCount = list.IdxBuffer.Size;
                 EnsureArrays(vertexCount, indexCount);
+
+                // 临时探针（定位爆顶点）：按 draw list 数命令。**ImGui 每个 window
+                // 就是一个 draw list**，所以这一眼能看出是谁在把命令/顶点撑大。
+                //
+                // 不能只记前几帧 —— 崩的是"拖动之后某一帧"，那个窗口盖不到。
+                // 改成按异常大小触发：任一窗口顶点或命令数明显偏大就记一笔。
+                if (vertexCount >= 20000 || list.CmdBuffer.Size >= 400)
+                {
+                    Main.Logger.Log("[ImGui命令] list" + i + " / 共 "
+                        + drawData.CmdListsCount + " 个：命令 " + list.CmdBuffer.Size
+                        + " 条，顶点 " + vertexCount + "（全帧 " + drawData.TotalVtxCount + "）");
+                }
 
                 ImDrawVert* vertices = (ImDrawVert*)list.VtxBuffer.Data.ToPointer();
                 for (int v = 0; v < vertexCount; v++)
@@ -1624,20 +2123,56 @@ namespace ADOFAIEditorStudio
                     {
                         _commandIndices = new int[elementCount];
                     }
+                    // **这条命令实际用到哪一段顶点，要从它自己的索引里求。**
+                    //
+                    // 不能用 `VtxOffset` 分段：ImGui 只有在后端声明了
+                    // `RendererHasVtxOffset` 时才会给它填非 0 值，我们这边**所有
+                    // 命令的 VtxOffset 都是 0** —— 拿"下一条减这条"算长度会得到 0，
+                    // 于是除每个窗口最后一条之外的命令全被跳过（实测就是
+                    // 「大部分控件不见了，只剩零星几个」）。
+                    //
+                    // 正确做法：扫一遍这条命令的索引，取 min/max —— 那才是它真正
+                    // 碰到的顶点。下面顶点只上传这一段、索引一并减去起点。
+                    int vtxStart = int.MaxValue;
+                    int vtxMax = int.MinValue;
                     for (int m = 0; m < elementCount; m++)
                     {
-                        // IdxOffset / VtxOffset 是 uint，加法会提升成 long，
-                        // 不转回 int 的话索引器会编译不过。
-                        _commandIndices[m] = _indices[(int)command.IdxOffset + m]
-                            + (int)command.VtxOffset;
+                        int index = _indices[(int)command.IdxOffset + m];
+                        _commandIndices[m] = index;
+                        if (index < vtxStart)
+                        {
+                            vtxStart = index;
+                        }
+                        if (index > vtxMax)
+                        {
+                            vtxMax = index;
+                        }
+                    }
+
+                    int vtxCount = vtxMax - vtxStart + 1;
+                    if (vtxStart < 0 || vtxCount <= 0
+                        || vtxMax >= vertexCount)
+                    {
+                        rendererIndex++;
+                        continue;
+                    }
+
+                    // 索引归零到这一段起点 —— 和下面 `SetVertices(_, vtxStart, _)`
+                    // 必须同一个基准，否则顶点全抓错（上一版就栽在这）。
+                    if (vtxStart != 0)
+                    {
+                        for (int m = 0; m < elementCount; m++)
+                        {
+                            _commandIndices[m] -= vtxStart;
+                        }
                     }
 
                     EnsureRenderer(rendererIndex);
                     Mesh mesh = _meshes[rendererIndex];
                     mesh.Clear();
-                    mesh.SetVertices(_vertices, 0, vertexCount);
-                    mesh.SetUVs(0, _uvs, 0, vertexCount);
-                    mesh.SetColors(_colors, 0, vertexCount);
+                    mesh.SetVertices(_vertices, vtxStart, vtxCount);
+                    mesh.SetUVs(0, _uvs, vtxStart, vtxCount);
+                    mesh.SetColors(_colors, vtxStart, vtxCount);
                     mesh.SetIndices(_commandIndices, 0, elementCount,
                         MeshTopology.Triangles, 0, false);
 
@@ -1669,6 +2204,7 @@ namespace ADOFAIEditorStudio
             {
                 _renderers[n].Clear();
             }
+            probeListFrames++;
         }
 
         private void EnsureArrays(int vertices, int indices)

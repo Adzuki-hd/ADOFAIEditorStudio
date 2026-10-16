@@ -2122,6 +2122,14 @@ namespace ADOFAIEditorStudio
 
         internal void SetDisabled(LevelEvent levelEvent, string key, bool disabled)
         {
+            // **只读模式：什么都不写。** 同 `Commit` 那条 —— 这里也是改谱面
+            // （切某个属性的「启用 / 禁用」）。ImGui 版参数栏
+            // （`EditorImGuiInspector`）的那个勾选框也走这一条。
+            if (owner != null && !owner.AllowEdit())
+            {
+                return;
+            }
+
             // 批量模式下「启用 / 禁用」也是整批一起改 —— 行的那个勾选开关
             // 在批量里代表的是「这一批」，只改掉一个等于说了句假话。
             // 判成员的理由和 Commit 那条一样：设置页不属于任何一批。
@@ -3520,6 +3528,15 @@ namespace ADOFAIEditorStudio
         /// </summary>
         internal void Commit(LevelEvent levelEvent, string key, object value)
         {
+            // **只读模式：什么都不写。**
+            //
+            // 拦这里就够 —— 事件参数的写入只有这一条路（技术架构里那条硬规矩），
+            // 不必去给参数栏每个控件单独挂开关。
+            if (owner != null && !owner.AllowEdit())
+            {
+                return;
+            }
+
             // **批量模式下，一次改值要落到这一批全部事件上。**
             //
             // 控件绑的都还是第一个选中事件（ShowBatch / EnterBatch 那里定的），

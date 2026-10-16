@@ -1073,12 +1073,63 @@ namespace ADOFAIEditorStudio
                 return false;
             }
 
+            // **按"它实际在哪个列表里"归类，不按"谁把它选中的"。**
+            //
+            // 时间轴选中的目标里可能混着装饰物和**文本** —— 文本（`AddText` 建的）
+            // 在游戏那边和装饰物同族，存在 `editor.decorations` 里。原来一律当
+            // 普通事件去 `editor.events` 里找，找不到就静默跳过，表现就是
+            // 「加了文本，Del 删不掉」：既不报错、也不删。
+            List<LevelEvent> eventTargets = new List<LevelEvent>();
+            List<LevelEvent> decorationTargets = new List<LevelEvent>();
+
+            // ① 调用方直接点名的装饰物（原生那份选中里的）
+            if (decorations != null)
+            {
+                for (int i = 0; i < decorations.Count; i++)
+                {
+                    LevelEvent target = decorations[i];
+                    if (target != null && FindReference(decorationTargets, target) < 0)
+                    {
+                        decorationTargets.Add(target);
+                    }
+                }
+            }
+
+            // ② 事件目标：看它究竟躺在哪个列表里，再决定走哪条删除路径
+            if (events != null)
+            {
+                for (int i = 0; i < events.Count; i++)
+                {
+                    LevelEvent target = events[i];
+                    if (target == null || FindReference(decorationTargets, target) >= 0)
+                    {
+                        continue;
+                    }
+                    if (FindReference(editor.decorations, target) >= 0)
+                    {
+                        decorationTargets.Add(target);
+                    }
+                    else
+                    {
+                        eventTargets.Add(target);
+                    }
+                }
+            }
+
             List<ICommand> commands = new List<ICommand>();
-            CollectRemovals(editor, editor.events, events, commands, false);
-            CollectRemovals(editor, editor.decorations, decorations, commands, true);
+            CollectRemovals(editor, editor.events, eventTargets, commands, false);
+            CollectRemovals(editor, editor.decorations, decorationTargets, commands, true);
 
             if (commands.Count == 0)
             {
+                // **一条都没删成得说一声。** 静默失败最难查 ——「Del 删不掉」这种
+                // 就是一路静默下来的。把目标实际在哪儿打出来，下次同类一眼可见。
+                if (Main.Logger != null && eventTargets.Count + decorationTargets.Count > 0)
+                {
+                    Main.Logger.Log("[删除] 没删成：目标 "
+                        + eventTargets.Count + " 个按事件找 / "
+                        + decorationTargets.Count + " 个按装饰物找，都没在对应列表里");
+                }
                 return false;
             }
 

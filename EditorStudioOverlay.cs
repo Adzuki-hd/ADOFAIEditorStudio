@@ -69,7 +69,18 @@ namespace ADOFAIEditorStudio
 
         private const float DesignWidth = 1920f;
         private const float DesignHeight = 1080f;
+        /// <summary>品牌那一行的高度。</summary>
         private const float HeaderHeight = 54f;
+        /// <summary>
+        /// 菜单栏（`文件 / 工程 / 偏好 / 设置`）那一行的高度，紧贴在品牌行下面。
+        ///
+        /// 单独一个常量，**不要并进 `HeaderHeight`** —— 品牌行的绘制按
+        /// `HeaderHeight` 居中，合起来会让标题掉到半空。下游凡是"从顶栏往下算"
+        /// 的位置改用 `LayoutTop`。
+        /// </summary>
+        private const float MenuBarHeight = 30f;
+        /// <summary>顶栏 + 菜单栏的总高。下面所有面板的起点从这里算。</summary>
+        private const float LayoutTop = HeaderHeight + MenuBarHeight;
         // 外边距与面板间距。原来都是 12，整个界面读起来是「紧」的——
         // 面板之间、面板与屏幕边、标题与内容全是同一个数，没有呼吸。
         // 提到 16 之后同样的内容从容很多，这是最容易见效、
@@ -102,7 +113,7 @@ namespace ADOFAIEditorStudio
         private const float MinimumTimelineHeight = 220f;
         private const float MaximumTimelineHeight = 520f;
         private const float TimelinePanelWidth = DesignWidth - OuterMargin * 2f;
-        private const float PreviewPanelY = HeaderHeight + 12f;
+        private const float PreviewPanelY = LayoutTop + 12f;
         private const float PreviewStageInsetY = 58f;
         // 目标列数。实际列数由当前面板宽度算出来，不是钉死的——
         // 面板变窄时宁可少一列，也不要把格子压到看不清缩略图。
@@ -343,6 +354,271 @@ namespace ADOFAIEditorStudio
         private bool wasVisibleBeforeReload;
         private bool buildFailed;
         private bool visible;
+
+        /// <summary>
+        /// 当前是只读还是编辑模式。
+        ///
+        /// **不持久化** —— 每次 F8 打开都从只读开始。只读是「看」的姿态、
+        /// 编辑是「改」的姿态，每次进来重新选一次，不容易误改谱面。
+        ///
+        /// 只读下块拖不动、参数改不了。拦截点只有一处：**写入路径本来就只有一条**
+        /// （技术架构里那条硬规矩），只要在那条路上问一句就够，
+        /// 不必给每个按钮单独挂开关。
+        /// </summary>
+        private bool editMode;
+
+        /// <summary>
+        /// 别的面板拿它判断「现在能不能改东西」。
+        ///
+        /// **「创建工程」那一屏还开着的时候不算编辑** —— 用户还没答应建，
+        /// 这时候放行写入会让他以为已经能改了，结果一取消全白摆。
+        /// </summary>
+        internal bool IsEditMode
+        {
+            get
+            {
+                EditorImGuiBridge bridge = EditorImGuiBridge.Instance;
+                if (bridge != null && bridge.ProjectCreateVisible)
+                {
+                    return false;
+                }
+                return editMode;
+            }
+        }
+
+        /// <summary>
+        /// 只读模式下，**统一**在"改谱面"的入口拦一次，并**说明为什么**。
+        ///
+        /// 用法：`if (!(owner?.AllowEdit() ?? true)) return;` —— 返回 true 表示可以动手，
+        /// false 表示已经在只读下拦住了、提示也发了。
+        ///
+        /// **为什么要有它**：每个入口各写一句 `if (!IsEditMode) return;` 的话，
+        /// 漏一处就变成"点了没反应"，而从现象上看那和"坏了"一模一样 ——
+        /// 今天这个坑连着骗了我们两回（事件面板、装饰物列表的新建），
+        /// 每次都从"为什么加不进时间轴"一路查回来。走同一个入口就不会再漏。
+        ///
+        /// 提示用的是那条瞬态状态（几秒后自己消失），文案统一成一句。
+        /// </summary>
+        internal bool AllowEdit()
+        {
+            if (IsEditMode)
+            {
+                return true;
+            }
+            SetTransientStatus(ReadOnlyEditMessage, 3f);
+            return false;
+        }
+
+        /// <summary>
+        /// 只读挡下时那句统一的话。
+        ///
+        /// `AllowEdit` 用它弹提示；**需要把自己拦下的原因回传给调用方的入口**
+        /// （时间轴的删除/粘贴：热键处理要靠"有没有原因"决定要不要吃掉这个键）
+        /// 也从这儿取，别各写一份 —— 文案走散之后，读日志的人会以为遇到了两种问题。
+        /// </summary>
+        internal const string ReadOnlyEditMessage = "只读模式不能修改谱面，先切到编辑模式";
+
+        /// <summary>
+        /// 「关工作台 / 切回只读」这两个动作要等用户答完保存提示才能做。
+        /// 弹窗是异步的，所以先把意图挂在这儿。
+        /// </summary>
+        private enum PendingExit { None, HideOverlay, ToReadOnly }
+
+        private PendingExit pendingExit;
+
+        /// <summary>
+        /// 关工作台或切只读之前，先问一句布局存了没有。
+        ///
+        /// 返回 true 表示**已经拦下**（弹窗开了、动作挂起来了），
+        /// 调用方这一下什么都别做，等 `UpdateConfirmSave` 那边收答案。
+        /// 返回 false 表示可以照常往下走。
+        /// </summary>
+        private bool InterceptForUnsavedLayout(PendingExit action)
+        {
+            if (Timeline == null || !Timeline.ProjectDirty)
+            {
+                return false;
+            }
+            EditorImGuiBridge bridge = EditorImGuiBridge.Instance;
+            if (bridge == null)
+            {
+                return false;
+            }
+            pendingExit = action;
+            bridge.OpenConfirmSave();
+            return true;
+        }
+
+        /// <summary>
+        /// 收「布局还没存」那扇窗的答复。每帧问一次，没答就什么都不做。
+        ///
+        /// 1 = 保存（存完再执行那个动作）、2 = 不保存（直接执行）、3 = 取消（什么都不做）。
+        /// </summary>
+        private void UpdateConfirmSave()
+        {
+            EditorImGuiBridge bridge = EditorImGuiBridge.Instance;
+            if (bridge == null)
+            {
+                return;
+            }
+            int answer;
+            if (!bridge.TakeConfirmSaveAnswer(out answer))
+            {
+                return;
+            }
+            PendingExit action = pendingExit;
+            pendingExit = PendingExit.None;
+
+            if (answer == 3)
+            {
+                // 取消：什么都不做，用户还在原地。
+                return;
+            }
+            if (answer == 1)
+            {
+                MenuSaveProject();
+                // 存失败（比如还没有工程）就别硬往下走了 —— 那会变成
+                // 「点了保存、结果布局还是丢了」。
+                if (Timeline != null && Timeline.ProjectDirty)
+                {
+                    return;
+                }
+            }
+
+            if (action == PendingExit.HideOverlay)
+            {
+                SetVisible(false);
+            }
+            else if (action == PendingExit.ToReadOnly)
+            {
+                ApplyEditMode(false);
+            }
+        }
+
+        /// <summary>切模式。只读 → 编辑时确保这张谱有工程。</summary>
+        internal void SetEditMode(bool value)
+        {
+            if (editMode == value)
+            {
+                return;
+            }
+            // 切回只读之前先问一句布局存了没有 —— 只读之后就不能再改了，
+            // 没存的话那次的改动就白摆。
+            if (!value && InterceptForUnsavedLayout(PendingExit.ToReadOnly))
+            {
+                return;
+            }
+            ApplyEditMode(value);
+        }
+
+        /// <summary>真正切模式，不拦截。给答复保存提示那条路用。</summary>
+        private void ApplyEditMode(bool value)
+        {
+            if (editMode == value)
+            {
+                return;
+            }
+            editMode = value;
+            Main.Logger.Log("[模式] 切到 " + (value ? "编辑" : "只读"));
+            if (value)
+            {
+                EnsureProjectForEdit();
+            }
+        }
+
+        /// <summary>
+        /// 切到编辑模式时确保这张谱有工程。
+        ///
+        /// 有工程就直接进去；没有就推开「创建工程」那一屏让用户起名 ——
+        /// **这时候还不算真的切过去了**，等他答完（见 `UpdateProjectCreate`）。
+        /// </summary>
+        private void EnsureProjectForEdit()
+        {
+            string chartPath = EditorProjectSession.GetCurrentLevelPath();
+            if (string.IsNullOrEmpty(chartPath))
+            {
+                // 拿不到路径就建不了工，退回只读，别让用户卡在「编辑」却存不了。
+                editMode = false;
+                SetTransientStatus("拿不到谱面路径，建不了工程");
+                return;
+            }
+            if (EditorProjectFile.FindProjectFile(chartPath) != null)
+            {
+                return;
+            }
+            EditorImGuiBridge bridge = EditorImGuiBridge.Instance;
+            if (bridge == null)
+            {
+                return;
+            }
+            bridge.OpenProjectCreate(
+                Path.GetFileNameWithoutExtension(chartPath),
+                EditorProjectFile.GetProjectDirectory(chartPath));
+        }
+
+        /// <summary>
+        /// 收「创建工程」那一屏的答复。每帧问一次，没有答复就什么都不做。
+        ///
+        /// 建工程只是**落盘**，不需要等 —— 自动排列的结果在 F8 那趟加载里算好了。
+        /// </summary>
+        private void UpdateProjectCreate()
+        {
+            EditorImGuiBridge bridge = EditorImGuiBridge.Instance;
+            if (bridge == null)
+            {
+                return;
+            }
+            string name;
+            bool confirmed;
+            if (!bridge.TakeProjectCreateResult(out name, out confirmed))
+            {
+                return;
+            }
+            if (!confirmed)
+            {
+                editMode = false;   // 取消 = 退回只读
+                return;
+            }
+            string chartPath = EditorProjectSession.GetCurrentLevelPath();
+            if (string.IsNullOrEmpty(chartPath) || Timeline == null)
+            {
+                editMode = false;
+                SetTransientStatus("建工程失败：拿不到谱面路径");
+                return;
+            }
+            string fileName = SanitizeProjectName(name) + EditorProjectFile.FileExtension;
+            string error = Timeline.SaveProjectRows(
+                Path.Combine(EditorProjectFile.GetProjectDirectory(chartPath), fileName),
+                Path.GetFileName(chartPath));
+            if (string.IsNullOrEmpty(error))
+            {
+                SetTransientStatus("工程已新建，时间轴排列会保存到工程里");
+            }
+            else
+            {
+                editMode = false;
+                SetTransientStatus("新建工程失败：" + error);
+            }
+        }
+
+        /// <summary>
+        /// 工程名里不能有的字符换成下划线 —— 它会变成一个真实文件名，
+        /// 带 `\ / : * ? " &lt; &gt; |` 的路径在 Windows 上根本建不出来。
+        /// </summary>
+        private static string SanitizeProjectName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return "project";
+            }
+            char[] bad = { '\\', '/', ':', '*', '?', '"', '<', '>', '|' };
+            string cleaned = name.Trim();
+            for (int i = 0; i < bad.Length; i++)
+            {
+                cleaned = cleaned.Replace(bad[i], '_');
+            }
+            return cleaned.Length == 0 ? "project" : cleaned;
+        }
         private int layoutScreenWidth;
         private int layoutScreenHeight;
         private float timelineHeight = DefaultTimelineHeight;
@@ -840,6 +1116,22 @@ namespace ADOFAIEditorStudio
             height = EditorTimelineView.TitleRowHeight;
         }
 
+        /// <summary>
+        /// 事件面板那排（时间轴第二行）在屏幕上的矩形。
+        ///
+        /// 它紧贴在标题行下面：顶端 = 标题行顶端 + `PaletteRowY`；**高度由时间轴
+        /// 按换行后的行数给** —— 事件多的时候这一排会往下排好几行，工具区跟着变高、
+        /// 可视区相应变矮（那套高度是 `LayoutPaletteRows` 定的，不要在这儿另算）。
+        /// </summary>
+        internal void GetTimelinePaletteRect(out float x, out float y, out float width,
+            out float height)
+        {
+            float titleHeight;
+            GetTimelineHeaderRect(out x, out y, out width, out titleHeight);
+            y += EditorTimelineView.PaletteRowYOffset;
+            height = timelineView == null ? 0f : timelineView.PaletteBandHeight;
+        }
+
         /// <summary>时间轴视图（标题行上的按钮都转发到它）。</summary>
         internal EditorTimelineView TimelineView
         {
@@ -852,6 +1144,151 @@ namespace ADOFAIEditorStudio
         /// 面板原点 + 相对量：`root` 就是面板根节点，所以相对量直接加。
         /// 面板高度跟着拖拽走，内容区的位置也跟着变 —— 所以每次都现算。
         /// </summary>
+        /// <summary>
+        /// 菜单栏那一条的位置（设计空间）。紧贴在品牌行下面，
+        /// 横跨整个设计宽度 —— 它是全屏级的一条，不属于某个面板。
+        /// </summary>
+        internal void GetMenuBarRect(out float x, out float y, out float width, out float height)
+        {
+            x = 0f;
+            y = HeaderHeight;
+            width = DesignWidth;
+            height = MenuBarHeight;
+        }
+
+        /// <summary>
+        /// 交给菜单栏的活儿：都是转发给游戏原生编辑器，AES 自己不碰 `.adofai`。
+        ///
+        /// **只有"打开/保存/另存"是完全转发**；撤销和重做要先走 AES 自己的栈
+        /// （工作台里改过的东西在原生那边没有记录），栈空了才轮到原生。
+        /// </summary>
+        internal void MenuOpenLevel()
+        {
+            scnEditor editor = scnEditor.instance;
+            if (editor != null)
+            {
+                editor.OpenLevel();
+            }
+        }
+
+        internal void MenuSaveLevel()
+        {
+            scnEditor editor = scnEditor.instance;
+            if (editor != null)
+            {
+                editor.SaveLevel();
+            }
+        }
+
+        internal void MenuSaveLevelAs()
+        {
+            scnEditor editor = scnEditor.instance;
+            if (editor != null)
+            {
+                editor.SaveLevelAs();
+            }
+        }
+
+        internal void MenuUndo()
+        {
+            // **先走工作台自己的撤销栈。**
+            //
+            // 拖块换行、装饰物、批量改参这些都只记在 `EditorCommandHistory` 里，
+            // 游戏原生那边根本没有 —— 拖块换行甚至不改谱面，原生无从知道。
+            // 直接转发原生的话，在时间轴上拖完再撤销会「什么都没发生」。
+            string status;
+            if (EditorCommandHistory.TryUndo(out status))
+            {
+                SetTransientStatus(string.IsNullOrEmpty(status) ? "已撤销" : status);
+                return;
+            }
+            // 工作台这边没得撤了，才轮到原生（比如原生面板里做的改动）。
+            scnEditor editor = scnEditor.instance;
+            if (editor != null)
+            {
+                editor.Undo();
+            }
+        }
+
+        internal void MenuRedo()
+        {
+            string status;
+            if (EditorCommandHistory.TryRedo(out status))
+            {
+                SetTransientStatus(string.IsNullOrEmpty(status) ? "已重做" : status);
+                return;
+            }
+            scnEditor editor = scnEditor.instance;
+            if (editor != null)
+            {
+                editor.Redo();
+            }
+        }
+
+        /// <summary>
+        /// 「重置时间轴排版」：丢掉工程里存的位置，让全部事件重新自动装箱。
+        ///
+        /// **这是破坏性的**（玩家摆好的位置会没），所以做之前重新载一次工程表
+        /// 是反的 —— 这里直接清空表再强制重排。
+        /// </summary>
+        internal void MenuResetTimelineLayout()
+        {
+            if (Timeline != null)
+            {
+                Timeline.ResetPlacementsToAuto();
+            }
+            SetTransientStatus("时间轴排版已重置为自动排列");
+        }
+
+        /// <summary>「保存工程」：按约定路径写 `.aesprj`。</summary>
+        /// <summary>
+        /// 关游戏（或卸载 mod）前自动存一份布局。**没有未保存改动时什么都不做。**
+        ///
+        /// 退出流程里弹不出 UI（没人看得到窗口），只能静默写 —— 总比
+        /// "在时间轴上摆了一晚上、关游戏全丢"好。
+        /// </summary>
+        internal void SaveProjectBeforeQuit()
+        {
+            if (Timeline == null || !Timeline.ProjectDirty)
+            {
+                return;
+            }
+            MenuSaveProject();
+            if (Timeline.ProjectDirty)
+            {
+                // 存完还脏（多半是这张谱还没有工程）—— 记一条，别假装成功。
+                Main.Logger.Warning("[工程] 关游戏前想自动保存，但没能写进去"
+                    + "（多半是这张谱还没有工程）");
+            }
+            else
+            {
+                Main.Logger.Log("[工程] 关游戏前自动保存了一份（之前有未存的布局改动）");
+            }
+        }
+
+        internal void MenuSaveProject()
+        {
+            string chartPath = EditorProjectSession.GetCurrentLevelPath();
+            if (string.IsNullOrEmpty(chartPath) || Timeline == null)
+            {
+                SetTransientStatus("拿不到谱面路径，存不了工程");
+                return;
+            }
+            if (EditorProjectFile.FindProjectFile(chartPath) == null)
+            {
+                SetTransientStatus("这张谱还没有工程，先切到编辑模式建一个");
+                return;
+            }
+            string directory = EditorProjectFile.GetProjectDirectory(chartPath);
+            string fileName = Path.GetFileNameWithoutExtension(chartPath)
+                + EditorProjectFile.FileExtension;
+            string error = Timeline.SaveProjectRows(
+                Path.Combine(directory, fileName), Path.GetFileName(chartPath));
+            SetTransientStatus(string.IsNullOrEmpty(error)
+                ? "工程已保存"
+                : "保存工程失败：" + error);
+        }
+
         internal void GetTimelineBodyRect(out float x, out float y, out float width, out float height)
         {
             float localX, localY, localWidth, localHeight;
@@ -878,6 +1315,20 @@ namespace ADOFAIEditorStudio
             if (timelineView != null)
             {
                 timelineView.SuppressTitleRow(suppressed);
+            }
+        }
+
+        /// <summary>
+        /// 把时间轴那排 uGUI 的**事件面板**藏掉（ImGui 版接管时）。
+        ///
+        /// 和第 1 行的开关分开：那排是"第 2 行"，换行行数、按钮位置都由
+        /// `LayoutPaletteRows` 现算，所以它有自己的一套快照（见 `EditorTimelineView`）。
+        /// </summary>
+        internal void SuppressTimelinePalette(bool suppressed)
+        {
+            if (timelineView != null)
+            {
+                timelineView.SuppressPalette(suppressed);
             }
         }
 
@@ -1142,7 +1593,9 @@ namespace ADOFAIEditorStudio
 
         private float PreviewPanelHeight
         {
-            get { return DesignHeight - HeaderHeight - timelineHeight - 28f; }
+            // 从「顶栏 + 菜单栏」下面算，不是从顶栏算 —— 菜单栏占的那 30 像素
+            // 要从预览区里让出来，否则它会被菜单栏压住一截。
+            get { return DesignHeight - LayoutTop - timelineHeight - 28f; }
         }
 
         private float PreviewStageAvailableHeight
@@ -1359,6 +1812,15 @@ namespace ADOFAIEditorStudio
                 MarkVersionNotesSeen();
             }
 
+            // 同一个套路：「创建工程」那一屏的答复也是它自己收的。
+            UpdateProjectCreate();
+
+            // 「布局还没存」那扇窗同理 —— 答复决定要不要真的关掉/切模式。
+            UpdateConfirmSave();
+
+            // 加载页：画预载进度，铺完自己收掉。
+            UpdateMediaPreload();
+
             if (visible && Input.GetKeyDown(KeyCode.Escape))
             {
                 // 有窗口开着时 Esc **先关它**：否则开着一层窗口按 Esc，整个
@@ -1367,7 +1829,14 @@ namespace ADOFAIEditorStudio
                 // 已经搬到 ImGui 的那两扇也要算进来：它们不挂在 uGUI 这棵树上
                 // （`OpenWindow` 遍历的是 uGUI 的窗口层），所以得单独问一句。
                 // 顺序和 `OpenWindow` 一致：先说明窗口，再版本说明。
-                if (imgui != null && imgui.HelpVisible)
+                //
+                // 「创建工程」排最前 —— 它是最新推开的一层，而且它是个要答复的
+                // 问题，Esc 关掉就等于回答「不建」（退回只读）。
+                if (imgui != null && imgui.ProjectCreateVisible)
+                {
+                    imgui.CancelProjectCreate();
+                }
+                else if (imgui != null && imgui.HelpVisible)
                 {
                     imgui.SetHelpVisible(false);
                 }
@@ -1382,8 +1851,9 @@ namespace ADOFAIEditorStudio
                     {
                         ToggleWindow(openWindow);
                     }
-                    else
+                    else if (!InterceptForUnsavedLayout(PendingExit.HideOverlay))
                     {
+                        // 布局没存的话上面那一句会把弹窗挂起来、这里就不关了。
                         SetVisible(false);
                     }
                 }
@@ -1700,7 +2170,7 @@ namespace ADOFAIEditorStudio
         /// 而遮罩恰恰要在重建期间一直盖着——挂上去就会跟着一起消失，
         /// 底下那一下闪烁又露出来了。
         ///
-        /// 给它更高的 sortingOrder（31000 对工作台的 30000），所以永远在最上面。
+        /// 给它最高的 sortingOrder（32767），所以永远在最上面 —— 工作台那层由它自己压。
         /// </summary>
         private GameObject loadingCanvas;
         private Multiplayer.MultiplayerLoadingScreen loadingScreen;
@@ -1734,7 +2204,15 @@ namespace ADOFAIEditorStudio
             Canvas loading = loadingCanvas.GetComponent<Canvas>();
             loading.renderMode = RenderMode.ScreenSpaceOverlay;
             loading.overrideSorting = true;
-            loading.sortingOrder = 31000;
+            // **32767 就是上限，不能再往上加。**
+            //
+            // **试过 32768，结果是黑屏整个掉到工作台底下** —— Unity 排画布用的是
+            // short，超了上限会翻成负数，越"高"越沉底。
+            //
+            // 但光站住 32767 还不够：工作台那层 ImGui 也在这个数上，谁压谁没准。
+            // 真正让它盖满全屏的是**加载期间把 ImGui 压到 0**
+            // （见 `SetImGuiSuppressedForLoading`），这里只是自己站到最高位。
+            loading.sortingOrder = 32767;
             loading.pixelPerfect = false;
 
             CanvasScaler scaler = loadingCanvas.GetComponent<CanvasScaler>();
@@ -1745,11 +2223,51 @@ namespace ADOFAIEditorStudio
             // 遮罩本体是 canvas 的子物体，这样「隐藏」只关它、不关 canvas。
             RectTransform screenRoot = CreateTopLeftRect("Screen", canvasRect, 0f, 0f,
                 DesignWidth, DesignHeight);
+            // **铺满整块画布，别用固定尺寸。**
+            //
+            // 上面那个 `DesignWidth × DesignHeight` 是"设计尺寸"，屏幕比它宽或
+            // 高的时候（比如 2560 宽的屏），遮罩只盖住左上角一块，
+            // 右边和下边会露出来 —— 用户看到的就是"黑屏没覆盖完全"。
+            // 拉伸锚点之后它跟着画布走，任何分辨率都盖满。
+            screenRoot.anchorMin = Vector2.zero;
+            screenRoot.anchorMax = Vector2.one;
+            screenRoot.offsetMin = Vector2.zero;
+            screenRoot.offsetMax = Vector2.zero;
+            // pivot 也要回正：`CreateTopLeftRect` 把它定在左上角 (0,1)，
+            // 而铺满的算法按"锚点即四角"推 rect，pivot 停在角上会整体偏出去。
+            screenRoot.pivot = new Vector2(0.5f, 0.5f);
+
             loadingScreen = screenRoot.gameObject.AddComponent<Multiplayer.MultiplayerLoadingScreen>();
             loadingScreen.Initialize(screenRoot, uiFont, GetRoundedSprite(24, CornerLarge, false, 0f));
+            // 遮罩一露头就把工作台那层 ImGui 压下去，收起来再抬回来。
+            // 挂回调而不是每帧轮询 `IsShowing`：轮询会晚一帧，那一帧工作台
+            // 会从黑屏后面漏出来。
+            loadingScreen.VisibilityChanged = SetImGuiSuppressedForLoading;
         }
 
-        /// <summary>加入房间期间的加载遮罩。会话层只描述状态，显示由这里做。</summary>
+        /// <summary>
+        /// 加载页显隐时压 / 抬工作台那层 ImGui。参数就是「加载页现在显示着没有」。
+        ///
+        /// 桥还没建出来（工作台一次都没开过）时是空操作 —— 那种情况下本来也没有
+        /// 工作台需要遮。
+        /// </summary>
+        private void SetImGuiSuppressedForLoading(bool suppressed)
+        {
+            EditorImGuiBridge bridge = EditorImGuiBridge.Instance;
+            if (bridge != null)
+            {
+                bridge.SetOverlaySuppressed(suppressed);
+            }
+        }
+
+        /// <summary>
+        /// 加入房间期间的加载遮罩。会话层只描述状态，显示由这里做。
+        ///
+        /// **预载媒体时不要收它。** 这块遮罩现在两头共用：联机加入、以及
+        /// F8 打开工作台时的媒体预载（见 `UpdateMediaPreload`）。
+        /// 原来这里只要「不是联机加载中」就无条件 Hide，于是预载刚 Show 出来
+        /// 就被它抹掉 —— 一帧都看不到，表现就是「加载页根本没出现」。
+        /// </summary>
         private void TickLoadingScreen()
         {
             if (Multiplayer.MultiplayerSession.Loading)
@@ -1763,7 +2281,7 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
-            if (loadingScreen != null && loadingScreen.IsShowing)
+            if (!mediaPreloading && loadingScreen != null && loadingScreen.IsShowing)
             {
                 loadingScreen.Hide();
             }
@@ -1800,7 +2318,22 @@ namespace ADOFAIEditorStudio
         /// 那个是 UMM 读的、也是版本闸门比对用的，这里是给人看的。
         /// 发版时两处一起改。
         /// </summary>
-        internal const string ModVersion = "0.29.2";
+        /// <summary>
+        /// mod 的版本号 —— 顶栏和更新说明都显示它。
+        ///
+        /// **从 UMM 读，不在这里写第二份。** 原来这里是个 `const "0.29.2"`，
+        /// 而真实版本在 `Info.json` 里 —— 两处各写一份，升版本时漏改一处
+        /// 就会出现「顶栏写着 0.29.2、实际装的是 0.31.0」。
+        /// （`pack-release.ps1` 当初为了避免同一个坑，程序集名也是从 `Info.json` 读的。）
+        /// </summary>
+        internal static string ModVersion
+        {
+            get
+            {
+                var entry = Main.Mod;
+                return entry == null ? "0.0.0" : entry.Version.ToString();
+            }
+        }
 
         /// <summary>版本号那串字的颜色：蓝，和品牌字（米白）分开。</summary>
         private static Color VersionLink
@@ -1819,24 +2352,25 @@ namespace ADOFAIEditorStudio
         {
             "<size=20><b>v" + ModVersion + " 更新内容</b></size>",
             "",
-            "<b>· 设置页</b>：左栏顶部那排多了「歌曲设置 / 关卡设置 / 轨道设置 / 背景设置 /",
-            "   摄像头设置 / 杂项设置」，点开就是原版那几页设置，但用工作台自己的控件画，",
-            "   改完立刻生效。",
-            "<b>· 调色盘</b>：颜色属性不再只能手打 HEX。点色块开调色盘 ——",
-            "   饱和/明度方块 + 色相条 + 透明度条 + HEX + RGBA。",
-            "   拖动时画面不跟着变，**松手才写进谱面**（一次拖动只落一次数据，不卡）。",
-            "<b>· 多选加强</b>：Ctrl+左键点选加选；Ctrl 从块上按住也能拉框；",
-            "   点空白处取消全部选中。",
-            "<b>· 批量改参</b>：多选之后参数栏只列公共属性，改一次落到整批，只记一步撤销。",
-            "<b>· 说明窗口</b>：右上角那颗「?」—— 这个 MOD 是什么、全部快捷键、全部新功能。",
+            "<b>· 卡顿</b>：事件多的谱面不再掉帧。时间轴不再每帧重算事件的「身份键」，",
+            "   装饰物列表按可见区域跳过，又去掉了每帧一次的全量排序，",
+            "   上千个事件的重谱依旧跟手。",
+            "<b>· 崩溃</b>：缓速曲线的段数以前没有上限，事件一多就撞上绘制层的顶点数上限、",
+            "   把游戏打崩，现在按总量预算来画。",
+            "<b>· 共存</b>：和 CheryTools 同时开时，工作台的文字不会再乱码。",
+            "<b>· 加载页</b>：切谱 / 联机时的加载画面不再被工作台盖住。",
+            "<b>· 事件面板</b>和顶部菜单栏换到新渲染层，外观跟别处统一了。",
             "",
             "<b>修好的</b>",
-            "<b>· 参数标签</b>：按原版那套三段式本地化，以前一部分参数显示成英文键名。",
-            "<b>· 多选拖动</b>：整组按同一个吸附后的位移走，各自的偏移不再被抹平。",
-            "<b>· 撤销</b>：撤回之后参数栏会跟着重画（以前数字停在撤回前）。",
-            "<b>· 输入框</b>：点进去又原样出来不再算一次修改，也不再抹平批量里不同的值。",
-            "<b>· Ctrl+点击</b>：块身上挂着 Button，事件被它吃掉，以前点了没反应。",
-            "<b>· 缓速曲线</b>：粗细与高度对齐原版。",
+            "<b>· 事件块重叠</b>：同一批事件在时间轴上叠成一坨，现在正常排开。",
+            "<b>· 首次排版</b>：第一次打开工程和之后重排的结果天差地别，现在一致了。",
+            "<b>· 添加不生效</b>：文本 / 粒子 / 对象 / 图片加完不在时间轴上出现，",
+            "   现在加完会滚到它那儿。",
+            "<b>· 新建落点</b>：新对象落在第 0 格而不是播放头那格，已修正。",
+            "<b>· 回到开头</b>：按钮图标显示不对、按下之后画面里的元素没复原，都修好了。",
+            "<b>· 媒体数量</b>：媒体很多的谱面，加载数量会少算，已修正。",
+            "<b>· 只读模式</b>：一批能改到谱面的入口（拖图片进预览、删除、改参数…）以前没拦住，",
+            "   现在统一提示「先切到编辑模式」。",
         });
 
         /// <summary>群号。ImGui 那扇说明窗口的标题也要用，所以是 internal。</summary>
@@ -2922,7 +3456,11 @@ namespace ADOFAIEditorStudio
             // 媒体页不在前台时不推进缩略图队列。那一步是在解码磁盘上的图片，
             // 一帧好几张；页面看不见的时候没必要付这个代价。数据索引照常刷新，
             // 切回来的那一帧再把图补上（RebuildVisibleMedia 会置脏标志）。
-            if (browserPane != BrowserPane.Media)
+            //
+            // **预载期间是例外**：那时队列里压着全部媒体，而用户可能停在
+            // 「装饰物」页 —— 按原来的判据队列就永远不消费，加载页卡在 0/N
+            // 不动，看起来像死机。探针实测就是这么卡住的。
+            if (browserPane != BrowserPane.Media && !mediaPreloading)
             {
                 return;
             }
@@ -3002,6 +3540,14 @@ namespace ADOFAIEditorStudio
                 EditorProjectMediaItem item = mediaDragCandidate;
                 mediaDragCandidate = null;
 
+                // **先试着武装，成了才停滚动。** 只读模式下 `ArmMediaDrop` 会拒绝
+                // （它最终会在预览视口里建一个装饰物，那是改谱面的动作）—— 那时不该
+                // 把手势吞掉，列表照常滚动就行。
+                if (!EditorSceneInteraction.ArmMediaDrop(item.FileName, item.AbsolutePath))
+                {
+                    return;
+                }
+
                 // 否则 ScrollRect 会把同一次拖动当成列表平移，
                 // 在装饰物跟着光标走的同时把整列从指针底下滚走。
                 // 手势一结束就恢复。
@@ -3010,7 +3556,6 @@ namespace ADOFAIEditorStudio
                     mediaScroll.enabled = false;
                 }
 
-                EditorSceneInteraction.ArmMediaDrop(item.FileName, item.AbsolutePath);
                 return;
             }
 
@@ -3358,8 +3903,16 @@ namespace ADOFAIEditorStudio
             // 在列表滚动时仍然会卡住每一帧，所以改成按墙上时钟
             // 限流：一直解码到预算用光，
             // 然后让这一帧渲染出去，下一帧继续。
-            float budgetEnd = Time.realtimeSinceStartup + MediaThumbnailBudgetSeconds;
-            int decodeBudget = MediaThumbnailMaxPerFrame;
+            //
+            // **预载期间换一套宽预算**（见那两个常量的说明）：那几帧加载页盖着
+            // 屏幕，掉帧看不见，把等待从十几秒压到一秒上下才是要紧的。
+            float budgetSeconds = mediaPreloading
+                ? MediaThumbnailPreloadBudgetSeconds
+                : MediaThumbnailBudgetSeconds;
+            int decodeBudget = mediaPreloading
+                ? MediaThumbnailPreloadMaxPerFrame
+                : MediaThumbnailMaxPerFrame;
+            float budgetEnd = Time.realtimeSinceStartup + budgetSeconds;
             while (mediaThumbnailQueue.Count > 0 && decodeBudget-- > 0)
             {
                 MediaThumbnailRequest request = mediaThumbnailQueue.Dequeue();
@@ -3382,42 +3935,183 @@ namespace ADOFAIEditorStudio
 
         }
 
+        /// <summary>
+        /// 缩略图的**磁盘缓存目录**。
+        ///
+        /// 优先用设置里指定的（`Settings.MediaCacheDirectory`）；留空则用默认的
+        /// **mod 目录下的 `MediaCache/`**。
+        ///
+        /// **刻意不放在谱面目录里** —— 那是玩家的地盘，往那儿写东西是越界；
+        /// 而且放在谱面目录就意味着「只读模式打开一张谱」也会产生文件，
+        /// 违背我们定的那条约定。缓存放 mod 目录之后，只读模式真的是零写入。
+        ///
+        /// 多张谱共用一份也没问题：缓存文件名里含源图的绝对路径，不会串。
+        /// </summary>
+        private string GetMediaCacheDirectory()
+        {
+            Settings settings = Main.Settings;
+            if (settings != null && !string.IsNullOrWhiteSpace(settings.MediaCacheDirectory))
+            {
+                return settings.MediaCacheDirectory;
+            }
+            var mod = Main.Mod;
+            if (mod == null || string.IsNullOrEmpty(mod.Path))
+            {
+                return null;
+            }
+            return Path.Combine(mod.Path, "MediaCache");
+        }
+
+        /// <summary>
+        /// 缓存文件名：源路径 + 修改时间 的哈希（FNV-1a，不要求加密强度）。
+        ///
+        /// **必须带上修改时间**：只按路径算的话，用户换了同名贴图之后
+        /// 看到的还是旧缩略图 —— 缓存看着像"坏了"，其实只是没失效。
+        /// </summary>
+        private static string GetMediaCacheFileName(MediaThumbnailRequest request)
+        {
+            long stamp = 0;
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(request.AbsolutePath)
+                    && File.Exists(request.AbsolutePath))
+                {
+                    stamp = File.GetLastWriteTimeUtc(request.AbsolutePath).Ticks;
+                }
+            }
+            catch
+            {
+                // 取不到时间就当 0 —— 缓存退化成"只按路径"，不影响正确性。
+            }
+            string raw = (request.AbsolutePath ?? request.Key ?? "") + "|" + stamp;
+            uint hash = 2166136261u;
+            for (int i = 0; i < raw.Length; i++)
+            {
+                hash = (hash ^ raw[i]) * 16777619u;
+            }
+            return hash.ToString("x8") + ".png";
+        }
+
+        /// <summary>
+        /// 从磁盘缓存读一张缩略图。没有、或者读坏了，都返回 false ——
+        /// 调用方会退回"解原图"那条路，顺手把坏的覆盖掉。
+        /// </summary>
+        private bool TryLoadThumbnailFromDisk(MediaThumbnailRequest request, out Texture2D texture)
+        {
+            texture = null;
+            string directory = GetMediaCacheDirectory();
+            if (string.IsNullOrEmpty(directory))
+            {
+                return false;
+            }
+            try
+            {
+                string path = Path.Combine(directory, GetMediaCacheFileName(request));
+                if (!File.Exists(path))
+                {
+                    return false;
+                }
+                byte[] bytes = File.ReadAllBytes(path);
+                var loaded = new Texture2D(2, 2, TextureFormat.RGBA32, false, false);
+                if (!TryLoadTextureImage(loaded, bytes))
+                {
+                    Destroy(loaded);
+                    return false;
+                }
+                loaded.filterMode = FilterMode.Bilinear;
+                loaded.wrapMode = TextureWrapMode.Clamp;
+                texture = loaded;
+                return true;
+            }
+            catch
+            {
+                // 缓存读坏了就当没有 —— 下一句会解原图并把它覆盖掉。
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 把缩略图写到磁盘缓存。失败只记日志，不影响这一帧的显示 ——
+        /// 缓存是"下次更快"，不是"这次能不能看见"。
+        /// </summary>
+        private void SaveThumbnailToDisk(MediaThumbnailRequest request, Texture2D texture)
+        {
+            string directory = GetMediaCacheDirectory();
+            if (string.IsNullOrEmpty(directory) || texture == null)
+            {
+                return;
+            }
+            try
+            {
+                if (!Directory.Exists(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+                byte[] png = EncodeTextureToPng(texture);
+                if (png == null)
+                {
+                    return;   // 编不出来就当没缓存，不影响这一帧的显示
+                }
+                string path = Path.Combine(directory, GetMediaCacheFileName(request));
+                File.WriteAllBytes(path, png);
+            }
+            catch (Exception exception)
+            {
+                if (Main.Logger != null)
+                {
+                    Main.Logger.Warning("[缩略图缓存] 写盘失败：" + exception.Message);
+                }
+            }
+        }
+
         private void DecodeMediaThumbnail(MediaThumbnailRequest request)
         {
             Texture2D texture = null;
             bool failed = true;
-            try
+
+            // **先看磁盘缓存。** 有工程时缩略图会落盘，第二次打开直接读小图
+            // （几十 KB），不用再解几 MB 的原图 —— 落盘缓存的意义全在这。
+            if (TryLoadThumbnailFromDisk(request, out texture))
             {
-                if (!string.Equals(request.Extension, ".gif", StringComparison.OrdinalIgnoreCase)
-                    && !string.IsNullOrWhiteSpace(request.AbsolutePath)
-                    && File.Exists(request.AbsolutePath))
+                failed = false;
+            }
+            else
+            {
+                try
                 {
-                    byte[] bytes = File.ReadAllBytes(request.AbsolutePath);
-                    texture = new Texture2D(2, 2, TextureFormat.RGBA32, false, false);
-                    if (TryLoadTextureImage(texture, bytes))
+                    if (!string.Equals(request.Extension, ".gif", StringComparison.OrdinalIgnoreCase)
+                        && !string.IsNullOrWhiteSpace(request.AbsolutePath)
+                        && File.Exists(request.AbsolutePath))
                     {
-                        texture = CreateThumbnailTexture(texture, 256);
-                        texture.filterMode = FilterMode.Bilinear;
-                        texture.wrapMode = TextureWrapMode.Clamp;
-                        failed = false;
+                        byte[] bytes = File.ReadAllBytes(request.AbsolutePath);
+                        texture = new Texture2D(2, 2, TextureFormat.RGBA32, false, false);
+                        if (TryLoadTextureImage(texture, bytes))
+                        {
+                            texture = CreateThumbnailTexture(texture, 256);
+                            texture.filterMode = FilterMode.Bilinear;
+                            texture.wrapMode = TextureWrapMode.Clamp;
+                            failed = false;
+                            // 解出来顺手存一份，下次就不用再解了。
+                            SaveThumbnailToDisk(request, texture);
+                        }
+                        else
+                        {
+                            Destroy(texture);
+                            texture = null;
+                        }
                     }
-                    else
+                }
+                catch (Exception exception)
+                {
+                    if (texture != null)
                     {
                         Destroy(texture);
                         texture = null;
                     }
-                }
-            }
-            catch (Exception exception)
-            {
-                if (texture != null)
-                {
-                    Destroy(texture);
-                    texture = null;
-                }
-                if (Main.Logger != null)
-                {
-                    Main.Logger.Warning("Media thumbnail failed: " + exception.Message);
+                    if (Main.Logger != null)
+                    {
+                        Main.Logger.Warning("Media thumbnail failed: " + exception.Message);
+                    }
                 }
             }
 
@@ -3435,6 +4129,20 @@ namespace ADOFAIEditorStudio
 
         private const float MediaThumbnailBudgetSeconds = 0.006f;
         private const int MediaThumbnailMaxPerFrame = 2;
+
+        /// <summary>
+        /// **预载期间**的解码预算（比平时宽得多）。
+        ///
+        /// 平时那 6ms / 2 张是为了「列表滚动时别卡住每一帧」—— 解码是同步读源图，
+        /// 一张就可能几十毫秒。但预载（F8 打开工作台）时屏幕被加载页盖着，
+        /// **掉帧用户看不见**，而等待是实打实的：178 张按 6ms 限流要十几秒
+        /// （实测「结束：10.17 秒」）。
+        ///
+        /// 放到 150ms / 6 张，同样的活半秒到一秒就完了 —— 用户少等十几秒，
+        /// 代价只是那几帧帧率低，而那几帧本来就遮着。
+        /// </summary>
+        private const float MediaThumbnailPreloadBudgetSeconds = 0.15f;
+        private const int MediaThumbnailPreloadMaxPerFrame = 6;
 
         private void ApplyMediaThumbnailToBoundCards(string key, MediaThumbnailCacheEntry entry)
         {
@@ -3530,6 +4238,53 @@ namespace ADOFAIEditorStudio
             card.Texture = null;
             card.Image.texture = null;
             card.TexturePath = null;
+        }
+
+        /// <summary>反射找出来的 `ImageConversion.EncodeToPNG`。</summary>
+        private static bool imageEncoderSearched;
+        private static MethodInfo encodeToPngMethod;
+
+        /// <summary>
+        /// 把贴图编成 PNG 字节。
+        ///
+        /// **必须反射调 `ImageConversion.EncodeToPNG`** —— 和 `TryLoadTextureImage`
+        /// 同一个原因：那个模块编译期引用不到，直接写 `texture.EncodeToPNG()`
+        /// 编译器会报「Texture2D 未包含 EncodeToPNG 的定义」（已经踩过）。
+        /// </summary>
+        private static byte[] EncodeTextureToPng(Texture2D texture)
+        {
+            if (texture == null)
+            {
+                return null;
+            }
+            if (!imageEncoderSearched)
+            {
+                imageEncoderSearched = true;
+                Type imageConversionType = Type.GetType(
+                    "UnityEngine.ImageConversion, UnityEngine.ImageConversionModule", false);
+                if (imageConversionType == null)
+                {
+                    Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
+                    for (int i = 0; i < assemblies.Length && imageConversionType == null; i++)
+                    {
+                        imageConversionType = assemblies[i].GetType("UnityEngine.ImageConversion", false);
+                    }
+                }
+                if (imageConversionType != null)
+                {
+                    encodeToPngMethod = imageConversionType.GetMethod(
+                        "EncodeToPNG",
+                        BindingFlags.Public | BindingFlags.Static,
+                        null,
+                        new[] { typeof(Texture2D) },
+                        null);
+                }
+            }
+            if (encodeToPngMethod == null)
+            {
+                return null;
+            }
+            return encodeToPngMethod.Invoke(null, new object[] { texture }) as byte[];
         }
 
         private static bool TryLoadTextureImage(Texture2D texture, byte[] bytes)
@@ -3686,6 +4441,49 @@ namespace ADOFAIEditorStudio
             mediaThumbnailCache.Clear();
             mediaThumbnailUseCounter = 0;
             mediaThumbnailLoadNotBefore = 0f;
+        }
+
+        /// <summary>
+        /// 清空媒体缩略图缓存 —— **内存和磁盘都清**（开发者设置里那个菜单项）。
+        ///
+        /// 要验证「首次打开谱面」那条路径（没有缓存时媒体得现解码、加载页会显示）
+        /// 点一下就行，不用跑到 mod 目录里手动删文件。
+        ///
+        /// **只删缓存目录里的文件** —— 不删目录本身，也不碰谱面、工程、设置。
+        /// </summary>
+        internal void ClearMediaCacheEverywhere()
+        {
+            int memoryBefore = mediaThumbnailCache.Count;
+            ClearMediaThumbnailCache();
+
+            int removedFiles = 0;
+            string directory = GetMediaCacheDirectory();
+            if (!string.IsNullOrEmpty(directory) && System.IO.Directory.Exists(directory))
+            {
+                try
+                {
+                    string[] files = System.IO.Directory.GetFiles(directory);
+                    for (int i = 0; i < files.Length; i++)
+                    {
+                        try
+                        {
+                            System.IO.File.Delete(files[i]);
+                            removedFiles++;
+                        }
+                        catch
+                        {
+                            // 被占用的跳过 —— 少删一两个不影响验证。
+                        }
+                    }
+                }
+                catch (Exception exception)
+                {
+                    Main.Logger.Warning("[媒体] 清磁盘缓存失败：" + exception.Message);
+                }
+            }
+
+            Main.Logger.Log("[媒体] 缓存已清空：内存 " + memoryBefore + " 张、磁盘 "
+                + removedFiles + " 个文件");
         }
 
         private void BuildPreview(RectTransform parent)
@@ -4052,6 +4850,136 @@ namespace ADOFAIEditorStudio
             system.SetSelectedGameObject(null);
         }
 
+        /// <summary>打开工作台时预载媒体缩略图的进度状态。</summary>
+        private bool mediaPreloading;
+        private int mediaPreloadTotal;
+
+        /// <summary>
+        /// 这次预载里**需要解码**的条数，以及开跑时缓存里已有的条数。
+        ///
+        /// 进度不能直接拿 `mediaThumbnailCache.Count` 当"已完成" —— 那个缓存是**按
+        /// 源图路径**存的、多张谱共用一份，别的谱留下的条目会把进度顶高，甚至超过
+        /// 总数（标签会显示成「320 / 300」）。所以要减掉开跑时的基线，而且"本来就
+        /// 有缓存、不用解码"的那些要单独算进去，否则进度永远到不了头。
+        /// </summary>
+        private int mediaPreloadPending;
+        private int mediaPreloadCacheBaseline;
+        private float mediaPreloadStartedAt;
+
+        /// <summary>探针：只打前几帧，不刷屏。定位完就删。</summary>
+        private int mediaPreloadLogCount;
+
+        /// <summary>加载页至少显示这么久，免得一闪而过像故障。</summary>
+        private const float MinimumLoadingScreenSeconds = 0.35f;
+
+        /// <summary>
+        /// 把所有媒体缩略图塞进解码队列，并撑起加载页。
+        ///
+        /// **这里只是「把活派下去」** —— 真正的解码在已有的缩略图队列里分帧做
+        /// （`ProcessMediaThumbnailQueue` 有时间和数量双重预算），所以这一下
+        /// 不会卡住任何一帧，加载页也就真的在动。
+        ///
+        /// 目的是「免得快速滚轮浏览图片卡顿」：不预载的话每张图都要等滚到
+        /// 眼前才现解，一路滚下去就是一路顿。
+        /// </summary>
+        private void BeginMediaPreload()
+        {
+            // **先把遮罩建出来。** 它是懒加载的 —— 只在联机加入那条路上被
+            // `EnsureLoadingScreen()` 创建过，平时是 null。不建就用，
+            // 下面那一句永远走不通（探针实测：「没开始：loadingScreen 是 null」）。
+            EnsureLoadingScreen();
+            if (loadingScreen == null)
+            {
+                Main.Logger.Log("[加载页] 没开始：loadingScreen 建不出来");
+                return;
+            }
+            List<EditorProjectMediaItem> items = VisibleMedia;
+            mediaPreloadTotal = items == null ? 0 : items.Count;
+            mediaPreloadStartedAt = Time.unscaledTime;
+            mediaPreloadLogCount = 0;
+            mediaPreloading = true;
+
+            // **先清队列的旧账。** 队列里可能还压着上一张谱入队、还没解码的请求
+            // （实测过「总数 7、队列 48」这种）。它们跟这次预载没关系，留着只会
+            // 让日志和进度都读不准；反正下面会把当前这张谱的要解码项重新入队。
+            ClearMediaThumbnailQueue();
+
+            mediaPreloadCacheBaseline = mediaThumbnailCache.Count;
+            int queued = 0;
+            for (int i = 0; i < mediaPreloadTotal; i++)
+            {
+                // 它自己会判断"有没有缓存"，没有就入队 —— 所以直接调就行。
+                Texture2D texture;
+                if (!TryGetMediaThumbnail(items[i], out texture))
+                {
+                    queued++;
+                }
+            }
+            mediaPreloadPending = queued;
+            Main.Logger.Log("[加载页] 开始：媒体 " + mediaPreloadTotal
+                + " 个，其中要解码 " + queued + " 个；队列现有 "
+                + mediaThumbnailQueue.Count);
+        }
+
+        /// <summary>
+        /// 推进加载页。进度按**缓存里已经有几张**算，不数队列 ——
+        /// 队列每帧都被消费，某一刻恰好为 0 不代表活干完了。
+        /// </summary>
+        private void UpdateMediaPreload()
+        {
+            if (!mediaPreloading)
+            {
+                return;
+            }
+            if (loadingScreen == null)
+            {
+                mediaPreloading = false;
+                return;
+            }
+
+            int total = mediaPreloadTotal;
+            // 「这次真解出来了多少」= 缓存增长量（减掉开跑时的基线 —— 那个缓存
+            // 是多张谱共用的），上限是本次需要解码的条数。
+            int decoded = Mathf.Clamp(
+                mediaThumbnailCache.Count - mediaPreloadCacheBaseline, 0, mediaPreloadPending);
+            int done = total - mediaPreloadPending + decoded;
+
+            float progress = 1f;
+            if (total > 0)
+            {
+                progress = Mathf.Clamp01((float)done / total);
+            }
+
+            if (mediaPreloadLogCount < 3)
+            {
+                mediaPreloadLogCount++;
+                Main.Logger.Log("[加载页] 帧" + mediaPreloadLogCount
+                    + "：已完成=" + done + "/" + total
+                    + "（本次解码 " + decoded + "/" + mediaPreloadPending + "）"
+                    + " 队列=" + mediaThumbnailQueue.Count
+                    + " progress=" + progress.ToString("0.00")
+                    + " showing=" + loadingScreen.IsShowing);
+            }
+
+            // 图少、或者全都命中缓存时，它会在同一帧里就到 100% ——
+            // 闪一下反而像哪里坏了，所以压一个最短显示时间。
+            if (progress >= 1f
+                && Time.unscaledTime - mediaPreloadStartedAt >= MinimumLoadingScreenSeconds)
+            {
+                Main.Logger.Log("[加载页] 结束："
+                    + (Time.unscaledTime - mediaPreloadStartedAt).ToString("0.00") + " 秒");
+                mediaPreloading = false;
+                loadingScreen.Hide();
+                return;
+            }
+
+            loadingScreen.Show(
+                total > 0
+                    ? "正在加载媒体 " + done + " / " + total
+                    : "正在准备时间轴",
+                progress);
+        }
+
         private void SetVisible(bool value)
         {
             visible = value;
@@ -4062,12 +4990,28 @@ namespace ADOFAIEditorStudio
             if (visible)
             {
                 ShowVersionNotesIfNew();
+                // **先把媒体清单纯净了再预载。**
+                //
+                // 清单的刷新挂在每帧的 `TickProjectWorkspace` 里，而这里是 F8 的那一帧、
+                // 跑在它前面 —— 直接预载的话读到的还是**上一张谱**的列表：换到一张有
+                // 上百个媒体的谱，加载页却按上一张的数量显示（比如「0/70」，而那张谱
+                // 刚好 70 个）。先把工作区刷新一遍，清单才是当前这张谱的。
+                RefreshProjectWorkspace(true);
+                // F8 进来就把媒体铺开 —— 加载页同时是"预热"和"别让用户
+                // 看着空界面等"这两个作用。
+                BeginMediaPreload();
             }
 
             if (!visible)
             {
                 HidePreviewHandoffImmediate();
                 nonPreviewPointerCapture = false;
+                // 加载页要一起收 —— 否则关掉工作台它还在那儿盖着。
+                mediaPreloading = false;
+                if (loadingScreen != null && loadingScreen.IsShowing)
+                {
+                    loadingScreen.Hide();
+                }
                 ReleaseMediaTextures();
                 RestorePreviewViewport();
                 EditorPlaybackBridge.TryStopPlayback();

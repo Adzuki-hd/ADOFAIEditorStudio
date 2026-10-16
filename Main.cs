@@ -22,12 +22,42 @@ namespace ADOFAIEditorStudio
             Logger = modEntry.Logger;
             Settings = ModSettings.Load<Settings>(modEntry);
             modEntry.OnToggle = OnToggle;
+            modEntry.OnUnload = OnUnload;
             EditorPlaybackBridge.InstallInputPatch();
             // 版本闸门。低于清单要求的 min 就自动下载新版、
             // 覆盖、重启游戏，用户不用做任何事。
             VersionGate.Check(modEntry);
             // 清掉上一次崩溃留下的联机会话副本。
             Multiplayer.ChartTransfer.SweepLeftoversInBackground();
+        }
+
+        /// <summary>
+        /// mod 被卸载（关游戏也走这条）：**把没存的布局静默写一份**。
+        ///
+        /// 这里**弹不出 UI** —— 退出流程里没人看得到窗口。所以只能直接保存。
+        /// 总比"在时间轴上摆了一晚上、关游戏全丢"好。
+        ///
+        /// 用户按过 `Ctrl+Alt+S`（或者菜单里的「保存工程」）的话这儿是空操作 ——
+        /// 只有真存在未保存改动时才写。
+        /// </summary>
+        private static bool OnUnload(ModEntry modEntry)
+        {
+            try
+            {
+                EditorStudioOverlay overlay = Overlay;
+                if (overlay != null)
+                {
+                    overlay.SaveProjectBeforeQuit();
+                }
+            }
+            catch (Exception exception)
+            {
+                if (Logger != null)
+                {
+                    Logger.Warning("[工程] 关游戏前自动保存失败：" + exception.Message);
+                }
+            }
+            return true;   // 返回 true 表示"可以卸载"
         }
 
         private static bool OnToggle(ModEntry modEntry, bool toggle)
@@ -143,6 +173,14 @@ namespace ADOFAIEditorStudio
         // 字段和当前版本号比 —— 不是一个「弹过了」的布尔：那样永远只弹一次，
         // 之后每次更新都不弹了。空字符串表示从没看过（新装的第一进来就弹）。
         public string LastSeenVersion = string.Empty;
+        // 媒体缩略图的磁盘缓存目录。
+        //
+        // **留空表示用默认**（mod 目录下的 `MediaCache/`）。
+        //
+        // 缓存放 mod 目录而不是谱面目录，是为了守住「只读模式打开谱面不产生
+        // 任何文件」那条 —— 往玩家的谱面目录里塞东西是越界，哪怕只是个 cache。
+        // 多张谱共用一份也没问题：缓存文件名里含源图的绝对路径，不会串。
+        public string MediaCacheDirectory = string.Empty;
         // 选中一个事件时，是否把预览画面和时间轴一起挪过去。
         //
         // 默认关掉：点一下事件只是想改它的参数，画面跟着跳会打断正在看的

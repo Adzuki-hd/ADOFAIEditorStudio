@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Diagnostics;
 using ImGuiNET;
 using UnityEngine;
 using NVec2 = System.Numerics.Vector2;
@@ -58,6 +59,15 @@ namespace ADOFAIEditorStudio
         // 拖动状态。**跨帧留着** —— 按下那一帧只知道起手位置，
         // 之后每帧拿当前鼠标减它才得到位移。
         private int _dragId = -1;
+
+        /// <summary>
+        /// 按下鼠标时，指针落在块顶往下多少像素。
+        ///
+        /// 拖动要**保留这个偏移**：不然块会被对齐到"鼠标所在那一行的顶部"，
+        /// 而你抓的是块中间 —— 一落地鼠标就跑到块上半部分去了，
+        /// 看着像块欠了一截。
+        /// </summary>
+        private float _dragGrabOffsetY;
         /// <summary>正在拖播放头 / 正在拉框。两者互斥，且都要跨帧记着。</summary>
         private bool _scrubbing;
         private bool _marqueeActive;
@@ -113,6 +123,22 @@ namespace ADOFAIEditorStudio
         private const float CurvePixelsPerSegment = 3f;
 
         /// <summary>
+        /// 一屏缓速曲线的**总段数预算**。
+        ///
+        /// **为什么必须有这个上限**：每段是一条 `AddLine`（4 个顶点），而 ImGui 用
+        /// 16 位索引 —— **单个窗口的顶点数不能超过 65535**，越线就弹原生断言、
+        /// 把整个游戏卡死。块自己的上限是 128 段（块宽 384 像素以上就顶满），
+        /// 单看不多，可一屏能同时摊开一百多个块：155 块 × 128 段 × 4 顶点 ≈ 8 万，
+        /// 正好越线 —— 实测就是这么崩的（`[ImGui命令]` 探针记到 list3 的顶点
+        /// 从 5.7 万一路爬到 6.5 万）。
+        ///
+        /// 给总量封顶之后，块越多每块分到的段数越少（155 块时约 15 段、28 块时约
+        /// 85 段）。曲线是「一眼看出缓速怎么走」的辅助信息，段数少些不影响它干这
+        /// 件事，而块的位置才是主角。
+        /// </summary>
+        private const int CurveSegmentBudget = 2400;
+
+        /// <summary>
         /// 停用的事件（`active=false`）压到多透。
         ///
         /// **和旧版 `BindMarker` 同一个数**：填充 0.46、文字 0.55。这两个数不是
@@ -129,6 +155,19 @@ namespace ADOFAIEditorStudio
         private const float SelectedBrighten = 0.06f;
 
         internal Rect Rect { get { return _rect; } }
+
+        /// <summary>拖动时「跟别人叠上了」那个红边。**这一档刻意跳出雾蓝主题** ——
+        /// 它是"这一下放不下"的警示，不能被主题色的克制压住。</summary>
+        private static readonly NVec4 OverlapOutline = new NVec4(0.92f, 0.26f, 0.28f, 1f);
+
+        /// <summary>
+        /// 拖动时标出**原来的行**那条参考线。
+        ///
+        /// 纵向是整行吸附的，拖动过程中块和鼠标会一级一级错开，光看块本身
+        /// 分不清"我离开原点多远了"。这条线把原点钉在屏幕上，松手就没了。
+        /// 压得很淡：它是参照物，不该抢块的注意力。
+        /// </summary>
+        private static readonly NVec4 OriginGuideLine = new NVec4(0.62f, 0.78f, 0.95f, 0.55f);
 
         internal void Draw()
         {
@@ -167,19 +206,64 @@ namespace ADOFAIEditorStudio
                 // Alt+滚轮调行高就是这么哑掉的（Ctrl 早就改成问 Unity 了，
                 // Alt/Shift 漏在外面）。见 `EditorTimelineView.IsAltHeld`。
                 ImGuiIOPtr io = ImGui.GetIO();
-                if (ImGui.IsWindowHovered() && !Mathf.Approximately(io.MouseWheel, 0f))
+                // **拖动中也算"在时间轴上"。**
+                //
+                // 拖动时鼠标被那个块的 `InvisibleButton` 按着，
+                // `ImGui.IsWindowHovered()` 会返回 **false**（实测：探针打出
+                // 「窗口悬停=False im拖=True」）—— 于是这一整条 `if` 进不去，
+                // 滚轮拿到了也没人用。加了 `_dragId >= 0` 之后拖动中照常滚。
+                bool onTimeline = ImGui.IsWindowHovered() || _dragId >= 0;
+                if (onTimeline && !Mathf.Approximately(io.MouseWheel, 0f))
                 {
                     timeline.ScrollBy(io.MouseWheel, CtrlHeld(),
                         EditorTimelineView.IsAltHeld(), EditorTimelineView.IsShiftHeld());
                 }
 
-                DrawBlocks(timeline, x, y, width, height);
+                // 探针跟着 VerboseDiagnostics 走（开发者设置里开）。
+                if (Main.Settings != null && Main.Settings.VerboseDiagnostics)
+                {
+                    Stopwatch watch = Stopwatch.StartNew();
+                    DrawBlocks(timeline, x, y, width, height);
+                    watch.Stop();
+                    ProbeFrame(watch.Elapsed.TotalMilliseconds, timeline.BlockViews.Count);
+                }
+                else
+                {
+                    DrawBlocks(timeline, x, y, width, height);
+                }
+
                 DrawRuler(timeline, x, y, width, height);
             }
             ImGui.End();
             ImGui.PopStyleVar();
             ImGui.PopStyleColor();
         }
+
+        /// <summary>
+        /// 时间轴绘制的耗时探针。每 60 帧汇总一行。
+        ///
+        /// **定位卡顿用**：高事件数的谱面上，「到底是遍历贵还是绘制贵」
+        /// 一眼就能分出来 —— 不靠猜。定位完收进开发者设置。
+        /// </summary>
+        private static void ProbeFrame(double milliseconds, int blockCount)
+        {
+            probeFrames++;
+            probeTotalMs += milliseconds;
+            probeLastBlocks = blockCount;
+            if (probeFrames < 60)
+            {
+                return;
+            }
+            Main.Logger.Log("[时间轴] 60 帧均值：DrawBlocks "
+                + (probeTotalMs / probeFrames).ToString("0.0") + " ms，块视图 "
+                + probeLastBlocks + " 个");
+            probeFrames = 0;
+            probeTotalMs = 0.0;
+        }
+
+        private static int probeFrames;
+        private static double probeTotalMs;
+        private static int probeLastBlocks;
 
         /// <summary>
         /// 画布上的事件块。**按行升序画** —— 块比行距高，相邻两块叠着，
@@ -197,7 +281,21 @@ namespace ADOFAIEditorStudio
             {
                 if (ImGui.IsMouseDown(ImGuiMouseButton.Left))
                 {
-                    float dy = io.MousePos.Y - _dragStartMouse.Y;
+                    // **纵向按「鼠标现在指在第几行」算，不按位移。**
+                    //
+                    // 位移那个基准（按下时的 Y）是固定的，而滚动会让整块画布挪走 ——
+                    // 滚动之后同一个位移对应的行早就变了，块于是跑到鼠标外面。
+                    // 直接问"鼠标指向哪一行"没有这个问题：滚轮、缩放、任何视口变化
+                    // 它都跟得住。
+                    // 把「指针在块内的偏移」先减掉再算行号 —— 这样落地时
+                    // 保持的是"块顶和鼠标的相对关系"，而不是把块顶对到鼠标上。
+                    // 不减的话，抓块中间拖一格，块就会往上欠半格。
+                    float dragContentTop = y + EditorTimelineView.RulerHeight
+                        - timeline.VerticalScrollOffset;
+                    int pointerRow = Mathf.RoundToInt(
+                        (io.MousePos.Y - _dragGrabOffsetY - dragContentTop)
+                        / timeline.BlockStridePixels);
+                    timeline.DragBlockRowBy(pointerRow - timeline.DraggedOriginRow);
                     // **纵向按行吸附，而且整批一起走。**
                     //
                     // 行号是优先级（写回谱面时按它排顺序），连续的小数位置没有意义
@@ -207,8 +305,31 @@ namespace ADOFAIEditorStudio
                     //
                     // 位移交给时间轴去分摊到整批 —— 这边原来只对被拖的那一个
                     // `SetBlockRow`，于是"能整批横向拖、纵向只有它自己动"。
-                    timeline.DragBlockRowBy(Mathf.RoundToInt(dy / timeline.BlockStridePixels));
                     timeline.DragBlockTo(PointerTime(timeline, x, io));
+
+                    // **贴到左右边缘就自动横滚。**
+                    //
+                    // 长事件要往右拖很远，而鼠标只能推到屏幕边上 —— 没有这一条，
+                    // 想把块挪到几屏外就得松手、滚动、再抓，中间还会掉。
+                    //
+                    // 速度按"探进去多深"给，不是碰到边就全速：刚挨上时是慢速微调，
+                    // 推到最边上才全速，这样靠近边缘时不会一下子冲过头。
+                    const float edge = 48f;
+                    const float maxSpeed = 18f;
+                    float push = 0f;
+                    if (io.MousePos.X < x + edge)
+                    {
+                        push = -(x + edge - io.MousePos.X) / edge;
+                    }
+                    else if (io.MousePos.X > x + width - edge)
+                    {
+                        push = (io.MousePos.X - (x + width - edge)) / edge;
+                    }
+                    if (!Mathf.Approximately(push, 0f))
+                    {
+                        push = Mathf.Clamp(push, -1f, 1f);
+                        timeline.AutoScrollHorizontally(push * maxSpeed);
+                    }
                 }
                 else
                 {
@@ -217,10 +338,16 @@ namespace ADOFAIEditorStudio
                     EditorCommandHistory.BeginBatch("移动事件块");
                     try
                     {
-                        // **纵向的撤销要在 EndBlockDrag 之前记**：那一步的结尾会
-                        // 清空拖动起点表，之后就问不到"原来在第几行"了。
-                        // 整批一起记（横向由各自的谱面命令负责）。
-                        timeline.RecordDragRowMove();
+                        // **还跟别人叠着就整批作废**（退回起点行）。
+                        // 必须在记撤销之前 —— 退回之后每块的行号都等于起点行，
+                        // `RecordDragRowMove` 自然认为"一个都没动"、不记撤销。
+                        if (!timeline.RevertDragIfOverlapping())
+                        {
+                            // **纵向的撤销要在 EndBlockDrag 之前记**：那一步的结尾会
+                            // 清空拖动起点表，之后就问不到"原来在第几行"了。
+                            // 整批一起记（横向由各自的谱面命令负责）。
+                            timeline.RecordDragRowMove();
+                        }
                         // 这一步写回谱面（横向），并按事件各记一条撤销。
                         timeline.EndBlockDrag();
                     }
@@ -232,13 +359,43 @@ namespace ADOFAIEditorStudio
                 }
             }
 
-            // 中键拖动也是横向平移 —— 原来 uGUI 那条路被挡点击层挡住了，
-            // 不补上的话习惯用中键的人会以为它坏了。
-            if (ImGui.IsWindowHovered() && ImGui.IsMouseDragging(ImGuiMouseButton.Middle, 0f))
+            // 中键拖动 = 横向平移 + 纵向滚动。
+            //
+            // **居中模式是个例外**：那个模式下播放头钉在屏幕上，「平移视图」这个动作
+            // 说不通 —— SyncCenteredView 每帧都会把视图摆回中点，直接挪 viewStartTime
+            // 等于白挪（用户报的「固定中间模式下时间轴拖不动」就是这个）。
+            // 那里改成推进时间，走的是**和 uGUI 那条完全一样的 scrub 流程**。
+            if (ImGui.IsWindowHovered())
             {
-                // **两个方向都要**：只做横向的话纵向拖不动（报过）。
-                timeline.PanBy(-io.MouseDelta.X);
-                timeline.PanVerticalBy(-io.MouseDelta.Y);
+                bool centered = timeline.IsCenteredPlayhead;
+                bool middleDown = ImGui.IsMouseDown(ImGuiMouseButton.Middle);
+
+                if (centered && ImGui.IsMouseClicked(ImGuiMouseButton.Middle))
+                {
+                    timeline.BeginCenteredBrowse();
+                }
+                if (centered && timeline.CenteredBrowsing
+                    && ImGui.IsMouseDragging(ImGuiMouseButton.Middle, 0f))
+                {
+                    timeline.BrowseCenteredBy(io.MouseDelta.X);
+                }
+                // 收尾用「不再按下」判断，而不是 IsMouseReleased ——
+                // 在窗口外松开时那个事件不一定送到，状态会一直挂着，
+                // 之后时间轴所有定位都被静默拒绝。
+                if (timeline.CenteredBrowsing && !middleDown)
+                {
+                    timeline.EndCenteredBrowse();
+                }
+
+                if (ImGui.IsMouseDragging(ImGuiMouseButton.Middle, 0f))
+                {
+                    // **两个方向都要**：只做横向的话纵向拖不动（报过）。
+                    if (!centered)
+                    {
+                        timeline.PanBy(-io.MouseDelta.X);
+                    }
+                    timeline.PanVerticalBy(-io.MouseDelta.Y);
+                }
             }
 
             timeline.CollectBlocks();
@@ -261,15 +418,51 @@ namespace ADOFAIEditorStudio
             bool hoverLeftEdge = false;
             bool hoverRightEdge = false;
 
+            // **整层的裁剪：从标尺下沿到视口底。**
+            //
+            // 事件块往上滚会越过标尺那条线。下面那个 `continue` 只跳过「**完全**落在
+            // 标尺上方」的块，压着线的那种照样整块画出来 —— 上半截就糊在标尺上，
+            // 看起来就是「块和齿标重叠、没从尺标下面裁」。
+            //
+            // 这里只压一次（不是每块一次）：整段绘制共用同一个裁剪矩形，桥那边
+            // 仍然只多一份网格，和「每块一次」根本不是一个量级。
+            // 播放头画在这个 Pop 之后 —— 它本来就要盖住标尺那一条。
+            draw.PushClipRect(new NVec2(x, y + rulerHeight), new NVec2(right, bottom), true);
+
+            // **拖动中：把「原来的时间」钉在屏幕上（竖线）。**
+            //
+            // 横向是按格吸附的，拖动时块和鼠标会一段一段错开 —— 光看块本身
+            // 分不清"离开原来的时间多远了"。这条竖线就是那个原点；
+            // 拖回它附近会自然吸回去（吸附本来就是按格算的）。松手就没了。
+            if (_dragId >= 0)
+            {
+                float originX = x
+                    + (timeline.DraggedOriginTime - viewStart) * pixelsPerSecond;
+                if (originX >= x && originX <= right)
+                {
+                    draw.AddLine(new NVec2(originX, y + rulerHeight),
+                        new NVec2(originX, bottom),
+                        ImGui.GetColorU32(OriginGuideLine), 1.5f);
+                }
+            }
+
+            // 这一帧缓速曲线的总段数预算（见 `CurveSegmentBudget`）。每块画之前从这里
+            // 扣，扣完就不再画曲线 —— 保证一个窗口的顶点数顶不破 ImGui 的 65535。
+            int curveBudget = CurveSegmentBudget;
+
             for (int i = 0; i < blocks.Count; i++)
             {
                 EditorTimelineView.BlockView block = blocks[i];
                 float blockTop = contentTop + block.Row * stride;
 
-                // 按行升序，所以顶已经落到底下之后，后面的都在更下面 —— 直接停。
+                // **这里原来是 `break`** —— 靠"块按行升序排过"来提前收工。现在
+                // `CollectBlocks` 不再排序了（那一步每帧要对 4237 个 struct 跑一趟
+                // 内省排序、实测 1.4ms），顺序无从假设，只能老实遍历到底：下面那两个
+                // `continue` 本来就会把看不见的块全跳过，只是不再提前停。
+                // 多空转 4000 次约 0.2ms，换掉的是 1.4ms。
                 if (blockTop >= bottom)
                 {
-                    break;
+                    continue;
                 }
                 if (blockTop + blockHeight <= y + rulerHeight)
                 {
@@ -311,12 +504,16 @@ namespace ADOFAIEditorStudio
                 //
                 // 而它的代价很大：每 Push/Pop 一次裁剪就是一次绘制命令切换，
                 // 而桥那边**每条绘制命令建一个 Unity Mesh**。一屏三百多个块，
-                // 光这一项就是几百条多余的网格。窗口本身已经裁在视口里，
-                // 不需要再套一层。
+                // 光这一项就是几百条多余的网格。
+                //
+                // **但「整层一次」那道裁剪得留着**（就是循环外面那个 PushClipRect）——
+                // 每块的网用不上，不等于块整体可以画到标尺上去。当时这两件事被当成
+                // 一件删了，于是块一往上滚就糊在标尺上。
 
                 // 缓速曲线：块里那条线，一眼看出缓速怎么走。
                 // 旧版是自绘网格，这边直接画折线。
                 if (block.Curve != null && block.Curve.Length >= 2
+                    && curveBudget > 0
                     && blockWidth >= CurveMinBlockWidth
                     && blockHeight > EditorTimelineView.EaseCurveMarginY * 2f + 4f)
                 {
@@ -339,7 +536,8 @@ namespace ADOFAIEditorStudio
                     // 肉眼分辨不出差别，而线段数掉到六分之一。
                     int wanted = Mathf.Clamp(
                         Mathf.CeilToInt(boxWidth / CurvePixelsPerSegment),
-                        2, block.Curve.Length);
+                        2, Mathf.Min(block.Curve.Length, curveBudget));
+                    curveBudget -= wanted;
                     int sampleStep = Mathf.Max(1,
                         Mathf.CeilToInt(block.Curve.Length / (float)wanted));
 
@@ -432,6 +630,19 @@ namespace ADOFAIEditorStudio
                         rounding, ImDrawFlags.None, 2f);
                 }
 
+                // **拖动中、而且还跟别人叠着 → 描红边**，松手时这一下会作废。
+                //
+                // 长事件往右铺得很远，拖动的时候只看这一块根本看不出后面撞没撞
+                // —— 这个红边就是那个提示（原来没有它，用户只能靠撤回之后
+                // "位置怎么不对"来反推，那是很糟的反馈）。
+                // 只查被拖着的那一块，所以每帧一次 O(块数)，不心疼。
+                if (_dragId == block.Id && block.Event != null
+                    && timeline.BlockOverlapsOthers(block.Event))
+                {
+                    draw.AddRect(min, max, ImGui.GetColorU32(OverlapOutline),
+                        rounding, ImDrawFlags.None, 3f);
+                }
+
                 // 交互层：整块当点击/拖动目标。**画在前、控件在后**，
                 // 这样拖起来的那一块就是这一帧刚摆好的位置，不慢一帧。
                 ImGui.PushID(block.Id);
@@ -492,6 +703,8 @@ namespace ADOFAIEditorStudio
 
                     _dragId = block.Id;
                     _dragStartMouse = io.MousePos;
+                    // 记下指针落在块顶往下多少 —— 拖动时保留它，块才不会"欠一截"。
+                    _dragGrabOffsetY = io.MousePos.Y - min.Y;
                     // 横向那条交给时间轴：它自己抓原值、自己吸附、自己写回。
                     if (block.Event != null
                         && !timeline.BeginBlockDrag(block.Event, mode,
@@ -509,6 +722,8 @@ namespace ADOFAIEditorStudio
                     ImGui.SetTooltip(block.Name);
                 }
             }
+
+            draw.PopClipRect();
 
             // 悬停在块边缘 → 左右箭头指针（**复用旧版那份实现**，
             // 连"纹理必须 CPU 可读"那个坑都在里面）。

@@ -1,3 +1,4 @@
+using System;
 using ADOFAIEditorStudio.Ui;
 using TMPro;
 using UnityEngine;
@@ -30,6 +31,16 @@ namespace ADOFAIEditorStudio.Multiplayer
         private TextMeshProUGUI label;
         private TMP_FontAsset font;
         private Sprite roundedSprite;
+
+        /// <summary>
+        /// 显隐变化时通知外面（参数是"现在显示着没有"）。
+        ///
+        /// 用途只有一个：加载页要盖住整个屏幕，而工作台那层 ImGui 画布也贴着
+        /// `sortingOrder` 的上限，两边没法比谁更高 —— 只能我们在显示期间把它压下去。
+        /// 挂这一手而不是让外面每帧轮询 `IsShowing`：轮询会晚一帧，那一帧工作台
+        /// 会从黑屏后面漏出来。
+        /// </summary>
+        internal Action<bool> VisibilityChanged;
 
         internal void Initialize(RectTransform host, TMP_FontAsset uiFont, Sprite rounded)
         {
@@ -84,6 +95,7 @@ namespace ADOFAIEditorStudio.Multiplayer
             {
                 root.gameObject.SetActive(true);
                 root.SetAsLastSibling();
+                NotifyVisibility(true);
             }
 
             if (label != null)
@@ -100,15 +112,26 @@ namespace ADOFAIEditorStudio.Multiplayer
 
         internal void Hide()
         {
-            if (root != null)
+            // 多问一句 `activeSelf`：重复 Hide 不该重复发通知。
+            if (root != null && root.gameObject.activeSelf)
             {
                 root.gameObject.SetActive(false);
+                NotifyVisibility(false);
             }
         }
 
         internal bool IsShowing
         {
             get { return root != null && root.gameObject.activeSelf; }
+        }
+
+        private void NotifyVisibility(bool value)
+        {
+            Action<bool> handler = VisibilityChanged;
+            if (handler != null)
+            {
+                handler(value);
+            }
         }
 
         // ---------------------------------------------------------------- 布局与构造

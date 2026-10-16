@@ -137,18 +137,35 @@ namespace ADOFAIEditorStudio
         /// <summary>
         /// 工作台在媒体缩略图上开始拖动时调用。此时什么都不
         /// 创建；指针到达预览区后装饰物才出现。
+        ///
+        /// **只读模式直接不武装。** 投放的落点动作是"在预览视口里建一个装饰物"，
+        /// 那是改谱面的动作 —— 只读模式本就该挡住，可这条链一路到场景交互都没查过
+        /// `IsEditMode`（别的编辑入口都查了：时间轴拖动、参数栏、属性面板）。
+        ///
+        /// 挡在这里是因为两条入口都汇到这一个函数：uGUI 的媒体列表
+        /// （`EditorStudioOverlay`）和 ImGui 的媒体面板（`EditorImGuiMediaPanel`）。
+        ///
+        /// 返回**有没有真的武装**。uGUI 那边靠它决定要不要停掉列表滚动 ——
+        /// 不然只读模式下拖着卡片也只是把手势吞掉、什么都不发生。
         /// </summary>
-        internal static void ArmMediaDrop(string imageFilename, string absolutePath)
+        internal static bool ArmMediaDrop(string imageFilename, string absolutePath)
         {
             if (string.IsNullOrEmpty(imageFilename))
             {
-                return;
+                return false;
+            }
+
+            EditorStudioOverlay overlay = Main.Overlay;
+            if (overlay != null && !overlay.AllowEdit())
+            {
+                return false;
             }
 
             CancelMediaDrop();
             mediaDropArmed = true;
             mediaDropImage = imageFilename;
             mediaDropAbsolutePath = absolutePath;
+            return true;
         }
 
         internal static bool IsMediaDropActive
@@ -1318,6 +1335,23 @@ namespace ADOFAIEditorStudio
 
         private static bool CanCreateDecorationCommand()
         {
+            // **只读模式一律不放行。**
+            //
+            // 这个函数是「能不能下发改动命令」的共用闸门：场景里拖装饰物
+            // （`BeginDrag`）和把媒体投进预览（`TryCreateMediaDrop`）都先走它。
+            // 只读模式本就该挡住这两件事，可这一层在此之前**一次都没查过
+            // `IsEditMode`**（时间轴拖动、参数栏、属性面板那几个编辑入口都查了），
+            // 于是只读下照样能拖、能投 —— 实测就是「只读模式还能把图片拖进预览
+            // 建装饰物」。
+            //
+            // 挡在这里而不是各处撒判断：两条路本来就共用着同一个闸门。
+            // 提示由 `AllowEdit` 统一发（见它的说明）。
+            EditorStudioOverlay overlay = Main.Overlay;
+            if (overlay != null && !overlay.AllowEdit())
+            {
+                return false;
+            }
+
             scnEditor editor = scnEditor.instance;
             scrDecorationManager manager = scrDecorationManager.instance;
 

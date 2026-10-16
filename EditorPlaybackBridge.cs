@@ -1834,18 +1834,38 @@ namespace ADOFAIEditorStudio
         /// <summary>
         /// 「回到开头」。由时间轴上的回到开头按钮调用。
         ///
-        /// 【现状:仍在走原生重建,待改造】
-        /// Track C 目前只接管了空格播放/暂停 —— 那条路径上求值器直接渲染,所以是无缝的。
-        /// 而这个入口转调的是 TryBeginPreviewRestart,即 Track A/B 留下的原生重建机制:
-        /// 它会 End 掉求值器会话、切回游戏自己的 transport、再由状态机把画面重建出来。
-        /// 功能是正常的,但重建过程会看到一下闪烁,不如空格播放那样无缝。
+        /// **走的是「把播放头拖到最前面」那条路**：进入拖动定位 → 定位到 0 → 退出。
         ///
-        /// 后续改造方向:让它像 TrySetEvaluatorPlayback 一样只移动求值器的时钟并直接重绘,
-        /// 不去动原生运行时。做完之后这里以及它下面整条重启状态机才能安全删除。
+        /// 原来它转调 `TryBeginPreviewRestart`（Track A/B 留下的原生重建）：停掉求值器、
+        /// 切回游戏自己的 transport、再由状态机把画面重建一遍。问题是**那个重建不会把
+        /// 已经生效的东西全部退回开头状态** —— 实测按一下回到开头，位置确实回去了，但
+        /// 一堆元素还留在原处（这个毛病从这个按钮诞生起就有）。
+        ///
+        /// 而拖动定位这条路由求值器直接重绘、画面是时钟的纯函数，拖到 0 时画出来的就是
+        /// 开头那一帧，没有"残留"这回事。所以这里不再动原生运行时，直接复用那条路 ——
+        /// 也正是原本记在 `TryBeginPreviewRestart` 上的改造方向。
+        ///
+        /// （拖动那条路里还有一条 `nativeScrubPrepared` 的遗留原生分支，但它只被赋过
+        /// false、从没被置 true，实际走的一直是求值器那条。）
         /// </summary>
         internal static bool TryReturnToStart(out string status)
         {
-            return TryBeginPreviewRestart(0f, true, out status);
+            if (!TryBeginTimelineScrub(out status))
+            {
+                return false;
+            }
+
+            if (!TryScrubTimelineToTime(0f, out status))
+            {
+                // 定位没成功：把拖动状态丢掉，别留下一个"还在拖"的假状态 ——
+                // 那会让下一次播放开始后被拖回旧时间（见 EndTimelineScrub 的说明）。
+                EndTimelineScrub(false);
+                return false;
+            }
+
+            // 停在最后定位到的时间（这里是 0），画面就留在开头。
+            EndTimelineScrub(true);
+            return true;
         }
 
         private static void BuildNativeScrubBoundaries(scnEditor editor)
@@ -6668,6 +6688,9 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private static void TickEvaluatorOwnedPreview(RectTransform viewport, scnEditor editor)
         {
+            // 性能探针（`[TickCost]` 那四段拆分）跟着 VerboseDiagnostics 走。
+            // 2026-10-16 定位"原版 160 帧 / 工作台 39 帧"时临时置过 true，
+            // 结论记在知识库的问题清单里。
             bool profile = VerboseDiagnostics;
             long t0 = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
 
@@ -7584,6 +7607,22 @@ namespace ADOFAIEditorStudio
 
                 if (!handled)
                 {
+                    // **被我们挡下的（只读模式那种）要把键吃掉。**
+                    //
+                    // 只有"我们压根没参与"（没选中东西、剪贴板空的）才放行给原生。
+                    // 拦下来还放行的话，请求会落到**原版自己那把删除/粘贴键**上 ——
+                    // 只读模式照样把事件删掉（实测就是这样）。
+                    //
+                    // 判据用"有没有留下一句话"：我们的守卫都会写明原因，
+                    // 而"没选中东西"是不吭声的。
+                    if (!string.IsNullOrEmpty(selectionStatus))
+                    {
+                        if (Main.Overlay != null)
+                        {
+                            Main.Overlay.SetTransientStatus(selectionStatus, 3f);
+                        }
+                        return false;
+                    }
                     return true;
                 }
 

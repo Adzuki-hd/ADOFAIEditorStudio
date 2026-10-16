@@ -44,6 +44,12 @@ namespace ADOFAIEditorStudio
         private const float StepButtonSize = 28f;
         private const float RewindWidth = 32f;
 
+        /// <summary>
+        /// 车道筛选按钮和左右邻居之间的空档。**两侧都要留** —— 左边是时间读数、
+        /// 右边是缩放读数，挨上去就会互相压（实测过：读数被按钮盖住、看着断成两截）。
+        /// </summary>
+        private const float LaneFilterGap = 20f;
+
         /// <summary>缩放手柄那道握把的宽。和 uGUI 那个 Grip 一致（48）。</summary>
         private const float GripWidth = 48f;
 
@@ -102,8 +108,25 @@ namespace ADOFAIEditorStudio
 
             DrawHeading(draw, x, y, height);
             float cursor = DrawToggles(timeline, draw, y, height);
+
+            // **右端那一串的位置在这里算一次。**
+            //
+            // 从右往左依次是：缩放 +/− 、缩放读数、**车道筛选**。连成一串算，
+            // 是为了让它们之间保持固定空档 —— 各自按右边距硬算的话，筛选按钮和
+            // 缩放读数会贴到一起（实测过）。
+            string zoom = timeline.ZoomReadout;
+            float zoomWidth = string.IsNullOrEmpty(zoom) ? 0f : ImGui.CalcTextSize(zoom).X;
+            float zoomInX = x + width - RightPadding - StepButtonSize;
+            float zoomOutX = zoomInX - 4f - StepButtonSize;
+            float rewindX = zoomOutX - 16f - RewindWidth;
+            float zoomTextX = rewindX - 12f - zoomWidth;
+            float lanesX = zoomTextX - LaneFilterGap - EditorImGuiPreviewPanel.LaneButtonsWidth;
+
+            // 时间读数摆在这一行的**正中间**（见 `DrawReadouts`），所以不用再按
+            // 右端那串控件给它算右边界了。
             DrawReadouts(overlay, timeline, draw, x, y, width, height, cursor);
-            DrawTransport(timeline, draw, x, y, width, height);
+            DrawTransport(overlay, timeline, draw, y, height,
+                rewindX, zoomOutX, zoomInX, zoomTextX, zoom, lanesX);
         }
 
         private static void DrawHeading(ImDrawListPtr draw, float x, float y, float height)
@@ -162,17 +185,25 @@ namespace ADOFAIEditorStudio
             return ToggleX + toggles.Count * (ToggleWidth + ToggleGap);
         }
 
-        /// <summary>摘要（左）和时间读数（右）。时间读数右对齐占住右端。</summary>
+        /// <summary>
+        /// 摘要（左）和时间读数（**正中间**）。
+        ///
+        /// 时间读数摆在这一行的中点 —— 它是这排里唯一"随时在变、一眼要看"的读数，
+        /// 放中间扫视时最省力。摘要则从开关那排之后起、到它之前收住。
+        /// </summary>
         private static void DrawReadouts(EditorStudioOverlay overlay, EditorTimelineView timeline,
             ImDrawListPtr draw, float x, float y, float width, float height, float summaryX)
         {
             float textY = y + (height - ImGui.GetTextLineHeight()) * 0.5f;
 
             string time = timeline.TimeReadout;
-            if (!string.IsNullOrEmpty(time))
+            float timeLeft = 0f;
+            bool hasTime = !string.IsNullOrEmpty(time);
+            if (hasTime)
             {
                 NVec2 size = ImGui.CalcTextSize(time);
-                draw.AddText(new NVec2(x + width - 200f - size.X, textY),
+                timeLeft = x + (width - size.X) * 0.5f;
+                draw.AddText(new NVec2(timeLeft, textY),
                     ImGui.GetColorU32(ToVec4(Palette.AccentSecondary)), time);
             }
 
@@ -181,33 +212,87 @@ namespace ADOFAIEditorStudio
             {
                 return;
             }
-            // 摘要从开关那排之后开始，到时间读数之前收住 —— 两端都得让开，
-            // 所以宽度是**算出来的**，不能写死。超宽走省略号。
+            // 摘要从开关那排之后开始，到**中间那个时间读数**之前收住 —— 两端都得
+            // 让开，所以宽度是**算出来的**，不能写死。超宽走省略号。
             float left = summaryX + 16f;
-            float right = x + width - 200f - 16f;
+            float right = hasTime ? timeLeft - 20f : x + width * 0.5f;
             draw.AddText(new NVec2(left, textY), ImGui.GetColorU32(ToVec4(Palette.TextMuted)),
                 FitText(summary, Mathf.Max(40f, right - left)));
         }
 
-        /// <summary>右侧那组：回到开头 | 缩放 - 读数 + 。</summary>
-        private static void DrawTransport(EditorTimelineView timeline, ImDrawListPtr draw,
-            float x, float y, float width, float height)
+        /// <summary>原版「回到开头」的图标 —— 取到就钉住，没取到每帧重试。</summary>
+        private static bool rewindIconResolved;
+        private static EditorImGuiIcons.Icon rewindIcon;
+
+        /// <summary>
+        /// 从游戏自己那枚「回到开头」按钮上借图标。
+        ///
+        /// 和 uGUI 那排工具栏是同一个来源（`EditorTimelineView.ApplyNativeRewindIcon`），
+        /// 只不过那边是喂给 uGUI 的 `Image`。编辑器没就绪时 `rewind` 可能是空的，
+        /// 所以**没取到就每帧重试**，取到才钉住。
+        /// </summary>
+        private static bool TryGetRewindIcon(out EditorImGuiIcons.Icon icon)
+        {
+            if (!rewindIconResolved)
+            {
+                scnEditor editor = scnEditor.instance;
+                UnityEngine.Sprite sprite = editor == null || editor.rewind == null
+                    || editor.rewind.image == null
+                    ? null
+                    : editor.rewind.image.sprite;
+                rewindIconResolved = EditorImGuiIcons.TryFromSprite(sprite, out rewindIcon);
+            }
+
+            icon = rewindIcon;
+            return rewindIconResolved;
+        }
+
+        /// <summary>
+        /// 右侧那组：车道筛选 | 回到开头 | 缩放 − 读数 + 。
+        ///
+        /// **位置全部由调用方算好传进来**（见 `DrawContents`）—— 中间那段时间读数
+        /// 要按这组控件让位，两边必须用同一套几何；各算各的迟早会撞上（撞上时读数
+        /// 的笔画会从按钮缝里透出来，看着像飘了一圈青括号）。
+        /// </summary>
+        private static void DrawTransport(EditorStudioOverlay overlay,
+            EditorTimelineView timeline, ImDrawListPtr draw, float y, float height,
+            float rewindX, float zoomOutX, float zoomInX, float zoomTextX, string zoom,
+            float lanesX)
         {
             float buttonY = y + (height - ToggleHeight) * 0.5f;
-            float right = x + width - RightPadding;
-
-            float zoomInX = right - StepButtonSize;
-            float zoomOutX = zoomInX - 4f - StepButtonSize;
-            float rewindX = zoomOutX - 16f - RewindWidth;
 
             ImGui.SetCursorScreenPos(new NVec2(rewindX, buttonY));
-            if (ImGui.Button("|<", new NVec2(RewindWidth, ToggleHeight)))
+            if (ImGui.Button("##rewind", new NVec2(RewindWidth, ToggleHeight)))
             {
                 timeline.GoToStart();
             }
             if (ImGui.IsItemHovered())
             {
                 ImGui.SetTooltip("回到开头");
+            }
+
+            // **画原版那枚图标，不自己写 "|<"。**
+            //
+            // 精灵直接从游戏自己那枚「回到开头」按钮上取（`scnEditor.rewind.image.sprite`）
+            // —— 和 uGUI 那排工具栏是同一个来源，见 `EditorTimelineView.ApplyNativeRewindIcon`。
+            // 取不到（编辑器还没就绪之类）才退回文字，别开天窗。
+            EditorImGuiIcons.Icon rewindIcon;
+            if (TryGetRewindIcon(out rewindIcon))
+            {
+                draw.AddImage(rewindIcon.TextureId,
+                    new NVec2(rewindX + (RewindWidth - IconWidth) * 0.5f, buttonY + IconY),
+                    new NVec2(rewindX + (RewindWidth + IconWidth) * 0.5f,
+                        buttonY + IconY + IconHeight),
+                    rewindIcon.UvMin, rewindIcon.UvMax,
+                    ImGui.GetColorU32(ToVec4(Palette.TextPrimary)));
+            }
+            else
+            {
+                NVec2 textSize = ImGui.CalcTextSize("|<");
+                draw.AddText(
+                    new NVec2(rewindX + (RewindWidth - textSize.X) * 0.5f,
+                        buttonY + (ToggleHeight - textSize.Y) * 0.5f),
+                    ImGui.GetColorU32(ToVec4(Palette.TextPrimary)), "|<");
             }
 
             ImGui.SetCursorScreenPos(new NVec2(zoomOutX, buttonY));
@@ -222,17 +307,21 @@ namespace ADOFAIEditorStudio
                 timeline.ZoomInStep();
             }
 
-            // 读数排在「回到开头」**左边**，不夹在缩小和回到开头之间 ——
-            // 那个缝是按 13px 的字量出来的，换成正文那一档之后读数宽了近一倍，
-            // 塞回去就会和 |< 撞上（离线预览里一眼可见）。
-            string zoom = timeline.ZoomReadout;
+            // 缩放读数。位置由调用方给：它排在「回到开头」左边，不夹在缩小和
+            // 回到开头之间 —— 那个缝是按 13px 的字量出来的，换成正文那一档之后
+            // 读数宽了近一倍，塞回去就会和回到开头撞上。
             if (!string.IsNullOrEmpty(zoom))
             {
-                NVec2 size = ImGui.CalcTextSize(zoom);
                 draw.AddText(
-                    new NVec2(rewindX - 12f - size.X, y + (height - ImGui.GetTextLineHeight()) * 0.5f),
+                    new NVec2(zoomTextX, y + (height - ImGui.GetTextLineHeight()) * 0.5f),
                     ImGui.GetColorU32(ToVec4(Palette.TextMuted)), zoom);
             }
+
+            // **车道筛选按钮画在这儿 —— 时间轴第一行的右边。**
+            //
+            // 它们原来在预览标题行里；那一行现在让给状态读数了（状态文本一长
+            // 就被顶栏中间的模式切换按钮压住）。
+            EditorImGuiPreviewPanel.DrawLaneButtons(overlay, draw, lanesX, y, height);
         }
     }
 }
