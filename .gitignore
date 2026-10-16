@@ -34,6 +34,11 @@ desktop.ini
 # Claude Code 本机设置（hook 等），不进仓库
 .claude/settings.local.json
 
+# 设计技能插件的载荷（设计 token 定义、审计脚本）。属于本机工具链，
+# 和这个 mod 的源码无关，放进来只会让仓库里多出一堆没人维护的文件。
+.claude/rules/
+.claude/scripts/
+
 # 工具的输出图（布局预览、图标自检），是产物不是源码
 tools/layout-preview/*.png
 tools/icons/selftest.png
