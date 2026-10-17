@@ -29,6 +29,13 @@ namespace ADOFAIEditorStudio.Multiplayer
         private RectTransform root;
         private Image barFill;
         private TextMeshProUGUI label;
+        /// <summary>
+        /// 进度条下面那行小字。目前只有媒体预载会用到（"首次加载较慢，请耐心等待"）。
+        ///
+        /// **和 <see cref="label"/> 分开一个控件**：那行是"正在做什么"，这句是
+        /// "为什么慢"。合成一句会让前者变长、居中对齐时把关键信息挤到边上。
+        /// </summary>
+        private TextMeshProUGUI hint;
         private TMP_FontAsset font;
         private Sprite roundedSprite;
 
@@ -76,6 +83,14 @@ namespace ADOFAIEditorStudio.Multiplayer
             barFill.rectTransform.pivot = new Vector2(0f, 0.5f);
             barFill.rectTransform.anchoredPosition = new Vector2(-BarWidth * 0.5f, -22f);
             ApplyRounded(barFill, true);
+
+            // 提示小字：进度条下面一行，比主文字小一档、灰一档。
+            hint = CreateText("Hint", root);
+            PlaceCentered(hint.rectTransform, 760f, 30f, 0f, -62f);
+            hint.text = string.Empty;
+            hint.fontSize = 18f;
+            hint.color = UiTheme.Current.TextMuted;
+            hint.alignment = TextAlignmentOptions.Center;
         }
 
         /// <summary>
@@ -83,8 +98,10 @@ namespace ADOFAIEditorStudio.Multiplayer
         ///
         /// `progress` 小于 0 表示**还不知道进度**（比如刚开始等谱面），
         /// 那时条留空——文字已经说清了在做什么，画一条假进度只会误导。
+        ///
+        /// `hintText` 是进度条下面那行灰字，传 null / 空串就留白。
         /// </summary>
-        internal void Show(string text, float progress)
+        internal void Show(string text, float progress, string hintText = null)
         {
             if (root == null)
             {
@@ -101,6 +118,11 @@ namespace ADOFAIEditorStudio.Multiplayer
             if (label != null)
             {
                 label.text = text ?? string.Empty;
+            }
+
+            if (hint != null)
+            {
+                hint.text = hintText ?? string.Empty;
             }
 
             if (barFill != null)

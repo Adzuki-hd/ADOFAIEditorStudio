@@ -120,7 +120,8 @@ namespace ADOFAIEditorStudio
             float helpX = x + width - SidePadding - HelpSize;
             float multiplayerX = helpX - 12f - MultiplayerWidth;
 
-            string shortcut = "F8  工作台  ·  Esc  关闭";
+            // 快捷键已经取消：工作台改由编辑器里那颗悬浮球打开。
+            string shortcut = "悬浮球  打开工作台  ·  Esc  关闭";
             NVec2 shortcutSize = ImGui.CalcTextSize(shortcut);
             draw.AddText(new NVec2(multiplayerX - 24f - shortcutSize.X, textY),
                 ImGui.GetColorU32(ToVec4(Palette.TextMuted)), shortcut);

@@ -136,7 +136,6 @@ namespace ADOFAIEditorStudio
 
     public class Settings : ModSettings
     {
-        public int Shortcut = (int)KeyCode.F8;
         public bool LockPreviewZoom = true;
         // 把预览视图锁在谱面自带的取景上。它与缩放锁分开，
         // 这样作者可以放开缩放，同时仍让相机停在谱面指定的位置

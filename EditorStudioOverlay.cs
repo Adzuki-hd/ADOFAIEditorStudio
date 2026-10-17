@@ -1749,25 +1749,17 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
-            KeyCode shortcut = (KeyCode)settings.Shortcut;
-            bool shortcutPressed = shortcut != KeyCode.None && Input.GetKeyDown(shortcut)
-                && (!built || !IsTextInputFocused());
+            // **快捷键已经取消**：工作台改由编辑器里那颗悬浮球打开
+            // （见 `EditorImGuiBridge.DrawFloatingBall`）。
+            //
+            // 原因：实测有用户的 F8 根本进不了 Unity（笔记本 F 键默认走媒体键、
+            // 或者被录屏 / 输入法 / 显卡 overlay 抢了全局热键），而键盘方案
+            // 没有任何可视入口 —— 用户连"这个功能存在"都不知道。
+            // 悬浮球看得见、点得到，也不跟任何按键冲突。
 
-            // **游玩中不给开**。关掉始终允许——不然进去了就出不来。
-            if (shortcutPressed && !visible && IsNativePlayModeRunning())
-            {
-                shortcutPressed = false;
-                SetTransientStatus("游玩中不能打开工作台，先按 Esc 退出游玩");
-            }
-
-            if (shortcutPressed)
-            {
-                if (!built && !TryBuildRuntimeUi())
-                {
-                    return;
-                }
-                SetVisible(!visible);
-            }
+            // （原来这里还有快捷键的"游玩中不给开"拦截和开关分支。
+            //  改成悬浮球之后，打开入口在 `EditorImGuiBridge.DrawFloatingBall`，
+            //  那边自己也判了游玩模式 —— 见那个方法。）
 
             // 场景重载销毁了 UI；重建它并重新打开工作台，
             // 好让恢复后的运行可见。
@@ -2079,7 +2071,10 @@ namespace ADOFAIEditorStudio
                 string.Empty, 13f, Accent, TextAlignmentOptions.MidlineLeft, false);
             statusLabel.color = Accent;
 
-            CreateText("Shortcut", header.rectTransform, DesignWidth - 230f, 13f, 206f, 28f, "F8  工作台  ·  Esc  关闭", 13f, TextMuted, TextAlignmentOptions.MidlineRight, false);
+            // 提示改成"点悬浮球" —— 快捷键已经取消（见 `DrawFloatingBall`）。
+            CreateText("Shortcut", header.rectTransform, DesignWidth - 230f, 13f, 206f, 28f,
+                "悬浮球  打开工作台  ·  Esc  关闭",
+                13f, TextMuted, TextAlignmentOptions.MidlineRight, false);
 
             // 联机入口。放在状态读数和快捷键提示之间那段空档里——
             // 它是个偶尔才点的东西，不该挤到常用控件那一带。
@@ -2352,25 +2347,25 @@ namespace ADOFAIEditorStudio
         {
             "<size=20><b>v" + ModVersion + " 更新内容</b></size>",
             "",
-            "<b>· 卡顿</b>：事件多的谱面不再掉帧。时间轴不再每帧重算事件的「身份键」，",
-            "   装饰物列表按可见区域跳过，又去掉了每帧一次的全量排序，",
-            "   上千个事件的重谱依旧跟手。",
-            "<b>· 崩溃</b>：缓速曲线的段数以前没有上限，事件一多就撞上绘制层的顶点数上限、",
-            "   把游戏打崩，现在按总量预算来画。",
-            "<b>· 共存</b>：和 CheryTools 同时开时，工作台的文字不会再乱码。",
-            "<b>· 加载页</b>：切谱 / 联机时的加载画面不再被工作台盖住。",
-            "<b>· 事件面板</b>和顶部菜单栏换到新渲染层，外观跟别处统一了。",
+            "<b>· 打开方式换了：悬浮球</b>。工作台关着时，编辑器右侧有一颗圆形按钮（产品 logo），",
+            "   点一下打开、按住可以拖到别处。",
+            "   F8 快捷键取消 —— 实测有用户的 F8 根本进不了游戏（笔记本 F 键默认走媒体键、",
+            "   或被录屏 / 输入法抢了全局热键），而键盘方案又没有任何可视入口。",
+            "<b>· 缓速曲线</b>：缩到最小时不再「只画左半边」。每帧的段数预算改成按可见块均分，",
+            "   每个块至少画一段，右边不再整片空白。",
+            "<b>· 参数栏</b>：文件类参数（装饰物图片、背景图、音视频）多了「浏览」按钮，",
+            "   走原版文件选择器 —— 选中的文件会自动复制进谱面目录。",
+            "   装饰物还多了一个「可见」开关（写进谱面，和装饰物列表那只眼睛是同一个值）。",
+            "<b>· 加载页</b>：媒体很多、又是第一次加载时，会提示「首次加载较慢，请耐心等待」。",
+            "<b>· 时间轴</b>：工作台打开时横向缩放直接给到最大，不用每次手动滚到顶。",
             "",
             "<b>修好的</b>",
-            "<b>· 事件块重叠</b>：同一批事件在时间轴上叠成一坨，现在正常排开。",
-            "<b>· 首次排版</b>：第一次打开工程和之后重排的结果天差地别，现在一致了。",
-            "<b>· 添加不生效</b>：文本 / 粒子 / 对象 / 图片加完不在时间轴上出现，",
-            "   现在加完会滚到它那儿。",
-            "<b>· 新建落点</b>：新对象落在第 0 格而不是播放头那格，已修正。",
-            "<b>· 回到开头</b>：按钮图标显示不对、按下之后画面里的元素没复原，都修好了。",
-            "<b>· 媒体数量</b>：媒体很多的谱面，加载数量会少算，已修正。",
-            "<b>· 只读模式</b>：一批能改到谱面的入口（拖图片进预览、删除、改参数…）以前没拦住，",
-            "   现在统一提示「先切到编辑模式」。",
+            "<b>· 拖动事件块</b>：松手后块会掉到时间轴最下面一行，已修正。",
+            "<b>· 换谱面</b>：新谱的事件会堆到最下面（沿用了上一张谱的行号），已修正。",
+            "<b>· 首次排版</b>：有时会拿还没加载完的事件清单去排，导致排版错乱，已修正。",
+            "<b>· 旧工程</b>：早期版本存的位置记录格式过时、会被静默忽略；现在能识别出来并重新排版。",
+            "<b>· 只读模式</b>：顶部「生效」开关和文件「浏览」以前照样能改谱面，现在都拦住。",
+            "<b>· 缓速曲线预热</b>：每种缓速第一次用到时要现算，进时间轴那几帧会卡；挪到加载页里算了。",
         });
 
         /// <summary>群号。ImGui 那扇说明窗口的标题也要用，所以是 internal。</summary>
@@ -3970,20 +3965,26 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private static string GetMediaCacheFileName(MediaThumbnailRequest request)
         {
+            return GetMediaCacheFileName(request.AbsolutePath, request.Key);
+        }
+
+        /// <summary>同上，但不依赖请求对象 —— 预载时要拿它探"磁盘上有没有"。</summary>
+        private static string GetMediaCacheFileName(string absolutePath, string key)
+        {
             long stamp = 0;
             try
             {
-                if (!string.IsNullOrWhiteSpace(request.AbsolutePath)
-                    && File.Exists(request.AbsolutePath))
+                if (!string.IsNullOrWhiteSpace(absolutePath)
+                    && File.Exists(absolutePath))
                 {
-                    stamp = File.GetLastWriteTimeUtc(request.AbsolutePath).Ticks;
+                    stamp = File.GetLastWriteTimeUtc(absolutePath).Ticks;
                 }
             }
             catch
             {
                 // 取不到时间就当 0 —— 缓存退化成"只按路径"，不影响正确性。
             }
-            string raw = (request.AbsolutePath ?? request.Key ?? "") + "|" + stamp;
+            string raw = (absolutePath ?? key ?? "") + "|" + stamp;
             uint hash = 2166136261u;
             for (int i = 0; i < raw.Length; i++)
             {
@@ -4863,6 +4864,14 @@ namespace ADOFAIEditorStudio
         /// 有缓存、不用解码"的那些要单独算进去，否则进度永远到不了头。
         /// </summary>
         private int mediaPreloadPending;
+        /// <summary>
+        /// 预载开始时，这张谱有多少个媒体的缩略图**已经在磁盘缓存里**。
+        ///
+        /// 用来判断"是不是真的第一次加载"：内存缓存每次关工作台都会清
+        /// （`ReleaseMediaTextures`），所以它区分不出首次与再次；磁盘缓存留得住。
+        /// 只有一张都没有的时候才提示「首次加载较慢」。
+        /// </summary>
+        private int mediaPreloadCachedOnDisk;
         private int mediaPreloadCacheBaseline;
         private float mediaPreloadStartedAt;
 
@@ -4893,6 +4902,13 @@ namespace ADOFAIEditorStudio
                 Main.Logger.Log("[加载页] 没开始：loadingScreen 建不出来");
                 return;
             }
+            // **缓速曲线也在这里预热。**
+            //
+            // 每种缓速第一次被画到时要现算 128 个采样点，一张用了好几种缓速的谱，
+            // 这些计算全挤在进时间轴的头几帧 —— 用户看到的"曲线加载很慢"。
+            // 加载页盖着的这段时间正好用来算完，等它收掉时曲线就是现成的。
+            EditorTimelineView.PrecomputeEaseCurves();
+
             List<EditorProjectMediaItem> items = VisibleMedia;
             mediaPreloadTotal = items == null ? 0 : items.Count;
             mediaPreloadStartedAt = Time.unscaledTime;
@@ -4905,20 +4921,42 @@ namespace ADOFAIEditorStudio
             ClearMediaThumbnailQueue();
 
             mediaPreloadCacheBaseline = mediaThumbnailCache.Count;
+            // 顺便数一遍磁盘缓存里已经有多少张 —— 提示语要靠它判断"是不是真的第一次"。
+            string cacheDirectory = GetMediaCacheDirectory();
             int queued = 0;
+            int cachedOnDisk = 0;
             for (int i = 0; i < mediaPreloadTotal; i++)
             {
+                EditorProjectMediaItem item = items[i];
                 // 它自己会判断"有没有缓存"，没有就入队 —— 所以直接调就行。
                 Texture2D texture;
-                if (!TryGetMediaThumbnail(items[i], out texture))
+                if (!TryGetMediaThumbnail(item, out texture))
                 {
                     queued++;
+                    string key = GetMediaThumbnailKey(item);
+                    if (!string.IsNullOrEmpty(cacheDirectory)
+                        && !string.IsNullOrWhiteSpace(key))
+                    {
+                        try
+                        {
+                            if (File.Exists(Path.Combine(cacheDirectory,
+                                GetMediaCacheFileName(item.AbsolutePath, key))))
+                            {
+                                cachedOnDisk++;
+                            }
+                        }
+                        catch
+                        {
+                            // 路径不合法之类的，当成"磁盘上没有"就行。
+                        }
+                    }
                 }
             }
             mediaPreloadPending = queued;
+            mediaPreloadCachedOnDisk = cachedOnDisk;
             Main.Logger.Log("[加载页] 开始：媒体 " + mediaPreloadTotal
-                + " 个，其中要解码 " + queued + " 个；队列现有 "
-                + mediaThumbnailQueue.Count);
+                + " 个，其中要解码 " + queued + " 个（磁盘缓存已有 " + cachedOnDisk
+                + " 个）；队列现有 " + mediaThumbnailQueue.Count);
         }
 
         /// <summary>
@@ -4973,14 +5011,45 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
+            // **只在「磁盘缓存里一张都没有」时提示。**
+            //
+            // 判据必须是磁盘，不是内存：内存缓存每次关工作台都会被
+            // `ReleaseMediaTextures` 清掉，所以"再次打开"和"第一次打开"在内存里
+            // 长得一模一样（实测连开三次都是「要解码 474 个」）。
+            // 磁盘缓存留得住 —— 它为空才是真正的第一次加载。
+            bool firstLoadOfThisChart = total > 0 && mediaPreloadCachedOnDisk == 0;
             loadingScreen.Show(
                 total > 0
                     ? "正在加载媒体 " + done + " / " + total
                     : "正在准备时间轴",
-                progress);
+                progress,
+                firstLoadOfThisChart ? "首次加载较慢，请耐心等待" : null);
         }
 
-        private void SetVisible(bool value)
+        /// <summary>
+        /// 悬浮球点开的入口。
+        ///
+        /// **必须先保证运行期 UI 建起来**：快捷键那条路一直有
+        /// `if (!built && !TryBuildRuntimeUi()) return;` 这道门，而悬浮球最初
+        /// 直接调了 `SetVisible(true)` —— `uiRoot` 还是 null，一进来就
+        /// NullReferenceException，结果只画出顶栏和菜单栏、其余面板全缺，
+        /// 原生面板还漏了出来（实测就是这么崩的）。
+        /// </summary>
+        internal void OpenFromFloatingBall()
+        {
+            if (visible)
+            {
+                return;
+            }
+            if (!built && !TryBuildRuntimeUi())
+            {
+                Main.Logger.Log("[工作台] 悬浮球打开失败：运行期 UI 没建起来");
+                return;
+            }
+            SetVisible(true);
+        }
+
+        internal void SetVisible(bool value)
         {
             visible = value;
 
@@ -4989,17 +5058,25 @@ namespace ADOFAIEditorStudio
             // 走的都是这条。
             if (visible)
             {
-                ShowVersionNotesIfNew();
-                // **先把媒体清单纯净了再预载。**
-                //
-                // 清单的刷新挂在每帧的 `TickProjectWorkspace` 里，而这里是 F8 的那一帧、
-                // 跑在它前面 —— 直接预载的话读到的还是**上一张谱**的列表：换到一张有
-                // 上百个媒体的谱，加载页却按上一张的数量显示（比如「0/70」，而那张谱
-                // 刚好 70 个）。先把工作区刷新一遍，清单才是当前这张谱的。
-                RefreshProjectWorkspace(true);
-                // F8 进来就把媒体铺开 —— 加载页同时是"预热"和"别让用户
-                // 看着空界面等"这两个作用。
-                BeginMediaPreload();
+                try
+                {
+                    ShowVersionNotesIfNew();
+                    // **先把媒体清单纯净了再预载。**
+                    //
+                    // 清单的刷新挂在每帧的 `TickProjectWorkspace` 里，而这里是打开工作台
+                    // 的那一帧、跑在它前面 —— 直接预载的话读到的还是**上一张谱**的列表：
+                    // 换到一张有上百个媒体的谱，加载页却按上一张的数量显示（比如「0/70」，
+                    // 而那张谱刚好 70 个）。先把工作区刷新一遍，清单才是当前这张谱的。
+                    RefreshProjectWorkspace(true);
+                    // 打开工作台就把媒体铺开 —— 加载页同时是"预热"和"别让用户
+                    // 看着空界面等"这两个作用。
+                    BeginMediaPreload();
+                }
+                catch (Exception exception)
+                {
+                    // 打开过程中任何一步出错都不该让整个入口失效 —— 记下来继续。
+                    Main.Logger.Log("[工作台] 打开过程异常：" + exception);
+                }
             }
 
             if (!visible)
@@ -5036,16 +5113,23 @@ namespace ADOFAIEditorStudio
             }
             else
             {
-                EnsureEventSystem();
-                uiRoot.transform.SetAsLastSibling();
-                projectDataDirty = true;
-                RefreshProjectWorkspace(true);
-                string ignored;
-                // 打开工作台是启动一次会话，不是一次拖动。这里用 scrub
-                // 那条入口会置上拖动标志，而空格处理器把它读成
-                // 「指针在播放头上」，于是拒绝切换，直到一次真正的拖动
-                // 恰好把它清掉。
-                EditorPlaybackBridge.TryBeginPreviewSession(out ignored);
+                try
+                {
+                    EnsureEventSystem();
+                    uiRoot.transform.SetAsLastSibling();
+                    projectDataDirty = true;
+                    RefreshProjectWorkspace(true);
+                    string ignored;
+                    // 打开工作台是启动一次会话，不是一次拖动。这里用 scrub
+                    // 那条入口会置上拖动标志，而空格处理器把它读成
+                    // 「指针在播放头上」，于是拒绝切换，直到一次真正的拖动
+                    // 恰好把它清掉。
+                    EditorPlaybackBridge.TryBeginPreviewSession(out ignored);
+                }
+                catch (Exception exception)
+                {
+                    Main.Logger.Log("[工作台] 打开分支异常：" + exception);
+                }
             }
 
             if (uiRoot != null)
@@ -5165,7 +5249,7 @@ namespace ADOFAIEditorStudio
         /// <c>EditorPlaybackBridge.ReadSnapshot</c> 顶部那条注释）。
         /// 只有原生 transport 真的在跑时它才是 true。
         /// </summary>
-        private static bool IsNativePlayModeRunning()
+        internal static bool IsNativePlayModeRunning()
         {
             scnEditor editor = scnEditor.instance;
             if (editor == null)

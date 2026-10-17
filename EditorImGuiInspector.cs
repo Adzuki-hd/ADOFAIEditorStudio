@@ -165,15 +165,12 @@ namespace ADOFAIEditorStudio
         private const float MixedChipWidth = 56f;
 
         /// <summary>
-        /// 顶上那个「生效」图标按钮的边长。取项目自己的刻度。
+        /// 顶部「生效」和「可见」两组之间的间距。
         ///
-        /// 和装饰物列表行尾那三个同档（32 的按钮），但**图标画得比那边满** ——
-        /// 那边一行挤三个、图标留白多一点才不糊；这个一行只有一个，
-        /// 按那边的留白画出来就"太小了，像误画的"。
+        /// 两组各自是「文字 + 开关」，靠得太近会读成一句长话；
+        /// 拉到 18 像素才看得出是两件事。
         /// </summary>
-        private const float EventActiveButtonSize = UiSpacing.Xxl;  // 32
-        /// <summary>图标占按钮边长的比例。留一点边，让图标不顶到按钮框上。</summary>
-        private const float IconInButton = 0.82f;
+        private const float EventToggleGap = 18f;
 
         /// <summary>它和下面第一张卡片之间真正要留出的间距。</summary>
         private const float EventActiveGap = UiSpacing.Md;          // 12
@@ -566,6 +563,60 @@ namespace ADOFAIEditorStudio
 
         /// <summary>宽面板：三列（启用 / 参数 / 值），行行对齐。</summary>
         /// <summary>
+        /// 开关式开关（轨道 + 圆钮，iOS 那种）。
+        ///
+        /// **为什么不用眼睛图标**：眼睛表达的是"看见 / 看不见"，而这两个开关
+        /// 一个管"求不求值"（生效）、一个管"画不画"（可见）—— 语义都对不上，
+        /// 只能靠文字补。开关本体天然表达"某个东西开着还是关着"，一眼就懂。
+        ///
+        /// 画法（关 / 开）：
+        ///   · 轨道：关 = 透明填充 + 2 像素描边；开 = 强调色实心
+        ///   · 圆钮：关 = 灰、靠左；开 = 亮、靠右
+        ///   · 悬停时描边提亮一档
+        ///
+        /// 返回是否被点了一下。调用方负责在它前面画标签。
+        /// </summary>
+        private static bool DrawToggleSwitch(string id, bool on)
+        {
+            const float width = 46f;
+            const float height = 24f;
+            const float knobPadding = 3f;
+            const float borderWidth = 2f;
+
+            NVec2 size = new NVec2(width, height);
+            NVec2 origin = ImGui.GetCursorScreenPos();
+            // 和同一行的文字 / 输入框垂直居中对齐。
+            origin.Y += (ImGui.GetFrameHeight() - height) * 0.5f;
+            ImGui.SetCursorScreenPos(origin);
+            ImGui.InvisibleButton("##toggle_" + id, size);
+            bool clicked = ImGui.IsItemClicked();
+            bool hovered = ImGui.IsItemHovered();
+
+            NVec2 min = ImGui.GetItemRectMin();
+            NVec2 max = ImGui.GetItemRectMax();
+            float radius = height * 0.5f;
+            float knobRadius = radius - knobPadding;
+            float knobX = on
+                ? max.X - knobRadius - knobPadding
+                : min.X + knobRadius + knobPadding;
+            NVec2 knobCenter = new NVec2(knobX, (min.Y + max.Y) * 0.5f);
+
+            ImDrawListPtr draw = ImGui.GetWindowDrawList();
+            uint trackColor = on
+                ? ImGui.GetColorU32(ToVec4(Palette.Accent))
+                : ImGui.GetColorU32(new NVec4(0f, 0f, 0f, 0f));
+            uint borderColor = ImGui.GetColorU32(ToVec4(
+                hovered ? Palette.TextSecondary : UiTheme.Current.BorderStrong));
+            uint knobColor = ImGui.GetColorU32(ToVec4(
+                on ? Palette.TextPrimary : Palette.TextMuted));
+
+            draw.AddRectFilled(min, max, trackColor, radius);
+            draw.AddRect(min, max, borderColor, radius, ImDrawFlags.None, borderWidth);
+            draw.AddCircleFilled(knobCenter, knobRadius, knobColor, 16);
+            return clicked;
+        }
+
+        /// <summary>
         /// 事件级的「生效 / 停用」开关。**图标按钮，两个状态。**
         ///
         /// 画法和装饰物列表行尾那三个按钮是同一套（见
@@ -587,32 +638,16 @@ namespace ADOFAIEditorStudio
 
             bool active = _target.active;
 
-            EditorImGuiIcons.Icon eyeIcon;
-            bool hasEye = EditorImGuiIcons.TryGetEye(active, out eyeIcon);
-
-            // **文字在前，图标在后。** 图标本身只表达"哪一态"，说不清这一项是什么；
-            // 写成"生效 / 不生效"才一眼看懂。（装饰物列表那三个按钮是反过来的 ——
-            // 那边是行操作，图标就是全部信息。）
+            // **文字在前、开关在后。** 开关本身只表达"开着还是关着"，
+            // 说不清这一项是什么 —— 写成「生效 / 不生效」才一眼看懂。
             ImGui.SetCursorPosX(ImGui.GetCursorPosX() + CardPad);
             ImGui.AlignTextToFramePadding();
             PushText(ImGuiCol.Text, active ? Palette.TextSecondary : Palette.TextMuted);
             ImGui.TextUnformatted(active ? "生效" : "不生效");
             ImGui.PopStyleColor();
 
-            // **按钮底色压成透明。**
-            //
-            // 默认样式那块亮底在这块深色面板上太跳 —— 它是"这个事件生不生效"，
-            // 不该比下面那一排参数卡片还抢眼（用户原话："看着太突出了"）。
-            // 留一个悬停/按下时的淡淡底色就够了：既说明"这里能点"，
-            // 平时又不占视觉重量。图标和文字本身照旧。
             ImGui.SameLine(0f, LabelLeftGap);
-            ImGui.PushStyleColor(ImGuiCol.Button, new NVec4(0f, 0f, 0f, 0f));
-            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, ToVec4(Palette.ButtonHover));
-            ImGui.PushStyleColor(ImGuiCol.ButtonActive, ToVec4(Palette.Selected));
-            bool toggled = ImGui.Button("##event_active",
-                new NVec2(EventActiveButtonSize, EventActiveButtonSize));
-            ImGui.PopStyleColor(3);
-            if (toggled)
+            if (DrawToggleSwitch("event_active", active))
             {
                 EditorPropertyPanel panel = Panel;
                 if (panel != null)
@@ -620,22 +655,48 @@ namespace ADOFAIEditorStudio
                     panel.SetEventActive(_target, !active);
                 }
             }
-            EditorImGuiIcons.DrawIcon(ImGui.GetWindowDrawList(),
-                ImGui.GetItemRectMin(), ImGui.GetItemRectMax(), EventActiveButtonSize * IconInButton,
-                hasEye, eyeIcon,
-                active ? EditorImGuiIcons.Drawn.EyeOpen : EditorImGuiIcons.Drawn.EyeClosed,
-                active ? "生" : "停",
-                active ? Palette.TextPrimary : Palette.TextMuted);
 
             if (ImGui.IsItemHovered())
             {
                 string scope = InBatchMode ? "这一批事件" : "这个事件";
                 ImGui.SetTooltip(
                     (active ? scope + "正在生效 —— 点一下停用" : scope + "已停用 —— 点一下启用")
-                    // 批量下图标只能画一个状态（第一个选中事件的），
-                    // 不一致就说明白，免得那个"睁眼"看起来像"整批都生效"。
-                    + (InBatchMode && !BatchActiveUniform() ? "\n（选中的事件里取值不一致，图标按第一个画）" : string.Empty)
+                    // 批量下开关只能画一个状态（第一个选中事件的），
+                    // 不一致就说明白，免得那个"开"看起来像"整批都生效"。
+                    + (InBatchMode && !BatchActiveUniform() ? "\n（选中的事件里取值不一致，开关按第一个画）" : string.Empty)
                     + "\n和每行左边那排勾选不是一回事：那些只管单条属性。");
+            }
+
+            // **「可见」只有装饰物才有这条属性。**
+            //
+            // 两个开关语义不同，别混：
+            //   · `active`  —— 这个事件求不求值（会话内，不写谱面）
+            //   · `visible` —— 这个装饰物画不画（**写进谱面**，装饰物列表行尾那个眼睛改的是同一个值）
+            // 放在同一行是为了"一眼看清这个块现在的状态"，间距拉开一档区分成两组。
+            if (_target.info != null && _target.info.propertiesInfo != null
+                && _target.info.propertiesInfo.ContainsKey("visible"))
+            {
+                bool visible;
+                _target.TryGet<bool>("visible", out visible);
+
+                ImGui.SameLine(0f, EventToggleGap);
+                ImGui.AlignTextToFramePadding();
+                PushText(ImGuiCol.Text, visible ? Palette.TextSecondary : Palette.TextMuted);
+                ImGui.TextUnformatted(visible ? "可见" : "不可见");
+                ImGui.PopStyleColor();
+
+                ImGui.SameLine(0f, LabelLeftGap);
+                if (DrawToggleSwitch("event_visible", visible))
+                {
+                    Commit("visible", !visible);
+                }
+
+                if (ImGui.IsItemHovered())
+                {
+                    ImGui.SetTooltip(visible
+                        ? "这个装饰物正在显示 —— 点一下隐藏\n（写进谱面的 visible，和装饰物列表那个眼睛是同一个值）"
+                        : "这个装饰物已隐藏 —— 点一下显示");
+                }
             }
 
             // **和下面第一张卡片拉开。**
@@ -1090,9 +1151,14 @@ namespace ADOFAIEditorStudio
                         break;
                     case ADOFAI.PropertyType.String:
                     case ADOFAI.PropertyType.LongString:
-                    case ADOFAI.PropertyType.File:
                         TextField(rowId, EditorPropertyPanel.SafeGet(_target, info, string.Empty), width,
                             delegate(string text) { Commit(info.name, text); });
+                        break;
+                    case ADOFAI.PropertyType.File:
+                        // 文件类参数（装饰物图片、背景图、音频、视频…）在**原版里
+                        // 有「浏览」按钮**，我们这版当初只给了个输入框 —— 用户得
+                        // 自己去谱面目录里翻文件名。见 `DrawFile`。
+                        DrawFile(info, rowId, width);
                         break;
                     case ADOFAI.PropertyType.Enum:
                         DrawEnum(info, width);
@@ -1160,6 +1226,99 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>
+        /// 参数栏里那种「带框的小按钮」（目前是文件参数的「浏览」）。
+        ///
+        /// **为什么不能直接用 `ImGui.Button`**：全局按钮底色是 `SurfaceRaised`
+        /// (#242A33)，面板是 `SurfacePanel` (#1A1F27) —— 明度只差一档，
+        /// 又没有描边，摆在输入框旁边会被读成一行普通文字，用户不知道它能点。
+        ///
+        /// 这里三件事一起做：填充提亮到 `SurfaceRaisedHover`、补 1 像素
+        /// `BorderStrong` 描边（那个色值是按"控件轮廓 3:1"选的）、
+        /// 悬停再亮一档。按下用选中色，和面板里其他可点元素一致。
+        /// </summary>
+        private static bool StyledSmallButton(string label, string id, float width)
+        {
+            UiTheme theme = UiTheme.Current;
+            ImGui.PushStyleColor(ImGuiCol.Button, ToVec4(theme.SurfaceRaisedHover));
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, ToVec4(theme.SurfaceThumb));
+            ImGui.PushStyleColor(ImGuiCol.ButtonActive, ToVec4(Palette.Selected));
+            ImGui.PushStyleColor(ImGuiCol.Border, ToVec4(theme.BorderStrong));
+            ImGui.PushStyleVar(ImGuiStyleVar.FrameBorderSize, 1f);
+            ImGui.PushStyleVar(ImGuiStyleVar.FrameRounding, EditorStudioOverlay.CornerSmall);
+            bool clicked = ImGui.Button(label + "##" + id, new NVec2(width, 0f));
+            ImGui.PopStyleVar(2);
+            ImGui.PopStyleColor(4);
+            return clicked;
+        }
+
+        /// <summary>
+        /// 文件类参数：输入框 + 「浏览」。
+        ///
+        /// **浏览必须走原版那条路**（`RDEditorUtils.ShowFileSelectorFor*`）：
+        /// 它内部用 `FileBrowser.PickFile` 打开系统文件对话框，选完还会**把文件
+        /// 复制进谱面目录**（重名自动改名），返回的就是参数要存的那个文件名。
+        /// 原版的 `BrowseButton` 走的是同一条 —— 自己实现一遍只会漏掉复制那一步，
+        /// 用户选完图谱面里却没有这张图。
+        ///
+        /// 选完照常走 `Commit`，刷新链（装饰物重建、设置页副作用）不用另写。
+        /// </summary>
+        private void DrawFile(ADOFAI.PropertyInfo info, string rowId, float width)
+        {
+            const float buttonWidth = 56f;
+            const float gap = 6f;
+            float fieldWidth = Mathf.Max(1f, width - buttonWidth - gap);
+
+            TextField(rowId, EditorPropertyPanel.SafeGet(_target, info, string.Empty), fieldWidth,
+                delegate(string text) { Commit(info.name, text); });
+
+            ImGui.SameLine(0f, gap);
+            // 标签带上 rowId：同一面板里可能同时有好几个文件参数（背景图 + 背景视频）。
+            if (StyledSmallButton("浏览", rowId, buttonWidth) && CanEditForFilePicker())
+            {
+                string picked = PickFileForProperty(info);
+                if (!string.IsNullOrEmpty(picked))
+                {
+                    Commit(info.name, picked);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 只读时不许开文件对话框。
+        ///
+        /// `Commit` 拦得住"把值写进事件"，但拦不住原版选择器**把文件复制进
+        /// 谱面目录**这一步 —— 那是实打实的写操作，只读下不该发生。
+        /// 守卫统一走 `AllowEdit`，提示语也只有那一句。
+        /// </summary>
+        private static bool CanEditForFilePicker()
+        {
+            EditorStudioOverlay overlay = Main.Overlay;
+            return overlay == null || overlay.AllowEdit();
+        }
+
+        /// <summary>
+        /// 打开原版的文件选择器，返回**文件名**（文件已经复制进谱面目录）。
+        /// 用户取消、或者谱面还没保存过（原生会先弹"先保存")时返回 null。
+        /// </summary>
+        private static string PickFileForProperty(ADOFAI.PropertyInfo info)
+        {
+            switch (info.fileType)
+            {
+                case ADOFAI.FileType.Audio:
+                    return RDEditorUtils.ShowFileSelectorForAudio(
+                        RDString.Get("editor.dialog.selectSound"), -1L);
+                case ADOFAI.FileType.Image:
+                    return RDEditorUtils.ShowFileSelectorForImage(
+                        RDString.Get("editor.dialog.selectImage"), -1L);
+                case ADOFAI.FileType.Video:
+                    return RDEditorUtils.ShowFileSelectorForVideo(
+                        RDString.Get("editor.dialog.selectVideo"), -1L);
+                default:
+                    return null;
+            }
+        }
+
+        /// <summary>
         /// 两个分量：地方够就并排，不够就上下叠。
         ///
         /// 叠的时候不用 `SameLine` 就行 —— `TextField` 画完光标本来就在下一行。
@@ -1212,6 +1371,17 @@ namespace ADOFAIEditorStudio
             string current = EditorPropertyPanel.ReadEnumName(_target, info);
             string display = EditorPropertyPanel.DisplayEnumName(_target, info, current);
 
+            // **带 `browsable` 的属性，原版在下拉右边还有一个「浏览」。**
+            //
+            // 典型的是打击音的 `sound`：下拉里挑现成的，或者直接选一个音频文件。
+            // 我们这版原来只画了下拉，等于把"选文件"这条路砍掉了。
+            const float browseButtonWidth = 56f;
+            const float browseGap = 6f;
+            bool browsable = info.browsable;
+            float fieldWidth = browsable
+                ? Mathf.Max(1f, width - browseButtonWidth - browseGap)
+                : width;
+
             // **宽度不用扣箭头 —— 箭头是算在这个宽度里面的。**
             //
             // 这里白减过一次：我从渲染图上看，以为"箭头是加在框外面的"，于是
@@ -1226,7 +1396,7 @@ namespace ADOFAIEditorStudio
             ImGui.PushStyleColor(ImGuiCol.Button,
                 style.Colors[(int)ImGuiCol.FrameBg]);
             ImGui.PushStyleColor(ImGuiCol.ButtonHovered, ToVec4(Palette.ButtonHover));
-            ImGui.SetNextItemWidth(Mathf.Max(1f, width));
+            ImGui.SetNextItemWidth(Mathf.Max(1f, fieldWidth));
             if (ImGui.BeginCombo("##enum", display))
             {
                 NotePopupRect();
@@ -1261,6 +1431,23 @@ namespace ADOFAIEditorStudio
                 ImGui.EndCombo();
             }
             ImGui.PopStyleColor(2);
+
+            // 按钮放在**弹栈之后**画：上面那两行把 `ImGuiCol.Button` 临时压成了
+            // 输入框底色（为了让下拉箭头不显得像另一个按钮），照那个颜色画出来
+            // 的按钮在面板上几乎看不见。
+            if (browsable)
+            {
+                ImGui.SameLine(0f, browseGap);
+                if (StyledSmallButton("浏览", info.name, browseButtonWidth)
+                    && CanEditForFilePicker())
+                {
+                    string picked = PickFileForProperty(info);
+                    if (!string.IsNullOrEmpty(picked))
+                    {
+                        Commit(info.name, picked);
+                    }
+                }
+            }
         }
 
         /// <summary>

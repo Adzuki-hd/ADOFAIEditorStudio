@@ -2077,6 +2077,16 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
+            // **只读模式：什么都不能改。**
+            //
+            // 这条是漏的：`Commit` 那条路一早就有这道闸，可顶部那个「生效」开关
+            // 走的是这里、不走 `Commit`，于是只读下照样能开关 —— 用户实测就是
+            // 「只读居然能开关」。守卫统一走 `AllowEdit`，提示语也只有一句。
+            if (owner != null && !owner.AllowEdit())
+            {
+                return;
+            }
+
             scnEditor editor = scnEditor.instance;
             if (editor == null)
             {

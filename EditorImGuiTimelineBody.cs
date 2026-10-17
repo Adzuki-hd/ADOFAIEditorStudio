@@ -446,9 +446,49 @@ namespace ADOFAIEditorStudio
                 }
             }
 
-            // 这一帧缓速曲线的总段数预算（见 `CurveSegmentBudget`）。每块画之前从这里
-            // 扣，扣完就不再画曲线 —— 保证一个窗口的顶点数顶不破 ImGui 的 65535。
+            // 这一帧缓速曲线的总段数预算（见 `CurveSegmentBudget`）——
+            // 保证一个窗口的顶点数顶不破 ImGui 的 65535。
             int curveBudget = CurveSegmentBudget;
+
+            // **预算要按「这一帧有多少块要画曲线」均分，不能先到先得。**
+            //
+            // 原来是绘制循环里边走边扣：块一多（缩小到最小时一屏几百个），
+            // 时间上靠左的那些先把预算吃光，后面的块整条曲线都画不出来 ——
+            // 用户看到的就是「缩到最小以后，右半边不加载、左半边加载」。
+            //
+            // 先数一遍候选块（可见 + 宽度/高度够画曲线），再按块数均分，
+            // 每个块至少 2 段（一条直线也是一条曲线），谁也不至于整条没有。
+            int curveSegmentsPerBlock = 0;
+            {
+                int candidates = 0;
+                for (int i = 0; i < blocks.Count; i++)
+                {
+                    EditorTimelineView.BlockView probe = blocks[i];
+                    float probeTop = contentTop + probe.Row * stride;
+                    if (probeTop >= bottom || probeTop + blockHeight <= y + rulerHeight)
+                    {
+                        continue;
+                    }
+                    float probeLeft = x + (probe.Time - viewStart) * pixelsPerSecond;
+                    float probeWidth = Mathf.Max(EditorTimelineView.BlockMinWidth,
+                        probe.Duration * pixelsPerSecond - EditorTimelineView.BlockGap);
+                    if (probeLeft >= right || probeLeft + probeWidth <= x)
+                    {
+                        continue;
+                    }
+                    if (probe.Curve != null && probe.Curve.Length >= 2
+                        && probeWidth >= CurveMinBlockWidth
+                        && blockHeight > EditorTimelineView.EaseCurveMarginY * 2f + 4f)
+                    {
+                        candidates++;
+                    }
+                }
+                if (candidates > 0)
+                {
+                    curveSegmentsPerBlock = Mathf.Clamp(
+                        CurveSegmentBudget / candidates, 2, 128);
+                }
+            }
 
             for (int i = 0; i < blocks.Count; i++)
             {
@@ -513,7 +553,8 @@ namespace ADOFAIEditorStudio
                 // 缓速曲线：块里那条线，一眼看出缓速怎么走。
                 // 旧版是自绘网格，这边直接画折线。
                 if (block.Curve != null && block.Curve.Length >= 2
-                    && curveBudget > 0
+                    && curveSegmentsPerBlock >= 2
+                    && curveBudget >= 2
                     && blockWidth >= CurveMinBlockWidth
                     && blockHeight > EditorTimelineView.EaseCurveMarginY * 2f + 4f)
                 {
@@ -534,9 +575,13 @@ namespace ADOFAIEditorStudio
                     //
                     // 按宽度给点数：每段不小于 3 像素。64 像素的块只要 21 段，
                     // 肉眼分辨不出差别，而线段数掉到六分之一。
+                    // 上限封两处：**这一帧均分到的段数**（`curveSegmentsPerBlock`，
+                    // 保证右边的块也有得画），以及剩余的**总预算**（硬上限，
+                    // 四舍五入的累积不能把它顶破）。
                     int wanted = Mathf.Clamp(
                         Mathf.CeilToInt(boxWidth / CurvePixelsPerSegment),
-                        2, Mathf.Min(block.Curve.Length, curveBudget));
+                        2, Mathf.Min(block.Curve.Length,
+                            Mathf.Min(curveSegmentsPerBlock, curveBudget)));
                     curveBudget -= wanted;
                     int sampleStep = Mathf.Max(1,
                         Mathf.CeilToInt(block.Curve.Length / (float)wanted));

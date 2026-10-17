@@ -902,6 +902,15 @@ namespace ADOFAIEditorStudio
         private float bodyWidth;
         private float bodyHeight;
         private float pixelsPerSecond = DefaultPixelsPerSecond;
+        /// <summary>
+        /// 打开谱面后，第一次排版完成时把横向缩放拉到最大（= Ctrl+上滚轮到顶）。
+        ///
+        /// **为什么不在"打开"那一刻直接设**：那一刻 `ChartBpm` 可能还是上一张谱
+        /// 残留的值，而缩放上限 = `MaxPixelsPerBeat × BPM ÷ 60` —— 用错 BPM 算出来的
+        /// 值，等真实 BPM 到了就落在合法区间外面，用户一滚轮反而会往下跳。
+        /// 所以先记一笔，等排版完成（那时 BPM 已经对了）再设。
+        /// </summary>
+        private bool pendingZoomToMaximum;
         private float viewStartTime;
         private float totalDuration;
         private float navigationDuration;
@@ -1694,6 +1703,8 @@ namespace ADOFAIEditorStudio
             outlineSprite = CreateOutlineSprite();
             BuildUi();
             viewInitialized = true;
+            // 第一张谱排完版后，横向缩放直接给到最大（见 `pendingZoomToMaximum`）。
+            pendingZoomToMaximum = true;
             UpdateZoomText();
             RefreshData(true);
         }
@@ -3092,6 +3103,19 @@ namespace ADOFAIEditorStudio
                 {
                     projectChartPath = chartPath;
                     LoadProjectRows(chartPath);
+
+                    // **换谱面了：旧谱的位置表对新谱没有意义。**
+                    //
+                    // 不清掉的话，下面那句「blockPlacements.Count > 0 就走重绑」
+                    // 会让新谱的事件去套旧谱的行号；套不上的一律 `++maxRow`
+                    // 补到最下面 —— 表现就是「一换谱面排版就乱」。
+                    //
+                    // 清掉之后，下面「还没排过版就先确认清单是最新的」那道检查
+                    // 才会生效：新谱的事件清单还没刷进来时先不排，等刷好再排。
+                    blockPlacements.Clear();
+
+                    // 换了一张谱：排完版后横向缩放重新给到最大。
+                    pendingZoomToMaximum = true;
                 }
             }
 
@@ -3117,8 +3141,67 @@ namespace ADOFAIEditorStudio
             // 身份要在**按时间重排之前**算好 —— 再往下 `ordered` 就被按时间排序了。
             EnsureEventKeys(ordered);
 
+            // **工程认不出来，就当没有工程。**
+            //
+            // 工程的键是「类型:格:时间:参数」，而时间/参数这两段跟着代码版本走
+            // （早期构建只存了「类型:格:序号」三段）。格式一变，旧文件**一个键都
+            // 对不上** —— 玩家的摆放被静默丢掉，界面上只表现为"排版不对"。
+            //
+            // 更糟的是 `projectRows != null` 会让下面那条
+            // 「还没有工程时，BPM 变了就重排一次」的防护失效：第一次装箱要是读到
+            // 了上一张谱残留的 BPM，排错之后就**再也不会自己纠正**。
+            //
+            // 判据取「一条都对不上」：只要还有一条能对上，就说明这份工程是有用的，
+            // 玩家的位置照旧保留（哪怕谱面改过、只剩一部分能认）。
+            // 真的一条都对不上时，它本来也提供不了任何位置。
+            if (projectRows != null && projectRows.Count > 0)
+            {
+                bool anyProjectRowMatched = false;
+                for (int i = 0; i < ordered.Count; i++)
+                {
+                    TimelineItem candidate = ordered[i];
+                    if (candidate != null && !string.IsNullOrEmpty(candidate.Key)
+                        && projectRows.ContainsKey(candidate.Key))
+                    {
+                        anyProjectRowMatched = true;
+                        break;
+                    }
+                }
+                if (!anyProjectRowMatched)
+                {
+                    Main.Logger.Log("[工程] 位置记录一条都对不上（" + projectRows.Count
+                        + " 条）：" + projectChartPath + " —— 按没有工程处理，重新自动排版");
+                    projectRows = null;
+                    if (owner != null)
+                    {
+                        owner.SetTransientStatus("工程的位置记录与当前版本不兼容，已重新自动排版", 5f);
+                    }
+                }
+            }
+
             scnEditor editor = scnEditor.instance;
             object chart = editor == null ? null : editor.levelData;
+
+            // **清单必须和谱面对得上，否则不许排版。**
+            //
+            // 实测（大谱首次打开）：自动排版拿的是上一次 `RefreshData` 留下的清单 ——
+            // 那张谱实际有 2826 个事件，清单里只有 357 个（打开过程中事件是边填边长的，
+            // 每 0.5 秒才刷一次）。剩下的两千来个后来才被刷新进来，走
+            // `RebindBlockPlacements` 的「新事件」分支被 `++maxRow` 补到最下面 ——
+            // 用户看到的就是「首次打开排版有问题」。
+            //
+            // 所以：**还没有位置表**（= 这张谱还没排过版）时，先比一次指纹；
+            // 对不上就先刷新、这一帧先不排，下一帧拿新清单再来。
+            // 只有在"第一次排"这一步做，正常拖动 / 编辑时每帧都会走原来的分支。
+            if (blockPlacements.Count == 0 && editor != null)
+            {
+                int currentFingerprint = ComputeDataFingerprint(editor);
+                if (!dataFingerprintValid || currentFingerprint != dataFingerprint)
+                {
+                    RefreshData(true);
+                    return;
+                }
+            }
 
             // **数量对得上、而且还是同一张谱面 —— 就只重新绑定，不重排。**
             //
@@ -3186,53 +3269,23 @@ namespace ADOFAIEditorStudio
             // 只影响**初次**排列：玩家自己拖过的位置由 `RebindBlockPlacements`
             // 按事件搬过去，一个都不动。
             ordered.Sort(CompareInitialPlacement);
-            int rowCount = AssignInitialRows(ordered);
+            AssignInitialRows(ordered);
             placementArranges++;
             // 记下这次用的是哪个 BPM —— 它要是和真实值不一样（谱面还没加载完就读了），
             // 下一帧会被上面那段补一次重排。见 `autoArrangedBpm` 的说明。
             autoArrangedBpm = ChartBpm;
-            // 临时探针（定位"首次打开与重排结果天差地别"）：装箱吃的是 `StartTime`，
-            // 而它在**首次打开**时可能还没算出来（谱面的格时间未就绪）——那样所有块
-            // 时间都是 0、彼此"完全重叠"，会被塞成一人一行。这里把装箱那一刻的时间
-            // 分布打出来，直接对照。定位完删。
-            int zeroTimes = 0;
-            float minStart = float.MaxValue;
-            float maxStart = float.MinValue;
-            for (int d = 0; d < ordered.Count; d++)
+
+            // 排版完成 = BPM 已经是这张谱的真实值，这时才能安全地把缩放拉到最大。
+            // **只动横向（X），行高（Y）保持用户自己的设置。**
+            if (pendingZoomToMaximum)
             {
-                float st = ordered[d] == null ? 0f : ordered[d].StartTime;
-                if (st <= 0f)
-                {
-                    zeroTimes++;
-                }
-                if (st < minStart)
-                {
-                    minStart = st;
-                }
-                if (st > maxStart)
-                {
-                    maxStart = st;
-                }
+                pendingZoomToMaximum = false;
+                pixelsPerSecond = MaximumPixelsPerSecond;
+                viewStartTime = 0f;
+                ClampViewStart();
+                UpdateZoomText();
+                visualsDirty = true;
             }
-            Main.Logger.Log("[Timeline] 自动排列画布：" + ordered.Count
-                + " 个块、" + rowCount + " 行（第 " + placementArranges + " 次）"
-                + " ｜ 装箱时 StartTime：零值 " + zeroTimes + " 个，范围 "
-                + minStart.ToString("0.###") + " ~ " + maxStart.ToString("0.###")
-                // 装箱还吃另外两个变量：占位时长由 `MinimumPixelsPerSecond` 推出来
-                // （它依赖 BPM），以及 `ordered` 的顺序（贪心装箱对顺序敏感）。
-                // 两次输入相同、结果却不同（实测 182 vs 190 行），就得靠这两项分辨。
-                + " ｜ BPM=" + ChartBpm.ToString("0.###")
-                + " 每秒像素下限=" + MinimumPixelsPerSecond.ToString("0.#")
-                + " ｜ 前 6 块(格:时间:源序)=");
-            var head = new System.Text.StringBuilder();
-            for (int d = 0; d < 6 && d < ordered.Count; d++)
-            {
-                TimelineItem it = ordered[d];
-                head.Append(it == null ? "空" : (it.FloorId + ":" + it.StartTime.ToString("0.###")
-                    + ":" + it.SourceOrder));
-                head.Append(' ');
-            }
-            Main.Logger.Log("[Timeline] 装箱顺序：" + head.ToString());
         }
 
         /// <summary>
@@ -3388,6 +3441,18 @@ namespace ADOFAIEditorStudio
             //   · 一模一样的那对（前三段当然也一样）→ 一人领一个旧行号，
             //     旧表里只有一个的话，第二个自然去补 → 不会再叠。
             var oldRowsByPrefix = new Dictionary<string, Queue<int>>();
+
+            // **再按事件对象存一份行号**，给「身份键的前三段也被改掉」的情况兜底。
+            //
+            // 键的前三段是 `类型 : 格 : 起点时间`，而**横向拖动改的正是后两样**。
+            // 松手提交后谱面指纹变化、下一次轮询重建 `TimelineItem`，重算出来的
+            // 键就再也对不上旧表 —— 于是走到下面那句 `row = ++maxRow`，
+            // 块当场掉到最下面一行。用户看到的就是「拖完 Y 轴突然往下跳很多」。
+            //
+            // 增量刷新时事件对象是**同一批**（`RefreshData` 只是重新遍历
+            // `editor.events`），所以按引用能精确认回来。只有撤销 / 换谱面那种
+            // 整体替换才会认不出，那时照旧补到最下面。
+            var oldRowsByEvent = new Dictionary<LevelEvent, int>(ReferenceComparer<LevelEvent>.Instance);
             int maxRow = -1;
             for (int i = 0; i < blockPlacements.Count; i++)
             {
@@ -3395,6 +3460,12 @@ namespace ADOFAIEditorStudio
                 if (placement == null || placement.Item == null)
                 {
                     continue;
+                }
+                // 事件对象 → 旧行号。键可能是空的（还没算出身份），
+                // 但对象本身照样能用来认「这是同一个事件」。
+                if (placement.Item.Event != null)
+                {
+                    oldRowsByEvent[placement.Item.Event] = placement.Row;
                 }
                 string oldKey = placement.Item.Key;
                 if (string.IsNullOrEmpty(oldKey))
@@ -3425,7 +3496,20 @@ namespace ADOFAIEditorStudio
                 int row = -1;
                 float time = item.StartTime;
 
-                if (!string.IsNullOrEmpty(item.Key))
+                // **先按事件对象认。** 同一个对象就是同一个事件，比身份键更准：
+                // 键里带着格和时间，而拖动 / 改格刚好会改掉它们（见上面那段说明）。
+                if (item.Event != null)
+                {
+                    int oldRow;
+                    if (oldRowsByEvent.TryGetValue(item.Event, out oldRow))
+                    {
+                        row = oldRow;
+                        // 一个事件只领一次，领完就摘掉。
+                        oldRowsByEvent.Remove(item.Event);
+                    }
+                }
+
+                if (row < 0 && !string.IsNullOrEmpty(item.Key))
                 {
                     Queue<int> queue;
                     if (oldRowsByPrefix.TryGetValue(KeyPrefix(item.Key), out queue)
@@ -3480,6 +3564,29 @@ namespace ADOFAIEditorStudio
                 }
             }
             return key;
+        }
+
+        /// <summary>
+        /// 按**引用**比较的字典键 —— 给「用事件对象反查旧行号」用。
+        ///
+        /// .NET Framework 4.8 没有 `ReferenceEqualityComparer`（那是 .NET 5 才有的），
+        /// 而默认的 `Equals` 万一被 `LevelEvent` 重写过，就会把两个不同的事件
+        /// 当成同一个 —— 那正好是这里最不能出的事（两块会被塞进同一行）。
+        /// </summary>
+        private sealed class ReferenceComparer<T> : IEqualityComparer<T>
+            where T : class
+        {
+            internal static readonly ReferenceComparer<T> Instance = new ReferenceComparer<T>();
+
+            public bool Equals(T a, T b)
+            {
+                return ReferenceEquals(a, b);
+            }
+
+            public int GetHashCode(T value)
+            {
+                return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(value);
+            }
         }
 
         /// <summary>
@@ -4977,7 +5084,10 @@ namespace ADOFAIEditorStudio
             //   · **改参数**（透明度、颜色、缓速…）→ 键确实会变，但重绑那边
             //     有"按位置兜底"（见 `RebindBlockPlacements`），改完块**留在原地**；
             //   · **拖动** → `DragBlockTo` 只写 `placement`（画布预览），
-            //     事件数据要等 `EndBlockDrag` 才提交 —— 拖动全程键不变；
+            //     事件数据要等 `EndBlockDrag` 才提交 —— 拖动**全程**键不变；
+            //     但**提交之后**格和时间都变了，键跟着变，所以重绑那边还留了一手
+            //     「按事件对象认」（见 `RebindBlockPlacements` 里的 `oldRowsByEvent`），
+            //     否则拖完块会掉到最下面一行；
             //   · **撤销 / 重做** → 事件回到哪个状态，键就是那个状态的键；
             //   · **加 / 删事件** → 只有那一个的键消失，别的照旧。
             //
@@ -5573,6 +5683,33 @@ namespace ADOFAIEditorStudio
         internal const float EaseCurveDotRadius = 2.2f;
         private const float EaseCurveDotFeather = 0.6f;
 
+
+        /// <summary>
+        /// 把所有缓速类型的采样点先算出来。
+        ///
+        /// 每种 `Ease` 第一次被画到时要现算 `EaseCurveSamples`（128）个采样点，
+        /// 每个都是一次 `DOVirtual.EasedValue`。一张用了好几种缓速的谱，
+        /// 这些计算全挤在进时间轴的头几帧里 —— 用户看到的就是
+        /// "事件块上的缓速曲线加载很慢"。
+        ///
+        /// 放这里给加载页调（F8 打开工作台时），逐帧摊不摊开都无所谓：
+        /// 全部算一遍也就几十次 × 128，加载页本来就压着最短 0.35 秒。
+        /// </summary>
+        internal static void PrecomputeEaseCurves()
+        {
+            System.Array all = System.Enum.GetValues(typeof(Ease));
+            for (int i = 0; i < all.Length; i++)
+            {
+                try
+                {
+                    GetEaseCurveValues((Ease)all.GetValue(i));
+                }
+                catch
+                {
+                    // 个别占位档（`Unset` / `INTERNAL_*`）算不出来不影响别的，跳过。
+                }
+            }
+        }
 
         private static float[] GetEaseCurveValues(Ease ease)
         {

@@ -111,6 +111,8 @@ namespace ADOFAIEditorStudio
         private Image _eventPaletteBlocker;
         /// <summary>时间轴内容区的挡点击层 —— 块归 ImGui 管了，得把 uGUI 那条路挡掉。</summary>
         private Image _timelineBodyBlocker;
+        /// <summary>悬浮球的点击遮挡块（工作台关着时也要生效）。</summary>
+        private Image _ballBlocker;
         /// <summary>顶栏（ImGui 版）。常驻，永远在工作台最上面那一条。</summary>
         private EditorImGuiHeader _header;
         private EditorImGuiMenuBar _menuBar;
@@ -407,25 +409,25 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private static readonly string[] VersionLines =
         {
-            "*卡顿：事件多的谱面不再掉帧。时间轴不再每帧重算事件的「身份键」，",
-            "   装饰物列表按可见区域跳过，又去掉了每帧一次的全量排序，",
-            "   上千个事件的重谱依旧跟手。",
-            "*崩溃：缓速曲线的段数以前没有上限，事件一多就撞上绘制层的顶点数上限、",
-            "   把游戏打崩，现在按总量预算来画。",
-            "*共存：和 CheryTools 同时开时，工作台的文字不会再乱码。",
-            "*加载页：切谱 / 联机时的加载画面不再被工作台盖住。",
-            "*事件面板和顶部菜单栏换到新渲染层，外观跟别处统一了。",
+            "*打开方式换了：悬浮球。工作台关着时，编辑器右侧有一颗圆形按钮（产品 logo），",
+            "   点一下打开、按住可以拖到别处。",
+            "   F8 快捷键取消 —— 实测有用户的 F8 根本进不了游戏（笔记本 F 键默认走媒体键、",
+            "   或被录屏 / 输入法抢了全局热键），而键盘方案又没有任何可视入口。",
+            "*缓速曲线：缩到最小时不再「只画左半边」。每帧的段数预算改成按可见块均分，",
+            "   每个块至少画一段，右边不再整片空白。",
+            "*参数栏：文件类参数（装饰物图片、背景图、音视频）多了「浏览」按钮，",
+            "   走原版文件选择器 —— 选中的文件会自动复制进谱面目录。",
+            "   装饰物还多了一个「可见」开关（写进谱面，和装饰物列表那只眼睛是同一个值）。",
+            "*加载页：媒体很多、又是第一次加载时，会提示「首次加载较慢，请耐心等待」。",
+            "*工作台打开时，时间轴的横向缩放直接给到最大，不用每次手动滚到顶。",
             "",
             "#修好的",
-            "*事件块重叠：同一批事件在时间轴上叠成一坨，现在正常排开。",
-            "*首次排版：第一次打开工程和之后重排的结果天差地别，现在一致了。",
-            "*添加不生效：文本 / 粒子 / 对象 / 图片加完不在时间轴上出现，",
-            "   现在加完会滚到它那儿。",
-            "*新建落点：新对象落在第 0 格而不是播放头那格，已修正。",
-            "*回到开头：按钮图标显示不对、按下之后画面里的元素没复原，都修好了。",
-            "*媒体数量：媒体很多的谱面，加载数量会少算，已修正。",
-            "*只读模式：一批能改到谱面的入口（拖图片进预览、删除、改参数…）以前没拦住，",
-            "   现在统一提示「先切到编辑模式」。",
+            "*拖动事件块：松手后块会掉到时间轴最下面一行，已修正。",
+            "*换谱面：新谱的事件会堆到最下面（沿用了上一张谱的行号），已修正。",
+            "*首次排版：有时会拿还没加载完的事件清单去排，导致排版错乱，已修正。",
+            "*旧工程：早期版本存的位置记录格式过时、会被静默忽略；现在能识别出来并重新排版。",
+            "*只读模式：顶部「生效」开关和文件「浏览」以前照样能改谱面，现在都拦住。",
+            "*缓速曲线：每种缓速第一次用到时要现算，进时间轴那几帧会卡；挪到加载页里预热了。",
         };
         /// <summary>
         /// 说明窗口的正文。一项一行，**行首那个记号决定怎么画**：
@@ -767,6 +769,8 @@ namespace ADOFAIEditorStudio
             _timelineHeaderBlocker = CreateBlocker("ImGuiTimelineHeaderBlocker");
             _eventPaletteBlocker = CreateBlocker("ImGuiEventPaletteBlocker");
             _timelineBodyBlocker = CreateBlocker("ImGuiTimelineBodyBlocker");
+            // 悬浮球那一块：它工作台关着时也在，所以单独一份。
+            _ballBlocker = CreateBlocker("ImGuiFloatingBallBlocker");
         }
 
         private Image CreateBlocker(string name)
@@ -1380,6 +1384,8 @@ namespace ADOFAIEditorStudio
             ImGui.NewFrame();
             // 常驻面板先画，模态的文字窗口后画 —— 后者必须压在它上面。
             DrawPanels();
+            // 悬浮球最后画：它工作台关着时才出现，和面板互斥。
+            DrawFloatingBall();
             DrawWindows();
             long profileBuild = profileFrame
                 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
@@ -1508,6 +1514,236 @@ namespace ADOFAIEditorStudio
             | ImGuiWindowFlags.NoResize
             | ImGuiWindowFlags.NoCollapse
             | ImGuiWindowFlags.NoSavedSettings;
+
+        // ---------------------------------------------------------------- 悬浮球
+
+        /// <summary>悬浮球直径（设计空间像素）。</summary>
+        private const float BallDiameter = 64f;
+        /// <summary>初始位置离屏幕右缘的距离。</summary>
+        private const float BallMargin = 28f;
+        /// <summary>按下到松开之间移动超过这么多像素就算拖动，不算点击。</summary>
+        private const float BallDragThreshold = 4f;
+
+        private Texture2D _logoTexture;
+        private IntPtr _logoTextureId;
+        private bool _logoLoadTried;
+        private NVec2 _ballCenter;
+        private bool _ballPlaced;
+        private NVec2 _ballPressPos;
+        private NVec2 _ballPressCenter;
+        private bool _ballMoved;
+
+        /// <summary>悬浮球图标的分辨率（随包的 `Logo.rgba` 就是这个尺寸）。</summary>
+        private const int LogoSize = 128;
+
+        /// <summary>
+        /// 把 mod 目录下的 `Logo.rgba` 读成纹理并登记给 ImGui。
+        ///
+        /// **为什么不是 PNG**：`Texture2D.LoadImage` 在 `UnityEngine.ImageConversionModule`
+        /// 里，而那个程序集是 netstandard 2.1 编的，和本项目的 net48 引用冲突
+        /// （CS1705）。所以图标随包发**原始 RGBA32 字节**，运行时
+        /// `LoadRawTextureData` 直接吃 —— 不需要任何图片解码库，也不依赖那个模块。
+        /// 文件按**图片自上而下**的顺序写，不要预翻 —— `LoadRawTextureData`
+        /// 就按写入顺序解释，预先翻转会让球上下颠倒（实测踩过）。
+        ///
+        /// 读不到就返回零，调用方会退回一个实心圆 —— **入口不能因为一张图没读到
+        /// 就消失**，那样用户连"有这个东西"都看不到。
+        /// </summary>
+        private IntPtr EnsureLogoTexture()
+        {
+            if (_logoLoadTried)
+            {
+                return _logoTextureId;
+            }
+            _logoLoadTried = true;
+            try
+            {
+                string modPath = Main.Mod == null ? null : Main.Mod.Path;
+                if (string.IsNullOrEmpty(modPath))
+                {
+                    return _logoTextureId;
+                }
+                string path = System.IO.Path.Combine(modPath, "Logo.rgba");
+                if (!System.IO.File.Exists(path))
+                {
+                    Main.Logger.Log("[悬浮球] 找不到 Logo.rgba：" + path);
+                    return _logoTextureId;
+                }
+                byte[] bytes = System.IO.File.ReadAllBytes(path);
+                int expected = LogoSize * LogoSize * 4;
+                if (bytes.Length != expected)
+                {
+                    Main.Logger.Log("[悬浮球] Logo.rgba 大小不对："
+                        + bytes.Length + "，应为 " + expected);
+                    return _logoTextureId;
+                }
+                Texture2D texture = new Texture2D(LogoSize, LogoSize,
+                    TextureFormat.RGBA32, false);
+                texture.LoadRawTextureData(bytes);
+                texture.Apply();
+                texture.name = "ADOFAIEditorStudio.Logo";
+                texture.wrapMode = TextureWrapMode.Clamp;
+                texture.filterMode = FilterMode.Bilinear;
+                _logoTexture = texture;
+                _logoTextureId = RegisterTexture(texture);
+            }
+            catch (Exception exception)
+            {
+                Main.Logger.Log("[悬浮球] 读 Logo.rgba 失败：" + exception.Message);
+            }
+            return _logoTextureId;
+        }
+
+        private void ClampBallCenter(NVec2 display)
+        {
+            float radius = BallDiameter * 0.5f;
+            _ballCenter = new NVec2(
+                Mathf.Clamp(_ballCenter.X, radius, Mathf.Max(radius, display.X - radius)),
+                Mathf.Clamp(_ballCenter.Y, radius, Mathf.Max(radius, display.Y - radius)));
+        }
+
+        /// <summary>
+        /// 工作台关着时，编辑器里那颗悬浮球。
+        ///
+        /// **为什么要它**：原来靠快捷键打开，但实测有用户的那个键**根本进不了
+        /// Unity**（笔记本 F 键默认走媒体键、或者被录屏 / 输入法 / 显卡 overlay
+        /// 抢了全局热键），而且键盘方案没有任何可视入口 —— 用户连"这个功能存在"
+        /// 都不知道。悬浮球看得见、点得到，也不跟任何按键冲突。
+        ///
+        /// 交互：**拖 = 挪位置**（钳在屏幕内），**点一下 = 打开工作台**
+        /// （按下到松开没怎么移动才算点击）。工作台打开时不画。
+        /// </summary>
+        private void DrawFloatingBall()
+        {
+            EditorStudioOverlay overlay = Main.Overlay;
+            if (overlay == null || overlay.IsVisible)
+            {
+                if (_ballBlocker != null && _ballBlocker.gameObject.activeSelf)
+                {
+                    _ballBlocker.gameObject.SetActive(false);
+                }
+                return;
+            }
+            if (!EditorBridge.IsEditorActive())
+            {
+                if (_ballBlocker != null && _ballBlocker.gameObject.activeSelf)
+                {
+                    _ballBlocker.gameObject.SetActive(false);
+                }
+                return;
+            }
+            // 游玩中不出现：原来 F8 那条路在这里会提示"先按 Esc 退出游玩"，
+            // 悬浮球更简单 —— 直接不画，玩家根本点不到。
+            if (EditorStudioOverlay.IsNativePlayModeRunning())
+            {
+                if (_ballBlocker != null && _ballBlocker.gameObject.activeSelf)
+                {
+                    _ballBlocker.gameObject.SetActive(false);
+                }
+                return;
+            }
+
+            IntPtr textureId = EnsureLogoTexture();
+            ImGuiIOPtr io = ImGui.GetIO();
+            NVec2 display = io.DisplaySize;
+            if (!_ballPlaced)
+            {
+                _ballPlaced = true;
+                _ballCenter = new NVec2(display.X - BallMargin - BallDiameter * 0.5f,
+                    display.Y * 0.30f);
+            }
+            ClampBallCenter(display);
+
+            NVec2 topLeft = new NVec2(_ballCenter.X - BallDiameter * 0.5f,
+                _ballCenter.Y - BallDiameter * 0.5f);
+            ImGui.SetNextWindowPos(topLeft, ImGuiCond.Always);
+            ImGui.SetNextWindowSize(new NVec2(BallDiameter, BallDiameter), ImGuiCond.Always);
+            ImGui.PushStyleVar(ImGuiStyleVar.WindowPadding, new NVec2(0f, 0f));
+            ImGui.PushStyleVar(ImGuiStyleVar.WindowBorderSize, 0f);
+            ImGui.PushStyleColor(ImGuiCol.WindowBg, new NVec4(0f, 0f, 0f, 0f));
+            bool open = ImGui.Begin("##aes_floating_ball",
+                ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize
+                | ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoCollapse
+                | ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse
+                | ImGuiWindowFlags.NoSavedSettings | ImGuiWindowFlags.NoBackground
+                | ImGuiWindowFlags.NoFocusOnAppearing | ImGuiWindowFlags.NoNav);
+            if (!open)
+            {
+                ImGui.End();
+                ImGui.PopStyleColor();
+                ImGui.PopStyleVar(2);
+                return;
+            }
+
+            NVec2 origin = ImGui.GetCursorScreenPos();
+            ImGui.InvisibleButton("##ball", new NVec2(BallDiameter, BallDiameter));
+            bool hovered = ImGui.IsItemHovered();
+
+            if (ImGui.IsItemActivated())
+            {
+                _ballPressPos = io.MousePos;
+                _ballPressCenter = _ballCenter;
+                _ballMoved = false;
+            }
+            if (ImGui.IsItemActive())
+            {
+                NVec2 delta = new NVec2(io.MousePos.X - _ballPressPos.X,
+                    io.MousePos.Y - _ballPressPos.Y);
+                if (!_ballMoved
+                    && Mathf.Abs(delta.X) + Mathf.Abs(delta.Y) > BallDragThreshold)
+                {
+                    _ballMoved = true;
+                }
+                if (_ballMoved)
+                {
+                    _ballCenter = new NVec2(_ballPressCenter.X + delta.X,
+                        _ballPressCenter.Y + delta.Y);
+                    ClampBallCenter(display);
+                }
+            }
+            // **松手才算点击**：按下就开会把"想拖一下位置"变成"打开了工作台"。
+            if (ImGui.IsItemDeactivated() && !_ballMoved)
+            {
+                overlay.OpenFromFloatingBall();
+            }
+
+            ImDrawListPtr draw = ImGui.GetWindowDrawList();
+            float radius = BallDiameter * 0.5f;
+            NVec2 center = new NVec2(origin.X + radius, origin.Y + radius);
+            if (textureId != IntPtr.Zero)
+            {
+                draw.AddImageRounded(textureId, origin,
+                    new NVec2(origin.X + BallDiameter, origin.Y + BallDiameter),
+                    new NVec2(0f, 0f), new NVec2(1f, 1f),
+                    ImGui.GetColorU32(new NVec4(1f, 1f, 1f, hovered ? 1f : 0.92f)), radius);
+            }
+            else
+            {
+                draw.AddCircleFilled(center, radius,
+                    ImGui.GetColorU32(ToVec4(Palette.Accent)), 32);
+            }
+            // **常驻描边。** 球是浮在游戏画面上的，没有轮廓时遇到亮背景会和背景
+            // 糊在一起、看不出边界。平时用控件轮廓色（就是主题里按 3:1 选的那档），
+            // 悬停换成强调色并加粗一点。
+            float ringRadius = radius - 1f;
+            draw.AddCircle(center, ringRadius,
+                ImGui.GetColorU32(ToVec4(hovered
+                    ? Palette.AccentSecondary
+                    : UiTheme.Current.BorderStrong)),
+                48, hovered ? 2.5f : 2f);
+            if (hovered)
+            {
+                ImGui.SetTooltip("打开工作台");
+            }
+
+            ImGui.End();
+            ImGui.PopStyleColor();
+            ImGui.PopStyleVar(2);
+
+            // 点击遮挡：不然点悬浮球会先选中它下面的格子。
+            SyncBlocker(_ballBlocker,
+                new Rect(topLeft.X, topLeft.Y, BallDiameter, BallDiameter), true);
+        }
 
         /// <summary>
         /// 画常驻面板（现在只有参数栏）。和文字窗口的区别：**不压暗、不模态**，

@@ -108,6 +108,14 @@ namespace ADOFAIEditorStudio
         /// <summary>开始一次测量，并标记空格键走的是哪条路径。</summary>
         internal static void Arm(string route)
         {
+            // **只在开发者设置打开"探针总闸"时才武装。**
+            // 原来从工作台按播放会**无条件**启动它：日志里刷一串 [HandoffProbe]，
+            // 顶栏还会被塞一句 "[探针] …"。那是排查交接帧时用的，不该出现在玩家那边。
+            if (Main.Settings == null || !Main.Settings.VerboseDiagnostics)
+            {
+                return;
+            }
+
             for (int i = 0; i < Buckets.Length; i++)
             {
                 if (Buckets[i] != null)
