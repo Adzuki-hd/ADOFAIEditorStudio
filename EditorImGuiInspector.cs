@@ -45,6 +45,33 @@ namespace ADOFAIEditorStudio
 
         /// <summary>当前画的那个事件。和 uGUI 一样每 0.12 秒去看一眼选中变了没有。</summary>
         private LevelEvent _target;
+
+        /// <summary>当前显示的事件。粒子编辑器要用它取属性表。</summary>
+        internal LevelEvent Target { get { return _target; } }
+
+        /// <summary>
+        /// 给外部面板用：在**当前光标处**画一个属性的值（不含标签），宽度固定。
+        ///
+        /// 内部只是临时把 `_target` 换成目标事件 —— `DrawValue` 和 `Commit`
+        /// 都认这个字段，所以提交、只读拦截、撤销都自动走同一条路。
+        /// </summary>
+        internal void DrawValueFor(LevelEvent target, ADOFAI.PropertyInfo info, float width)
+        {
+            if (target == null || info == null)
+            {
+                return;
+            }
+            LevelEvent saved = _target;
+            _target = target;
+            try
+            {
+                DrawValue(info, ImGui.GetCursorPosX() + width);
+            }
+            finally
+            {
+                _target = saved;
+            }
+        }
         private float _nextPoll;
 
         internal EditorImGuiInspector(bool settingsPane)
@@ -923,7 +950,7 @@ namespace ADOFAIEditorStudio
                 draw.ChannelsSetCurrent(0);
                 draw.AddRectFilled(cardMin, cardMax,
                     ImGui.GetColorU32(ToVec4(
-                        ImGui.IsMouseHoveringRect(cardMin, cardMax)
+                        RowHovered(cardMin, cardMax)
                             ? Palette.ButtonHover
                             : Palette.Raised)),
                     EditorStudioOverlay.CornerSmall);
@@ -999,7 +1026,7 @@ namespace ADOFAIEditorStudio
                 draw.ChannelsSetCurrent(0);
                 draw.AddRectFilled(cardMin, cardMax,
                     ImGui.GetColorU32(ToVec4(
-                        ImGui.IsMouseHoveringRect(cardMin, cardMax)
+                        RowHovered(cardMin, cardMax)
                             ? Palette.ButtonHover
                             : Palette.Raised)),
                     EditorStudioOverlay.CornerSmall);
@@ -1008,6 +1035,19 @@ namespace ADOFAIEditorStudio
                 ImGui.PopID();
             }
             ImGui.PopStyleVar();
+        }
+
+        /// <summary>
+        /// 鼠标是不是真的停在**这张卡片**上。
+        ///
+        /// `ImGui.IsMouseHoveringRect` 只是纯几何判断：弹出层（下拉列表、调色盘、
+        /// 悬停提示）盖在卡片上时它照样为真 —— 鼠标在弹层里移动，下面那一行
+        /// 就跟着高亮，看起来像"弹层能穿透到底下的参数栏"。
+        /// `IsWindowHovered` 在鼠标落在弹层上时为假，两条一起用才是"真的指在这"。
+        /// </summary>
+        private static bool RowHovered(NVec2 min, NVec2 max)
+        {
+            return ImGui.IsMouseHoveringRect(min, max) && ImGui.IsWindowHovered();
         }
 
         /// <summary>
@@ -1051,12 +1091,19 @@ namespace ADOFAIEditorStudio
             }
         }
 
+        /// <summary>
+        /// 提交过多少次修改。粒子编辑器靠它判断"预览要不要重建" ——
+        /// 预览对象是打开时按事件 `Setup` 出来的，改完参数不重建就看不到变化。
+        /// </summary>
+        internal int CommitVersion;
+
         private void Commit(string key, object value)
         {
             EditorPropertyPanel panel = Panel;
             if (panel != null && _target != null)
             {
                 panel.Commit(_target, key, value);
+                CommitVersion++;
             }
         }
 
@@ -1165,6 +1212,24 @@ namespace ADOFAIEditorStudio
                         break;
                     case ADOFAI.PropertyType.Color:
                         DrawColor(info, rowId, width);
+                        break;
+                    case ADOFAI.PropertyType.ParticlePlayback:
+                        // 粒子发射器那一行（原版 `PropertyControl_ParticlePlayback`）：
+                        // 播放/暂停、停止、重置、编辑。**以前这里显示「暂不支持」。**
+                        DrawParticlePlayback(info, rowId, width);
+                        break;
+                    case ADOFAI.PropertyType.FloatPair:
+                        DrawFloatPair(info, rowId, width);
+                        break;
+                    case ADOFAI.PropertyType.Vector2Range:
+                        DrawVector2Range(info, rowId, width);
+                        break;
+                    case ADOFAI.PropertyType.MinMaxGradient:
+                        DrawMinMaxGradient(info, rowId, width);
+                        break;
+                    case ADOFAI.PropertyType.Tile:
+                        // `startTile` / `endTile` 这一类：数字 + 「相对谁」。
+                        DrawTile(info, rowId, width);
                         break;
                     default:
                         ImGui.TextUnformatted("<暂不支持 " + info.type + ">");
@@ -1294,6 +1359,277 @@ namespace ADOFAIEditorStudio
         {
             EditorStudioOverlay overlay = Main.Overlay;
             return overlay == null || overlay.AllowEdit();
+        }
+
+        /// <summary>
+        /// 粒子发射器的播放控制。
+        ///
+        /// 原版是 `PropertyControl_ParticlePlayback`：绑到该事件对应的
+        /// `scrParticleDecoration`，直接操作它的 `ParticleSystem` ——
+        /// 播放/暂停（用非缩放时间，暂停游戏也能看）、停止（连已有粒子一起清）、
+        /// 重置（只清空）、编辑（打开原版粒子编辑器）。
+        ///
+        /// **这一项不改谱面数据**，只控制预览里的粒子，所以不受只读限制。
+        /// </summary>
+        private void DrawParticlePlayback(ADOFAI.PropertyInfo info, string rowId, float width)
+        {
+            scrParticleDecoration decoration = null;
+            try
+            {
+                if (_target != null && scrDecorationManager.instance != null)
+                {
+                    decoration = scrDecorationManager.GetDecoration(_target) as scrParticleDecoration;
+                }
+            }
+            catch
+            {
+                decoration = null;
+            }
+
+            ParticleSystem system = decoration == null ? null : decoration.particleSystem;
+            if (system == null)
+            {
+                ImGui.AlignTextToFramePadding();
+                PushText(ImGuiCol.Text, Palette.TextMuted);
+                ImGui.TextUnformatted("（还没有对应的粒子对象）");
+                ImGui.PopStyleColor();
+                return;
+            }
+
+            bool playing = system.isPlaying;
+            const float gap = 6f;
+            float buttonWidth = Mathf.Max(1f, (width - gap * 3f) * 0.25f);
+
+            if (StyledSmallButton(playing ? "暂停" : "播放", rowId + "_play", buttonWidth))
+            {
+                ParticleSystem.MainModule main = system.main;
+                main.useUnscaledTime = true;
+                if (system.isPlaying)
+                {
+                    system.Pause();
+                }
+                else
+                {
+                    system.Play();
+                }
+            }
+
+            ImGui.SameLine(0f, gap);
+            if (StyledSmallButton("停止", rowId + "_stop", buttonWidth))
+            {
+                system.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+            }
+
+            ImGui.SameLine(0f, gap);
+            if (StyledSmallButton("重置", rowId + "_reset", buttonWidth))
+            {
+                system.Clear();
+            }
+
+            ImGui.SameLine(0f, gap);
+            if (StyledSmallButton("编辑", rowId + "_edit", buttonWidth))
+            {
+                // **打开我们自己画的那扇粒子编辑器。**
+                // 原版那扇（uGUI，canvas order=1）被工作台两层画布压住，
+                // 压排序和关工作台都试过 —— 看不见。所以自己复刻一扇。
+                EditorImGuiBridge bridge = EditorImGuiBridge.Instance;
+                if (bridge != null)
+                {
+                    bridge.ParticleEditor.Visible = true;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 一对浮点（`Tuple&lt;float,float&gt;`）—— 粒子的 startRotation / lifetime /
+        /// size / emissionRate 都是这种"最小 ~ 最大"的范围值。
+        /// </summary>
+        private void DrawFloatPair(ADOFAI.PropertyInfo info, string rowId, float width)
+        {
+            Tuple<float, float> pair = EditorPropertyPanel.SafeGet<Tuple<float, float>>(
+                _target, info, null) ?? new Tuple<float, float>(0f, 0f);
+            const float gap = 6f;
+            float half = Mathf.Max(1f, (width - gap) * 0.5f);
+            float low = pair.Item1;
+            float high = pair.Item2;
+
+            TextField(rowId + "#lo", EditorPropertyPanel.FormatFloat(low), half,
+                delegate(string text)
+                {
+                    float parsed;
+                    if (float.TryParse(text, NumberStyles.Float,
+                        CultureInfo.InvariantCulture, out parsed))
+                    {
+                        Commit(info.name, new Tuple<float, float>(parsed, high));
+                    }
+                });
+            ImGui.SameLine(0f, gap);
+            TextField(rowId + "#hi", EditorPropertyPanel.FormatFloat(high), half,
+                delegate(string text)
+                {
+                    float parsed;
+                    if (float.TryParse(text, NumberStyles.Float,
+                        CultureInfo.InvariantCulture, out parsed))
+                    {
+                        Commit(info.name, new Tuple<float, float>(low, parsed));
+                    }
+                });
+        }
+
+        /// <summary>
+        /// 两对 Vector2（`Tuple&lt;Vector2,Vector2&gt;`）—— 粒子的「随时间变速」就是这个。
+        ///
+        /// **排成两行**（X 一行、Y 一行，各自「最小 - 最大」），和原版一致。
+        /// 原来挤成一行四个框，读不出哪个是最小、哪个是最大，也分不清 X/Y。
+        /// </summary>
+        private void DrawVector2Range(ADOFAI.PropertyInfo info, string rowId, float width)
+        {
+            Tuple<Vector2, Vector2> range =
+                EditorPropertyPanel.SafeGet<Tuple<Vector2, Vector2>>(_target, info, null)
+                ?? new Tuple<Vector2, Vector2>(Vector2.zero, Vector2.zero);
+            Vector2 a = range.Item1;
+            Vector2 b = range.Item2;
+
+            string unit = ResolveUnit(info);
+            float unitWidth = string.IsNullOrEmpty(unit)
+                ? 0f : ImGui.CalcTextSize(unit).X + 6f;
+            const float axisWidth = 18f;
+            const float dashWidth = 14f;
+            float fieldWidth = Mathf.Max(24f,
+                (width - axisWidth - dashWidth - unitWidth) * 0.5f);
+            float startX = ImGui.GetCursorPosX();
+
+            DrawRangeLine(startX, "X", rowId + "#x", a.x, b.x, unit, fieldWidth,
+                delegate(float low, float high)
+                {
+                    Commit(info.name, new Tuple<Vector2, Vector2>(
+                        new Vector2(low, a.y), new Vector2(high, b.y)));
+                });
+
+            ImGui.SetCursorPosX(startX);
+            DrawRangeLine(startX, "Y", rowId + "#y", a.y, b.y, unit, fieldWidth,
+                delegate(float low, float high)
+                {
+                    Commit(info.name, new Tuple<Vector2, Vector2>(
+                        new Vector2(a.x, low), new Vector2(b.x, high)));
+                });
+        }
+
+        /// <summary>「X  [最小] - [最大]  单位」这一行。</summary>
+        private void DrawRangeLine(float startX, string axisLabel, string id,
+            float low, float high, string unit, float fieldWidth,
+            System.Action<float, float> apply)
+        {
+            ImGui.AlignTextToFramePadding();
+            ImGui.TextUnformatted(axisLabel);
+            ImGui.SameLine(startX + 18f);
+
+            TextField(id + "#lo", EditorPropertyPanel.FormatFloat(low), fieldWidth,
+                delegate(string text)
+                {
+                    float parsed;
+                    if (float.TryParse(text, NumberStyles.Float,
+                        CultureInfo.InvariantCulture, out parsed))
+                    {
+                        apply(parsed, high);
+                    }
+                });
+
+            ImGui.SameLine(0f, 4f);
+            ImGui.TextUnformatted("-");
+            ImGui.SameLine(0f, 4f);
+
+            TextField(id + "#hi", EditorPropertyPanel.FormatFloat(high), fieldWidth,
+                delegate(string text)
+                {
+                    float parsed;
+                    if (float.TryParse(text, NumberStyles.Float,
+                        CultureInfo.InvariantCulture, out parsed))
+                    {
+                        apply(low, parsed);
+                    }
+                });
+
+            if (!string.IsNullOrEmpty(unit))
+            {
+                ImGui.SameLine(0f, 6f);
+                ImGui.TextUnformatted(unit);
+            }
+        }
+
+        /// <summary>
+        /// 两个颜色（`ParticleSystem.MinMaxGradient`）—— 粒子的 color /
+        /// colorOverLifetime 用这个。统一按 TwoColors 存。
+        /// </summary>
+        private void DrawMinMaxGradient(ADOFAI.PropertyInfo info, string rowId, float width)
+        {
+            ParticleSystem.MinMaxGradient gradient;
+            try
+            {
+                gradient = _target.GetMinMaxGradient(info.name);
+            }
+            catch
+            {
+                gradient = default(ParticleSystem.MinMaxGradient);
+            }
+
+            bool twoColors = gradient.mode == ParticleSystemGradientMode.TwoColors;
+            Color low = twoColors ? gradient.colorMin : gradient.color;
+            Color high = twoColors ? gradient.colorMax : gradient.color;
+
+            const float gap = 6f;
+            float half = Mathf.Max(1f, (width - gap) * 0.5f);
+
+            DrawGradientHalf(rowId + "#lo", low, half,
+                delegate(Color picked) { CommitMinMaxGradient(info.name, picked, high); });
+            ImGui.SameLine(0f, gap);
+            DrawGradientHalf(rowId + "#hi", high, half,
+                delegate(Color picked) { CommitMinMaxGradient(info.name, low, picked); });
+        }
+
+        private void CommitMinMaxGradient(string key, Color low, Color high)
+        {
+            // **必须存 `SerializedMinMaxGradient`，不能存 Unity 的 `MinMaxGradient`。**
+            //
+            // 游戏读的是前者：`LevelEvent.GetMinMaxGradient` 走的是
+            // `Get<SerializedMinMaxGradient>(key).ToMinMaxGradient()`。
+            // 存一个 Unity 结构体进去，类型对不上 → 读出来是默认值 → 全黑，
+            // 而且再改也还是黑（实测就是这么坏的）。
+            ADOFAI.Editor.Models.SerializedMinMaxGradient value =
+                new ADOFAI.Editor.Models.SerializedMinMaxGradient
+                {
+                    mode = ParticleSystemGradientMode.TwoColors,
+                    color1 = EditorPropertyPanel.ColorToHex(low),
+                    color2 = EditorPropertyPanel.ColorToHex(high),
+                };
+            Commit(key, value);
+        }
+
+        /// <summary>半个渐变：色块（点开取色器）+ HEX 输入框。</summary>
+        private void DrawGradientHalf(string id, Color color, float width,
+            System.Action<Color> apply)
+        {
+            NVec4 value = new NVec4(color.r, color.g, color.b, color.a);
+            float swatch = ImGui.GetTextLineHeight();
+            ImGui.SetNextItemWidth(swatch);
+            if (ImGui.ColorEdit4("##" + id, ref value,
+                ImGuiColorEditFlags.NoInputs
+                | ImGuiColorEditFlags.AlphaPreviewHalf
+                | ImGuiColorEditFlags.NoLabel))
+            {
+                apply(new Color(value.X, value.Y, value.Z, value.W));
+            }
+            ImGui.SameLine(0f, 4f);
+            TextField(id + "#hex", EditorPropertyPanel.ColorToHex(color),
+                Mathf.Max(1f, width - swatch - 4f),
+                delegate(string text)
+                {
+                    Color parsed;
+                    if (EditorPropertyPanel.TryParseHex(text, out parsed))
+                    {
+                        apply(parsed);
+                    }
+                });
         }
 
         /// <summary>
@@ -1447,6 +1783,113 @@ namespace ADOFAIEditorStudio
                         Commit(info.name, picked);
                     }
                 }
+            }
+        }
+
+        /// <summary>
+        /// Tile 参数（`startTile` / `endTile` 这一类）：一个相对数字 + 一个「相对谁」。
+        ///
+        /// **存储格式别搞错**：内存里是 `Tuple<int, TileRelativeTo>`，写盘时由
+        /// 游戏编码成 `[数字, "ThisTile"/"Start"/"End"]`（见 `LevelEvent.Decode`
+        /// 和 `RDEditorUtils.EncodeTile`）。原版控件是「输入框 + 三个按钮」
+        /// （`PropertyControl_Tile`），这里压成「输入框 + 下拉」—— 面板宽度
+        /// 放三个按钮会把数字框挤没。
+        ///
+        /// 语义和 `PreviewTimelineContext.ResolveTile` 一致：
+        ///   · 本格 = 事件所在格 + n
+        ///   · 起点 = 第 n 格（绝对）
+        ///   · 终点 = 最后一格 + n
+        /// </summary>
+        private void DrawTile(ADOFAI.PropertyInfo info, string rowId, float width)
+        {
+            const float gap = 6f;
+            float numberWidth = Mathf.Clamp(width * 0.42f, 48f, width);
+            float modeWidth = Mathf.Max(1f, width - numberWidth - gap);
+
+            Tuple<int, TileRelativeTo> current = ReadTile(info);
+            TextField(rowId, current.Item1.ToString(CultureInfo.InvariantCulture),
+                numberWidth,
+                delegate(string text)
+                {
+                    int parsed;
+                    if (int.TryParse(text, NumberStyles.Integer,
+                        CultureInfo.InvariantCulture, out parsed))
+                    {
+                        // 模式取**提交这一刻**的值：用户可能刚改过下拉，
+                        // 而这里只拿到了数字。
+                        Commit(info.name, new Tuple<int, TileRelativeTo>(
+                            parsed, ReadTile(info).Item2));
+                    }
+                });
+
+            ImGui.SameLine(0f, gap);
+            // 下拉箭头那块的底色压成和输入框一样 —— 它默认用 `ImGuiCol.Button`，
+            // 连到这里就和数字框读成两个控件（和 `DrawEnum` 同一条处理）。
+            ImGuiStylePtr style = ImGui.GetStyle();
+            ImGui.PushStyleColor(ImGuiCol.Button,
+                style.Colors[(int)ImGuiCol.FrameBg]);
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, ToVec4(Palette.ButtonHover));
+            ImGui.SetNextItemWidth(modeWidth);
+            if (ImGui.BeginCombo("##tileref-" + rowId, TileRelativeLabel(current.Item2)))
+            {
+                NotePopupRect();
+                TileRelativeTo[] options =
+                {
+                    TileRelativeTo.ThisTile,
+                    TileRelativeTo.Start,
+                    TileRelativeTo.End
+                };
+                for (int i = 0; i < options.Length; i++)
+                {
+                    bool selected = current.Item2 == options[i];
+                    if (ImGui.Selectable(TileRelativeLabel(options[i]), selected))
+                    {
+                        Commit(info.name, new Tuple<int, TileRelativeTo>(
+                            ReadTile(info).Item1, options[i]));
+                    }
+                    if (selected)
+                    {
+                        ImGui.SetItemDefaultFocus();
+                    }
+                }
+                ImGui.EndCombo();
+            }
+            ImGui.PopStyleColor(2);
+        }
+
+        private Tuple<int, TileRelativeTo> ReadTile(ADOFAI.PropertyInfo info)
+        {
+            Tuple<int, TileRelativeTo> value =
+                EditorPropertyPanel.SafeGet<Tuple<int, TileRelativeTo>>(_target, info, null);
+            // 老谱面可能没写这一项 —— 默认就是「本格 + 0」，也就是事件自己那一格，
+            // 和 `ResolveTile` 对 null 的处理一致。
+            return value ?? new Tuple<int, TileRelativeTo>(0, TileRelativeTo.ThisTile);
+        }
+
+        private static string TileRelativeLabel(TileRelativeTo mode)
+        {
+            string key = "enum.TileRelativeTo." + mode;
+            try
+            {
+                string localized = RDString.Get(key);
+                if (!string.IsNullOrWhiteSpace(localized)
+                    && !string.Equals(localized, key, StringComparison.Ordinal))
+                {
+                    return localized;
+                }
+            }
+            catch
+            {
+                // 没有本地化就用下面这组短标签。
+            }
+            switch (mode)
+            {
+                case TileRelativeTo.Start:
+                    return "起点";
+                case TileRelativeTo.End:
+                    return "终点";
+                default:
+                    return "本格";
             }
         }
 

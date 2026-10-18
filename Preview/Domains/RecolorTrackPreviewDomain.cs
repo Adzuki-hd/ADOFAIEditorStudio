@@ -87,6 +87,26 @@ namespace ADOFAIEditorStudio.Preview.Domains
         private Color[] floorBaseColor = new Color[0];
         private float[] floorBaseGlow = new float[0];
 
+        /// <summary>
+        /// 每格**在被我们接管之前**的 baked 颜色状态，回退到"这一格还没有任何
+        /// recolor 事件"时用来还原。
+        ///
+        /// 不还原的话：播放走过 575 格的 RecolorTrack 之后往回拖，求值器对
+        /// "当前时刻之前没有事件"的格直接跳过 —— 而我们上一帧已经把
+        /// `specialColor*` / `glowMultiplier` 改成事件那一套了，`scrFloor.Update`
+        /// 会继续按那套算，格就永远停在事件的颜色上（实测症状就是
+        /// "经过 575 格再退回 575 之前，轨道颜色不还原"）。
+        /// </summary>
+        private TrackColorType[] bakedSpecialType = new TrackColorType[0];
+        private Color[] bakedSpecialColor1 = new Color[0];
+        private Color[] bakedSpecialColor2 = new Color[0];
+        private float[] bakedSpecialAnimDuration = new float[0];
+        private float[] bakedSpecialTimeOffset = new float[0];
+        /// <summary>格子在加载时被赋予的轨道样式（`initialTrackStyle`）。</summary>
+        private TrackStyle[] bakedStyle = new TrackStyle[0];
+        /// <summary>这一格被我们写过没有。没写过就别碰它 —— 游戏自己管得好好的。</summary>
+        private bool[] touched = new bool[0];
+
         private Color defaultSecondaryColor = Color.white;
         private TrackColorType defaultColorType;
         private TrackColorPulse defaultPulse;
@@ -206,6 +226,13 @@ namespace ADOFAIEditorStudio.Preview.Domains
             int count = context.Floors.Count;
             floorBaseColor = new Color[count];
             floorBaseGlow = new float[count];
+            bakedSpecialType = new TrackColorType[count];
+            bakedSpecialColor1 = new Color[count];
+            bakedSpecialColor2 = new Color[count];
+            bakedSpecialAnimDuration = new float[count];
+            bakedSpecialTimeOffset = new float[count];
+            bakedStyle = new TrackStyle[count];
+            touched = new bool[count];
             for (int i = 0; i < count; i++)
             {
                 scrFloor floor = context.GetFloorBinding(i);
@@ -217,6 +244,20 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 // 谱面设置是确定的，不受时机影响。
                 floorBaseColor[i] = defaultTrackColor;
                 floorBaseGlow[i] = defaultGlowIntensity / 100f;
+
+                // **这四个字段是求值器自己会改写的**，所以要留一份原件。
+                // 拿不到格对象时留默认值 —— 那种格本来也不会被求值（见 Evaluate
+                // 里的 null 判断），还原分支同样碰不到它。
+                if (floor == null)
+                {
+                    continue;
+                }
+                bakedSpecialType[i] = floor.specialColorType;
+                bakedSpecialColor1[i] = floor.specialColor1;
+                bakedSpecialColor2[i] = floor.specialColor2;
+                bakedSpecialAnimDuration[i] = floor.specialAnimDuration;
+                bakedSpecialTimeOffset[i] = floor.specialTimeOffset;
+                bakedStyle[i] = floor.initialTrackStyle;
             }
         }
 
@@ -246,13 +287,17 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 RecolorEvent current = FindLastAffectingEvent(floorIndex, frame.Time);
                 if (current == null)
                 {
-                    // 没有东西拥有这一格的颜色，所以别管它。
+                    // **当前时刻之前没有事件 = 这一格应该回到 baked 状态。**
                     //
-                    // 这一格每帧自己驱动颜色，来源是烤入的
-                    // specialColor/Pulse 字段（scrFloor.Update），Glow 和
-                    // Pulse 轨道就是这么来的。在这里写任何东西——关卡默认值，
-                    // 甚至只是某一帧的快照——都会覆盖那个动画，
-                    // 把轨道冻成一片平色。
+                    // 以前这里直接跳过，理由是"这一格每帧自己驱动颜色"——
+                    // 那在**从没被我们写过的格**上成立（Glow/Pulse 的 baked 动画
+                    // 由 scrFloor.Update 自己跑）。可一旦我们接管过这一格，
+                    // `specialColor*` / `glowMultiplier` 已经被事件那套覆盖了，
+                    // Update 会继续按那套算 —— 于是把播放头拖回事件之前，
+                    // 格还停在事件的颜色上（"经过 575 格再退回 575 之前不还原"）。
+                    //
+                    // 没被我们碰过的格仍然不碰：还原成它自己才是对的。
+                    RestoreBakedState(floorIndex, floor);
                     continue;
                 }
 
@@ -315,6 +360,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     continue;
                 }
 
+                // 从这一刻起这一格归我们管 —— 之后回退到事件之前要还原。
+                touched[floorIndex] = true;
                 floor.SetColor(color);
                 floor.glowMultiplier = glow;
 
@@ -358,6 +405,43 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     appliedGlow[floorIndex] = glow;
                     appliedValid[floorIndex] = true;
                 }
+            }
+        }
+
+        /// <summary>
+        /// 把一格还原成"我们接管之前"的样子。只有被写过（<see cref="touched"/>）
+        /// 的格才动 —— 没写过的格本来就是这个状态，去写反而会打断它的 baked 动画。
+        /// </summary>
+        private void RestoreBakedState(int floorIndex, scrFloor floor)
+        {
+            if (floorIndex < 0 || floorIndex >= touched.Length || !touched[floorIndex])
+            {
+                return;
+            }
+            touched[floorIndex] = false;
+
+            floor.specialColorType = bakedSpecialType[floorIndex];
+            floor.specialColor1 = bakedSpecialColor1[floorIndex];
+            floor.specialColor2 = bakedSpecialColor2[floorIndex];
+            floor.specialAnimDuration = bakedSpecialAnimDuration[floorIndex];
+            floor.specialTimeOffset = bakedSpecialTimeOffset[floorIndex];
+            floor.SetColor(floorBaseColor[floorIndex]);
+            floor.glowMultiplier = floorBaseGlow[floorIndex];
+
+            // 样式也归我们改过（SetTrackStyle），一并退回这一格 baked 的样式。
+            // 只有真的推过样式才走 —— SetTrackStyle 要写十来个材质属性。
+            if (floorIndex < appliedStyle.Length && appliedStyle[floorIndex] >= 0
+                && floorIndex < bakedStyle.Length)
+            {
+                TrackStyle style = bakedStyle[floorIndex];
+                appliedStyle[floorIndex] = (int)style;
+                floor.SetTrackStyle(style, false, null);
+            }
+
+            // 缓存跟着作废：下一次走到事件上必须重新写一遍。
+            if (floorIndex < appliedValid.Length)
+            {
+                appliedValid[floorIndex] = false;
             }
         }
 

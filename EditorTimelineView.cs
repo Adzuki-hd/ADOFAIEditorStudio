@@ -1421,8 +1421,10 @@ namespace ADOFAIEditorStudio
         /// <summary>
         /// 当前选中的**事件**（多选优先，否则主选中的那一个）。装饰物不在内。
         ///
-        /// 参数栏也用它：批量改参要知道「现在算是选中了哪一批」，
-        /// 而那个判断和多选删除/复制必须是同一个 —— 两处各写一套迟早会岔开。
+        /// 复制 / 剪切用它（装饰物走另一条复制路径）。
+        /// **删除不能用它** —— 见 <see cref="DeleteSelection"/> 里那段：框选出来的
+        /// 装饰物不在这份里，会被静默漏掉。参数栏也用不滤装饰物的
+        /// <see cref="PanelSelection"/>。
         /// </summary>
         internal List<LevelEvent> CollectSelection()
         {
@@ -1556,7 +1558,17 @@ namespace ADOFAIEditorStudio
                 return false;
             }
 
-            List<LevelEvent> targets = CollectSelection();
+            // **删除要用不滤装饰物的那份选集。**
+            //
+            // `CollectSelection()` 会把装饰物（`AddDecoration` / `AddText`）整个滤掉，
+            // 指望它们由游戏那侧的 `selectedDecorations` 单独交上来。可那份只有
+            // "在时间轴上直接点一下"才会被 `SyncSceneSelection` 填上 ——
+            // **框选和 Ctrl 点选都不填**，于是那些装饰物块看着选中了，按 Delete
+            // 却一个都不删。
+            //
+            // `RemoveSelection` 本来就会按"目标实际躺在 events 还是 decorations 里"
+            // 分类，所以这里直接把全都交给它，重复的它自己会去重。
+            List<LevelEvent> targets = PanelSelection();
 
             List<LevelEvent> decorations = new List<LevelEvent>();
             if (editor.selectedDecorations != null)
@@ -1575,12 +1587,12 @@ namespace ADOFAIEditorStudio
                 return false;
             }
 
-            if (!EditorCommandHistory.RemoveSelection(editor, targets, decorations))
+            int removed;
+            if (!EditorCommandHistory.RemoveSelection(editor, targets, decorations, out removed))
             {
                 return false;
             }
 
-            int removed = targets.Count + decorations.Count;
             // 装饰物已经不在谱面里了，原生那份选中还指着它们 —— 不清掉
             // 面板会拿着一批死引用继续显示。
             if (editor.selectedDecorations != null)
@@ -2818,6 +2830,20 @@ namespace ADOFAIEditorStudio
         private readonly List<BlockPlacement> blockPlacements = new List<BlockPlacement>();
         private readonly List<BlockView> blockViews = new List<BlockView>();
 
+        /// <summary>
+        /// 刚**消失**的事件记着它最后一次待的行号，撤销回来时按这张表领回去。
+        ///
+        /// 不记的话：删除 → 下一次刷新位置表里那一条被丢掉 → 撤销把**同一个**
+        /// `LevelEvent` 放回来，但它对现在的表来说是个"新块"，前缀也查不到，
+        /// 只能领 `++maxRow`，也就是掉到最下面 —— 用户看到的就是
+        /// "撤回后没回到之前的位置"。
+        ///
+        /// 按**事件对象**记（引用比较），因为撤销插回来的就是被删的那个对象；
+        /// 换个对象的一般是换谱面 / 原生撤销，那种走前缀兜底，不该套这张表。
+        /// </summary>
+        private readonly Dictionary<LevelEvent, int> removedRows =
+            new Dictionary<LevelEvent, int>(ReferenceComparer<LevelEvent>.Instance);
+
         /// <summary>画布上摆着的块，**按行升序**（上面的先画，下面的盖住它）。</summary>
         internal List<BlockView> BlockViews { get { return blockViews; } }
 
@@ -3068,6 +3094,8 @@ namespace ADOFAIEditorStudio
             // 等于什么都没重置，清掉 `projectRows` 也白搭。
             forcePlacementRebuild = true;
             blockPlacements.Clear();
+            // 整张重排，之前删掉那些事件的行号对新布局没有意义。
+            removedRows.Clear();
             EnsureBlockPlacements();
             visualsDirty = true;
             // 整张重排过了，这就是一份没存过的新布局。
@@ -3113,6 +3141,8 @@ namespace ADOFAIEditorStudio
                     // 清掉之后，下面「还没排过版就先确认清单是最新的」那道检查
                     // 才会生效：新谱的事件清单还没刷进来时先不排，等刷好再排。
                     blockPlacements.Clear();
+                    // 换谱面了：上一张谱里删掉那些事件的行号不能套到新谱上。
+                    removedRows.Clear();
 
                     // 换了一张谱：排完版后横向缩放重新给到最大。
                     pendingZoomToMaximum = true;
@@ -3526,6 +3556,26 @@ namespace ADOFAIEditorStudio
                     }
                 }
 
+                if (row < 0 && item.Event != null)
+                {
+                    // **刚才被删掉、现在又回来了的事件。**
+                    //
+                    // 撤销插回的就是当初删掉的那个对象（见 `RemoveEvents`），
+                    // 所以能按引用认出来，把它原来的行号还给它。
+                    // 放在前缀兜底之后 —— 前缀更准（它要求身份一致），
+                    // 只有前缀也查不到才轮到这里。
+                    int restoredRow;
+                    if (removedRows.TryGetValue(item.Event, out restoredRow))
+                    {
+                        row = restoredRow;
+                        removedRows.Remove(item.Event);
+                        if (row > maxRow)
+                        {
+                            maxRow = row;
+                        }
+                    }
+                }
+
                 if (row < 0)
                 {
                     // 前缀在旧表里没有（真·新事件），或者那一组已经分完了：
@@ -3535,6 +3585,30 @@ namespace ADOFAIEditorStudio
 
                 blockPlacements.Add(new BlockPlacement { Item = item, Row = row, Time = time });
             }
+
+            // **这一轮没被任何块领走的旧行号 = 刚刚消失的事件。**
+            //
+            // 记起来给撤销用。上限只是防长期不关工作台时无限攒 ——
+            // 真到了这一步，说明删掉的量已经远超一次撤销能覆盖的范围，
+            // 丢掉最旧的那批行号用户也看不出来。
+            foreach (KeyValuePair<LevelEvent, int> leftover in oldRowsByEvent)
+            {
+                RememberRemovedRow(leftover.Key, leftover.Value);
+            }
+        }
+
+        /// <summary>记下"这个事件消失前待在第几行"。见 <see cref="removedRows"/>。</summary>
+        private void RememberRemovedRow(LevelEvent levelEvent, int row)
+        {
+            if (levelEvent == null)
+            {
+                return;
+            }
+            if (removedRows.Count >= 16384)
+            {
+                removedRows.Clear();
+            }
+            removedRows[levelEvent] = row;
         }
 
         /// <summary>
@@ -4426,9 +4500,26 @@ namespace ADOFAIEditorStudio
         /// </summary>
         internal void SelectBlocksInRect(float left, float top, float right, float bottom)
         {
+            SelectBlocksInRect(left, top, right, bottom, false);
+        }
+
+        /// <summary>
+        /// 框选的完整版本：`additive` 为真时把框到的块**并进**已有的多选，
+        /// 而不是先清空。
+        ///
+        /// Ctrl 是起框键，所以"加选框"只能借 Shift 区分 —— 见
+        /// `EditorImGuiTimelineBody.BeginMarquee`。不分开的话，第二次框选
+        /// 会把第一次那一批整个清掉（用户看到的就是"框完第二段，第一段没了"）。
+        /// </summary>
+        internal void SelectBlocksInRect(float left, float top, float right, float bottom,
+            bool additive)
+        {
             EnsureBlockPlacements();
             float speed = Mathf.Max(1f, pixelsPerSecond);
-            multiSelection.Clear();
+            if (!additive)
+            {
+                multiSelection.Clear();
+            }
             for (int i = 0; i < blockPlacements.Count; i++)
             {
                 BlockPlacement placement = blockPlacements[i];

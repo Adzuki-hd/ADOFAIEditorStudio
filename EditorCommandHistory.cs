@@ -1066,8 +1066,9 @@ namespace ADOFAIEditorStudio
         /// 两者互不影响（不同的列表），所以谁先谁后无所谓。
         /// </summary>
         internal static bool RemoveSelection(scnEditor editor,
-            IList<LevelEvent> events, IList<LevelEvent> decorations)
+            IList<LevelEvent> events, IList<LevelEvent> decorations, out int removedCount)
         {
+            removedCount = 0;
             if (editor == null)
             {
                 return false;
@@ -1138,6 +1139,7 @@ namespace ADOFAIEditorStudio
                 Commands = commands.ToArray(),
                 Label = "删除 " + commands.Count + " 项"
             });
+            removedCount = commands.Count;
             return true;
         }
 

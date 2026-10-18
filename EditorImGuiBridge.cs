@@ -113,6 +113,8 @@ namespace ADOFAIEditorStudio
         private Image _timelineBodyBlocker;
         /// <summary>悬浮球的点击遮挡块（工作台关着时也要生效）。</summary>
         private Image _ballBlocker;
+        /// <summary>粒子编辑器窗口的点击遮挡块。</summary>
+        private Image _particleBlocker;
         /// <summary>顶栏（ImGui 版）。常驻，永远在工作台最上面那一条。</summary>
         private EditorImGuiHeader _header;
         private EditorImGuiMenuBar _menuBar;
@@ -121,6 +123,8 @@ namespace ADOFAIEditorStudio
         /// <summary>时间轴标题行（ImGui 版）。只接管最上面那 42 像素。</summary>
         private EditorImGuiTimelineHeader _timelineHeader;
         private EditorImGuiEventPalette _eventPalette;
+        /// <summary>自己复刻的粒子编辑器（原版那扇被工作台画布压住，看不见）。</summary>
+        internal readonly EditorImGuiParticleEditor ParticleEditor = new EditorImGuiParticleEditor();
         /// <summary>时间轴内容区（ImGui 版）。目前只有标尺。</summary>
         private EditorImGuiTimelineBody _timelineBody;
         /// <summary>参数栏（ImGui 版）。常驻面板，不是模态窗口。</summary>
@@ -193,8 +197,8 @@ namespace ADOFAIEditorStudio
         ///
         /// **里面存的贴图有游戏自己的，绝不能 Destroy。** 这里只清表，不碰贴图。
         /// </summary>
-        private readonly System.Collections.Generic.Dictionary<IntPtr, Texture2D> _textures
-            = new System.Collections.Generic.Dictionary<IntPtr, Texture2D>();
+        private readonly System.Collections.Generic.Dictionary<IntPtr, Texture> _textures
+            = new System.Collections.Generic.Dictionary<IntPtr, Texture>();
 
         private Vector3[] _vertices = new Vector3[0];
         private Vector2[] _uvs = new Vector2[0];
@@ -322,6 +326,15 @@ namespace ADOFAIEditorStudio
         /// </summary>
         internal static IntPtr RegisterTexture(Texture2D texture)
         {
+            return RegisterTexture((Texture)texture);
+        }
+
+        /// <summary>
+        /// 登记一张任意贴图（`RenderTexture` 也走这条 —— 粒子编辑器的预览就是它）。
+        /// 调用方负责别把它 Destroy 掉。
+        /// </summary>
+        internal static IntPtr RegisterTexture(Texture texture)
+        {
             EditorImGuiBridge bridge = Instance;
             if (bridge == null || texture == null)
             {
@@ -409,25 +422,22 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private static readonly string[] VersionLines =
         {
-            "*打开方式换了：悬浮球。工作台关着时，编辑器右侧有一颗圆形按钮（产品 logo），",
-            "   点一下打开、按住可以拖到别处。",
-            "   F8 快捷键取消 —— 实测有用户的 F8 根本进不了游戏（笔记本 F 键默认走媒体键、",
-            "   或被录屏 / 输入法抢了全局热键），而键盘方案又没有任何可视入口。",
-            "*缓速曲线：缩到最小时不再「只画左半边」。每帧的段数预算改成按可见块均分，",
-            "   每个块至少画一段，右边不再整片空白。",
-            "*参数栏：文件类参数（装饰物图片、背景图、音视频）多了「浏览」按钮，",
-            "   走原版文件选择器 —— 选中的文件会自动复制进谱面目录。",
-            "   装饰物还多了一个「可见」开关（写进谱面，和装饰物列表那只眼睛是同一个值）。",
-            "*加载页：媒体很多、又是第一次加载时，会提示「首次加载较慢，请耐心等待」。",
-            "*工作台打开时，时间轴的横向缩放直接给到最大，不用每次手动滚到顶。",
+            "#新增",
+            "*粒子编辑器：原版那扇面板在工作台里打不开（被两层画布压在下面），现在自己复刻了一扇 ——",
+            "   通用 / 形状 / 变换三个页签，参数和原版同一串；底下是实时预览，改一个值画面当场变。",
+            "*参数栏补齐了以前显示「暂不支持」的几类参数：粒子发射器、最小~最大浮点、",
+            "   随时间变速（X / Y 两组范围）、渐变调色板、效果起止方块（数字 + 本格 / 起点 / 终点）。",
+            "*框选：锚点钉在时间轴上。拖着框的时候用 Shift+滚轮滚时间轴、或 Ctrl+滚轮缩放，",
+            "   框会跟着内容走，不再停在屏幕上不动。",
+            "*框选：Ctrl+Shift+拖动是叠加框选，可以分几次框不同段落，之前的选中保留。",
             "",
             "#修好的",
-            "*拖动事件块：松手后块会掉到时间轴最下面一行，已修正。",
-            "*换谱面：新谱的事件会堆到最下面（沿用了上一张谱的行号），已修正。",
-            "*首次排版：有时会拿还没加载完的事件清单去排，导致排版错乱，已修正。",
-            "*旧工程：早期版本存的位置记录格式过时、会被静默忽略；现在能识别出来并重新排版。",
-            "*只读模式：顶部「生效」开关和文件「浏览」以前照样能改谱面，现在都拦住。",
-            "*缓速曲线：每种缓速第一次用到时要现算，进时间轴那几帧会卡；挪到加载页里预热了。",
+            "*删除：框选或 Ctrl 点选进来的装饰物 / 文本，以前按 Delete 删不掉，已修正。",
+            "*删除后撤销：事件能回来，但位置掉到时间轴最下面，已修正 —— 现在回到原来的行。",
+            "*标尺：指在尺标上会穿透点到底下的事件块，已修正。",
+            "*轨道颜色：经过一个改色事件后再退回它之前，颜色不还原，已修正。",
+            "*下拉列表：展开后鼠标在列表里移动，下面的参数卡片跟着高亮（像能穿透），已修正。",
+            "*渐变调色板：调一次色就变黑、怎么调都是黑，已修正。",
         };
         /// <summary>
         /// 说明窗口的正文。一项一行，**行首那个记号决定怎么画**：
@@ -458,7 +468,8 @@ namespace ADOFAIEditorStudio
             "*独立预览：拖动即出画面，不受原版播放 / 暂停状态影响。",
             "*时间线：事件按类型分节。拖块改时间与时长；拖动中块跟着光标走，"
                 + "松手回到该在的行；默认吸附到格（按住 Alt 临时关掉）。",
-            "*选择：Ctrl+左键点选加选、从空白处拖动框选；点空白处取消全部。"
+            "*选择：Ctrl+左键点选加选、从空白处拖动框选；Ctrl+Shift+拖动是叠加框选"
+                + "（不清掉前一批）；点空白处取消全部。"
                 + "选中一批可以一起拖，各自的偏移不丢。",
             "*参数栏：原生全部事件参数，含缓动曲线；标签按原生那套三段式本地化，和游戏里一致。",
             "*调色盘：饱和 / 明度方块 + 色相条 + 透明度条 + HEX + RGBA。"
@@ -471,8 +482,8 @@ namespace ADOFAIEditorStudio
             "*Ctrl+S 保存：走原生 SaveLevel，存出来和原版逐字节一样。",
             "",
             "#快捷键",
-            "|F8|工作台开 / 关",
-            "|Esc|关闭工作台（游玩中则是退出游玩）",
+            "|悬浮球|拖动可移动；单击打开 / 关闭工作台",
+            "|Esc|逐层关闭（粒子编辑器 → 弹窗 → 工作台；游玩中则是退出游玩）",
             "|Space|播放 / 暂停",
             "|Ctrl+Z|撤销",
             "|Ctrl+Y|重做（Ctrl+Shift+Z 同）",
@@ -481,6 +492,7 @@ namespace ADOFAIEditorStudio
             "|Delete / Backspace|删除选中",
             "|Shift+C|清除全部选中",
             "|Ctrl+左键|点选加选；从空白处拖动则框选",
+            "|Ctrl+Shift+拖动|叠加框选（保留之前选中的）",
             "|点空白处|清除全部选中",
             "",
             "#时间轴",
@@ -771,6 +783,7 @@ namespace ADOFAIEditorStudio
             _timelineBodyBlocker = CreateBlocker("ImGuiTimelineBodyBlocker");
             // 悬浮球那一块：它工作台关着时也在，所以单独一份。
             _ballBlocker = CreateBlocker("ImGuiFloatingBallBlocker");
+            _particleBlocker = CreateBlocker("ImGuiParticleEditorBlocker");
         }
 
         private Image CreateBlocker(string name)
@@ -812,6 +825,36 @@ namespace ADOFAIEditorStudio
             {
                 _canvas.sortingOrder = wanted;
             }
+        }
+
+        private bool _suppressForLoading;
+        private bool _suppressForParticleEditor;
+
+        /// <summary>加载页显隐时压 / 抬工作台那层。</summary>
+        internal void SetOverlaySuppressedForLoading(bool suppressed)
+        {
+            _suppressForLoading = suppressed;
+            ApplyOverlaySuppression();
+        }
+
+        /// <summary>
+        /// 原版的粒子编辑器开着时压 / 抬工作台那层。
+        ///
+        /// **为什么需要**：粒子编辑器是原生 uGUI 面板，而我们的 ImGui 画布在
+        /// `sortingOrder = 32000` —— 它被工作台整层盖住（尤其中间那块预览区），
+        /// 表现就是「点『编辑』什么都没出现」。
+        /// 两个来源（加载页 / 粒子编辑器）各自记一个标志再合并，
+        /// 否则谁后关谁就会把另一个的压层也一起抬起来。
+        /// </summary>
+        internal void SetOverlaySuppressedForParticleEditor(bool suppressed)
+        {
+            _suppressForParticleEditor = suppressed;
+            ApplyOverlaySuppression();
+        }
+
+        private void ApplyOverlaySuppression()
+        {
+            SetOverlaySuppressed(_suppressForLoading || _suppressForParticleEditor);
         }
 
         private void OnDestroy()
@@ -1381,6 +1424,30 @@ namespace ADOFAIEditorStudio
             long profileStart = profileFrame
                 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
 
+            // **原版粒子编辑器开着时，把我们这层压到底。**
+            // 它是原生 uGUI 面板，而我们的画布在 32000 —— 不压的话它被工作台
+            // 整层盖住，用户点「编辑」什么都看不到（实测反馈）。
+            bool particleEditorOpen = false;
+            try
+            {
+                scnEditor particleScene = scnEditor.instance;
+                particleEditorOpen = particleScene != null
+                    && particleScene.particleEditorContainer != null
+                    && particleScene.particleEditorContainer.gameObject.activeSelf;
+            }
+            catch
+            {
+                particleEditorOpen = false;
+            }
+            SetOverlaySuppressedForParticleEditor(particleEditorOpen);
+            // **uGUI 那层也要一起压。** 工作台的 uGUI 画布排在 30000，
+            // 比原生粒子编辑器（order=1）高得多 —— 只压 ImGui 那层的话，
+            // 它照样把面板盖在中间（实测「工作台消失一半、面板没出来」）。
+            if (Main.Overlay != null)
+            {
+                Main.Overlay.SetCanvasSuppressed(particleEditorOpen);
+            }
+
             ImGui.NewFrame();
             // 常驻面板先画，模态的文字窗口后画 —— 后者必须压在它上面。
             DrawPanels();
@@ -1472,6 +1539,10 @@ namespace ADOFAIEditorStudio
                 panelOn && _eventPalette.Rect.width > 0f && _eventPalette.Rect.height > 1f);
             SyncBlocker(_timelineBodyBlocker, _timelineBody.Rect,
                 panelOn && _timelineBody.Rect.width > 0f);
+            // 粒子编辑器是浮层：它自己盖住的那一块也要挡，否则拖窗口会带着
+            // 后面的游戏画面一起动（实测就是这个"穿透"）。
+            SyncBlocker(_particleBlocker, ParticleEditor.Rect,
+                ParticleEditor.Visible && ParticleEditor.Rect.width > 0f);
 
             // **上下文还回去** —— 见方法开头那段说明。
             //
@@ -1766,6 +1837,7 @@ namespace ADOFAIEditorStudio
                 SyncBlocker(_timelineHeaderBlocker, new Rect(0f, 0f, 0f, 0f), false);
                 SyncBlocker(_eventPaletteBlocker, new Rect(0f, 0f, 0f, 0f), false);
                 SyncBlocker(_timelineBodyBlocker, new Rect(0f, 0f, 0f, 0f), false);
+                SyncBlocker(_particleBlocker, new Rect(0f, 0f, 0f, 0f), false);
                 if (overlay != null)
                 {
                     overlay.SuppressInspector(false);
@@ -1792,6 +1864,8 @@ namespace ADOFAIEditorStudio
             _decorationList.Draw();
             _mediaPanel.Draw();
             _settingsInspector.Draw();
+            // 粒子编辑器最后画：它是覆盖层，要压在其他面板上面。
+            ParticleEditor.Draw(_inspector);
             // 接管这两个坑：把 uGUI 那两扇整个藏掉，不然会和 ImGui 版叠在一起。
             // 装饰物那扇只在它自己那一页压 —— 切到媒体页时 ImGui 不画东西，
             // 压住的话媒体页就是空的。
@@ -2421,7 +2495,7 @@ namespace ADOFAIEditorStudio
                     // 字体图集（汉字和图标字体）和游戏自己的那张图标图集
                     // （见 RegisterTexture）。**认不出来就退回字体图集** ——
                     // 退回去至少画出字来，比给一片空白强。
-                    Texture2D texture;
+                    Texture texture;
                     if (!_textures.TryGetValue(command.TextureId, out texture) || texture == null)
                     {
                         texture = _fontTexture;

@@ -71,7 +71,28 @@ namespace ADOFAIEditorStudio
         /// <summary>正在拖播放头 / 正在拉框。两者互斥，且都要跨帧记着。</summary>
         private bool _scrubbing;
         private bool _marqueeActive;
+        /// <summary>
+        /// 框的锚角在**屏幕**上的位置。**每帧由锚点重算**（见 <see cref="UpdateMarqueeStart"/>），
+        /// 别只改它 —— 滚动、缩放之后它得跟着内容走。
+        /// </summary>
         private NVec2 _marqueeStart;
+        /// <summary>
+        /// 框的锚角在**时间轴内容坐标**里的位置：横向是时间（秒），纵向是行空间像素。
+        ///
+        /// 原来只存屏幕坐标，于是 `Shift+滚轮` 滚走时间轴之后，锚角还钉在原来那块
+        /// 屏幕上，框自然不跟着内容变 —— 看起来就是"滚完框还是原来那么大"。
+        /// 记成内容坐标，滚动/缩放改的只是视口，锚角自己不动。
+        /// </summary>
+        private float _marqueeAnchorTime;
+        private float _marqueeAnchorContentY;
+        /// <summary>
+        /// 这一次框是**叠加**还是**替换**。起框那一刻定下来（`Shift` 按住 = 叠加）。
+        ///
+        /// 不这样分的话，第二次框选会把第一次的整批清掉 —— 而 Ctrl 本来就是
+        /// 起框键，没法再拿它区分"加选"，只能借 Shift（和 Ctrl+点击加选同一套
+        /// 心智：Ctrl 起框、再加 Shift 就是往已有的里面并）。
+        /// </summary>
+        private bool _marqueeAdditive;
         private NVec2 _dragStartMouse;
 
         /// <summary>块窄到这个数以下就不写名字了 —— 几个像素里塞两个字比不写还难看。</summary>
@@ -104,6 +125,38 @@ namespace ADOFAIEditorStudio
 
         /// <summary>框小于这个尺寸就不算框选（Ctrl 点一下不该把多选清掉）。</summary>
         private const float MarqueeMinSize = 4f;
+
+        /// <summary>
+        /// 起框：把锚角记进**内容坐标**（时间 + 行空间像素），再换算回屏幕一次。
+        ///
+        /// 起点和"鼠标当前在哪"必须分开存：鼠标会被滚轮推着换位置，而锚角
+        /// 要留在原来那个时间/那一行上 —— 这才是"框住 10 到 20 格"的操作方式。
+        /// </summary>
+        private void BeginMarquee(EditorTimelineView timeline, ImGuiIOPtr io, float x, float y)
+        {
+            _marqueeActive = true;
+            _marqueeAdditive = EditorTimelineView.IsShiftHeld();
+            _marqueeAnchorTime = timeline.ViewStartSeconds
+                + (io.MousePos.X - x) / Mathf.Max(1f, timeline.PixelsPerSecond);
+            _marqueeAnchorContentY = io.MousePos.Y - y
+                - EditorTimelineView.RulerHeight + timeline.VerticalScrollOffset;
+            UpdateMarqueeStart(timeline, x, y);
+        }
+
+        /// <summary>
+        /// 按当前视口把锚角换算回屏幕坐标。
+        ///
+        /// 滚动改的是 `ViewStartSeconds` / `VerticalScrollOffset`，缩放改的是
+        /// `PixelsPerSecond` —— 三者都只影响这一句，锚角本身的记录不动。
+        /// </summary>
+        private void UpdateMarqueeStart(EditorTimelineView timeline, float x, float y)
+        {
+            _marqueeStart = new NVec2(
+                x + (_marqueeAnchorTime - timeline.ViewStartSeconds)
+                    * Mathf.Max(1f, timeline.PixelsPerSecond),
+                y + EditorTimelineView.RulerHeight + _marqueeAnchorContentY
+                    - timeline.VerticalScrollOffset);
+        }
 
         /// <summary>排查框选用：打开后会打日志说明框有多小。</summary>
         /// <summary>排查框选用。**已经定位完了，关掉** —— 要看再改回 true。</summary>
@@ -688,83 +741,91 @@ namespace ADOFAIEditorStudio
                         rounding, ImDrawFlags.None, 3f);
                 }
 
-                // 交互层：整块当点击/拖动目标。**画在前、控件在后**，
-                // 这样拖起来的那一块就是这一帧刚摆好的位置，不慢一帧。
-                ImGui.PushID(block.Id);
-                ImGui.SetCursorScreenPos(min);
-                ImGui.InvisibleButton("##block",
-                    new NVec2(blockWidth, blockHeight));
-                bool hovered = ImGui.IsItemHovered();
-                // 落在左右那 6 像素里就是"拉时长"，其余是"整体移动"。
+                // **可点区域不能伸进标尺。**
                 //
-                // **两道前提**：
-                //   · 块不能太窄 —— 否则整块都落进边缘区，永远挪不动；
-                //   · 这个事件得**真的能拉时长**（声明了 `duration`）。
-                //     点事件（没有 duration）给了边缘区就是纯死区：按在边上走
-                //     "改时长"，而没东西可改，结果什么都不发生 —— 用户看到的就是
-                //     "这块拖不动"。实测日志里那块 64 像素宽、4 次按下的落点全在
-                //     右边 6 像素里，于是 4 次都原地不动。
-                bool hasEdgeZone = block.Resizable
-                    && blockWidth > EditorTimelineView.BlockEdgeZone * 2f;
-                bool atLeftEdge = hovered && hasEdgeZone
-                    && io.MousePos.X - min.X <= EditorTimelineView.BlockEdgeZone;
-                bool atRightEdge = hovered && hasEdgeZone
-                    && io.MousePos.X - min.X >= blockWidth - EditorTimelineView.BlockEdgeZone;
-                if (atLeftEdge)
+                // 块比行距高，往上滚的时候上半截会压到标尺下面。视觉上那截已经被
+                // 裁剪掉了，但 `InvisibleButton` 是按整块铺的 —— 点在尺标上其实
+                // 点中的是后面那块事件（表现就是"尺标能穿透点到事件块"）。
+                // 交互矩形改从标尺下沿起算，只留看得见的那一段。
+                float hitTop = Mathf.Max(min.Y, y + rulerHeight);
+                float hitHeight = min.Y + blockHeight - hitTop;
+                if (hitHeight > 0f)
                 {
-                    hoverLeftEdge = true;
-                }
-                if (atRightEdge)
-                {
-                    hoverRightEdge = true;
-                }
-
-                if (ImGui.IsItemClicked())
-                {
-                    timeline.SelectBlock(block.Id, CtrlHeld());
-                }
-                if (ImGui.IsItemActivated())
-                {
-                    // **Ctrl 从块上按下 = 拉框**（旧版专门做了转交，这里直接分叉）。
-                    // 块身上从此也能起框，不用先挪到空白处。
-                    if (CtrlHeld())
-                    {
-                        _marqueeActive = true;
-                        _marqueeStart = io.MousePos;
-                        LogMarquee("块上");
-                        ImGui.PopID();
-                        continue;
-                    }
-
-                    EditorTimelineView.BlockDragMode mode = EditorTimelineView.BlockDragMode.Move;
+                    ImGui.PushID(block.Id);
+                    ImGui.SetCursorScreenPos(new NVec2(min.X, hitTop));
+                    ImGui.InvisibleButton("##block",
+                        new NVec2(blockWidth, hitHeight));
+                    bool hovered = ImGui.IsItemHovered();
+                    // 落在左右那 6 像素里就是"拉时长"，其余是"整体移动"。
+                    //
+                    // **两道前提**：
+                    //   · 块不能太窄 —— 否则整块都落进边缘区，永远挪不动；
+                    //   · 这个事件得**真的能拉时长**（声明了 `duration`）。
+                    //     点事件（没有 duration）给了边缘区就是纯死区：按在边上走
+                    //     "改时长"，而没东西可改，结果什么都不发生 —— 用户看到的就是
+                    //     "这块拖不动"。实测日志里那块 64 像素宽、4 次按下的落点全在
+                    //     右边 6 像素里，于是 4 次都原地不动。
+                    bool hasEdgeZone = block.Resizable
+                        && blockWidth > EditorTimelineView.BlockEdgeZone * 2f;
+                    bool atLeftEdge = hovered && hasEdgeZone
+                        && io.MousePos.X - min.X <= EditorTimelineView.BlockEdgeZone;
+                    bool atRightEdge = hovered && hasEdgeZone
+                        && io.MousePos.X - min.X >= blockWidth - EditorTimelineView.BlockEdgeZone;
                     if (atLeftEdge)
                     {
-                        mode = EditorTimelineView.BlockDragMode.ResizeLeft;
+                        hoverLeftEdge = true;
                     }
-                    else if (atRightEdge)
+                    if (atRightEdge)
                     {
-                        mode = EditorTimelineView.BlockDragMode.ResizeRight;
+                        hoverRightEdge = true;
                     }
 
-                    _dragId = block.Id;
-                    _dragStartMouse = io.MousePos;
-                    // 记下指针落在块顶往下多少 —— 拖动时保留它，块才不会"欠一截"。
-                    _dragGrabOffsetY = io.MousePos.Y - min.Y;
-                    // 横向那条交给时间轴：它自己抓原值、自己吸附、自己写回。
-                    if (block.Event != null
-                        && !timeline.BeginBlockDrag(block.Event, mode,
-                            PointerTime(timeline, x, io)))
+                    if (ImGui.IsItemClicked())
                     {
-                        // 拿不到（事件已经不在了）就不要进拖动状态，
-                        // 否则松手时会对一个空目标提交。
-                        _dragId = -1;
+                        timeline.SelectBlock(block.Id, CtrlHeld());
                     }
-                }
-                ImGui.PopID();
+                    if (ImGui.IsItemActivated())
+                    {
+                        // **Ctrl 从块上按下 = 拉框**（旧版专门做了转交，这里直接分叉）。
+                        // 块身上从此也能起框，不用先挪到空白处。
+                        if (CtrlHeld())
+                        {
+                            BeginMarquee(timeline, io, x, y);
+                            LogMarquee("块上");
+                            ImGui.PopID();
+                            continue;
+                        }
 
-                if (hovered && !string.IsNullOrEmpty(block.Name))
-                {
-                    ImGui.SetTooltip(block.Name);
+                        EditorTimelineView.BlockDragMode mode = EditorTimelineView.BlockDragMode.Move;
+                        if (atLeftEdge)
+                        {
+                            mode = EditorTimelineView.BlockDragMode.ResizeLeft;
+                        }
+                        else if (atRightEdge)
+                        {
+                            mode = EditorTimelineView.BlockDragMode.ResizeRight;
+                        }
+
+                        _dragId = block.Id;
+                        _dragStartMouse = io.MousePos;
+                        // 记下指针落在块顶往下多少 —— 拖动时保留它，块才不会"欠一截"。
+                        _dragGrabOffsetY = io.MousePos.Y - min.Y;
+                        // 横向那条交给时间轴：它自己抓原值、自己吸附、自己写回。
+                        if (block.Event != null
+                            && !timeline.BeginBlockDrag(block.Event, mode,
+                                PointerTime(timeline, x, io)))
+                        {
+                            // 拿不到（事件已经不在了）就不要进拖动状态，
+                            // 否则松手时会对一个空目标提交。
+                            _dragId = -1;
+                        }
+                    }
+                    ImGui.PopID();
+
+                    if (hovered && !string.IsNullOrEmpty(block.Name))
+                    {
+                        ImGui.SetTooltip(block.Name);
+                    }
                 }
             }
 
@@ -849,6 +910,13 @@ namespace ADOFAIEditorStudio
 
             if (_marqueeActive)
             {
+                // **先把锚角按当前视口换算回来。**
+                //
+                // 拉框的同一帧里也可能滚了滚轮（Shift+滚轮横向、普通滚轮纵向），
+                // 或者 Ctrl+滚轮缩了放 —— 锚角、缩放基准都会变。不重算的话，
+                // 框还停在上一帧的屏幕位置上，跟着内容一起"漂"。
+                UpdateMarqueeStart(timeline, x, y);
+
                 if (!down)
                 {
                     float left = Mathf.Min(_marqueeStart.X, io.MousePos.X) - x;
@@ -864,7 +932,7 @@ namespace ADOFAIEditorStudio
                     // "Ctrl 能单选不能多选"。点就归点，框就归框。
                     if (right - left >= MarqueeMinSize && bottom - top >= MarqueeMinSize)
                     {
-                        timeline.SelectBlocksInRect(left, top, right, bottom);
+                        timeline.SelectBlocksInRect(left, top, right, bottom, _marqueeAdditive);
                         if (VerboseMarquee)
                         {
                             Main.Logger.Log("[Timeline] 框选 "
@@ -898,8 +966,7 @@ namespace ADOFAIEditorStudio
             {
                 if (CtrlHeld())
                 {
-                    _marqueeActive = true;
-                    _marqueeStart = io.MousePos;
+                    BeginMarquee(timeline, io, x, y);
                     LogMarquee("空地");
                 }
                 else

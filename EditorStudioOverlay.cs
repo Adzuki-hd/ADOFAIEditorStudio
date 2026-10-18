@@ -346,6 +346,30 @@ namespace ADOFAIEditorStudio
 
         private GameObject uiRoot;
         private Canvas canvas;
+
+        /// <summary>工作台 uGUI 那层的排序（ImGui 那层是 32000，见桥接）。</summary>
+        private const int CanvasSortingOrder = 30000;
+
+        /// <summary>
+        /// 原版粒子编辑器开着时，把 **uGUI 这层也压到底**。
+        ///
+        /// 只压 ImGui 那层不够 —— 工作台还有一层 uGUI 画布（预览遮罩、
+        /// 时间轴残件）排在 30000，比原生粒子编辑器（`levelEditorScene`
+        /// 的 order=1）高得多，正好盖在屏幕中间。
+        /// 实测症状就是「点了编辑，工作台消失了一半、面板没出来」。
+        /// </summary>
+        internal void SetCanvasSuppressed(bool suppressed)
+        {
+            if (canvas == null)
+            {
+                return;
+            }
+            int wanted = suppressed ? 0 : CanvasSortingOrder;
+            if (canvas.sortingOrder != wanted)
+            {
+                canvas.sortingOrder = wanted;
+            }
+        }
         private TMP_FontAsset uiFont;
         private TMP_FontAsset generatedTmpFont;
         private GameObject ownedEventSystem;
@@ -1824,7 +1848,12 @@ namespace ADOFAIEditorStudio
                 //
                 // 「创建工程」排最前 —— 它是最新推开的一层，而且它是个要答复的
                 // 问题，Esc 关掉就等于回答「不建」（退回只读）。
-                if (imgui != null && imgui.ProjectCreateVisible)
+                // 「粒子编辑器」排最前 —— 它是最新推开的一层（从参数栏点「编辑」打开的）。
+                if (imgui != null && imgui.ParticleEditor.Visible)
+                {
+                    imgui.ParticleEditor.Close();
+                }
+                else if (imgui != null && imgui.ProjectCreateVisible)
                 {
                     imgui.CancelProjectCreate();
                 }
@@ -1942,7 +1971,7 @@ namespace ADOFAIEditorStudio
             canvas = uiRoot.GetComponent<Canvas>();
             canvas.renderMode = RenderMode.ScreenSpaceOverlay;
             canvas.overrideSorting = true;
-            canvas.sortingOrder = 30000;
+            canvas.sortingOrder = CanvasSortingOrder;
             canvas.pixelPerfect = false;
 
             CanvasScaler scaler = uiRoot.GetComponent<CanvasScaler>();
@@ -2251,7 +2280,7 @@ namespace ADOFAIEditorStudio
             EditorImGuiBridge bridge = EditorImGuiBridge.Instance;
             if (bridge != null)
             {
-                bridge.SetOverlaySuppressed(suppressed);
+                bridge.SetOverlaySuppressedForLoading(suppressed);
             }
         }
 
@@ -2347,25 +2376,22 @@ namespace ADOFAIEditorStudio
         {
             "<size=20><b>v" + ModVersion + " 更新内容</b></size>",
             "",
-            "<b>· 打开方式换了：悬浮球</b>。工作台关着时，编辑器右侧有一颗圆形按钮（产品 logo），",
-            "   点一下打开、按住可以拖到别处。",
-            "   F8 快捷键取消 —— 实测有用户的 F8 根本进不了游戏（笔记本 F 键默认走媒体键、",
-            "   或被录屏 / 输入法抢了全局热键），而键盘方案又没有任何可视入口。",
-            "<b>· 缓速曲线</b>：缩到最小时不再「只画左半边」。每帧的段数预算改成按可见块均分，",
-            "   每个块至少画一段，右边不再整片空白。",
-            "<b>· 参数栏</b>：文件类参数（装饰物图片、背景图、音视频）多了「浏览」按钮，",
-            "   走原版文件选择器 —— 选中的文件会自动复制进谱面目录。",
-            "   装饰物还多了一个「可见」开关（写进谱面，和装饰物列表那只眼睛是同一个值）。",
-            "<b>· 加载页</b>：媒体很多、又是第一次加载时，会提示「首次加载较慢，请耐心等待」。",
-            "<b>· 时间轴</b>：工作台打开时横向缩放直接给到最大，不用每次手动滚到顶。",
+            "<b>新增</b>",
+            "<b>· 粒子编辑器</b>：原版那扇面板在工作台里打不开（被两层画布压在下面），现在自己复刻了一扇 ——",
+            "   通用 / 形状 / 变换三个页签，参数和原版同一串；底下是实时预览，改一个值画面当场变。",
+            "<b>· 参数栏</b>补齐了以前显示「暂不支持」的几类参数：粒子发射器、最小~最大浮点、",
+            "   随时间变速（X / Y 两组范围）、渐变调色板、效果起止方块（数字 + 本格 / 起点 / 终点）。",
+            "<b>· 框选</b>：锚点钉在时间轴上。拖着框的时候用 Shift+滚轮滚时间轴、或 Ctrl+滚轮缩放，",
+            "   框会跟着内容走，不再停在屏幕上不动。",
+            "<b>· 框选</b>：Ctrl+Shift+拖动是叠加框选，可以分几次框不同段落，之前的选中保留。",
             "",
             "<b>修好的</b>",
-            "<b>· 拖动事件块</b>：松手后块会掉到时间轴最下面一行，已修正。",
-            "<b>· 换谱面</b>：新谱的事件会堆到最下面（沿用了上一张谱的行号），已修正。",
-            "<b>· 首次排版</b>：有时会拿还没加载完的事件清单去排，导致排版错乱，已修正。",
-            "<b>· 旧工程</b>：早期版本存的位置记录格式过时、会被静默忽略；现在能识别出来并重新排版。",
-            "<b>· 只读模式</b>：顶部「生效」开关和文件「浏览」以前照样能改谱面，现在都拦住。",
-            "<b>· 缓速曲线预热</b>：每种缓速第一次用到时要现算，进时间轴那几帧会卡；挪到加载页里算了。",
+            "<b>· 删除装饰物</b>：框选或 Ctrl 点选进来的装饰物 / 文本，以前按 Delete 删不掉，已修正。",
+            "<b>· 删除后撤销</b>：事件能回来，但位置掉到时间轴最下面，已修正 —— 现在回到原来的行。",
+            "<b>· 标尺穿透</b>：指在尺标上会穿透点到底下的事件块，已修正。",
+            "<b>· 轨道颜色</b>：经过一个改色事件后再退回它之前，颜色不还原，已修正。",
+            "<b>· 下拉列表</b>：展开后鼠标在列表里移动，下面的参数卡片跟着高亮（像能穿透），已修正。",
+            "<b>· 渐变调色板</b>：调一次色就变黑、怎么调都是黑，已修正。",
         });
 
         /// <summary>群号。ImGui 那扇说明窗口的标题也要用，所以是 internal。</summary>
