@@ -417,7 +417,21 @@ namespace ADOFAIEditorStudio.Preview
                 // 事件重放到后面的格或拍上。跳过这一步让 936 个事件里有 446 个
                 // 起始时间错误（最坏差 38.4 秒），这就是为什么拖动之后
                 // 轨道消失动画一直回不来。
-                if (snapshot.EventType == LevelEventType.RepeatEvents || levelEvent.IsDecoration)
+                //
+                // **装饰物也要展开。** 原生 `ApplyEvent` 的 switch 对
+                // `MoveDecorations` 同样 `AddComponent<ffxMoveDecorationsPlus>()`，
+                // 而 `runManually` 只在标签命中「点击热区」时置位
+                // （`hitboxEventTagDecorations.TryGetValue` 命中才设，
+                // 本谱没有任何 hitbox 字段）——所以原生里带 eventTag 的
+                // MoveDecorations 会照常重复。这里原来把整个装饰物类别都跳过，
+                // 结果第 1045 格那批 `fps` / `3` / `4` 的闪色、换图只触发一次，
+                // 相机被甩开的那 0.06 秒里画面比原生空。
+                //
+                // 只放开 `MoveDecorations`（动画类）：`AddDecoration` 被重复
+                // 会凭空多出装饰物实例，那不是原生做的事。
+                if (snapshot.EventType == LevelEventType.RepeatEvents
+                    || (levelEvent.IsDecoration
+                        && snapshot.EventType != LevelEventType.MoveDecorations))
                 {
                     continue;
                 }

@@ -188,6 +188,17 @@ namespace ADOFAIEditorStudio
             = new System.Collections.Generic.List<Mesh>();
 
         /// <summary>
+        /// 这一帧每个渲染器槽有没有被写入新网格。
+        ///
+        /// **旧版只清「超出末尾」的那些**（`n >= rendererIndex`），于是任何
+        /// 「占了一个槽但没写网格」的分支都会把上一帧的网格留在画面上——
+        /// 那就是传过来的"暂停时拉时间轴看到 UI 重影"：旧的一层 UI 还贴在
+        /// 原地，新的一层画在偏移后的位置。
+        /// </summary>
+        private readonly System.Collections.Generic.List<bool> _rendererTouched
+            = new System.Collections.Generic.List<bool>();
+
+        /// <summary>
         /// `ImDrawCmd.TextureId` → Unity 贴图。
         ///
         /// 我们不接 ImGui 的原生渲染后端，所以"纹理 ID"由我们自己定：约定用
@@ -888,6 +899,7 @@ namespace ADOFAIEditorStudio
             }
             _meshes.Clear();
             _renderers.Clear();
+            _rendererTouched.Clear();
             if (_material != null)
             {
                 UnityEngine.Object.Destroy(_material);
@@ -2369,6 +2381,13 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
+            // 每帧重开「这一槽写过没有」的标记：收尾时凡是没写的槽都清掉，
+            // 免得上一帧的网格留成重影。
+            for (int n = 0; n < _rendererTouched.Count; n++)
+            {
+                _rendererTouched[n] = false;
+            }
+
             // ImGui 是左上原点，Unity 的 ScreenSpaceOverlay 画布是中心原点。
             float halfWidth = -Screen.width * 0.5f;
             float halfHeight = Screen.height * 0.5f;
@@ -2463,6 +2482,12 @@ namespace ADOFAIEditorStudio
                     if (vtxStart < 0 || vtxCount <= 0
                         || vtxMax >= vertexCount)
                     {
+                        // 跳过这条命令时**必须把这个槽清掉**：它可能还挂着上一帧的
+                        // 网格，留着就是叠在画面上的一层旧 UI（重影）。
+                        if (rendererIndex < _renderers.Count)
+                        {
+                            _renderers[rendererIndex].Clear();
+                        }
                         rendererIndex++;
                         continue;
                     }
@@ -2506,13 +2531,18 @@ namespace ADOFAIEditorStudio
                     target.SetMaterial(_material, texture);
                     target.SetColor(Color.white);
                     target.SetMesh(mesh);
+                    _rendererTouched[rendererIndex] = true;
                     rendererIndex++;
                 }
             }
 
-            for (int n = rendererIndex; n < _renderers.Count; n++)
+            // 这一帧**所有没写过网格的槽**都清掉 —— 不只是超出末尾的那些。
+            for (int n = 0; n < _renderers.Count; n++)
             {
-                _renderers[n].Clear();
+                if (n >= _rendererTouched.Count || !_rendererTouched[n])
+                {
+                    _renderers[n].Clear();
+                }
             }
             probeListFrames++;
         }
@@ -2540,6 +2570,7 @@ namespace ADOFAIEditorStudio
             GameObject host = new GameObject("ImGui_Command_" + index, typeof(RectTransform));
             host.transform.SetParent(_canvas.transform, false);
             _renderers.Add(host.AddComponent<CanvasRenderer>());
+            _rendererTouched.Add(false);
 
             Mesh mesh = new Mesh { name = "ImGui_Mesh_" + index };
             // 每帧重建，标注成动态让 Unity 走更快的上传路径。
