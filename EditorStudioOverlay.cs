@@ -3938,6 +3938,12 @@ namespace ADOFAIEditorStudio
             {
                 MediaThumbnailRequest request = mediaThumbnailQueue.Dequeue();
                 mediaThumbnailQueued.Remove(request.Key);
+                if (mediaPreloading)
+                {
+                    // 预载的进度就是"出队了多少条"，和解码成功与否、和缓存有没有
+                    // 被削都无关（见 mediaPreloadDrained 的说明）。
+                    mediaPreloadDrained++;
+                }
                 MediaThumbnailCacheEntry existing;
                 if (mediaThumbnailCache.TryGetValue(request.Key, out existing))
                 {
@@ -4898,7 +4904,24 @@ namespace ADOFAIEditorStudio
         /// 只有一张都没有的时候才提示「首次加载较慢」。
         /// </summary>
         private int mediaPreloadCachedOnDisk;
-        private int mediaPreloadCacheBaseline;
+
+        /// <summary>
+        /// 预载开始时**已经有缩略图、不用再解码**的条数（= 总数 - 排进队列的数）。
+        /// </summary>
+        private int mediaPreloadAlreadyReady;
+
+        /// <summary>
+        /// 这次预载里**已经从队列里处理掉**的条数，每出队一条加一。
+        ///
+        /// 进度必须按它算，**不能**按 `mediaThumbnailCache.Count` 的增长算：
+        /// 那个缓存有 512 条的上限（`MediaThumbnailCacheCapacity`），媒体一多，
+        /// 解码还在继续、缓存却已经被 `TrimMediaThumbnailCache` 削回 512，
+        /// 「缓存增长量」就永远停在 512。实测一张 943 个媒体的谱面就是这么
+        /// 卡死在「正在加载媒体 512 / 943」上的——活其实干完了，计数器不动，
+        /// `progress` 到不了 1，加载页永远不关。
+        /// </summary>
+        private int mediaPreloadDrained;
+
         private float mediaPreloadStartedAt;
 
         /// <summary>探针：只打前几帧，不刷屏。定位完就删。</summary>
@@ -4946,7 +4969,6 @@ namespace ADOFAIEditorStudio
             // 让日志和进度都读不准；反正下面会把当前这张谱的要解码项重新入队。
             ClearMediaThumbnailQueue();
 
-            mediaPreloadCacheBaseline = mediaThumbnailCache.Count;
             // 顺便数一遍磁盘缓存里已经有多少张 —— 提示语要靠它判断"是不是真的第一次"。
             string cacheDirectory = GetMediaCacheDirectory();
             int queued = 0;
@@ -4979,6 +5001,8 @@ namespace ADOFAIEditorStudio
                 }
             }
             mediaPreloadPending = queued;
+            mediaPreloadAlreadyReady = Mathf.Max(0, mediaPreloadTotal - queued);
+            mediaPreloadDrained = 0;
             mediaPreloadCachedOnDisk = cachedOnDisk;
             Main.Logger.Log("[加载页] 开始：媒体 " + mediaPreloadTotal
                 + " 个，其中要解码 " + queued + " 个（磁盘缓存已有 " + cachedOnDisk
@@ -5002,11 +5026,19 @@ namespace ADOFAIEditorStudio
             }
 
             int total = mediaPreloadTotal;
-            // 「这次真解出来了多少」= 缓存增长量（减掉开跑时的基线 —— 那个缓存
-            // 是多张谱共用的），上限是本次需要解码的条数。
-            int decoded = Mathf.Clamp(
-                mediaThumbnailCache.Count - mediaPreloadCacheBaseline, 0, mediaPreloadPending);
-            int done = total - mediaPreloadPending + decoded;
+            // 「已经到位多少」= 开跑时就有的 + 这次从队列里处理掉的。
+            //
+            // **不能再用缓存增长量**：那个缓存有 512 条上限，媒体多于 512 时
+            // 缓存会被 Trim 削回上限，增长量就永久停在 512 —— 943 个媒体的谱面
+            // 会卡在「512 / 943」再也不动，加载页关不掉。出队计数不受这个影响。
+            int done = Mathf.Clamp(mediaPreloadAlreadyReady + mediaPreloadDrained, 0, total);
+
+            // 兜底：队列空了就说明活儿真的干完了。计数万一哪里算漏，也不能
+            // 把用户永久锁在加载页上——那是最难自救的一种卡死。
+            if (mediaThumbnailQueue.Count == 0)
+            {
+                done = total;
+            }
 
             float progress = 1f;
             if (total > 0)
@@ -5019,7 +5051,8 @@ namespace ADOFAIEditorStudio
                 mediaPreloadLogCount++;
                 Main.Logger.Log("[加载页] 帧" + mediaPreloadLogCount
                     + "：已完成=" + done + "/" + total
-                    + "（本次解码 " + decoded + "/" + mediaPreloadPending + "）"
+                    + "（本次处理 " + mediaPreloadDrained + "/" + mediaPreloadPending
+                    + "，开跑前已有 " + mediaPreloadAlreadyReady + "）"
                     + " 队列=" + mediaThumbnailQueue.Count
                     + " progress=" + progress.ToString("0.00")
                     + " showing=" + loadingScreen.IsShowing);
