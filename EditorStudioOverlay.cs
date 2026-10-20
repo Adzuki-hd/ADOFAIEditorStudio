@@ -782,6 +782,18 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>
+        /// 加载遮罩（媒体预载 / 联机加入）正盖在屏幕上。
+        ///
+        /// 键盘输入要靠这个判断让路：uGUI 的遮罩只挡鼠标（GraphicRaycaster 挡射线），
+        /// **挡不住键盘** —— 加载期间按空格，求值器预览就会开始播，用户听到
+        /// "黑屏底下有音乐"。所有快捷键都必须在遮罩期间吃掉。
+        /// </summary>
+        internal bool IsLoadingScreenShowing
+        {
+            get { return mediaPreloading && loadingScreen != null && loadingScreen.IsShowing; }
+        }
+
+        /// <summary>
         /// uGUI 那扇参数栏实例。
         ///
         /// ImGui 那版**借它来写值**（`Commit` / `SetDisabled`）：撤销、联机上报、

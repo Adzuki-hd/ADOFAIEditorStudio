@@ -7766,6 +7766,19 @@ namespace ADOFAIEditorStudio
                 return true;
             }
 
+            // **加载遮罩期间吃掉输入。**
+            //
+            // uGUI 的遮罩挡住的是鼠标（GraphicRaycaster + 全屏 Backdrop），
+            // 键盘它挡不住：按空格会直接走到下面的 togglePlayback，于是
+            // 求值器预览开始播歌 —— 用户看到的是"加载页还盖着，音乐响了"。
+            //
+            // 只在**真有输入的那一帧**整帧吞掉（返回 false，连原生 Update
+            // 一起跳过）；没有输入的帧照常放行，别把编辑器每帧该做的事也停掉。
+            if (overlay.IsLoadingScreenShowing)
+            {
+                return !Input.anyKeyDown;
+            }
+
             bool togglePlayback = Input.GetKeyDown(KeyCode.Space);
             bool controlHeld = Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl);
             bool altHeld = Input.GetKey(KeyCode.LeftAlt) || Input.GetKey(KeyCode.RightAlt);
