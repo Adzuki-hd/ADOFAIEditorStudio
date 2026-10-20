@@ -708,6 +708,27 @@ namespace ADOFAIEditorStudio
                 }
             }
 
+            if (Input.GetMouseButtonUp(0) && pointerInside)
+            {
+                // **定位模式的回退路径。**
+                //
+                // 正常那条是：点轨道 → 原生 `SelectFloor` → `SelectFloor` 补丁
+                // → 跳转。但它依赖 `PickObject` 命中格子的碰撞体 —— 预览期间
+                // 那些碰撞体是临时生成的（`GenerateNearbyFloorColliders`），
+                // 命中不了就什么都不会发生，表现就是「点了没反应」。
+                //
+                // 所以这里不再依赖拾取：只要没命中格子、也没在拖东西，
+                // 就按**指针的世界坐标**找最近的一格（半径和临时碰撞体用的
+                // 同一个 range），命中就直接跳过去。两条路最终都走同一次走位。
+                if (!dragging
+                    && pendingKind != SceneTargetKind.Floor
+                    && Main.Settings != null
+                    && Main.Settings.LocateOnTrackClick)
+                {
+                    TryLocateAtPointer(viewport);
+                }
+            }
+
             if (Input.GetMouseButtonUp(0) && pendingKind != SceneTargetKind.None)
             {
                 EndPointer();
@@ -1240,6 +1261,63 @@ namespace ADOFAIEditorStudio
             {
                 EditorPlaybackBridge.TrySetPaused(false, out _);
             }
+        }
+
+        /// <summary>
+        /// 定位模式的回退：按指针的世界坐标找最近的一格，命中就跳。
+        ///
+        /// 半径用 `scrFloor.LongDimensions.magnitude` —— 和
+        /// `GenerateNearbyFloorColliders` 给临时碰撞体划定的范围同一个值，
+        /// 所以"算不算点在轨道上"这判断和拾取那条路是一致的。
+        ///
+        /// 命中不了（离轨道太远）就什么都不做：空白处点击不该把画面拽走。
+        /// </summary>
+        private static void TryLocateAtPointer(RectTransform viewport)
+        {
+            scnEditor editor = scnEditor.instance;
+            if (editor == null || editor.floors == null || editor.floors.Count == 0)
+            {
+                return;
+            }
+
+            Vector2 world;
+            if (!TryScreenToWorld(viewport, Input.mousePosition, out world))
+            {
+                return;
+            }
+
+            float range = scrFloor.LongDimensions.magnitude;
+            scrFloor nearest = null;
+            float nearestDistance = float.PositiveInfinity;
+            for (int i = 0; i < editor.floors.Count; i++)
+            {
+                scrFloor floor = editor.floors[i];
+                if (floor == null)
+                {
+                    continue;
+                }
+
+                float distance = Vector2.Distance(floor.transform.position, world);
+                if (distance <= range && distance < nearestDistance)
+                {
+                    nearestDistance = distance;
+                    nearest = floor;
+                }
+            }
+
+            if (nearest == null)
+            {
+                return;
+            }
+
+            if (Main.Logger != null)
+            {
+                Main.Logger.Log("[定位] 回退定位：f" + nearest.seqID
+                    + " 距离=" + nearestDistance.ToString("0.00")
+                    + " range=" + range.ToString("0.00") + ".");
+            }
+
+            EditorPlaybackBridge.JumpPreviewToFloor(nearest);
         }
 
         private static GameObject PickObject(RectTransform viewport, Vector2 screenPoint)

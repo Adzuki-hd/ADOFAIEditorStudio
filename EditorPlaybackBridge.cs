@@ -4896,7 +4896,40 @@ namespace ADOFAIEditorStudio
             // 定位模式（`LocateOnTrackClick`）打开时，选格一律带动播放头。
             // 预览里点轨道走的就是这条路：点击 → `scnEditor.SelectFloor`
             // → SelectFloor 补丁 → 这里。所以「点轨道跳画面」不需要第二套拾取。
-            FollowSelectedFloor(floor, Main.Settings != null && Main.Settings.LocateOnTrackClick);
+            bool locate = Main.Settings != null && Main.Settings.LocateOnTrackClick;
+            if (floor != null && Main.Logger != null
+                && (locate || (Main.Settings != null && Main.Settings.FollowSelectionOnClick)))
+            {
+                // 一行一拍。这个入口只在"选中项真的变了"时进来（方向键、点轨道、
+                // 原生格子面板），不是每帧，留着能直接看出点轨道到底有没有走到这里。
+                Main.Logger.Log("[定位] 选格 f" + floor.seqID
+                    + " t=" + ((float)floor.entryTime).ToString("0.000")
+                    + " 定位=" + locate
+                    + " 选中跟随=" + (Main.Settings != null && Main.Settings.FollowSelectionOnClick)
+                    + ".");
+            }
+            FollowSelectedFloor(floor, locate);
+        }
+
+        /// <summary>
+        /// 直接按格跳（定位模式点轨道用）。
+        ///
+        /// 和 `JumpToNativeSelection` 的区别：这个是"指定格"，不读原生选中项。
+        /// 两条路最后都落到同一次走位（`BeginPlayheadTravel`）。
+        /// </summary>
+        internal static bool JumpPreviewToFloor(scrFloor floor)
+        {
+            if (floor == null)
+            {
+                return false;
+            }
+            if (!evaluatorOwnedActive && !previewRequested)
+            {
+                return false;
+            }
+
+            FollowSelectedFloor(floor, true);
+            return true;
         }
 
         /// <summary>
@@ -7104,6 +7137,17 @@ namespace ADOFAIEditorStudio
                 distance * TravelSecondsPerSongSecond, TravelMinSeconds, TravelMaxSeconds);
             travelStartedAt = Time.unscaledTime;
             travelActive = true;
+
+            // 一次跳转一行日志（不是每帧）。定位点轨道没反应时，靠它区分
+            // "根本没走到这里"和"走了又被谁取消"。
+            if (Main.Logger != null)
+            {
+                Main.Logger.Log("[定位] 开始走位 " + travelFromTime.ToString("0.000")
+                    + " → " + travelToTime.ToString("0.000")
+                    + " 时长=" + travelDuration.ToString("0.000") + " 秒"
+                    + " 求值器自有=" + evaluatorOwnedActive
+                    + " 静帧=" + staticPreviewFrameActive + ".");
+            }
         }
 
         /// <summary>取消走位（用户自己拖播放头、开始播放、关工作台时用）。</summary>
@@ -7128,14 +7172,29 @@ namespace ADOFAIEditorStudio
 
             // 播放（原生 transport 或求值器播放）和手动拖动都优先于走位：
             // 那两种情况下时钟由别人掌握，这里必须立刻让位。
-            // 原生那条要单独判 —— `trackBTransportActive` / `nativePlaybackStarted`
-            // 两条路都不一定让 `previewClockRunning` 为真。
+            //
+            // **不能用 `NativeRuntimeIsLive`**：它的第二个条件是
+            // `editor.playMode && !editor.inStrictlyEditingMode`，而
+            // `ApplyStaticPreviewState` 会让 `pausedInPlayMode` 置位 ——
+            // 那个字段一置位，`scnEditor.playMode` 的 getter 就**无条件返回 true**，
+            // 也就是工作台拥有预览的**整个期间**都成立。拿它当"原生正在播"的判据，
+            // 走位一开就被自己取消，表现就是「点轨道完全没反应」。
+            // 只认真正那几个"别人已经接管时钟"的旗标。
             if (!previewRequested
                 || previewClockRunning
                 || timelineScrubActive
-                || NativeRuntimeIsLive(scnEditor.instance))
+                || nativePlaybackStarted
+                || trackBTransportActive)
             {
                 travelActive = false;
+                if (Main.Logger != null)
+                {
+                    Main.Logger.Log("[定位] 走位取消：previewRequested=" + previewRequested
+                        + " playing=" + previewClockRunning
+                        + " scrub=" + timelineScrubActive
+                        + " nativePlayback=" + nativePlaybackStarted
+                        + " trackB=" + trackBTransportActive + ".");
+                }
                 return;
             }
 
