@@ -4908,14 +4908,17 @@ namespace ADOFAIEditorStudio
                     + " 选中跟随=" + (Main.Settings != null && Main.Settings.FollowSelectionOnClick)
                     + ".");
             }
-            FollowSelectedFloor(floor, locate);
+            // 点轨道这条**只有它**要"加速走过去"（用户明确要求：1 秒内加速）。
+            // 其它路（打开工作台落选中格、点事件块跟随）一律瞬跳，见各自调用点。
+            FollowSelectedFloor(floor, locate, locate);
         }
 
         /// <summary>
-        /// 直接按格跳（定位模式点轨道用）。
+        /// 直接按格跳（定位模式点轨道用，走位版）。
         ///
-        /// 和 `JumpToNativeSelection` 的区别：这个是"指定格"，不读原生选中项。
-        /// 两条路最后都落到同一次走位（`BeginPlayheadTravel`）。
+        /// 和 `JumpToNativeSelection` 的区别：一个是"指定格 + 加速走过去"，
+        /// 另一个是"打开工作台时瞬跳到原生选中项"。两条都落到同一个
+        /// `FollowSelectedFloor`，只是 `animate` 不同。
         /// </summary>
         internal static bool JumpPreviewToFloor(scrFloor floor)
         {
@@ -4928,7 +4931,7 @@ namespace ADOFAIEditorStudio
                 return false;
             }
 
-            FollowSelectedFloor(floor, true);
+            FollowSelectedFloor(floor, true, true);
             return true;
         }
 
@@ -4966,10 +4969,13 @@ namespace ADOFAIEditorStudio
 
             // 打开工作台属于"用户明确要过去"，不受 `FollowSelectionOnClick`
             // 那个开关限制 —— 那个开关管的是"点事件块时要不要跟"。
-            FollowSelectedFloor(floor, true);
-            if (Main.Settings != null && Main.Settings.VerboseDiagnostics)
+            //
+            // **这里是瞬跳，不走位**：打开工作台那一瞬间画面就应该已经在
+            // 选中的格上；"1 秒内加速过去"只属于在 AES 里点轨道那条路。
+            FollowSelectedFloor(floor, true, false);
+            if (Main.Logger != null)
             {
-                Main.Logger.Log("[定位] 打开工作台落到原生选中格：f" + floor.seqID
+                Main.Logger.Log("[定位] 打开工作台瞬跳到 f" + floor.seqID
                     + " t=" + ((float)floor.entryTime).ToString("0.000") + ".");
             }
             return true;
@@ -7043,7 +7049,7 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private static void FollowSelectedFloor(scrFloor floor)
         {
-            FollowSelectedFloor(floor, false);
+            FollowSelectedFloor(floor, false, false);
         }
 
         /// <param name="force">
@@ -7051,7 +7057,15 @@ namespace ADOFAIEditorStudio
         /// 定位模式打开时的点轨道（用户明确要"点哪跳哪"）、
         /// 以及打开工作台时落到原生选中的那一格。
         /// </param>
-        private static void FollowSelectedFloor(scrFloor floor, bool force)
+        /// <param name="animate">
+        /// true = 用 1 秒内的加速走位过去（**只有"在 AES 里点轨道"这一条**）；
+        /// false = 瞬跳。
+        ///
+        /// 为什么只有点轨道走位：打开工作台那一刻画面应该**已经在**选中的格上
+        /// （用户是从原生编辑器切过来的，等 1 秒没有任何信息量）；
+        /// 点事件块跟随同理，那是"检查下一个事件"，不是"飞到别处去"。
+        /// </param>
+        private static void FollowSelectedFloor(scrFloor floor, bool force, bool animate)
         {
             if (floor == null || timelineScrubActive || previewClockRunning)
             {
@@ -7075,19 +7089,31 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
-            // **不直接跳过去**：瞬移会让画面硬切一下，读者找不到东西去哪了。
-            // 改成用最多一秒、慢起步加速过去的走位（见 BeginPlayheadTravel）。
-            BeginPlayheadTravel(target);
+            if (animate)
+            {
+                // 点轨道：最多一秒、慢起步加速过去（见 BeginPlayheadTravel）。
+                BeginPlayheadTravel(target);
+                return;
+            }
+
+            // 其它路：瞬跳。先把可能还在跑的走位撤掉，否则它下一帧又把
+            // 播放头拽回原来的轨迹上。
+            CancelPlayheadTravel();
+            previewClockTime = target;
+            previewClockLastUnscaledTime = Time.unscaledTime;
+            evaluatorBackend.TryEvaluate(previewClockTime, out string ignored);
+            ApplyStaticPreviewState();
         }
 
         // ------------------------------------------------------------ 播放头走位
         //
-        // 「跳转」在这之前是**直接赋值**：previewClockTime = 目标，一帧到位。
-        // 隔得远的时候画面像被剪了一刀 —— 尤其定位模式点轨道、打开工作台落到
-        // 选中格这两条路，用户刚看的那一节会整个消失。
+        // 「跳转」原来是直接赋值：previewClockTime = 目标，一帧到位。
+        // 现在只有**在 AES 里点轨道**这一条路改成走过去（从当前时间出发，
+        // 慢起步加速，1 秒以内到达目标）；打开工作台落选中格、点事件块跟随
+        // 仍然是瞬跳 —— 前者的画面应该一进去就已经在那一格上，等一秒没有
+        // 任何信息量。
         //
-        // 现在改成走过去：从当前时间出发，用一条**加速**曲线（慢起步、越走越快）
-        // 在 1 秒以内到达目标。每一帧照常求值，所以中间看到的仍是真实的谱面画面。
+        // 每一帧照常求值，所以走位途中看到的仍是真实的谱面画面。
 
         /// <summary>走位最长时间（秒）。用户要的是"1 秒内到"。</summary>
         private const float TravelMaxSeconds = 1f;
