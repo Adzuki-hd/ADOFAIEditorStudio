@@ -191,9 +191,10 @@ namespace ADOFAIEditorStudio
         // 「选中事件时跟随」是两件事：那个管时间轴上的事件块，这个管画面里的轨道。
         // 快捷键 Ctrl+Alt+L。
         public bool LocateOnTrackClick = false;
-        // 播放头跑出时间轴右边缘时，把视图整页翻过去（瞬间，不做动画）。
+        // 播放头跑到时间轴尽头时，把视图整页翻过去（瞬间，不做动画）。
         //
-        // 默认关：有的人习惯自己滚，自动翻页会在拖动时抢视野。
+        // 只管"手动把播放头拖到尽头"这件事；播放中的跟随是另一条既有路径
+        // （`FollowPlayback`），不受这个开关影响。默认关。
         // 快捷键 Ctrl+Alt+P。
         public bool AutoPageTimeline = false;
         // 参数栏的显示缩放。参数栏是按 1920x1080 的设计尺寸排的，

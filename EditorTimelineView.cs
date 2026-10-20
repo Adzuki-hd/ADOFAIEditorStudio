@@ -912,6 +912,8 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private bool pendingZoomToMaximum;
         private float viewStartTime;
+        /// <summary>自动翻页探针已输出几次（上限 5，避免拖动时刷屏）。</summary>
+        private int pageLogCount;
         private float totalDuration;
         private float navigationDuration;
         private float nextDataRefresh;
@@ -7257,13 +7259,21 @@ namespace ADOFAIEditorStudio
 
             float x = (currentTime - viewStartTime) * pixelsPerSecond;
             float margin = Mathf.Max(24f, bodyWidth * 0.04f);
+            // 拖播放头时 `QueueScrubAtX` 会把 x 钳在 [0, bodyWidth]，
+            // 所以**播放头永远越不过右边缘**——原来判据写的是 `x > bodyWidth`，
+            // 这一支在实际拖动里一次都不会成立，功能等于没接上（用户报的
+            // 「自动翻页开关失效」就是它）。改成「碰到边缘」：留 1.5 像素容差，
+            // 让"拖到尽头"也能翻页。
+            const float edgeTolerance = 1.5f;
             float targetStart = viewStartTime;
-            if (x > bodyWidth)
+            if (x >= bodyWidth - edgeTolerance)
             {
                 // 翻过去之后播放头落在左侧留白处，和拖动时的落点手感一致。
                 targetStart = currentTime - margin / pixelsPerSecond;
             }
-            else if (x < 0f)
+            // 反向只在"确实离开了开头"时才翻：t≈0 时 x 天然是 0，
+            // 不加这个条件会每帧做一次空翻（夹回 0，什么也不变，但会白跑）。
+            else if (x <= edgeTolerance && currentTime > 0.001f)
             {
                 targetStart = currentTime - (bodyWidth - margin) / pixelsPerSecond;
             }
@@ -7273,9 +7283,25 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
+            float before = viewStartTime;
             viewStartTime = targetStart;
             ClampViewStart();
+            if (Mathf.Approximately(before, viewStartTime))
+            {
+                // 夹完没动（比如已经在最左端）—— 不算一次翻页，不置脏、不记日志。
+                return;
+            }
             visualsDirty = true;
+
+            // 探针：只记前几次，用来确认这个开关到底有没有真的翻过页
+            // （上一版判据写成了永远不成立的条件，功能是死的）。
+            if (pageLogCount < 5 && Main.Logger != null)
+            {
+                pageLogCount++;
+                Main.Logger.Log("[翻页] t=" + currentTime.ToString("0.000")
+                    + " 视口起点=" + viewStartTime.ToString("0.000")
+                    + " x=" + x.ToString("0.0") + "/" + bodyWidth.ToString("0.0") + ".");
+            }
         }
 
         /// <summary>
