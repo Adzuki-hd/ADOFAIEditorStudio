@@ -1840,6 +1840,9 @@ namespace ADOFAIEditorStudio
             // 打开工作台时"落到原生选中格"的待办，落地一次就撤。
             TickPendingSelectionJump();
 
+            // 跳转的走位：定位点轨道、打开落格都靠它"加速过去"而不是硬切。
+            EditorPlaybackBridge.TickPlayheadTravel();
+
             if (visible && Input.GetKeyDown(KeyCode.Escape))
             {
                 // 有窗口开着时 Esc **先关它**：否则开着一层窗口按 Esc，整个

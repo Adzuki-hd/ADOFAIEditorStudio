@@ -53,9 +53,6 @@ namespace ADOFAIEditorStudio
         /// <summary>缩放手柄那道握把的宽。和 uGUI 那个 Grip 一致（48）。</summary>
         private const float GripWidth = 48f;
 
-        /// <summary>功能开关按钮的宽。两个汉字 + 左右留白（正文那档字号约 46）。</summary>
-        private const float FeatureButtonWidth = 52f;
-
         internal Rect Rect { get { return _rect; } }
 
         internal void Draw()
@@ -194,9 +191,15 @@ namespace ADOFAIEditorStudio
         /// <summary>
         /// 两个功能开关：**定位**、**自动翻页**。
         ///
-        /// 和左边那排图标开关不是一类东西，所以不塞进 `CollectHeaderToggles()`：
-        /// 那个接口的图标是 uGUI 那边造好的 Sprite，这两个没有图标，
-        /// 用文字按钮画更省事、也更好认。
+        /// 和左边那排图标开关不是一类东西，所以不塞进 `CollectHeaderToggles()`
+        /// （那个接口的图标是 uGUI 那边造好的 Sprite，这里是现算的矢量图形）。
+        /// 尺寸和左边那排**完全一致**（32×29、间距 6），读起来还是同一排按钮。
+        ///
+        /// 图标是自己画的两笔几何形，不带文字：
+        ///   定位   = 准星（圆环 + 四向刻线 + 中心点）
+        ///   翻页   = 页面左边界 + 两个向右的尖角
+        /// 开/关的差别画在颜色上（开 = 强调色，关 = 次要文字色），
+        /// 和「拖动吸附」那个开关同一种表达。
         ///
         /// 状态直接读 `Main.Settings`（和图标开关读同一份设置），点一下调
         /// 时间轴那边的 Toggle 方法 —— 设置写盘、状态栏提示都在那里。
@@ -209,55 +212,82 @@ namespace ADOFAIEditorStudio
             float buttonY = y + (height - ToggleHeight) * 0.5f;
 
             float x = startX;
-            DrawFeatureButton(draw, x, buttonY, "locate", "定位", locate,
-                "点轨道跳画面（Ctrl+Alt+L）", timeline.ToggleLocateOnTrackClick);
-            x += FeatureButtonWidth + ToggleGap;
-            DrawFeatureButton(draw, x, buttonY, "autopage", "翻页", autoPage,
-                "播放头跑出右边缘就整页翻过去（Ctrl+Alt+P）", timeline.ToggleAutoPageTimeline);
-            x += FeatureButtonWidth + ToggleGap;
+            DrawFeatureButton(draw, x, buttonY, "locate", locate,
+                "定位", "点轨道跳过去（Ctrl+Alt+L）",
+                timeline.ToggleLocateOnTrackClick, PaintLocateIcon);
+            x += ToggleWidth + ToggleGap;
+            DrawFeatureButton(draw, x, buttonY, "autopage", autoPage,
+                "自动翻页", "播放头跑出右边缘就整页翻过去（Ctrl+Alt+P）",
+                timeline.ToggleAutoPageTimeline, PaintPageIcon);
+            x += ToggleWidth + ToggleGap;
             return x;
         }
 
         private static void DrawFeatureButton(ImDrawListPtr draw, float x, float y,
-            string id, string label, bool on, string hint, System.Action click)
+            string id, bool on, string title, string hint, System.Action click,
+            System.Action<ImDrawListPtr, NVec2, uint> paintIcon)
         {
             NVec2 topLeft = new NVec2(x, y);
-            NVec2 size = new NVec2(FeatureButtonWidth, ToggleHeight);
+            NVec2 size = new NVec2(ToggleWidth, ToggleHeight);
 
+            // 背景 / 悬停 / 按下交给 ImGui 自己的按钮样式，
+            // 和左边那排图标开关长得一模一样；图标只是画在它上面。
             ImGui.SetCursorScreenPos(topLeft);
-            ImGui.InvisibleButton("##feat_" + id, size);
+            if (ImGui.Button("##feat_" + id, size))
+            {
+                if (click != null)
+                {
+                    click();
+                }
+            }
             bool hovered = ImGui.IsItemHovered();
-            if (ImGui.IsItemClicked() && click != null)
-            {
-                click();
-            }
 
-            // 开：强调色实心 + 亮字；关：只有描边 + 灰字。
-            // 和参数栏那个自绘开关同一种语言（开 = 实心）。
-            if (on)
-            {
-                draw.AddRectFilled(topLeft, topLeft + size,
-                    ImGui.GetColorU32(ToVec4(Palette.Accent)), EditorStudioOverlay.CornerSmall);
-            }
-            else
-            {
-                draw.AddRectFilled(topLeft, topLeft + size,
-                    ImGui.GetColorU32(ToVec4(Palette.ButtonNormal)), EditorStudioOverlay.CornerSmall);
-            }
-            draw.AddRect(topLeft, topLeft + size,
-                ImGui.GetColorU32(ToVec4(hovered ? Palette.TextSecondary : Palette.PanelRule)),
-                EditorStudioOverlay.CornerSmall, ImDrawFlags.None, 1f);
-
-            NVec2 textSize = ImGui.CalcTextSize(label);
-            draw.AddText(new NVec2(
-                    x + (FeatureButtonWidth - textSize.X) * 0.5f,
-                    y + (ToggleHeight - ImGui.GetTextLineHeight()) * 0.5f),
-                ImGui.GetColorU32(ToVec4(on ? Palette.TextPrimary : Palette.TextMuted)),
-                label);
+            NVec2 center = new NVec2(x + ToggleWidth * 0.5f, y + ToggleHeight * 0.5f);
+            uint color = ImGui.GetColorU32(ToVec4(on ? Palette.Accent : Palette.TextMuted));
+            paintIcon(draw, center, color);
 
             if (hovered)
             {
-                ImGui.SetTooltip(label + (on ? "：开" : "：关") + "\n" + hint);
+                ImGui.SetTooltip(title + (on ? "：开" : "：关") + "\n" + hint);
+            }
+        }
+
+        /// <summary>定位图标：准星。圆环 + 四向刻线 + 中心点。</summary>
+        private static void PaintLocateIcon(ImDrawListPtr draw, NVec2 center, uint color)
+        {
+            const float radius = 5.2f;
+            const float tick = 3.2f;
+            const float thickness = 1.6f;
+
+            draw.AddCircle(center, radius, color, 20, thickness);
+            draw.AddLine(new NVec2(center.X - radius - tick, center.Y),
+                new NVec2(center.X - radius + 0.6f, center.Y), color, thickness);
+            draw.AddLine(new NVec2(center.X + radius - 0.6f, center.Y),
+                new NVec2(center.X + radius + tick, center.Y), color, thickness);
+            draw.AddLine(new NVec2(center.X, center.Y - radius - tick),
+                new NVec2(center.X, center.Y - radius + 0.6f), color, thickness);
+            draw.AddLine(new NVec2(center.X, center.Y + radius - 0.6f),
+                new NVec2(center.X, center.Y + radius + tick), color, thickness);
+            draw.AddCircleFilled(center, 1.5f, color, 8);
+        }
+
+        /// <summary>翻页图标：页面左边界 + 两个向右的尖角（"整页往右翻"）。</summary>
+        private static void PaintPageIcon(ImDrawListPtr draw, NVec2 center, uint color)
+        {
+            const float halfHeight = 5.5f;
+            const float thickness = 1.6f;
+
+            float left = center.X - 6.5f;
+            draw.AddLine(new NVec2(left, center.Y - halfHeight),
+                new NVec2(left, center.Y + halfHeight), color, thickness);
+
+            for (int i = 0; i < 2; i++)
+            {
+                float x = center.X - 2.6f + i * 4.2f;
+                draw.AddLine(new NVec2(x, center.Y - halfHeight + 0.5f),
+                    new NVec2(x + 3.8f, center.Y), color, thickness);
+                draw.AddLine(new NVec2(x + 3.8f, center.Y),
+                    new NVec2(x, center.Y + halfHeight - 0.5f), color, thickness);
             }
         }
 

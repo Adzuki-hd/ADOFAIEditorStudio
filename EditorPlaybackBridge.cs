@@ -1603,6 +1603,9 @@ namespace ADOFAIEditorStudio
         internal static bool TryBeginTimelineScrub(out string status)
         {
             status = null;
+            // 用户自己动播放头了，跳转的走位立刻让位 —— 两个写入者同时改
+            // previewClockTime 会让画面一顿一顿地往回拉。
+            CancelPlayheadTravel();
             scnEditor editor = scnEditor.instance;
             if (editor == null)
             {
@@ -1613,8 +1616,7 @@ namespace ADOFAIEditorStudio
             // 拖动把画面交还给求值器。一个仍在播放的原生运行时
             // 必须先停止推进——相机上有两个写入者
             // 是这个项目踩得最多的缺陷。
-            //
-            // 选暂停而不是退出：退出会在好几帧里慢慢拆掉运行时，
+            //            // 选暂停而不是退出：退出会在好几帧里慢慢拆掉运行时，
             // 而这个入口只被调用一次，拖动就会被直接丢掉。
             // 暂停保住运行时和播放头，空格就从
             // 这里原样恢复。
@@ -5007,6 +5009,9 @@ namespace ADOFAIEditorStudio
             }
             previewRequested = false;
             nativePlaybackStarted = false;
+            // 走位一起撤：关掉工作台之后没人再 tick 它，留着等于下次打开
+            // 从一半的位置接着走。
+            CancelPlayheadTravel();
             // Track B 自己的旗标得和其他一起清：正是它把一次按空格
             // 路由到暂停/恢复分支，而它指向的运行时已经被场景重载
             // 销毁了。留着它，下一次按键会试图去暂停一个
@@ -7037,10 +7042,121 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
-            previewClockTime = target;
+            // **不直接跳过去**：瞬移会让画面硬切一下，读者找不到东西去哪了。
+            // 改成用最多一秒、慢起步加速过去的走位（见 BeginPlayheadTravel）。
+            BeginPlayheadTravel(target);
+        }
+
+        // ------------------------------------------------------------ 播放头走位
+        //
+        // 「跳转」在这之前是**直接赋值**：previewClockTime = 目标，一帧到位。
+        // 隔得远的时候画面像被剪了一刀 —— 尤其定位模式点轨道、打开工作台落到
+        // 选中格这两条路，用户刚看的那一节会整个消失。
+        //
+        // 现在改成走过去：从当前时间出发，用一条**加速**曲线（慢起步、越走越快）
+        // 在 1 秒以内到达目标。每一帧照常求值，所以中间看到的仍是真实的谱面画面。
+
+        /// <summary>走位最长时间（秒）。用户要的是"1 秒内到"。</summary>
+        private const float TravelMaxSeconds = 1f;
+
+        /// <summary>走位最短时间：只跳一两格时走满一秒反而像慢动作。</summary>
+        private const float TravelMinSeconds = 0.25f;
+
+        /// <summary>
+        /// 每秒谱面时间对应的走位时长。25 秒以上的跨度就会吃满 1 秒上限，
+        /// 一两格的小跳只走四分之一秒。
+        /// </summary>
+        private const float TravelSecondsPerSongSecond = 0.04f;
+
+        private static bool travelActive;
+        private static float travelFromTime;
+        private static float travelToTime;
+        private static float travelStartedAt;
+        private static float travelDuration = TravelMinSeconds;
+
+        /// <summary>正在走位（定位点击、打开落格、选中跟随都走这条路）。</summary>
+        internal static bool IsPlayheadTravelling
+        {
+            get { return travelActive; }
+        }
+
+        /// <summary>
+        /// 开始一次播放头走位。已经在走的时候从**当前显示的时间**接着走，
+        /// 所以连点几下轨道不会跳回去。
+        /// </summary>
+        internal static void BeginPlayheadTravel(float targetTime)
+        {
+            if (!evaluatorOwnedActive && !previewRequested)
+            {
+                return;
+            }
+
+            float distance = Mathf.Abs(targetTime - previewClockTime);
+            if (distance < 0.0001f)
+            {
+                travelActive = false;
+                return;
+            }
+
+            travelFromTime = Mathf.Max(0f, previewClockTime);
+            travelToTime = Mathf.Max(0f, targetTime);
+            travelDuration = Mathf.Clamp(
+                distance * TravelSecondsPerSongSecond, TravelMinSeconds, TravelMaxSeconds);
+            travelStartedAt = Time.unscaledTime;
+            travelActive = true;
+        }
+
+        /// <summary>取消走位（用户自己拖播放头、开始播放、关工作台时用）。</summary>
+        internal static void CancelPlayheadTravel()
+        {
+            travelActive = false;
+        }
+
+        /// <summary>
+        /// 每帧推进走位。由叠加层的 Update 调用 —— 静态预览下没有别的东西
+        /// 在推进 `previewClockTime`。
+        ///
+        /// 曲线是 `t²`（加速：起步慢、越走越快），因为要求就是"加速过去"。
+        /// 想换成两头缓的，把这一行换成 smoothstep 即可。
+        /// </summary>
+        internal static void TickPlayheadTravel()
+        {
+            if (!travelActive)
+            {
+                return;
+            }
+
+            // 播放（原生 transport 或求值器播放）和手动拖动都优先于走位：
+            // 那两种情况下时钟由别人掌握，这里必须立刻让位。
+            // 原生那条要单独判 —— `trackBTransportActive` / `nativePlaybackStarted`
+            // 两条路都不一定让 `previewClockRunning` 为真。
+            if (!previewRequested
+                || previewClockRunning
+                || timelineScrubActive
+                || NativeRuntimeIsLive(scnEditor.instance))
+            {
+                travelActive = false;
+                return;
+            }
+
+            float ratio = travelDuration <= 0.0001f
+                ? 1f
+                : Mathf.Clamp01((Time.unscaledTime - travelStartedAt) / travelDuration);
+            float eased = ratio * ratio;
+
+            float time = ratio >= 1f
+                ? travelToTime
+                : Mathf.LerpUnclamped(travelFromTime, travelToTime, eased);
+
+            previewClockTime = time;
             previewClockLastUnscaledTime = Time.unscaledTime;
             evaluatorBackend.TryEvaluate(previewClockTime, out string ignored);
             ApplyStaticPreviewState();
+
+            if (ratio >= 1f)
+            {
+                travelActive = false;
+            }
         }
 
         /// <summary>
