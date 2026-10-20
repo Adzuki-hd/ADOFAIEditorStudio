@@ -558,7 +558,9 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // 处理器刚刚把它打开。
             // 只记报告粒子缺陷的那几个格，而且上限放宽，这样
             // 谱面开头的事件挤不掉真正有意思的那些。
-            if (Main.Settings != null && Main.Settings.VerboseDiagnostics
+            // 临时：为了抓 992/993 那次"不该出现的发射器"，这轮先无条件打开
+            // （上限 200 行不变）。取证完把 VerboseDiagnostics 那道门加回去。
+            if (Main.Logger != null
                 && current.SourceFloor >= 700 && particleLogCount < 200)
             {
                 particleLogCount++;
