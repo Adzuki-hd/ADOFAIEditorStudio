@@ -514,7 +514,22 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 bool skipHiddenWrites = hiddenCulling
                     && !visible
                     && !decoration.GetVisible();
-                bool skipTransparentWrites = cullTransparent && opacity <= 0.001f;
+                // transparent 剔除：不透明度为 0 就当它看不见，省掉这组 setter。
+                //
+                // **但粒子装饰物不适用**：`SetOpacity` 走的是 `ApplyColor`，
+                // 对 `scrParticleDecoration` 只是改
+                // `main.startColor = colorGradient` —— **已经在飞的粒子不受影响，
+                // 系统照样在喷**。也就是说"opacity 0"对粒子根本不是"看不见"。
+                //
+                // 以前这里一视同仁，于是凡是「`opacity: 0` 和 `SetParticle Start`
+                // 一起发」的谱面（本谱 739 / 754 的 `6-7 6-8 6-9 6-16` 正是），
+                // 发射器的 position / rotation / scale **整段被跳过**：原生每帧
+                // 都在跟着父格移动旋转，求值器却把它们冻在旧位置旧角度上，
+                // 而粒子还在照常往外喷 —— 用户看到的就是"727 格之后角度和位置
+                // 全都错了"。
+                bool skipTransparentWrites = cullTransparent
+                    && opacity <= 0.001f
+                    && !(decoration is scrParticleDecoration);
 
                 // 不透明度无条件写入，放在下面那块之外。
                 //

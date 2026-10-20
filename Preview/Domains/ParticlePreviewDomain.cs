@@ -600,6 +600,26 @@ namespace ADOFAIEditorStudio.Preview.Domains
             if (deco.sourceLevelEvent != null)
             {
                 deco.ResetParticle(deco.sourceLevelEvent, true);
+
+                // **把发射形状的尺寸写回"常驻那一套"的值。**
+                //
+                // `ResetParticle` 里写的是
+                //     shape.scale = (Vector2)ev["scale"] / 100f * tileSize
+                // 也就是按**格**换算过的尺寸；而原生每帧在 `scrParticleDecoration.Update`
+                // 里用的是
+                //     shape.scale = scale;      // scale 来自 SetScale(scaleVec) = scale/100
+                // 两者差一个 tileSize（默认 100 倍）。
+                //
+                // 原生那边 Update 每帧都会盖回来，所以从来看不出来。求值器这边
+                // 不一样：它在装饰物"透明 / 隐藏"时会跳过 SetScale（那是省开销的
+                // 剔除），于是这个 100 倍大的发射面就留在系统上 ——
+                // 粒子从一个巨大得多的矩形里往外发，看起来就是"位置全乱了"。
+                // 本谱 739 / 754 那两条 MoveDecorations 正是 `opacity: 0` 和
+                // `SetParticle Start` 一起发，正好踩中。
+                //
+                // 这里补一次，等价于原生 Update 每帧做的那一步，而且不依赖剔除。
+                deco.SetScale(deco.scaleVec);
+                deco.SetRotation(deco.rotAngle);
             }
 
             // ResetParticle 会停掉系统；没有别的东西会自己再播放它。
