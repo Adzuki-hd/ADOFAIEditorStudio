@@ -870,6 +870,15 @@ namespace ADOFAIEditorStudio
         // 片段被排程到开始可听的 dsp 时刻。画面保持
         // 在恢复时刻不动，直到设备时钟越过它，这样两者一起开始。
         private static double audioStartDsp;
+        /// <summary>
+        /// 为了等 audioStartDsp 而定帧的帧数。超时就用 MaxAudioStartHoldFrames 放弃。
+        /// </summary>
+        private static int audioStartHoldFrames;
+        /// <summary>
+        /// 这次起播要不要"定住画面等音频"。只有排程余量那 0.1 秒才需要；
+        /// 倒计时前奏那种长等待绝不定帧（否则画面会僵住整个倒计时）。
+        /// </summary>
+        private static bool holdPictureForAudioStart;
         // 兜底，防止一个始终不落地的排程回调把画面冻住。
         // 相对它要覆盖的 Windows ~0.5s 缓冲区来说，这个值很宽裕。
         private const int MaxAudioStartHoldFrames = 120;
@@ -5348,7 +5357,18 @@ namespace ADOFAIEditorStudio
                     ? -rawClipTime / pitch
                     : MinSchedulingLeadSeconds;
 
-                double clipTime = rawClipTime + startLead;
+                // **余量只加在排程上，不加在片段位置上。**
+                //
+                // 原来这里写的是 `clipTime = rawClipTime + startLead`，等于
+                // "音频晚 0.1 秒开始，但直接从 0.1 秒之后的内容播" ——
+                // 于是那 0.1 秒的音乐被**凭空剪掉**。音画仍然同步（画面也走了
+                // 0.1 秒），听起来却是"音乐开头少了一截、还顿一下"。
+                //
+                // 现在的做法：片段从 target 的内容开始，同时**把画面定住**
+                // 直到音频真的开始（见 TickEvaluatorOwnedPreview 里的
+                // audioStartDsp 等待分支）。这样既不剪内容、也不产生音画偏移，
+                // 代价只是开头那一小段画面停顿（和倒计时的味道一样）。
+                double clipTime = rawClipTime;
                 if (clipTime < conductor.song.clip.length)
                 {
                     // **排程无条件做，不再只在 startAudio 时做。**
@@ -5373,6 +5393,12 @@ namespace ADOFAIEditorStudio
                         // 场景时钟上面已经被移到 targetTime，不等的话画面就会比音乐
                         // 快出正好这么多——听起来就是声音晚到一拍。
                         audioStartDsp = currentDspTime + startLead;
+                        audioStartHoldFrames = 0;
+                        // **只有"排程余量"那种情况才定帧等**。
+                        // 倒计时前奏（rawClipTime < 0）时 startLead 是真实内容
+                        // 长度，可能长达两秒 —— 那种情况绝不能定帧，否则每次
+                        // 起播画面都会僵住整个倒计时（老注释里踩过这个坑）。
+                        holdPictureForAudioStart = rawClipTime >= 0d;
                     }
 
                     conductor.song.time = (float)Math.Max(0d, clipTime);
@@ -6835,13 +6861,17 @@ namespace ADOFAIEditorStudio
                     audioStartPendingFrames++;
                     if (audioStartDsp > 0d)
                     {
+                        // 回调落地了，时钟可以信了。**但 audioStartDsp 留着** ——
+                        // 下一步还要用它把画面定到"音频真正开始"的那一刻，
+                        // 否则画面会先跑掉 0.1 秒，那 0.1 秒的音乐又变成被剪掉。
                         audioStartPending = false;
-                        audioStartDsp = 0d;
                     }
                     else if (audioStartPendingFrames > MaxAudioStartHoldFrames)
                     {
                         // 回调始终没落地。别再等了，让正常路径
                         audioStartPending = false;
+                        // 也别再拿它定画面了，否则会一直定在起播位置。
+                        audioStartDsp = 0d;
                         if (Main.Logger != null)
                         {
                             Main.Logger.Log("[AudioResume] gave up waiting for the schedule "
@@ -6857,8 +6887,43 @@ namespace ADOFAIEditorStudio
                             + AudioSettings.dspTime.ToString("0.000"));
                     }
                 }
+                else if (holdPictureForAudioStart
+                    && audioStartDsp > 0d && AudioSettings.dspTime < audioStartDsp - 0.002d)
+                {
+                    // **音频排程还在未来：把画面定住等它。**
+                    //
+                    // 歌曲被排到 dsp+0.1（`MinSchedulingLeadSeconds`），而片段
+                    // 位置现在是 target 的内容。这几帧里若让画面照常跑，画面就
+                    // 比音乐快出这 0.1 秒 —— 要么把片段往后挪 0.1 秒（那就是
+                    // 早期版本"音乐凭空少一截"的做法），要么让画面等。这里选等：
+                    // 内容不剪、音画不偏，只是开头停一小下。
+                    previewClockTime = audioStartTime;
+                    audioStartHoldFrames++;
+                    if (audioStartHoldFrames > MaxAudioStartHoldFrames)
+                    {
+                        // 排程时刻迟迟不到（设备异常），放弃等待。
+                        audioStartDsp = 0d;
+                        if (Main.Logger != null)
+                        {
+                            Main.Logger.Log("[AudioStart] 等不到排程时刻，放弃定帧。");
+                        }
+                    }
+                }
                 else if (conductor != null)
                 {
+                    // 走到这里说明排程时刻已过（或本来就没有要等的），
+                    // 把"定帧等音频"的标记清掉，恢复正常推进。
+                    if (holdPictureForAudioStart && Main.Logger != null)
+                    {
+                        // 一行日志，证明"定帧等音频"这条路真的走到过：
+                        // 帧数 × 帧时长 ≈ 定帧时长（约 0.1 秒）。
+                        Main.Logger.Log("[AudioStart] 定帧等待 " + audioStartHoldFrames
+                            + " 帧后与音乐同时开始（片段从 target 内容起，不剪音乐）。");
+                    }
+                    audioStartDsp = 0d;
+                    audioStartHoldFrames = 0;
+                    holdPictureForAudioStart = false;
+
                     // 画面按帧时间推进，方式和原生相机一样，
                     // 并被拉向音频时钟，而不是从它读取。
                     //
