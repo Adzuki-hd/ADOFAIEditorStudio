@@ -1310,7 +1310,7 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
-            if (Main.Logger != null)
+            if (Main.VerboseLog)
             {
                 Main.Logger.Log("[定位] 回退定位：f" + nearest.seqID
                     + " 距离=" + nearestDistance.ToString("0.00")

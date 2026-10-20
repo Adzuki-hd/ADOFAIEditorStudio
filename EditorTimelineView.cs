@@ -1925,7 +1925,7 @@ namespace ADOFAIEditorStudio
             {
                 SyncCenteredView(snapshot.CurrentTime);
             }
-            // 自动翻页（开关在标题行，快捷键 Ctrl+Alt+P）。
+            // 自动翻页（开关在标题行，快捷键 Ctrl+K）。
             //
             // 和「固定中间」互斥——那个模式每帧自己把视图摆回中点，
             // 再翻页会两边打架。开关关掉时这里也不动（和上面播放中的跟随
@@ -7306,7 +7306,7 @@ namespace ADOFAIEditorStudio
 
             // 探针：只记前几次，用来确认这个开关到底有没有真的翻过页
             // （上一版判据写成了永远不成立的条件，功能是死的）。
-            if (pageLogCount < 5 && Main.Logger != null)
+            if (pageLogCount < 5 && Main.VerboseLog)
             {
                 pageLogCount++;
                 Main.Logger.Log("[翻页] t=" + currentTime.ToString("0.000")
@@ -8515,8 +8515,8 @@ namespace ADOFAIEditorStudio
             if (Main.Overlay != null)
             {
                 Main.Overlay.SetTransientStatus(Main.Settings.LocateOnTrackClick
-                    ? "定位：开（点轨道跳画面，Ctrl+Alt+L）"
-                    : "定位：关（Ctrl+Alt+L）");
+                    ? "定位：开（点轨道跳画面，Ctrl+J）"
+                    : "定位：关（Ctrl+J）");
             }
         }
 
@@ -8534,7 +8534,7 @@ namespace ADOFAIEditorStudio
             Main.SaveSettings();
             // 探针：开关切换留痕。前一版"开关失效"其实是这一项被关掉了，
             // 没有这条日志就只能靠猜。
-            if (Main.Logger != null)
+            if (Main.VerboseLog)
             {
                 Main.Logger.Log("[翻页] 切换 → " + (Main.Settings.AutoPageTimeline ? "开" : "关")
                     + "（已写盘）");
@@ -8542,8 +8542,8 @@ namespace ADOFAIEditorStudio
             if (Main.Overlay != null)
             {
                 Main.Overlay.SetTransientStatus(Main.Settings.AutoPageTimeline
-                    ? "自动翻页：开（播放头出界就翻页，Ctrl+Alt+P）"
-                    : "自动翻页：关（Ctrl+Alt+P）");
+                    ? "自动翻页：开（播放头出界就翻页，Ctrl+K）"
+                    : "自动翻页：关（Ctrl+K）");
             }
         }
 

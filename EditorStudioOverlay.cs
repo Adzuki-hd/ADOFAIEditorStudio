@@ -5164,7 +5164,7 @@ namespace ADOFAIEditorStudio
 
             // 探针：打开工作台时把"自动翻页 / 定位"两个开关的**运行时值**打出来。
             // 判断"开关失效"前先看这两行，能直接排除"其实是被关掉了"。
-            if (value && Main.Logger != null && Main.Settings != null)
+            if (value && Main.VerboseLog)
             {
                 Main.Logger.Log("[翻页] 打开工作台：自动翻页="
                     + (Main.Settings.AutoPageTimeline ? "开" : "关")

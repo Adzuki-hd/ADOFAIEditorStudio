@@ -85,30 +85,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
         // Player 打开它，Tile/Global 调 SetToFreeMode 关掉它，LastPosition
         // 保持原样。
         private bool[] followModeAtFloor = new bool[0];
-        // 【诊断】已打印的逐事件条数。
-
-        // ── 临时诊断：528 附近的镜头整体偏移 ─────────────────────────────
-        // 只在下面这个格区间打印，且每条事件 / 每一格各一行（几十行量级），
-        // 取证完整段删除。判读方式：
-        //   [镜头事件] 看 Tile 事件的 anchor 和 live（快照锚点 vs 活的格位置）
-        //              是否一致，以及 resolved 是不是 floorPos + offset；
-        //   [镜头帧]   看 out 与 ball 的差（镜头离球多远）、pan 有没有被累加。
-        private const int ProbeFloorMin = 492;
-        private const int ProbeFloorMax = 548;
-        private readonly HashSet<int> probeFloors = new HashSet<int>();
-        private readonly HashSet<int> probeKeyframes = new HashSet<int>();
         private PreviewTimelineContext probeContext;
-
-        // 1045 之后整屏抽搐：逐帧记录相机跳变，判断是「按拍子跳」还是「每帧跳」。
-        private float jitterLastTime = float.NaN;
-        private Vector2 jitterLastPosition;
-        private float jitterLastRotation;
-        private float jitterLastZoom;
-        private int jitterLogCount;
-
-        // 「暂停也抽搐」：静帧取样，看同一处暂停时播放头时间到底动没动。
-        private float stillLastTime = float.NaN;
-        private int stillLogCount;
 
         // 1045 那种「掉帧」演出：谱面在同一批 tag 里把相机甩到 10000 格外
         // （`[null, 10000]`），**同时**打开 HallOfMirrors。
@@ -124,15 +101,6 @@ namespace ADOFAIEditorStudio.Preview.Domains
         // 但不需要残留帧缓冲，也不会有旧内容的糊影。
         private const float HoldDistance = 500f;
         private const float HoldWindowSeconds = 0.5f;
-        private int holdLogCount;
-
-        /// <summary>
-        /// 这张谱里有没有「把相机甩到极远」的位移。没有的话
-        /// <see cref="ResolveFrameHold"/> 一次都不做额外计算 —— 绝大多数谱面
-        /// 属于这一类，不能为了一个特例给每帧加一次全量扫关键帧。
-        /// </summary>
-        private bool hasFarTargets;
-        private int farLogCount;
 
         /// <summary>
         /// 当前引擎正在用的实例。求值引擎在建好帧时间之后、跑各域之前调用
@@ -363,95 +331,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
             BuildFollowTrack(context, StableFrameSeconds);
             // 引擎会在跑各域之前问这个实例「这一帧要不要定格」。
             Active = this;
-            hasFarTargets = false;
-            for (int i = 0; i < keyframes.Count; i++)
-            {
-                // **逐轴判，不能取模长**：`position: [null, 10000]` 里那个 null
-                // 分量被解成 NaN，`magnitude` 于是整个变成 NaN，`NaN > 500`
-                // 恒为 false —— 第一次写这里就是这么漏掉的（日志
-                // farTargets=False 但相机明明在甩）。
-                if (!keyframes[i].HasPosition)
-                {
-                    continue;
-                }
-
-                Vector2 probe = keyframes[i].Position;
-                if (Mathf.Abs(probe.x) > HoldDistance || Mathf.Abs(probe.y) > HoldDistance)
-                {
-                    hasFarTargets = true;
-                    if (farLogCount < 3 && Main.Logger != null)
-                    {
-                        farLogCount++;
-                        Main.Logger.Log("[镜头远端] f=" + keyframes[i].Floor
-                            + " t=" + keyframes[i].StartTime.ToString("0.000")
-                            + " pos=" + probe.ToString("0.0") + ".");
-                    }
-                    if (hasFarTargets && farLogCount >= 3)
-                    {
-                        break;
-                    }
-                }
-            }
             Main.Logger.Log("[StaticPreview/Camera] analyzed " + keyframes.Count
-                + " events, " + floorCount + " floors, farTargets=" + hasFarTargets + ".");
-            LogStrobeWindow();
-        }
-
-        /// <summary>
-        /// 临时：1045 那段的 MoveCamera 关键帧密度。RepeatEvents 223 次 × 0.125 拍
-        /// 应当展开成一条 0.079 秒一步的序列；这里把首尾各几条的起始时间打出来，
-        /// 直接看展开后的节奏对不对（连成一片 = 每帧都在跳）。
-        /// </summary>
-        private void LogStrobeWindow()
-        {
-            if (Main.Logger == null)
-            {
-                return;
-            }
-
-            int first = -1;
-            int last = -1;
-            for (int i = 0; i < keyframes.Count; i++)
-            {
-                if (keyframes[i].Floor >= 1035 && keyframes[i].Floor <= 1085)
-                {
-                    if (first < 0)
-                    {
-                        first = i;
-                    }
-                    last = i;
-                }
-            }
-            if (first < 0)
-            {
-                return;
-            }
-
-            Main.Logger.Log("[镜头窗口] 关键帧 " + (last - first + 1) + " 条，位置 #"
-                + first + "~#" + last + "。");
-            for (int i = first; i <= Mathf.Min(first + 7, last); i++)
-            {
-                LogStrobeKeyframe(i);
-            }
-            for (int i = Mathf.Max(last - 3, first + 8); i <= last; i++)
-            {
-                LogStrobeKeyframe(i);
-            }
-        }
-
-        private void LogStrobeKeyframe(int index)
-        {
-            CameraKeyframe keyframe = keyframes[index];
-            Main.Logger.Log("[镜头窗口] #" + index
-                + " f=" + keyframe.Floor
-                + " t=" + keyframe.StartTime.ToString("0.0000")
-                + " dur=" + keyframe.Duration.ToString("0.000")
-                + " mode=" + keyframe.Mode
-                + " modeUsed=" + (keyframe.ModeUsed ? 1 : 0)
-                + " hasPos=" + (keyframe.HasPosition ? 1 : 0)
-                + " pos=" + keyframe.Position.x.ToString("0.0") + ","
-                + keyframe.Position.y.ToString("0.0")
-                + " zoom=" + keyframe.Zoom.ToString("0.000") + ".");
+                + " events, " + floorCount + " floors.");
         }
 
         // 持续跟踪的帧长。初值取 1/144：它只是"第一条轨道还没攒到数据时"
@@ -491,8 +372,6 @@ namespace ADOFAIEditorStudio.Preview.Domains
         {
 
             floorCount = context.FloorCount;
-            probeFloors.Clear();
-            probeKeyframes.Clear();
             cameraAtFloorEntry = new Vector2[floorCount];
             zoomBaseAtFloor = new float[floorCount];
             ballAtFloorEntry = new Vector2[floorCount];
@@ -737,9 +616,6 @@ namespace ADOFAIEditorStudio.Preview.Domains
             ApplyCamera(camera, context, resolved, rotation, zoom);
             LogChannelJump(frame.Time, resolved, rotation, zoom);
             LogCameraCompare(frame.Time, floorIndex, resolved, rotation, zoom);
-            ProbeFloorState(floorIndex, frame.Time, resolved, follow, rotation, zoom);
-            ProbeJitter(floorIndex, frame.Time, resolved, rotation, zoom);
-            ProbeStillFrame(floorIndex, frame.Time, resolved, rotation, zoom);
         }
 
         /// <summary>
@@ -778,13 +654,6 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 return time;
             }
 
-            if (holdLogCount < 8 && Main.Logger != null)
-            {
-                holdLogCount++;
-                Main.Logger.Log("[镜头定格] t=" + time.ToString("0.000")
-                    + " 锚=" + anchor.ToString("0.000")
-                    + " 相隔=" + (time - anchor).ToString("0.000") + "s。");
-            }
             return anchor;
         }
 
@@ -875,157 +744,6 @@ namespace ADOFAIEditorStudio.Preview.Domains
             }
 
             return (position - follow).magnitude > HoldDistance;
-        }
-
-        /// <summary>
-        /// 临时：用户报「在 AES 里暂停也抽搐」。暂停时正确行为是取同一个时间、
-        /// 得到同一个落点，所以这里每 6 帧取一行，把**时间列**和落点一起记下来。
-        /// 判读：`t` 恒定而 `out` 变 → 求值器对同一个时间是二义的（重建/状态问题）；
-        /// `t` 在抖 → 播放头其实没停住，画面跳的是时间本身。
-        /// </summary>
-        private void ProbeStillFrame(int floorIndex, float time, Vector2 output,
-            float rotation, float zoom)
-        {
-            if (Main.Logger == null || floorIndex < 1035 || floorIndex > 1095
-                || stillLogCount >= 200 || Time.frameCount % 6 != 0)
-            {
-                return;
-            }
-
-            float deltaTime = float.IsNaN(stillLastTime) ? 1f : time - stillLastTime;
-            stillLastTime = time;
-
-            // 只记**暂停帧**：播放时每 6 帧一行会把上限吃光，暂停那几秒反而
-            // 一条都不剩（上一次就是这样，暂停样本只抓到 1040/1092 两段）。
-            if (Mathf.Abs(deltaTime) > 0.000001f)
-            {
-                return;
-            }
-
-            stillLogCount++;
-            Main.Logger.Log("[镜头静帧] f=" + floorIndex
-                + " t=" + time.ToString("0.0000")
-                + " dt=" + deltaTime.ToString("0.0000")
-                + " out=" + output.x.ToString("0.0") + "," + output.y.ToString("0.0")
-                + " rot=" + rotation.ToString("0.00")
-                + " zoom=" + zoom.ToString("0.000")
-                + " mode=" + diagMode + ".");
-        }
-
-        /// <summary>
-        /// 临时：1045 之后整屏抽搐。逐帧比对相机落点，只记超过阈值的跳变
-        /// （上限 200 行）。判读：
-        ///   dt≈0.079s 说明在按谱面的 0.125 拍间隔跳（原生也这样）；
-        ///   dt≈0.016s 说明每个渲染帧都在跳 —— 那是求值器的错，不是谱面。
-        /// </summary>
-        private void ProbeJitter(int floorIndex, float time, Vector2 output,
-            float rotation, float zoom)
-        {
-            if (Main.Logger == null || floorIndex < 1035 || floorIndex > 1085)
-            {
-                return;
-            }
-
-            if (!float.IsNaN(jitterLastTime))
-            {
-                float deltaPos = Vector2.Distance(output, jitterLastPosition);
-                float deltaRot = Mathf.Abs(rotation - jitterLastRotation);
-                float deltaZoom = Mathf.Abs(zoom - jitterLastZoom);
-                if ((deltaPos > 0.25f || deltaRot > 0.1f || deltaZoom > 0.05f)
-                    && jitterLogCount < 200)
-                {
-                    jitterLogCount++;
-                    Main.Logger.Log("[镜头抖] f=" + floorIndex
-                        + " t=" + time.ToString("0.0000")
-                        + " dt=" + (time - jitterLastTime).ToString("0.0000")
-                        + " dPos=" + deltaPos.ToString("0.00")
-                        + " dRot=" + deltaRot.ToString("0.00")
-                        + " dZoom=" + deltaZoom.ToString("0.000")
-                        + " out=" + output.x.ToString("0.0") + "," + output.y.ToString("0.0")
-                        + " rot=" + rotation.ToString("0.00")
-                        + " zoom=" + zoom.ToString("0.000")
-                        + " mode=" + diagMode
-                        + " 事件格=" + diagPosFloor + ".");
-                }
-            }
-
-            jitterLastTime = time;
-            jitterLastPosition = output;
-            jitterLastRotation = rotation;
-            jitterLastZoom = zoom;
-        }
-
-        /// <summary>临时：这一格第一帧的镜头落点与球的距离。</summary>
-        private void ProbeFloorState(int floorIndex, float time, Vector2 output,
-            Vector2 follow, float rotation, float zoom)
-        {
-            if (floorIndex < ProbeFloorMin || floorIndex > ProbeFloorMax
-                || Main.Logger == null || !probeFloors.Add(floorIndex))
-            {
-                return;
-            }
-
-            Vector2 ball = GetBallPosition(Vector2.zero);
-            Vector2 tile = floorPosition[Mathf.Clamp(floorIndex, 0, floorCount - 1)];
-            Vector2 offsetFromBall = output - ball;
-            Main.Logger.Log("[镜头帧] f=" + floorIndex
-                + " t=" + time.ToString("0.000")
-                + " out=" + output.x.ToString("0.00") + "," + output.y.ToString("0.00")
-                + " ball=" + ball.x.ToString("0.00") + "," + ball.y.ToString("0.00")
-                + " d=" + offsetFromBall.x.ToString("0.00") + ","
-                + offsetFromBall.y.ToString("0.00")
-                + " follow=" + follow.x.ToString("0.00") + "," + follow.y.ToString("0.00")
-                + " tile=" + tile.x.ToString("0.00") + "," + tile.y.ToString("0.00")
-                + " mode=" + diagMode
-                + " followMode=" + (followModeAtFloor[Mathf.Clamp(floorIndex, 0, floorCount - 1)] ? 1 : 0)
-                + " rot=" + rotation.ToString("0.00")
-                + " zoom=" + zoom.ToString("0.000")
-                + " pan=" + userPan.x.ToString("0.00") + "," + userPan.y.ToString("0.00") + ".");
-        }
-
-        /// <summary>
-        /// 临时：每条 MoveCamera 事件第一次被走到的样子。
-        /// 重点看 Tile 事件的 anchor（快照里的格位置）和 live（活的格位置）
-        /// 是否一致 —— 不一致就说明相机的锚点和原生不是同一个点。
-        /// </summary>
-        private void ProbeKeyframeState(int index, CameraKeyframe keyframe,
-            CamMovementType mode, CamMovementType previousMode, Vector2 offset,
-            Vector2 followStart, Vector2 carry, Vector2 resolved)
-        {
-            if (keyframe.Floor < ProbeFloorMin || keyframe.Floor > ProbeFloorMax
-                || Main.Logger == null || !probeKeyframes.Add(index))
-            {
-                return;
-            }
-
-            Vector2 tile = floorPosition[Mathf.Clamp(keyframe.Floor, 0, floorCount - 1)];
-            string live = "-";
-            if (probeContext != null)
-            {
-                scrFloor bound = probeContext.GetFloorBinding(keyframe.Floor);
-                if (bound != null)
-                {
-                    Vector3 position = PreviewEvaluationEngine.FloorPositionThisFrame(bound);
-                    live = position.x.ToString("0.00") + "," + position.y.ToString("0.00");
-                }
-            }
-
-            Main.Logger.Log("[镜头事件] f=" + keyframe.Floor
-                + " t=" + keyframe.StartTime.ToString("0.000")
-                + " mode=" + mode + " prev=" + previousMode
-                + " modeUsed=" + (keyframe.ModeUsed ? 1 : 0)
-                + " posUsed=" + (keyframe.HasPosition ? 1 : 0)
-                + " pos=" + keyframe.Position.x.ToString("0.00") + ","
-                + keyframe.Position.y.ToString("0.00")
-                + " dur=" + keyframe.Duration.ToString("0.000")
-                + " anchor=" + tile.x.ToString("0.00") + "," + tile.y.ToString("0.00")
-                + " live=" + live
-                + " followStart=" + followStart.x.ToString("0.00") + ","
-                + followStart.y.ToString("0.00")
-                + " carry=" + carry.x.ToString("0.00") + "," + carry.y.ToString("0.00")
-                + " resolved=" + resolved.x.ToString("0.00") + ","
-                + resolved.y.ToString("0.00")
-                + " off=" + offset.x.ToString("0.00") + "," + offset.y.ToString("0.00") + ".");
         }
 
         /// <summary>
@@ -1619,8 +1337,6 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     Vector2 resolved = ResolveWorld(resolveMode, offset, keyframe.Floor,
                         ballAtFloorEntry[Mathf.Clamp(keyframe.Floor, 0, floorCount - 1)],
                         eventWorld);
-                    ProbeKeyframeState(i, keyframe, resolveMode, previousMode, offset,
-                        followAtStart, eventWorld, resolved);
 
                     // 一根轴什么时候被重新指向：**事件真的给了值**，
                     // 或者**模式换了**（换模式时原生会把 camParent 从相机

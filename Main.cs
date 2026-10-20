@@ -16,6 +16,17 @@ namespace ADOFAIEditorStudio
         public static Settings Settings { get; private set; }
         public static EditorStudioOverlay Overlay { get; private set; }
 
+        /// <summary>
+        /// 逐动作探针日志的开关：`Settings.xml` 里的 VerboseDiagnostics。
+        ///
+        /// 这些日志每条对应一次用户动作（点一格、翻一页、起播一次），不是每帧，
+        /// 排查时非常有用；对正常使用纯属噪声，所以统一挂在这个开关后面。
+        /// </summary>
+        internal static bool VerboseLog
+        {
+            get { return Logger != null && Settings != null && Settings.VerboseDiagnostics; }
+        }
+
         public static void Load(ModEntry modEntry)
         {
             Mod = modEntry;
@@ -166,6 +177,7 @@ namespace ADOFAIEditorStudio
         // 这些 trace，用来诊断「拖动定位后再恢复播放」的缺陷。默认关闭：它们
         // 很吵，只在排查特定播放问题时才需要。
         public bool VerboseDiagnostics = false;
+
         // 上一次「看过更新内容」的版本号。
         //
         // 更新窗口只在**换了版本之后第一次**打开工作台时弹一次，判据就是这个
@@ -189,7 +201,7 @@ namespace ADOFAIEditorStudio
         //
         // 默认关。它改的是**点击**的含义（点轨道＝跳过去），和上面那个
         // 「选中事件时跟随」是两件事：那个管时间轴上的事件块，这个管画面里的轨道。
-        // 快捷键 Ctrl+Alt+L。
+        // 快捷键 Ctrl+J。
         public bool LocateOnTrackClick = false;
         // 时间轴的自动翻页总开关：
         //   · 开：播放时视图跟着播放头走；手动把播放头拖到尽头时整页翻过去。

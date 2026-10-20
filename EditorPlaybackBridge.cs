@@ -4906,7 +4906,7 @@ namespace ADOFAIEditorStudio
             // 预览里点轨道走的就是这条路：点击 → `scnEditor.SelectFloor`
             // → SelectFloor 补丁 → 这里。所以「点轨道跳画面」不需要第二套拾取。
             bool locate = Main.Settings != null && Main.Settings.LocateOnTrackClick;
-            if (floor != null && Main.Logger != null
+            if (floor != null && Main.VerboseLog
                 && (locate || (Main.Settings != null && Main.Settings.FollowSelectionOnClick)))
             {
                 // 一行一拍。这个入口只在"选中项真的变了"时进来（方向键、点轨道、
@@ -4982,7 +4982,7 @@ namespace ADOFAIEditorStudio
             // **这里是瞬跳，不走位**：打开工作台那一瞬间画面就应该已经在
             // 选中的格上；"1 秒内加速过去"只属于在 AES 里点轨道那条路。
             FollowSelectedFloor(floor, true, false);
-            if (Main.Logger != null)
+            if (Main.VerboseLog)
             {
                 Main.Logger.Log("[定位] 打开工作台瞬跳到 f" + floor.seqID
                     + " t=" + ((float)floor.entryTime).ToString("0.000") + ".");
@@ -6886,7 +6886,7 @@ namespace ADOFAIEditorStudio
                         audioStartPending = false;
                         // 也别再拿它定画面了，否则会一直定在起播位置。
                         audioStartDsp = 0d;
-                        if (Main.Logger != null)
+                        if (Main.VerboseLog)
                         {
                             Main.Logger.Log("[AudioResume] gave up waiting for the schedule "
                                 + "callback after " + audioStartPendingFrames + " frames.");
@@ -6927,7 +6927,7 @@ namespace ADOFAIEditorStudio
                 {
                     // 走到这里说明排程时刻已过（或本来就没有要等的），
                     // 把"定帧等音频"的标记清掉，恢复正常推进。
-                    if (holdPictureForAudioStart && Main.Logger != null)
+                    if (holdPictureForAudioStart && Main.VerboseLog)
                     {
                         // 一行日志，证明"定帧等音频"这条路真的走到过：
                         // 帧数 × 帧时长 ≈ 定帧时长（约 0.1 秒）。
@@ -7245,7 +7245,7 @@ namespace ADOFAIEditorStudio
 
             // 一次跳转一行日志（不是每帧）。定位点轨道没反应时，靠它区分
             // "根本没走到这里"和"走了又被谁取消"。
-            if (Main.Logger != null)
+            if (Main.VerboseLog)
             {
                 Main.Logger.Log("[定位] 开始走位 " + travelFromTime.ToString("0.000")
                     + " → " + travelToTime.ToString("0.000")
@@ -7292,7 +7292,7 @@ namespace ADOFAIEditorStudio
                 || trackBTransportActive)
             {
                 travelActive = false;
-                if (Main.Logger != null)
+                if (Main.VerboseLog)
                 {
                     Main.Logger.Log("[定位] 走位取消：previewRequested=" + previewRequested
                         + " playing=" + previewClockRunning
@@ -7863,7 +7863,7 @@ namespace ADOFAIEditorStudio
             // 探针：只记 Ctrl+J / Ctrl+K（上限 20 行）。判读：J/K 为 True 即通；
             // 都是 False 且 input="" 说明这组键也在进 Unity 之前被吃掉。
             if (ctrlOnly && (Input.GetKeyDown(KeyCode.J) || Input.GetKeyDown(KeyCode.K))
-                && Main.Logger != null && featureProbeCount < 20)
+                && Main.VerboseLog && featureProbeCount < 20)
             {
                 featureProbeCount++;
                 Main.Logger.Log("[快捷键] ctrl=" + controlHeld + " alt=" + altHeld
