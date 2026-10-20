@@ -7734,6 +7734,8 @@ namespace ADOFAIEditorStudio
 
     internal static class EditorUpdateInputPatch
     {
+        /// <summary>功能快捷键探针已输出几次（上限 20，避免按住按键时刷屏）。</summary>
+        private static int featureProbeCount;
         /// <summary>
         /// 清除所有选中：游戏侧的格与装饰物，以及工作台自己维护的
         /// 时间轴事件和媒体卡片。
@@ -7839,15 +7841,31 @@ namespace ADOFAIEditorStudio
 
             // 定位（点轨道跳画面）与自动翻页的开关。
             //
-            // 都用 **Ctrl+Alt+字母**：原生编辑器把 Ctrl+L、Ctrl+P 这类组合占掉了
-            // （反编译里能看到它注册了 L / P / O / H / A 等），再叠一个 Alt 就不撞；
-            // 而且工作台可见时这一帧会被吃掉（返回 false），即使哪天原生也绑了同一个，
+            // **两组修饰键都认**：Ctrl+Alt+字母 和 Ctrl+Shift+字母。
+            //
+            // 起因：这两条快捷键上线后用户反馈"全部失效"。可疑点是 Alt ——
+            // 中文输入法 / 输入法切换器常把 Ctrl+Alt+字母 当自己的全局热键吃掉，
+            // 那种情况下 Unity 的 `Input.GetKeyDown(KeyCode.L)` 根本收不到。
+            // 所以补一组不含 Alt 的绑定；两组都要求 Ctrl，避免和普通打字冲突。
+            // 工作台可见时命中就整帧吃掉（返回 false），即使原生也绑了同一个，
             // 也是工作台说了算。
-            bool locateToggle = controlHeld && altHeld && !shiftHeld
-                && Input.GetKeyDown(KeyCode.L);
-            bool autoPageToggle = controlHeld && altHeld && !shiftHeld
-                && Input.GetKeyDown(KeyCode.P);
+            bool featureModifiers = (controlHeld && altHeld && !shiftHeld)
+                || (controlHeld && shiftHeld && !altHeld);
+            bool locateToggle = featureModifiers && Input.GetKeyDown(KeyCode.L);
+            bool autoPageToggle = featureModifiers && Input.GetKeyDown(KeyCode.P);
             bool featureToggle = locateToggle || autoPageToggle;
+
+            // 探针：这两条快捷键"有没有被 Unity 看见"。上限 20 行，不会刷屏。
+            if (featureModifiers && Input.anyKeyDown && Main.Logger != null
+                && featureProbeCount < 20)
+            {
+                featureProbeCount++;
+                Main.Logger.Log("[快捷键] ctrl=" + controlHeld + " alt=" + altHeld
+                    + " shift=" + shiftHeld
+                    + " L=" + Input.GetKeyDown(KeyCode.L)
+                    + " P=" + Input.GetKeyDown(KeyCode.P)
+                    + " input=\"" + Input.inputString + "\".");
+            }
 
             // 原生编辑器也会消费这些快捷键。时间轴在悬停期间
             // 拥有它们，所以跳过原生输入循环的这一帧。
