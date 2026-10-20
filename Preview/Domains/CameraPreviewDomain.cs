@@ -1226,11 +1226,55 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     anyPositionEvent = true;
                 }
 
-                if (keyframe.HasRotation && !float.IsNaN(keyframe.Rotation)
-                    && !float.IsInfinity(keyframe.Rotation))
+                // 旋转通道。原生 ffxCameraPlus 那条 tween 是：
+                //
+                //   rotationTween = DOTween.To(() => vfx.camAngle, x => vfx.camAngle = x,
+                //                              targetRot + num, duration);
+                //
+                // 而 `num` **只有一种情况非 0**：
+                //
+                //   case CamMovementType.LastPosition:   num = vfx.camAngle;   // 相对当前角度
+                //   case LastPositionNoRotation:         num 保持 0             // 绝对
+                //   Player / Tile / Global:              num 保持 0             // 绝对
+                //
+                // 也就是说 **`relativeTo: LastPosition` 的 rotation 是相对量**，
+                // 其余全是绝对量。以前这里一律按绝对处理，于是每一个
+                // 「LastPosition + rotation 0」的落点都会把角度**瞬移回 0**。
+                //
+                // 这张谱 68 格之后正是一串这样的对子：
+                //   (LastPosition, 0 拍, rotation 0, zoom 160) + (Player, 1 拍, rotation 7/20/27/34…)
+                // 原版的角度是 7 → 20 → 27 → 34 → 41 → 48 一路小步往上走；
+                // 求值器每一拍都先掉回 0、再一帧冲到 34/41/48 —— 幅度大了一倍多，
+                // 还多出一记回甩，看起来就是「组合运镜和原版不一样、幅度很大」。
+                //
+                // 另外原生那道门是
+                //   `if (rotationUsed || (movementTypeUsed && movementTypeIsLastPosition))`
+                // ——显式写了 LastPosition 的事件**即使没有 rotation** 也会重启旋转
+                // tween，目标就是「当前角度 + 0」，等于把飞在半路的旋转就地钉住。
+                // LastPositionNoRotation 同样重启，但 num 是 0，所以是钉到绝对 0。
+                bool rotationValueUsable = keyframe.HasRotation
+                    && !float.IsNaN(keyframe.Rotation)
+                    && !float.IsInfinity(keyframe.Rotation);
+                bool lastPositionRotation = mode == CamMovementType.LastPosition;
+                bool lastPositionRestart = lastPositionRotation
+                    || mode == CamMovementType.LastPositionNoRotation;
+
+                if (rotationValueUsable || lastPositionRestart)
                 {
                     rotationOrigin = rotation;
-                    rotationTarget = keyframe.Rotation;
+                    if (!rotationValueUsable)
+                    {
+                        // 没写 rotation 的 LastPosition 系事件：LastPosition 钉在
+                        // 当前角度，LastPositionNoRotation 钉到绝对 0（num=0）。
+                        rotationTarget = lastPositionRotation ? rotation : 0f;
+                    }
+                    else
+                    {
+                        rotationTarget = lastPositionRotation
+                            ? rotation + keyframe.Rotation
+                            : keyframe.Rotation;
+                    }
+
                     rotationStart = (float)keyframe.StartTime;
                     rotationDuration = keyframe.Duration;
                     rotationEase = keyframe.Ease;
