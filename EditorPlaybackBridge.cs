@@ -1625,7 +1625,7 @@ namespace ADOFAIEditorStudio
             // 拖动把画面交还给求值器。一个仍在播放的原生运行时
             // 必须先停止推进——相机上有两个写入者
             // 是这个项目踩得最多的缺陷。
-            //            // 选暂停而不是退出：退出会在好几帧里慢慢拆掉运行时，
+            // 选暂停而不是退出：退出会在好几帧里慢慢拆掉运行时，
             // 而这个入口只被调用一次，拖动就会被直接丢掉。
             // 暂停保住运行时和播放头，空格就从
             // 这里原样恢复。
@@ -6917,7 +6917,7 @@ namespace ADOFAIEditorStudio
                     {
                         // 排程时刻迟迟不到（设备异常），放弃等待。
                         audioStartDsp = 0d;
-                        if (Main.Logger != null)
+                        if (Main.VerboseLog)
                         {
                             Main.Logger.Log("[AudioStart] 等不到排程时刻，放弃定帧。");
                         }

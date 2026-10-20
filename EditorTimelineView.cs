@@ -1930,7 +1930,13 @@ namespace ADOFAIEditorStudio
             // 和「固定中间」互斥——那个模式每帧自己把视图摆回中点，
             // 再翻页会两边打架。开关关掉时这里也不动（和上面播放中的跟随
             // 用的是同一个 autoPage）。
-            else if (autoPage)
+            // **只在播放头真的被驱动时翻页：播放中，或者正在拖播放头。**
+            //
+            // 之前这里是每帧无条件跑。开关默认又是开的，于是用户手动横向滚
+            // 去看别处时，播放头一离开视口就会被拽回来 —— 等于"开了自动翻页
+            // 就没法自己滚"。静止时视口归用户，翻页只服务于播放和拖播放头。
+            else if (autoPage
+                && (scrubbing || snapshot.State == EditorPlaybackState.Playing))
             {
                 PageViewAtPlayhead(snapshot.CurrentTime);
             }

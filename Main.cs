@@ -209,7 +209,7 @@ namespace ADOFAIEditorStudio
         //
         // 默认开：以前"播放时跟随"是无条件的行为，默认关会让所有人一进游戏
         // 就发现时间轴不跟了。开关的作用是"能关掉"，不是"默认关着"。
-        // 快捷键 Ctrl+Alt+P。
+        // 快捷键 Ctrl+K。
         public bool AutoPageTimeline = true;
         // 参数栏的显示缩放。参数栏是按 1920x1080 的设计尺寸排的，
         // 在 1440p / 4K 上会显得比工作台其它面板小一号。
