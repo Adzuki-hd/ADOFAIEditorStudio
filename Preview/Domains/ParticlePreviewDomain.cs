@@ -463,7 +463,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 // 由停变播。记下当时的 tag、时间、当前生效的 mode 动作、
                 // autoPlay 还挂没挂 —— 三者能直接指认是谁点着的。
                 ParticleSystem probeSystem = state.Deco == null ? null : state.Deco.particleSystem;
-                if (probeSystem != null && Main.Logger != null)
+                if (probeSystem != null && Main.Logger != null
+                    && Main.Settings != null && Main.Settings.VerboseDiagnostics)
                 {
                     bool playing = probeSystem.isPlaying;
                     if (playing != state.WasPlaying)
