@@ -424,6 +424,25 @@ namespace ADOFAIEditorStudio.Preview
                 long engineStart = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
                 float frameTime = Mathf.Max(0f, time);
 
+                // **「掉帧」演出：整帧定格。**
+                //
+                // 谱面把相机甩到极远（配合 HallOfMirrors 的「不清屏」）时，原生
+                // 屏幕上留住的其实是上一帧 —— 看起来是卡帧，不是黑屏。预览每帧
+                // 都要清屏，照抄就成黑闪，所以把这类帧整个换成上一张正常帧的
+                // 时间重算：相机、滤镜、装饰物透明度、粒子全部一起回到那一张。
+                //
+                // 必须在**跑各域之前**做：只冻相机的话，同一帧里的
+                // SetFilter / Bloom / MoveDecorations 照样会变，还是闪。
+                CameraPreviewDomain holdOwner = CameraPreviewDomain.Active;
+                if (holdOwner != null)
+                {
+                    float heldTime = holdOwner.ResolveFrameHold(context, frameTime);
+                    if (heldTime >= 0f)
+                    {
+                        frameTime = heldTime;
+                    }
+                }
+
                 // **播放头跳转 → 让各域作废它们的历史状态。**
                 //
                 // 一帧里挪出超过阈值就一定是拖动或瞬间点击（正常播放一帧只走
