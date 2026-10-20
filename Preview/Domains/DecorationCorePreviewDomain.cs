@@ -125,6 +125,19 @@ namespace ADOFAIEditorStudio.Preview.Domains
             internal bool DisplacedForPlanet;
 
             /// <summary>
+            /// 上一帧这个装饰物是不是**正在被渲染**。只用于粒子探针：
+            /// 在"由隐藏变可见"那一帧打一份变换快照 —— 那正是用户重新看到
+            /// 发射器、也是最容易看出位置 / 角度对不对的时刻。
+            /// </summary>
+            internal bool WasRendered;
+
+            /// <summary>
+            /// 粒子探针用：最近一条"给这个装饰物写了位置/旋转"的 MoveDecorations
+            /// 事件。同一条事件只记一次，避免每帧刷屏。
+            /// </summary>
+            internal MoveEvent ProbedMove;
+
+            /// <summary>
             /// 最近推给装饰物的图，这样只在活跃的图片事件变化时
             /// 才换图。sprite 加载不免费，而逐帧动画
             /// 每帧都有一个事件。
@@ -312,6 +325,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 int maskingFrontDepth = state.MaskingFrontDepth;
                 int maskingBackDepth = state.MaskingBackDepth;
                 string imageFilename = state.DefaultImage;
+                bool probeMoveApplied = false;
 
                 for (int eventIndex = 0; eventIndex < state.Events.Count; eventIndex++)
                 {
@@ -319,6 +333,13 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     if (value.Start > frame.Time)
                     {
                         break;
+                    }
+
+                    if ((value.HasPosition || value.HasRotation) && state.ProbedMove != value)
+                    {
+                        // 粒子探针：这条事件**首次**给这个发射器写位置/旋转时记一次。
+                        state.ProbedMove = value;
+                        probeMoveApplied = decoration is scrParticleDecoration;
                     }
 
                     float ratio = value.Duration <= 0f
@@ -630,6 +651,34 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 // 遮罩写完了，现在才推可见性——SetVisible 正是从 maskingType
                 // 推导 sprite / spriteMask 的 enabled 的，所以它必须排在后面。
                 decoration.SetVisible(visible && !decoration.forceHide);
+
+                // 粒子探针：只在"由隐藏变可见"那一帧记一行（用户重新看见发射器的时刻）。
+                // 位置 / 角度 / 形状缩放 / 贴格标记一起记，才能判断是变换错了
+                // 还是发射形状（shape.scale）错了。
+                bool rendered = visible && !decoration.forceHide;
+                if ((rendered && !state.WasRendered) || probeMoveApplied)
+                {
+                    if (decoration is scrParticleDecoration particleProbe)
+                    {
+                        ParticleSystem probeSystem = particleProbe.particleSystem;
+                        if (probeSystem != null)
+                        {
+                            ParticleSystem.ShapeModule probeShape = probeSystem.shape;
+                            Main.Logger.Log("[粒子] " + (probeMoveApplied ? "移动" : "显示")
+                                + " f" + decoration.sourceLevelEvent.floor
+                                + " tag=" + decoration.sourceLevelEvent.GetString("tag")
+                                + " t=" + frame.Time.ToString("0.000")
+                                + " pos=" + ((Vector2)decoration.transform.position).ToString("0.00")
+                                + " rotZ=" + decoration.transform.eulerAngles.z.ToString("0.00")
+                                + " shapeScale=" + probeShape.scale.ToString("0.00")
+                                + " scaleVec=" + particleProbe.scale.ToString("0.00")
+                                + " stick=" + decoration.stickToFloor
+                                + " placement=" + particleProbe.placementType
+                                + " opacity=" + opacity.ToString("0.00") + ".");
+                        }
+                    }
+                }
+                state.WasRendered = rendered;
 
                 // 每帧重试直到成功：sprite 可能还在加载。
                 if (!string.Equals(state.AppliedImage, imageFilename, StringComparison.Ordinal))
