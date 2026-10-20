@@ -95,19 +95,20 @@ namespace ADOFAIEditorStudio.Preview.Domains
             internal bool AutoPlayPending;
 
             /// <summary>
-            /// 最近触发的 Emit 动作，以及它触发的真实时间。参考
-            /// 预览器会在活跃的 emit 事件变化时重新触发，或者
-            /// 同一个事件已经活跃了一阵子时——这是个重复守卫，不是
-            /// 只跑一次的锁存，因为长 emit 本来就该持续喷。
+            /// 最近一条已经炸过的 emit 事件。只用来挡"同一条事件重复炸"，
+            /// 真正的触发条件是播放头跨过它的起始时刻（见 ApplyEmit）。
             /// </summary>
             internal ParticleAction EmittedLast;
-            internal float EmittedAtUnscaledTime = float.NegativeInfinity;
         }
 
-        // 与参考预览器对「仍然活跃的 emit 重新触发」的速率限制一致。
-        // still active.
-        private const float EmitRepeatSeconds = 1f;
-        private const float EmitActiveWindowSeconds = 1f;
+        /// <summary>
+        /// 判断"这一步是不是真的跨过了事件"允许的最大跨度（谱面秒）。
+        ///
+        /// 一帧能挪出这么多秒，说明用户在快拖或者直接跳位置，而不是在
+        /// 一帧一帧地走过事件。那种情况下原生也不会补这次爆发——粒子早该散了。
+        /// 和求值引擎自己识别"跳转"用的阈值保持一致。
+        /// </summary>
+        private const float EmitCrossingMaxStep = 0.25f;
 
         private readonly List<DecoState> states = new List<DecoState>();
         private int particleLogCount;
@@ -126,7 +127,6 @@ namespace ADOFAIEditorStudio.Preview.Domains
             {
                 states[i].AppliedTargetMode = null;
                 states[i].EmittedLast = null;
-                states[i].EmittedAtUnscaledTime = float.NegativeInfinity;
             }
         }
 
@@ -353,6 +353,10 @@ namespace ADOFAIEditorStudio.Preview.Domains
         {
             float time = frame.Time;
 
+            // 上一帧的播放头时刻。Emit 要靠它判断"这一步是不是真的跨过了事件"，
+            // 所以必须在下面把 lastEvaluatedTime 覆盖掉之前取出来。
+            float previousTime = lastEvaluatedTime;
+
             // 时间方向翻转 = 用户在回拖定位。
             //
             // 必须清掉所有"这个动作已经跑过了"的闩。闩记的是"我跑过"，
@@ -413,7 +417,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 ApplyAutoPlay(state);
                 ApplyTargetMode(state, currentMode, time);
                 ApplySimulationSpeed(state, previousSpeed, currentSpeed, time);
-                ApplyEmit(state, currentEmit, time);
+                ApplyEmit(state, currentEmit, previousTime, time);
             }
         }
 
@@ -629,29 +633,48 @@ namespace ADOFAIEditorStudio.Preview.Domains
         }
 
         /// <summary>
-        /// 触发当前活跃的那个 emit 动作，遵循参考
-        /// 预览器的规则：活跃的 emit 事件变化时发射，同一个事件
-        /// 只有在既已经活跃了一会儿、又已经一秒钟没触发过时，
-        /// 才重新发射。长 emit 本来就该持续喷，所以只跑一次的锁存是错的；
-        /// 速率限制才是阻止它每帧触发的东西。
+        /// 触发当前这条 emit 事件，规则只有一条：**播放头一步一步跨过它的起始时刻**。
         ///
-        /// 因为判断只依据活跃事件本身，向后拖动定位
-        /// 不需要特殊处理：活跃事件自己会变，emit
-        /// 就会重新触发。
+        /// 原生的 EmitParticle 是个一次性事件——`ffxEmitParticlePlus.StartEffect`
+        /// 只做一件事：对每个 tag 命中的粒子装饰物调一次
+        /// `particleSystem.Emit(count)`。它没有 duration、没有"持续喷"的语义，
+        /// 谱面里这条事件的字段也只有 tag / count / eventTag。
+        ///
+        /// 以前这里挂了两条额外的重复规则，都会让已经炸过的发射器再炸一次：
+        ///
+        ///   ① 同一条事件"已经活跃了一阵子、又有一秒没触发过"就重来一次
+        ///      （墙钟时间 1 秒 + 谱面时间在事件起点后 1 秒内）。人停在事件附近
+        ///      看画面，一秒后就是平地一声雷。
+        ///   ② 回拖会 `ResetLatches()` 把 `EmittedLast` 清空，而这里只看
+        ///      "闩是空的、且现在在事件之后"——于是回拖一点点再往前，
+        ///      所有已经炸过的发射器会在**当前这个位置**同时补炸一次，
+        ///      看起来就是"在后面突然又炸了"。
+        ///
+        /// 现在只按跨过判定：`previousTime < 起点 <= time`。回拖到事件之前
+        /// 会把闩清掉，再往前跨过时自然会重炸；停在事件之后则一概不补。
+        /// 另外要求这一步的跨度不超过 <see cref="EmitCrossingMaxStep"/>：
+        /// 拖得飞快、或者直接跳到事件之后，原生也不会补这一次爆发
+        /// （粒子早该散了），补了反而是凭空多一炸。
         /// </summary>
-        private void ApplyEmit(DecoState state, ParticleAction current, float time)
+        private void ApplyEmit(DecoState state, ParticleAction current, float previousTime, float time)
         {
+            // 回到事件之前：清闩，下次再跨过时重新炸。
             if (current == null)
+            {
+                state.EmittedLast = null;
+                return;
+            }
+
+            if (state.EmittedLast == current)
             {
                 return;
             }
 
-            float unscaledNow = Time.unscaledTime;
-            bool eventChanged = state.EmittedLast != current;
-            bool sameEventDueAgain = unscaledNow - state.EmittedAtUnscaledTime > EmitRepeatSeconds
-                && time - current.StartTime < EmitActiveWindowSeconds;
+            state.EmittedLast = current;
 
-            if (!eventChanged && !sameEventDueAgain)
+            bool crossed = previousTime < (float)current.StartTime && (float)current.StartTime <= time;
+            bool stepIsContiguous = time - previousTime <= EmitCrossingMaxStep;
+            if (!crossed || !stepIsContiguous)
             {
                 return;
             }
@@ -662,8 +685,18 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 system.Emit(current.EmitCount);
             }
 
-            state.EmittedLast = current;
-            state.EmittedAtUnscaledTime = unscaledNow;
+            // 探针：每次真的补了一次爆发都记一行，用来核对"同一事件只炸一次"。
+            if (Main.Settings != null && Main.Settings.VerboseDiagnostics)
+            {
+                Main.Logger.Log("[ParticleEmit] f" + current.SourceFloor
+                    + " tag=" + current.SourceTag
+                    + " count=" + current.EmitCount
+                    + " start=" + current.StartTime.ToString("0.000")
+                    + " prev=" + previousTime.ToString("0.000")
+                    + " t=" + time.ToString("0.000")
+                    + " deco=" + (state.Deco == null ? "?" : state.Deco.name)
+                    + ".");
+            }
         }
 
         public void EndSession()
