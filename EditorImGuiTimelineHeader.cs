@@ -53,6 +53,9 @@ namespace ADOFAIEditorStudio
         /// <summary>缩放手柄那道握把的宽。和 uGUI 那个 Grip 一致（48）。</summary>
         private const float GripWidth = 48f;
 
+        /// <summary>功能开关按钮的宽。两个汉字 + 左右留白（正文那档字号约 46）。</summary>
+        private const float FeatureButtonWidth = 52f;
+
         internal Rect Rect { get { return _rect; } }
 
         internal void Draw()
@@ -108,6 +111,9 @@ namespace ADOFAIEditorStudio
 
             DrawHeading(draw, x, y, height);
             float cursor = DrawToggles(timeline, draw, y, height);
+            // 两个功能开关贴在模式开关那排后面，用文字按钮画（它们没有图标，
+            // 而且"定位 / 翻页"两个词本身就是最短的说明）。
+            cursor = DrawFeatureButtons(timeline, draw, cursor, y, height);
 
             // **右端那一串的位置在这里算一次。**
             //
@@ -183,6 +189,76 @@ namespace ADOFAIEditorStudio
             }
 
             return ToggleX + toggles.Count * (ToggleWidth + ToggleGap);
+        }
+
+        /// <summary>
+        /// 两个功能开关：**定位**、**自动翻页**。
+        ///
+        /// 和左边那排图标开关不是一类东西，所以不塞进 `CollectHeaderToggles()`：
+        /// 那个接口的图标是 uGUI 那边造好的 Sprite，这两个没有图标，
+        /// 用文字按钮画更省事、也更好认。
+        ///
+        /// 状态直接读 `Main.Settings`（和图标开关读同一份设置），点一下调
+        /// 时间轴那边的 Toggle 方法 —— 设置写盘、状态栏提示都在那里。
+        /// </summary>
+        private float DrawFeatureButtons(EditorTimelineView timeline, ImDrawListPtr draw,
+            float startX, float y, float height)
+        {
+            bool locate = Main.Settings != null && Main.Settings.LocateOnTrackClick;
+            bool autoPage = Main.Settings != null && Main.Settings.AutoPageTimeline;
+            float buttonY = y + (height - ToggleHeight) * 0.5f;
+
+            float x = startX;
+            DrawFeatureButton(draw, x, buttonY, "locate", "定位", locate,
+                "点轨道跳画面（Ctrl+Alt+L）", timeline.ToggleLocateOnTrackClick);
+            x += FeatureButtonWidth + ToggleGap;
+            DrawFeatureButton(draw, x, buttonY, "autopage", "翻页", autoPage,
+                "播放头跑出右边缘就整页翻过去（Ctrl+Alt+P）", timeline.ToggleAutoPageTimeline);
+            x += FeatureButtonWidth + ToggleGap;
+            return x;
+        }
+
+        private static void DrawFeatureButton(ImDrawListPtr draw, float x, float y,
+            string id, string label, bool on, string hint, System.Action click)
+        {
+            NVec2 topLeft = new NVec2(x, y);
+            NVec2 size = new NVec2(FeatureButtonWidth, ToggleHeight);
+
+            ImGui.SetCursorScreenPos(topLeft);
+            ImGui.InvisibleButton("##feat_" + id, size);
+            bool hovered = ImGui.IsItemHovered();
+            if (ImGui.IsItemClicked() && click != null)
+            {
+                click();
+            }
+
+            // 开：强调色实心 + 亮字；关：只有描边 + 灰字。
+            // 和参数栏那个自绘开关同一种语言（开 = 实心）。
+            if (on)
+            {
+                draw.AddRectFilled(topLeft, topLeft + size,
+                    ImGui.GetColorU32(ToVec4(Palette.Accent)), EditorStudioOverlay.CornerSmall);
+            }
+            else
+            {
+                draw.AddRectFilled(topLeft, topLeft + size,
+                    ImGui.GetColorU32(ToVec4(Palette.ButtonNormal)), EditorStudioOverlay.CornerSmall);
+            }
+            draw.AddRect(topLeft, topLeft + size,
+                ImGui.GetColorU32(ToVec4(hovered ? Palette.TextSecondary : Palette.PanelRule)),
+                EditorStudioOverlay.CornerSmall, ImDrawFlags.None, 1f);
+
+            NVec2 textSize = ImGui.CalcTextSize(label);
+            draw.AddText(new NVec2(
+                    x + (FeatureButtonWidth - textSize.X) * 0.5f,
+                    y + (ToggleHeight - ImGui.GetTextLineHeight()) * 0.5f),
+                ImGui.GetColorU32(ToVec4(on ? Palette.TextPrimary : Palette.TextMuted)),
+                label);
+
+            if (hovered)
+            {
+                ImGui.SetTooltip(label + (on ? "：开" : "：关") + "\n" + hint);
+            }
         }
 
         /// <summary>

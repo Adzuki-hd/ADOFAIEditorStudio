@@ -4891,7 +4891,53 @@ namespace ADOFAIEditorStudio
         /// <summary>Called by the SelectFloor patch; see FollowSelectedFloor.</summary>
         internal static void OnFloorSelected(scrFloor floor)
         {
-            FollowSelectedFloor(floor);
+            // 定位模式（`LocateOnTrackClick`）打开时，选格一律带动播放头。
+            // 预览里点轨道走的就是这条路：点击 → `scnEditor.SelectFloor`
+            // → SelectFloor 补丁 → 这里。所以「点轨道跳画面」不需要第二套拾取。
+            FollowSelectedFloor(floor, Main.Settings != null && Main.Settings.LocateOnTrackClick);
+        }
+
+        /// <summary>
+        /// 打开工作台时把播放头落到原生编辑器当前选中的那一格。
+        ///
+        /// 返回 false 表示预览会话还没起来（打开工作台是异步的：媒体预载的加载页
+        /// 可能还盖着，求值器还没接管），调用方下一帧再试 —— 见
+        /// `EditorStudioOverlay.TickPendingSelectionJump`。
+        /// 返回 true 表示这件事已经了结（跳过了，或者本来就没有选中格）。
+        /// </summary>
+        internal static bool JumpToNativeSelection()
+        {
+            scnEditor editor = scnEditor.instance;
+            if (editor == null)
+            {
+                return false;
+            }
+            if (editor.selectedFloors == null || editor.selectedFloors.Count == 0)
+            {
+                // 没选中格：没有可跳的目标，别让调用方一直重试。
+                return true;
+            }
+
+            scrFloor floor = editor.selectedFloors[0];
+            if (floor == null)
+            {
+                return true;
+            }
+
+            if (!evaluatorOwnedActive && !previewRequested)
+            {
+                return false;
+            }
+
+            // 打开工作台属于"用户明确要过去"，不受 `FollowSelectionOnClick`
+            // 那个开关限制 —— 那个开关管的是"点事件块时要不要跟"。
+            FollowSelectedFloor(floor, true);
+            if (Main.Settings != null && Main.Settings.VerboseDiagnostics)
+            {
+                Main.Logger.Log("[定位] 打开工作台落到原生选中格：f" + floor.seqID
+                    + " t=" + ((float)floor.entryTime).ToString("0.000") + ".");
+            }
+            return true;
         }
 
         internal static void HandleSceneReloaded(string sceneName)
@@ -6959,14 +7005,24 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private static void FollowSelectedFloor(scrFloor floor)
         {
+            FollowSelectedFloor(floor, false);
+        }
+
+        /// <param name="force">
+        /// true = 不看 `FollowSelectionOnClick` 开关。用在两处：
+        /// 定位模式打开时的点轨道（用户明确要"点哪跳哪"）、
+        /// 以及打开工作台时落到原生选中的那一格。
+        /// </param>
+        private static void FollowSelectedFloor(scrFloor floor, bool force)
+        {
             if (floor == null || timelineScrubActive || previewClockRunning)
             {
                 return;
             }
             // 开关关掉时点事件只选中，画面和时间轴都别动。
             // 默认就是关的：点一下通常只是想改参数，跟着跳会打断
-            // 正在看的那一段。
-            if (Main.Settings != null && !Main.Settings.FollowSelectionOnClick)
+            // 正在看的那一段。force 是"用户刚刚明确要求跳"的那几条路。
+            if (!force && Main.Settings != null && !Main.Settings.FollowSelectionOnClick)
             {
                 return;
             }
@@ -7488,6 +7544,18 @@ namespace ADOFAIEditorStudio
             bool timelineWheel = (controlHeld || altHeld)
                 && Mathf.Abs(Input.mouseScrollDelta.y) > 0.001f;
 
+            // 定位（点轨道跳画面）与自动翻页的开关。
+            //
+            // 都用 **Ctrl+Alt+字母**：原生编辑器把 Ctrl+L、Ctrl+P 这类组合占掉了
+            // （反编译里能看到它注册了 L / P / O / H / A 等），再叠一个 Alt 就不撞；
+            // 而且工作台可见时这一帧会被吃掉（返回 false），即使哪天原生也绑了同一个，
+            // 也是工作台说了算。
+            bool locateToggle = controlHeld && altHeld && !shiftHeld
+                && Input.GetKeyDown(KeyCode.L);
+            bool autoPageToggle = controlHeld && altHeld && !shiftHeld
+                && Input.GetKeyDown(KeyCode.P);
+            bool featureToggle = locateToggle || autoPageToggle;
+
             // 原生编辑器也会消费这些快捷键。时间轴在悬停期间
             // 拥有它们，所以跳过原生输入循环的这一帧。
             if ((timelineWheel || timelineShortcut)
@@ -7508,7 +7576,7 @@ namespace ADOFAIEditorStudio
             bool nativeRedo = redo && !workbenchRedo;
 
             if (!togglePlayback && !workbenchUndo && !workbenchRedo && !nativeUndo && !nativeRedo
-                && !clearSelection && !save && !selectionShortcut)
+                && !clearSelection && !save && !selectionShortcut && !featureToggle)
             {
                 return true;
             }
@@ -7541,6 +7609,25 @@ namespace ADOFAIEditorStudio
             if (clearSelection)
             {
                 ClearEditorSelection();
+                return false;
+            }
+
+            // 定位 / 自动翻页。状态与提示都在时间轴那边（它负责写设置和报状态），
+            // 这里只负责把键接住、别让它落到原生编辑器上。
+            if (featureToggle)
+            {
+                EditorTimelineView featureTimeline = overlay.Timeline;
+                if (featureTimeline != null)
+                {
+                    if (locateToggle)
+                    {
+                        featureTimeline.ToggleLocateOnTrackClick();
+                    }
+                    if (autoPageToggle)
+                    {
+                        featureTimeline.ToggleAutoPageTimeline();
+                    }
+                }
                 return false;
             }
 

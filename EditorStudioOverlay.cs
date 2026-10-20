@@ -1837,6 +1837,9 @@ namespace ADOFAIEditorStudio
             // 加载页：画预载进度，铺完自己收掉。
             UpdateMediaPreload();
 
+            // 打开工作台时"落到原生选中格"的待办，落地一次就撤。
+            TickPendingSelectionJump();
+
             if (visible && Input.GetKeyDown(KeyCode.Escape))
             {
                 // 有窗口开着时 Esc **先关它**：否则开着一层窗口按 Esc，整个
@@ -4885,6 +4888,14 @@ namespace ADOFAIEditorStudio
 
         /// <summary>打开工作台时预载媒体缩略图的进度状态。</summary>
         private bool mediaPreloading;
+
+        /// <summary>
+        /// 打开工作台时"把播放头落到原生选中格"这个待办还挂着没有。
+        /// 会话是异步起来的，所以不能只在打开那一帧做一次。
+        /// </summary>
+        private bool pendingSelectionJump;
+        /// <summary>上面那个待办的截止时刻（unscaledTime）。超时就放弃。</summary>
+        private float pendingSelectionJumpDeadline;
         private int mediaPreloadTotal;
 
         /// <summary>
@@ -5007,6 +5018,30 @@ namespace ADOFAIEditorStudio
             Main.Logger.Log("[加载页] 开始：媒体 " + mediaPreloadTotal
                 + " 个，其中要解码 " + queued + " 个（磁盘缓存已有 " + cachedOnDisk
                 + " 个）；队列现有 " + mediaThumbnailQueue.Count);
+        }
+
+        /// <summary>
+        /// 打开工作台时「播放头落到原生选中格」的待办，每帧重试一次。
+        ///
+        /// 打开是异步的：媒体预载那扇加载页可能还盖着，求值器与会话未必已经就绪，
+        /// 那一帧直接跳会被挡掉。所以挂一个有时限的重试，落地一次就撤；
+        /// 超时（3 秒）也要撤 —— 卡住不该让工作台一直重试。
+        /// </summary>
+        private void TickPendingSelectionJump()
+        {
+            if (!pendingSelectionJump)
+            {
+                return;
+            }
+            if (!visible || Time.unscaledTime > pendingSelectionJumpDeadline)
+            {
+                pendingSelectionJump = false;
+                return;
+            }
+            if (EditorPlaybackBridge.JumpToNativeSelection())
+            {
+                pendingSelectionJump = false;
+            }
         }
 
         /// <summary>
@@ -5184,6 +5219,14 @@ namespace ADOFAIEditorStudio
                     // 「指针在播放头上」，于是拒绝切换，直到一次真正的拖动
                     // 恰好把它清掉。
                     EditorPlaybackBridge.TryBeginPreviewSession(out ignored);
+
+                    // 打开工作台之后，播放头要落在原生编辑器**当前选中**的那一格。
+                    //
+                    // 不能在这里直接跳：打开是异步的（媒体预载那扇加载页还盖着，
+                    // 求值器可能还没接管），直接调会被 "会话还没起来" 挡掉。
+                    // 挂一个最多 3 秒的待办，由 TickPendingSelectionJump 每帧重试。
+                    pendingSelectionJump = true;
+                    pendingSelectionJumpDeadline = Time.unscaledTime + 3f;
                 }
                 catch (Exception exception)
                 {

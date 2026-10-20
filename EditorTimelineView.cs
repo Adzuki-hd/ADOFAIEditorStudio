@@ -1912,6 +1912,15 @@ namespace ADOFAIEditorStudio
             {
                 SyncCenteredView(snapshot.CurrentTime);
             }
+            // 自动翻页（开关在标题行，快捷键 Ctrl+Alt+P）。
+            //
+            // 和「固定中间」互斥——那个模式每帧自己把视图摆回中点，
+            // 再翻页会两边打架。播放中 `FollowPlayback` 已经在管这件事，
+            // 这里补的是**不播、纯拖播放头**那种情况：拖出右边缘视图就跟过去。
+            else if (Main.Settings != null && Main.Settings.AutoPageTimeline)
+            {
+                PageViewAtPlayhead(snapshot.CurrentTime);
+            }
 
             if (visualsDirty)
             {
@@ -7232,6 +7241,44 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>
+        /// 播放头**整根跑出视口**时把视图翻一页（瞬间完成，没有动画）。
+        ///
+        /// 与 <see cref="FollowPlayback"/> 的区别：那个是"接近边缘就开始挪"，
+        /// 只在播放时用；这个是"已经出去了才翻"，给手动拖播放头用。判据用
+        /// 出界而不是接近，是为了不跟用户的横向滚动抢视野 —— 播放头还在视口里
+        /// 就一帧都不动。
+        /// </summary>
+        private void PageViewAtPlayhead(float currentTime)
+        {
+            if (!viewInitialized || pixelsPerSecond <= 0f)
+            {
+                return;
+            }
+
+            float x = (currentTime - viewStartTime) * pixelsPerSecond;
+            float margin = Mathf.Max(24f, bodyWidth * 0.04f);
+            float targetStart = viewStartTime;
+            if (x > bodyWidth)
+            {
+                // 翻过去之后播放头落在左侧留白处，和拖动时的落点手感一致。
+                targetStart = currentTime - margin / pixelsPerSecond;
+            }
+            else if (x < 0f)
+            {
+                targetStart = currentTime - (bodyWidth - margin) / pixelsPerSecond;
+            }
+
+            if (Mathf.Approximately(targetStart, viewStartTime))
+            {
+                return;
+            }
+
+            viewStartTime = targetStart;
+            ClampViewStart();
+            visualsDirty = true;
+        }
+
+        /// <summary>
         /// 把视图挪到播放头附近。只在播放头接近视口边缘时才动，
         /// 这样正常播放时画面是「一页一页」翻，而不是每帧都在挪。
         /// </summary>
@@ -8410,6 +8457,50 @@ namespace ADOFAIEditorStudio
 
             Main.Settings.FollowSelectionOnClick = !Main.Settings.FollowSelectionOnClick;
             Main.SaveSettings();
+        }
+
+        /// <summary>
+        /// 定位模式：预览画面里点轨道，播放头立刻跳到那一格。
+        ///
+        /// 开关只改一个设置项 —— 真正的跳转挂在 `SelectFloor` 补丁那条路上
+        /// （点轨道 → 原生 `SelectFloor` → `EditorPlaybackBridge.OnFloorSelected`
+        /// → `FollowSelectedFloor(force: 定位模式)`），所以这里没有第二套拾取逻辑。
+        /// </summary>
+        internal void ToggleLocateOnTrackClick()
+        {
+            if (Main.Settings == null)
+            {
+                return;
+            }
+
+            Main.Settings.LocateOnTrackClick = !Main.Settings.LocateOnTrackClick;
+            Main.SaveSettings();
+            if (Main.Overlay != null)
+            {
+                Main.Overlay.SetTransientStatus(Main.Settings.LocateOnTrackClick
+                    ? "定位：开（点轨道跳画面，Ctrl+Alt+L）"
+                    : "定位：关（Ctrl+Alt+L）");
+            }
+        }
+
+        /// <summary>
+        /// 自动翻页：播放头跑出时间轴右边缘时，把视图整页翻过去（瞬间）。
+        /// </summary>
+        internal void ToggleAutoPageTimeline()
+        {
+            if (Main.Settings == null)
+            {
+                return;
+            }
+
+            Main.Settings.AutoPageTimeline = !Main.Settings.AutoPageTimeline;
+            Main.SaveSettings();
+            if (Main.Overlay != null)
+            {
+                Main.Overlay.SetTransientStatus(Main.Settings.AutoPageTimeline
+                    ? "自动翻页：开（播放头出界就翻页，Ctrl+Alt+P）"
+                    : "自动翻页：关（Ctrl+Alt+P）");
+            }
         }
 
         /// <summary>
