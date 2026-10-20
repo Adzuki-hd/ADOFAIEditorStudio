@@ -213,11 +213,11 @@ namespace ADOFAIEditorStudio
 
             float x = startX;
             DrawFeatureButton(draw, x, buttonY, "locate", locate,
-                "定位", "点轨道跳过去（Ctrl+J，或 Ctrl+Shift+L）",
+                "定位", "点轨道跳过去（Ctrl+J）",
                 timeline.ToggleLocateOnTrackClick, PaintLocateIcon);
             x += ToggleWidth + ToggleGap;
             DrawFeatureButton(draw, x, buttonY, "autopage", autoPage,
-                "自动翻页", "播放头跑出右边缘就整页翻过去（Ctrl+K，或 Ctrl+Shift+P）",
+                "自动翻页", "播放头跑出右边缘就整页翻过去（Ctrl+K）",
                 timeline.ToggleAutoPageTimeline, PaintPageIcon);
             x += ToggleWidth + ToggleGap;
             return x;

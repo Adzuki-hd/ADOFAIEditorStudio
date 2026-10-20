@@ -7841,43 +7841,35 @@ namespace ADOFAIEditorStudio
 
             // 定位（点轨道跳画面）与自动翻页的开关。
             //
-            // **主绑定用 Ctrl+字母，不带 Alt / Shift**：
-            //   Ctrl+J = 定位、Ctrl+K = 自动翻页
+            // **只有一组：Ctrl+J = 定位、Ctrl+K = 自动翻页。**
             //
-            // 依据（本机实测）：
-            //   [快捷键] ctrl=True alt=True shift=False L=False P=False input=""
-            // 按住 Ctrl+Alt 时 Unity **根本收不到字母键**，inputString 也是空的
-            // —— 键在进 Unity 之前就被输入法拦了。而 Ctrl+Shift 在中文输入法里
-            // 通常是"切换输入法"，同样不能指望。纯 Ctrl 组合不在这些名单上。
+            // 历史（别再走一遍）：
+            //   · 最初用 Ctrl+Alt+字母，实测本机按住 Ctrl+Alt 时 Unity
+            //     **根本收不到字母键**、`inputString` 也是空的
+            //     （`[快捷键] ctrl=True alt=True L=False input=""`）——
+            //     键在进 Unity 之前就被输入法拦掉了；
+            //   · Ctrl+Shift+字母 也不行：中文输入法里那是"切换输入法"；
+            //   · 功能性单键（F8/F9）按用户要求不采用。
+            // 纯 Ctrl 组合不在上面这些名单里，所以只留这一组，不再挂备用。
             //
             // 选 J / K 是因为**原生编辑器没绑它们**（原生绑的是
-            // N O V S X C Z Y T Q F E A H L P），避免和它的快捷键撞车。
-            // 工作台可见时命中就整帧吃掉（返回 false），即使原生也绑了同一个，
-            // 也是工作台说了算。
-            // 另留一组 Ctrl+Shift+L / Ctrl+Shift+P 兜底（L / P 与旧习惯一致）。
+            // N O V S X C Z Y T Q F E A H L P）。
+            // 工作台可见时命中就整帧吃掉（返回 false）。
             bool ctrlOnly = controlHeld && !altHeld && !shiftHeld;
-            bool ctrlShift = controlHeld && shiftHeld && !altHeld;
-            bool locateToggle = (ctrlOnly && Input.GetKeyDown(KeyCode.J))
-                || (ctrlShift && Input.GetKeyDown(KeyCode.L));
-            bool autoPageToggle = (ctrlOnly && Input.GetKeyDown(KeyCode.K))
-                || (ctrlShift && Input.GetKeyDown(KeyCode.P));
+            bool locateToggle = ctrlOnly && Input.GetKeyDown(KeyCode.J);
+            bool autoPageToggle = ctrlOnly && Input.GetKeyDown(KeyCode.K);
             bool featureToggle = locateToggle || autoPageToggle;
 
-            // 探针：任一候选组合被按下就记一行（上限 20 行）。判读很直接：
-            // J / K 为 True → 主绑定可用；只有 L / P 为 True → 只有 Ctrl+Shift 那组可用；
-            // 全为 False 且 input="" → 这组键在进 Unity 之前就被吃了。
-            bool probeCandidate = (controlHeld && (
-                Input.GetKeyDown(KeyCode.J) || Input.GetKeyDown(KeyCode.K)
-                || Input.GetKeyDown(KeyCode.L) || Input.GetKeyDown(KeyCode.P)));
-            if (probeCandidate && Main.Logger != null && featureProbeCount < 20)
+            // 探针：只记 Ctrl+J / Ctrl+K（上限 20 行）。判读：J/K 为 True 即通；
+            // 都是 False 且 input="" 说明这组键也在进 Unity 之前被吃掉。
+            if (ctrlOnly && (Input.GetKeyDown(KeyCode.J) || Input.GetKeyDown(KeyCode.K))
+                && Main.Logger != null && featureProbeCount < 20)
             {
                 featureProbeCount++;
                 Main.Logger.Log("[快捷键] ctrl=" + controlHeld + " alt=" + altHeld
                     + " shift=" + shiftHeld
                     + " J=" + Input.GetKeyDown(KeyCode.J)
                     + " K=" + Input.GetKeyDown(KeyCode.K)
-                    + " L=" + Input.GetKeyDown(KeyCode.L)
-                    + " P=" + Input.GetKeyDown(KeyCode.P)
                     + " input=\"" + Input.inputString + "\".");
             }
 
