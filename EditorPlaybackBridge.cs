@@ -5313,6 +5313,10 @@ namespace ADOFAIEditorStudio
             conductor.dspTime = currentDspTime;
 
             double startLead = 0d;
+            // 本次调用先假定"不定帧"。只有真正起播、且走的是排程余量那条路
+            // （rawClipTime >= 0）时才置位 —— 否则上一轮留下的 true 会让
+            // 场景锚点被多加一次 0.1 秒。
+            holdPictureForAudioStart = false;
             if (conductor.song != null && conductor.song.clip != null)
             {
                 if (AudioManager.Instance != null)
@@ -5414,7 +5418,17 @@ namespace ADOFAIEditorStudio
             // 负时间开始，于是时间轴和画面冻住，直到
             // 倒计时走完。两者必须分开：dspTimeSong 放
             // 场景，SetScheduledStartTime 放音频。
-            conductor.dspTimeSong = currentDspTime
+            //
+            // **但"定帧等音频"那条路要把锚点也一起后移。**
+            // 音频是从 target 的内容开始的（`clipTime = rawClipTime`），
+            // 而排程在 `now + startLead`。若锚点仍按 `now` 算，设备时钟一越过
+            // 排程时刻，由 dsp 推导出来的场景时间就已经是 `target + startLead`，
+            // 比音乐内容快出整整 0.1 秒 —— 音画会脱拍（上一版就是这么错的）。
+            // 把锚点改成 `now + startLead`，两者在那一刻才对齐。
+            double sceneAnchorDsp = holdPictureForAudioStart
+                ? currentDspTime + startLead
+                : currentDspTime;
+            conductor.dspTimeSong = sceneAnchorDsp
                 - targetTime / pitch
                 - conductor.addoffset / pitch
                 - scrConductor.calibration_i;
