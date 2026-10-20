@@ -1882,6 +1882,13 @@ namespace ADOFAIEditorStudio
             // 否则用户点了按钮画面纹丝不动，看不出这个模式有什么不同。
             // **这一帧必须用 SyncCenteredView**：FollowPlayback 只在指针贴近
             // 边缘时才动，指针本来就在中间附近的话它什么也不做。
+            // 所有"视图自己跟着播放头跑"的行为都归这一个开关管：
+            //   · 播放中的跟随（FollowPlayback）
+            //   · 手动把播放头拖到尽头时的翻页（PageViewAtPlayhead，见下面那个分支）
+            // 以前前者是无条件的，于是"关掉开关"在播放时看起来毫无区别 ——
+            // 用户报的"关的时候也能翻页"就是它。
+            bool autoPage = Main.Settings != null && Main.Settings.AutoPageTimeline;
+
             if (centerViewOnNextFollow)
             {
                 centerViewOnNextFollow = false;
@@ -1889,13 +1896,14 @@ namespace ADOFAIEditorStudio
                 {
                     SyncCenteredView(snapshot.CurrentTime);
                 }
-                else
+                else if (autoPage)
                 {
                     FollowPlayback(snapshot.CurrentTime);
                 }
             }
             else if (snapshot.State == EditorPlaybackState.Playing
-                && now >= manualNavigationUntil)
+                && now >= manualNavigationUntil
+                && autoPage)
             {
                 FollowPlayback(snapshot.CurrentTime);
             }
@@ -1910,16 +1918,19 @@ namespace ADOFAIEditorStudio
             // 不是这一句。
             //
             // 纵向滚动不受影响：那是看更多行，与水平居中无关。
-            if (followMode == TimelineFollowMode.CenteredPlayhead)
+            //
+            // **开关关掉时居中也不生效**：这个开关的语义是"时间轴要不要自动滚"，
+            // 居中是其中最激进的一种（每帧都摆），留着它就等于开关关不掉。
+            if (followMode == TimelineFollowMode.CenteredPlayhead && autoPage)
             {
                 SyncCenteredView(snapshot.CurrentTime);
             }
             // 自动翻页（开关在标题行，快捷键 Ctrl+Alt+P）。
             //
             // 和「固定中间」互斥——那个模式每帧自己把视图摆回中点，
-            // 再翻页会两边打架。播放中 `FollowPlayback` 已经在管这件事，
-            // 这里补的是**不播、纯拖播放头**那种情况：拖出右边缘视图就跟过去。
-            else if (Main.Settings != null && Main.Settings.AutoPageTimeline)
+            // 再翻页会两边打架。开关关掉时这里也不动（和上面播放中的跟随
+            // 用的是同一个 autoPage）。
+            else if (autoPage)
             {
                 PageViewAtPlayhead(snapshot.CurrentTime);
             }
