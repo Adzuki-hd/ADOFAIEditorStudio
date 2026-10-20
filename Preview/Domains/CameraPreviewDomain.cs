@@ -124,8 +124,6 @@ namespace ADOFAIEditorStudio.Preview.Domains
         // 但不需要残留帧缓冲，也不会有旧内容的糊影。
         private const float HoldDistance = 500f;
         private const float HoldWindowSeconds = 0.5f;
-        private float holdAnchor = float.NaN;
-        private float holdRequestedTime = float.NaN;
         private int holdLogCount;
 
         /// <summary>
@@ -365,8 +363,6 @@ namespace ADOFAIEditorStudio.Preview.Domains
             BuildFollowTrack(context, StableFrameSeconds);
             // 引擎会在跑各域之前问这个实例「这一帧要不要定格」。
             Active = this;
-            holdAnchor = float.NaN;
-            holdRequestedTime = float.NaN;
             hasFarTargets = false;
             for (int i = 0; i < keyframes.Count; i++)
             {
@@ -765,34 +761,87 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 return time;
             }
 
-            // 时间没往前走（暂停 / 停在原地）：不定格。
-            // 这时候用户是在看某一格，给的就是那一格的真实画面。
-            bool advancing = !float.IsNaN(holdRequestedTime)
-                && Mathf.Abs(time - holdRequestedTime) > 0.0001f;
-            holdRequestedTime = time;
-            if (!advancing)
+            if (!IsCameraFarAt(context, time))
             {
-                holdAnchor = float.NaN;
                 return time;
             }
 
-            bool far = IsCameraFarAt(context, time);
-
-            // 锚点只可能是**正常帧**（下面这条只在 !far 时才写入），所以这一支
-            // 拿到的一定是一张正常取景，不会出现「锚在远帧上、一直黑着」。
-            if (far && !float.IsNaN(holdAnchor) && time - holdAnchor <= HoldWindowSeconds)
+            // 定格到**哪一张**：最近一条"位置不是远端"的关键帧的起始时刻。
+            //
+            // 这里不能用"上一次采样到的正常帧"。预览一帧要 25–30ms，比这段
+            // 谱面的正常窗口（5° = 17.5ms）还长，靠采样会整轮漏掉 —— 漏一轮就
+            // 卡一下，这正是「稳定掉帧一会突然卡一会」的来源。改成按关键帧
+            // 自己排的时间来定，跟帧率无关，每一轮的时长都是恒定的。
+            float anchor = FindHoldAnchorTime(time);
+            if (float.IsNaN(anchor) || time - anchor > HoldWindowSeconds)
             {
-                if (holdLogCount < 8 && Main.Logger != null)
-                {
-                    holdLogCount++;
-                    Main.Logger.Log("[镜头定格] t=" + time.ToString("0.000")
-                        + " 按 " + holdAnchor.ToString("0.000") + " 的取景重算（相机目标过远）。");
-                }
-                return holdAnchor;
+                return time;
             }
 
-            holdAnchor = far ? float.NaN : time;
-            return time;
+            if (holdLogCount < 8 && Main.Logger != null)
+            {
+                holdLogCount++;
+                Main.Logger.Log("[镜头定格] t=" + time.ToString("0.000")
+                    + " 锚=" + anchor.ToString("0.000")
+                    + " 相隔=" + (time - anchor).ToString("0.000") + "s。");
+            }
+            return anchor;
+        }
+
+        /// <summary>
+        /// 找出 `time` 之前最近一条**位置不是远端**的相机关键帧的时刻。
+        ///
+        /// 判据只看关键帧自己写的 `position`（逐轴、容忍 NaN 分量），不看解算后的
+        /// 世界位置 —— 这一步每帧都要跑，不能对每个候选再做一次全量通道求值。
+        /// </summary>
+        private float FindHoldAnchorTime(float time)
+        {
+            int index = -1;
+            for (int i = 0; i < keyframes.Count; i++)
+            {
+                if (keyframes[i].StartTime > time)
+                {
+                    break;
+                }
+                index = i;
+            }
+            if (index < 0)
+            {
+                return float.NaN;
+            }
+
+            for (int i = index; i >= 0 && index - i <= 40; i--)
+            {
+                CameraKeyframe keyframe = keyframes[i];
+                if (time - keyframe.StartTime > HoldWindowSeconds)
+                {
+                    break;
+                }
+
+                // 只看**这一条真的写了的轴**。`position: [null, null]` 那种
+                // （只改旋转 / 缩放的事件）一个轴都没写，它的相机位置是继承来的，
+                // 拿它当锚点会把锚定在远端状态上 —— 结果还是黑。
+                Vector2 probe = keyframe.Position;
+                bool wroteAxis = false;
+                bool farAxis = false;
+                if (!float.IsNaN(probe.x))
+                {
+                    wroteAxis = true;
+                    farAxis |= Mathf.Abs(probe.x) > HoldDistance;
+                }
+                if (!float.IsNaN(probe.y))
+                {
+                    wroteAxis = true;
+                    farAxis |= Mathf.Abs(probe.y) > HoldDistance;
+                }
+
+                if (wroteAxis && !farAxis)
+                {
+                    return (float)keyframe.StartTime;
+                }
+            }
+
+            return float.NaN;
         }
 
         /// <summary>
