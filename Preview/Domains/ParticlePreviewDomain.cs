@@ -99,6 +99,12 @@ namespace ADOFAIEditorStudio.Preview.Domains
             /// 真正的触发条件是播放头跨过它的起始时刻（见 ApplyEmit）。
             /// </summary>
             internal ParticleAction EmittedLast;
+
+            /// <summary>
+            /// 上一帧这个粒子系统是不是在播。只给"出现/停止"探针用：
+            /// 992/993 多出不该有的发射器时，靠它定位"是谁在那一刻点着的"。
+            /// </summary>
+            internal bool WasPlaying;
         }
 
         /// <summary>
@@ -418,6 +424,30 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 ApplyTargetMode(state, currentMode, time);
                 ApplySimulationSpeed(state, previousSpeed, currentSpeed, time);
                 ApplyEmit(state, currentEmit, previousTime, time);
+
+                // 探针：播放状态跳变（起 / 停）各记一行。
+                //
+                // 992/993 那种"多出来的发射器"，本质就是某个系统在那一刻
+                // 由停变播。记下当时的 tag、时间、当前生效的 mode 动作、
+                // autoPlay 还挂没挂 —— 三者能直接指认是谁点着的。
+                ParticleSystem probeSystem = state.Deco == null ? null : state.Deco.particleSystem;
+                if (probeSystem != null && Main.Logger != null)
+                {
+                    bool playing = probeSystem.isPlaying;
+                    if (playing != state.WasPlaying)
+                    {
+                        state.WasPlaying = playing;
+                        ParticleAction applied = state.AppliedTargetMode;
+                        Main.Logger.Log("[粒子出现] tag=" + state.Tag
+                            + " t=" + time.ToString("0.000")
+                            + " playing=" + playing
+                            + " active=" + probeSystem.gameObject.activeSelf
+                            + " mode=" + (applied == null ? "-" : applied.Mode.ToString())
+                            + " 事件格=" + (applied == null ? "-" : applied.SourceFloor.ToString())
+                            + " 事件时间=" + (applied == null ? "-" : applied.StartTime.ToString("0.000"))
+                            + " autoPlay待播=" + state.AutoPlayPending + ".");
+                    }
+                }
             }
         }
 
@@ -558,9 +588,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // 处理器刚刚把它打开。
             // 只记报告粒子缺陷的那几个格，而且上限放宽，这样
             // 谱面开头的事件挤不掉真正有意思的那些。
-            // 临时：为了抓 992/993 那次"不该出现的发射器"，这轮先无条件打开
-            // （上限 200 行不变）。取证完把 VerboseDiagnostics 那道门加回去。
-            if (Main.Logger != null
+            if (Main.Settings != null && Main.Settings.VerboseDiagnostics
                 && current.SourceFloor >= 700 && particleLogCount < 200)
             {
                 particleLogCount++;
