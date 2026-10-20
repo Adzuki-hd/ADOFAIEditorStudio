@@ -245,6 +245,38 @@ namespace ADOFAIEditorStudio.Preview.Domains
         /// 走 allDecorations 而不是 GetTaggedDecorations：自动播放和 tag
         /// 无关，每个粒子装饰物都有自己的 autoPlay 标记。
         /// </summary>
+        /// <summary>
+        /// 这个发射器有没有被谱面**显式 Start 过**。
+        ///
+        /// 有的话就不能再替原生补那一次 autoPlay：
+        ///
+        /// - 原生那边 `autoPlay` 是在 `Update` 里被消费的 ——
+        ///   `if (atStart) { if (autoPlay && !paused) Play(); autoPlay = false; }`。
+        ///   关卡加载时物体只要激活过一帧，标志就被烧掉了，之后永远不会再自播；
+        ///   而求值器是"等它第一次露面才播"，于是**露面的那一刻**就会喷出来。
+        /// - 本谱 7-6.57 / 7-6.59 就是这种：`AddParticle` 写的是 `visible: false`
+        ///   加 `autoPlay: true`，真正的启动在 1009 格的 `SetParticle Start`。
+        ///   而 1009 格那条 `MoveDecorations` 带 `angleOffset: -360`（提前整整一圈
+        ///   生效），于是在 992-993 一带就把它们掀开 —— 求值器顺手把 autoPlay
+        ///   补播了，原版这里什么都不该有。
+        ///
+        /// 判据只看"有没有 Start 动作"：只有 Stop、没有 Start 的发射器
+        /// 仍然需要 autoPlay 才能起来，不能一起挡掉。
+        /// </summary>
+        private static bool HasExplicitStart(DecoState state)
+        {
+            for (int i = 0; i < state.Actions.Count; i++)
+            {
+                ParticleAction action = state.Actions[i];
+                if (action.Kind == ParticleActionKind.TargetMode
+                    && action.Mode == ParticlePlayMode.Start)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         private void CollectAutoPlayDecorations(scrDecorationManager manager)
         {
             List<scrDecoration> all = manager.allDecorations;
@@ -271,7 +303,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
                 try
                 {
-                    if (source.GetBool("autoPlay"))
+                    if (source.GetBool("autoPlay") && !HasExplicitStart(state))
                     {
                         state.AutoPlayPending = true;
                         autoPlayCount++;
@@ -442,6 +474,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
                             + " t=" + time.ToString("0.000")
                             + " playing=" + playing
                             + " active=" + probeSystem.gameObject.activeSelf
+                            + " 域内可见=" + state.Deco.GetVisible()
+                            + " 事件visible=" + state.Deco.sourceLevelEvent.visible
                             + " mode=" + (applied == null ? "-" : applied.Mode.ToString())
                             + " 事件格=" + (applied == null ? "-" : applied.SourceFloor.ToString())
                             + " 事件时间=" + (applied == null ? "-" : applied.StartTime.ToString("0.000"))
