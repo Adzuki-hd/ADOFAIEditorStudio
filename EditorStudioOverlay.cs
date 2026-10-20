@@ -5150,6 +5150,15 @@ namespace ADOFAIEditorStudio
         {
             visible = value;
 
+            // 探针：打开工作台时把"自动翻页 / 定位"两个开关的**运行时值**打出来。
+            // 判断"开关失效"前先看这两行，能直接排除"其实是被关掉了"。
+            if (value && Main.Logger != null && Main.Settings != null)
+            {
+                Main.Logger.Log("[翻页] 打开工作台：自动翻页="
+                    + (Main.Settings.AutoPageTimeline ? "开" : "关")
+                    + "，定位=" + (Main.Settings.LocateOnTrackClick ? "开" : "关") + "。");
+            }
+
             // 换了版本之后第一次打开才弹更新内容（见 ShowVersionNotesIfNew）。
             // 放这里而不是 F8 那一处：重开工作台、场景重载后重开，
             // 走的都是这条。

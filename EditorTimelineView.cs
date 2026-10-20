@@ -8521,6 +8521,13 @@ namespace ADOFAIEditorStudio
 
             Main.Settings.AutoPageTimeline = !Main.Settings.AutoPageTimeline;
             Main.SaveSettings();
+            // 探针：开关切换留痕。前一版"开关失效"其实是这一项被关掉了，
+            // 没有这条日志就只能靠猜。
+            if (Main.Logger != null)
+            {
+                Main.Logger.Log("[翻页] 切换 → " + (Main.Settings.AutoPageTimeline ? "开" : "关")
+                    + "（已写盘）");
+            }
             if (Main.Overlay != null)
             {
                 Main.Overlay.SetTransientStatus(Main.Settings.AutoPageTimeline
