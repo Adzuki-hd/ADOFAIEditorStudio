@@ -134,6 +134,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
         /// 属于这一类，不能为了一个特例给每帧加一次全量扫关键帧。
         /// </summary>
         private bool hasFarTargets;
+        private int farLogCount;
 
         /// <summary>
         /// 当前引擎正在用的实例。求值引擎在建好帧时间之后、跑各域之前调用
@@ -369,11 +370,30 @@ namespace ADOFAIEditorStudio.Preview.Domains
             hasFarTargets = false;
             for (int i = 0; i < keyframes.Count; i++)
             {
-                if (keyframes[i].HasPosition
-                    && keyframes[i].Position.magnitude > HoldDistance)
+                // **逐轴判，不能取模长**：`position: [null, 10000]` 里那个 null
+                // 分量被解成 NaN，`magnitude` 于是整个变成 NaN，`NaN > 500`
+                // 恒为 false —— 第一次写这里就是这么漏掉的（日志
+                // farTargets=False 但相机明明在甩）。
+                if (!keyframes[i].HasPosition)
+                {
+                    continue;
+                }
+
+                Vector2 probe = keyframes[i].Position;
+                if (Mathf.Abs(probe.x) > HoldDistance || Mathf.Abs(probe.y) > HoldDistance)
                 {
                     hasFarTargets = true;
-                    break;
+                    if (farLogCount < 3 && Main.Logger != null)
+                    {
+                        farLogCount++;
+                        Main.Logger.Log("[镜头远端] f=" + keyframes[i].Floor
+                            + " t=" + keyframes[i].StartTime.ToString("0.000")
+                            + " pos=" + probe.ToString("0.0") + ".");
+                    }
+                    if (hasFarTargets && farLogCount >= 3)
+                    {
+                        break;
+                    }
                 }
             }
             Main.Logger.Log("[StaticPreview/Camera] analyzed " + keyframes.Count
@@ -736,7 +756,11 @@ namespace ADOFAIEditorStudio.Preview.Domains
         /// </summary>
         internal float ResolveFrameHold(PreviewTimelineContext context, float time)
         {
-            if (context == null || floorCount == 0 || !hasFarTargets)
+            // 这里**不做** `hasFarTargets` 预筛：预筛只是省一点开销，一旦它
+            // 判错（第一次就是因为 `[null,10000]` 的 NaN 分量让模长变成 NaN，
+            // 整段功能静默失效），表现就是"改了等于没改"。每帧多走一次
+            // 通道求值的代价远小于一次误判。
+            if (context == null || floorCount == 0)
             {
                 return time;
             }
