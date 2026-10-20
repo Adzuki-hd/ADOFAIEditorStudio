@@ -118,6 +118,13 @@ namespace ADOFAIEditorStudio.Preview.Domains
             internal int AppliedMaskingBackDepth;
 
             /// <summary>
+            /// 本域是否把行星的世界坐标预加进了这个装饰物的 pivotPosVec。
+            /// 退出预览时要还原，否则原生播放（那时 paused=false，原生自己
+            /// 还会再加一次行星坐标）会偏移两遍。
+            /// </summary>
+            internal bool DisplacedForPlanet;
+
+            /// <summary>
             /// 最近推给装饰物的图，这样只在活跃的图片事件变化时
             /// 才换图。sprite 加载不免费，而逐帧动画
             /// 每帧都有一个事件。
@@ -142,6 +149,9 @@ namespace ADOFAIEditorStudio.Preview.Domains
         }
 
         private readonly List<DecorationState> states = new List<DecorationState>();
+
+        /// <summary>行星跟随探针上一次输出的帧号，避免每帧刷屏。仅诊断时使用。</summary>
+        private static int lastPlanetFollowProbeFrame = -1000;
 
         public string Name
         {
@@ -493,9 +503,43 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 // 那次写入也会被跳过。
                 decoration.SetOpacity(Mathf.Clamp01(opacity));
 
+                // relativeTo = Red/Blue/GreenPlanet 的装饰物跟着球走。
+                //
+                // 原生 scrDecoration.UpdatePosition 是这么算的：
+                //
+                //   vector2 = pivotPosVec + ((!controller.paused && followPlanet != null)
+                //                            ? (Vector2)followPlanet.transform.position
+                //                            : Vector2.zero);
+                //
+                // 编辑器里 controller.paused 恒为 true，那一项就恒为 0 —— 于是
+                // 这类装饰物全塌到 pivotPosVec 上。而它们通常写的是
+                // position: [0,0]，等于全部堆在世界原点。表现就是「作者把球缩成 0、
+                // 用两个圆形装饰物代替球，工作台里两个圆一个都不在球身上」。
+                //
+                // 这里把行星当前的世界坐标**预加进传给 SetPosition 的坐标**：原生
+                // 那一步再加 0，结果正好是「跟着球」。这一手是刻意的——
+                // 另一条路（临时把 controller.paused 置 false 再调）只能让偏移落到
+                // parallax 的 startPosition 上，而 scrDecorationManager.LateUpdate
+                // 每帧都会拿 pivotPosVec 重算一次（暂停时加 0），两边交替写，
+                // 装饰物会在球和原点之间来回弹。预加进 pivotPosVec，则不管谁后跑、
+                // 跑几遍，算出来的都是同一个位置。
+                Vector2 anchored = position;
+                scrPlanet followPlanet = ResolveFollowPlanet(decoration, placement);
+                scrController controller = ADOBase.controller;
+                bool suppressPlanetFollow = controller != null && controller.paused;
+                if (followPlanet != null && suppressPlanetFollow)
+                {
+                    // 只在原生自己会丢掉这段偏移的时候补（暂停 = 编辑器里的常态）。
+                    // 万一工作台是在原生 transport 跑着的时候被打开的，paused 为
+                    // false，原生 UpdatePosition 会自己加上行星位置，我们再补就是
+                    // 加两遍——那种情况交给原生。
+                    anchored += (Vector2)followPlanet.transform.position;
+                }
+
                 if (!skipHiddenWrites && !skipTransparentWrites)
                 {
-                    decoration.SetPosition(position, pivot);
+                    decoration.SetPosition(anchored, pivot);
+                    state.DisplacedForPlanet = followPlanet != null && suppressPlanetFollow;
                     decoration.SetRotation(rotation);
                     decoration.SetScale(scale);
                     decoration.SetColor(color);
@@ -594,6 +638,25 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     {
                         state.AppliedImage = imageFilename;
                     }
+                }
+
+                // 探针：确认行星相对的装饰物真的贴在球上（位置 ≈ 行星位置）。
+                // 挂在 VerboseDiagnostics 后面，默认一条都不输出。
+                if (followPlanet != null
+                    && Main.Settings != null
+                    && Main.Settings.VerboseDiagnostics
+                    && Time.frameCount - lastPlanetFollowProbeFrame >= 60)
+                {
+                    lastPlanetFollowProbeFrame = Time.frameCount;
+                    Main.Logger.Log("[DecorationCore/PlanetFollow] " + decoration.name
+                        + " placement=" + placement
+                        + " planet=" + (followPlanet.name ?? "?")
+                        + " planetPos=" + ((Vector2)followPlanet.transform.position).ToString("0.00")
+                        + " decoPos=" + ((Vector2)decoration.transform.position).ToString("0.00")
+                        + " anchored=" + anchored.ToString("0.00")
+                        + " paused=" + suppressPlanetFollow
+                        + " opacity=" + opacity.ToString("0.00")
+                        + " visible=" + visible + ".");
                 }
             }
         }
@@ -738,7 +801,63 @@ namespace ADOFAIEditorStudio.Preview.Domains
         }
 
         public void EndSession()
-        {            states.Clear();
+        {
+            // 行星相对的装饰物被预加过行星坐标（见 Evaluate），退出预览得把
+            // 干净的 pivotPosVec 还给原生：原生播放时 paused=false，它自己还会
+            // 再加一次行星位置，旧偏移留着就是加两遍——退出工作台后这两个
+            // 装饰物会整体挪开一整个球的距离。
+            for (int i = 0; i < states.Count; i++)
+            {
+                DecorationState state = states[i];
+                if (state == null || !state.DisplacedForPlanet || state.Decoration == null)
+                {
+                    continue;
+                }
+
+                state.Decoration.SetPosition(state.Position, state.Pivot);
+                state.DisplacedForPlanet = false;
+            }
+
+            states.Clear();
+        }
+
+        /// <summary>
+        /// 这个装饰物当前跟着哪颗行星；不是行星相对的装饰物返回 null。
+        ///
+        /// 原生在 `SetPlacementType` 里把控制器上那颗球记进 `followPlanet`，
+        /// 并且在同一个方法的开头就把它清空，所以 `followPlanet` 永远和
+        /// `placementType` 一致——它比我们自己按枚举去猜更可靠。兜底那条
+        /// 分支只照顾"刚建出来、还没跑过 SetPlacementType"的装饰物。
+        /// </summary>
+        private static scrPlanet ResolveFollowPlanet(scrDecoration decoration, DecPlacementType placement)
+        {
+            if (decoration == null)
+            {
+                return null;
+            }
+
+            if (decoration.followPlanet != null)
+            {
+                return decoration.followPlanet;
+            }
+
+            scrController controller = ADOBase.controller;
+            if (controller == null)
+            {
+                return null;
+            }
+
+            switch (placement)
+            {
+                case DecPlacementType.RedPlanet:
+                    return controller.planetRed;
+                case DecPlacementType.BluePlanet:
+                    return controller.planetBlue;
+                case DecPlacementType.GreenPlanet:
+                    return controller.planetGreen;
+                default:
+                    return null;
+            }
         }
 
         private static Dictionary<string, List<MoveEvent>> BuildTaggedEvents(PreviewTimelineContext context)
