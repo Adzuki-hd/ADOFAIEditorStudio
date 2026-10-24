@@ -135,11 +135,6 @@ namespace ADOFAIEditorStudio.Preview.Domains
             internal bool FrameVisible;
             internal float FrameOpacity;
 
-            /// <summary>
-            /// 上一次通知管理器重算遮罩缓存时的 (遮罩类型 + 目标 tag) 签名。
-            /// 只有签名变化才值得重算 —— 每帧重算会把 CPU 打满。
-            /// </summary>
-            internal int LastMaskCacheSignature;
 
             /// <summary>上次驱动 AO 遮罩合成刷新的帧号。</summary>
             internal int LastAlphaMaskForceFrame = -1000;
@@ -165,9 +160,6 @@ namespace ADOFAIEditorStudio.Preview.Domains
             /// 排序号，不是每帧都该重复做的事。
             /// </summary>
             internal bool MaskingDepthApplied;
-            internal bool AppliedUseMaskingDepth;
-            internal int AppliedMaskingFrontDepth;
-            internal int AppliedMaskingBackDepth;
 
             /// <summary>
             /// 本域是否把行星的世界坐标预加进了这个装饰物的 pivotPosVec。

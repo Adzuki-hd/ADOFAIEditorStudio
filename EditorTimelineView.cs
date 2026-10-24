@@ -488,7 +488,6 @@ namespace ADOFAIEditorStudio
 
             // 行坐标，用于索引 layoutRowSection / layoutRowY。
             internal int HeaderRow;
-            internal int EventRowStart;
             internal int EventRowCount;
             internal int ShownRows;
 
@@ -501,10 +500,6 @@ namespace ADOFAIEditorStudio
             // 前面每个分类框的所有行。
             internal float RowScrollOffset;
 
-            // 本分类框窗口在内容空间里的 Y，由 BuildRowTable 填入。
-            internal float WindowTop;
-            internal float WindowBottom;
-            internal float EventRowsTop;
 
             internal int HiddenRows
             {
@@ -520,7 +515,6 @@ namespace ADOFAIEditorStudio
             internal Image Icon;
             internal TextMeshProUGUI Label;
             internal Button Button;
-            internal TimelineSection Section;
         }
 
         private sealed class CollapsedBadge

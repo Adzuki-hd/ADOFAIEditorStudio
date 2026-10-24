@@ -99,8 +99,6 @@ namespace ADOFAIEditorStudio
             internal TMP_InputField Field2;
             internal TextMeshProUGUI EnumLabel;
             internal Image Swatch;
-            internal TextMeshProUGUI SwatchHex;
-            internal bool Refreshing;
         }
 
         // ── 对外 ─────────────────────────────────────────────────────────
