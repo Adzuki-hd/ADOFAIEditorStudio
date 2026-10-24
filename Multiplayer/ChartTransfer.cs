@@ -831,25 +831,6 @@ namespace ADOFAIEditorStudio.Multiplayer
             }
         }
 
-        /// <summary>读磁盘上那份谱面的原文。读不到返回 null。</summary>
-        internal static string ReadDiskChart(string path)
-        {
-            if (string.IsNullOrWhiteSpace(path))
-            {
-                return null;
-            }
-
-            try
-            {
-                return File.Exists(path) ? RDFile.ReadAllText(path) : null;
-            }
-            catch (Exception exception)
-            {
-                Warn("读取谱面失败", exception);
-                return null;
-            }
-        }
-
         /// <summary>
         /// 一段谱面文本的指纹。**跨机器可比**。
         ///

@@ -409,7 +409,6 @@ namespace ADOFAIEditorStudio
         }
     }
 
-
     /// <summary>
     /// 临时：把一次 Track B 运行的最后几帧留在内存里，这样 transport 死掉的那一刻
     /// 可以往回读——之前每一帧时钟、状态和球分别在做什么，
@@ -715,7 +714,6 @@ namespace ADOFAIEditorStudio
         private static bool previousAutoMode;
         private static int lastToggleFrame = -1;
         private static int lastColliderRefreshFrame = -100;
-        private static int lastStartAttemptFrame = -100;
         private static int lastTimelineScrubFloor = -1;
         private static int lastTimelineScrubEditorId;
         private static float lastTimelineScrubTime = float.NaN;
@@ -1349,7 +1347,6 @@ namespace ADOFAIEditorStudio
 
         private static int lastNativeRunStateFrame = -1000;
 
-
         public static EditorPlaybackSnapshot ReadSnapshot()        {
             var snapshot = new EditorPlaybackSnapshot
             {
@@ -1552,52 +1549,6 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private static float handoffTargetTime;
         private static int handoffArmedFrame;
-
-        /// <summary>
-        /// 启动一次交接所武装的原生重启。从捕获的
-        /// 回调里运行，此时画面已经安全地冻在视口上。
-        /// </summary>
-        private static void StartHandoffRestart()
-        {
-            if (!nativeHandoffPending)
-            {
-                return;
-            }
-
-            nativeHandoffPending = false;
-
-            // scnEditor.Play 从当前选中项取起始格：
-            //
-            //     if (SelectionIsSingle()) num = selectedFloors[0].seqID;
-            //     ...
-            //     GCS.checkpointNum = num;
-            //
-            // 所以重启运行时选中什么，什么就成了游戏被告知
-            // 的起始格。选中播放头自己所在的格，才使那个格
-            // 就是作者实际所在的格。选在别处，scnGame.Play 会把起点
-            // 当成检查点恢复——GCS.checkpointNum != 0 会让 OnMusicScheduled
-            // 走它的检查点分支，那会把歌曲淡入并把运行时 seek 到
-            // 那个格，于是画面跳回选中项，音频时钟在它下面
-            // 被重置。这既是拖动之后可见的那一顿，也是那次失步。
-            scnEditor editor = scnEditor.instance;
-            if (editor != null && editor.floors != null && editor.floors.Count > 0)
-            {
-                int targetFloor = FindFloorAtOrBefore(editor.floors, Mathf.Max(0f, handoffTargetTime));
-                editor.SelectFloor(editor.floors[targetFloor], cameraJump: false);
-                editor.DeselectAnyUIGameObject();
-            }
-
-            string status;
-            if (!TryBeginPreviewRestart(handoffTargetTime, true, out status, true))
-            {
-                EditorStudioOverlay overlay = Main.Overlay;
-                if (overlay != null)
-                {
-                    // 否则冻住的那一帧会永久停在视口上。
-                    overlay.HidePreviewHandoffImmediate();
-                }
-            }
-        }
 
         /// <summary>
         /// 是否有一个原生预览运行时已加载并正在运行关卡，与之相对的是
@@ -1887,44 +1838,6 @@ namespace ADOFAIEditorStudio
             return true;
         }
 
-        private static void BuildNativeScrubBoundaries(scnEditor editor)
-        {
-            nativeScrubBoundaries.Clear();
-            if (editor == null || editor.floors == null)
-            {
-                return;
-            }
-
-            for (int i = 0; i < editor.floors.Count; i++)
-            {
-                scrFloor floor = editor.floors[i];
-                if (floor == null || floor.plusEffects == null)
-                {
-                    continue;
-                }
-
-                foreach (ffxPlusBase effect in floor.plusEffects)
-                {
-                    if (effect == null || effect.runManually || effect.runOnHit)
-                    {
-                        continue;
-                    }
-
-                    nativeScrubBoundaries.Add(Mathf.Max(0f,
-                        Convert.ToSingle(effect.startTime - effect.startEffectOffset)));
-                    if (effect.duration > 0f)
-                    {
-                        nativeScrubBoundaries.Add(Mathf.Max(0f,
-                            Convert.ToSingle(effect.startTime + effect.duration)));
-                    }
-                }
-            }
-
-            nativeScrubBoundaries.Sort();
-            Main.Logger.Log("[NativeScrub] indexed " + nativeScrubBoundaries.Count
-                + " native VFX boundaries.");
-        }
-
         private static bool HasNativeScrubBoundaryBetween(float lower, float upper)
         {
             int low = 0;
@@ -2070,73 +1983,6 @@ namespace ADOFAIEditorStudio
                 + FormatTimelineTime(targetTime) + "; floor=" + floorIndex
                 + " checkpoint=" + GCS.checkpointNum + ".");
             return true;
-        }
-
-        private static void ReplayResidentNativeHitEffects(
-            scnEditor editor,
-            scrController controller,
-            int floorIndex)
-        {
-            if (editor == null || editor.floors == null || controller == null)
-            {
-                return;
-            }
-
-            scrPlanet planet = controller.playerOne == null
-                || controller.playerOne.planetarySystem == null
-                ? controller.chosenPlanet
-                : controller.playerOne.planetarySystem.chosenPlanet;
-            if (planet == null)
-            {
-                return;
-            }
-
-            List<Tween> before = DOTween.PlayingTweens();
-            var existingTweens = new HashSet<Tween>();
-            if (before != null)
-            {
-                for (int i = 0; i < before.Count; i++)
-                {
-                    if (before[i] != null)
-                    {
-                        existingTweens.Add(before[i]);
-                    }
-                }
-            }
-
-            int maximum = Mathf.Clamp(floorIndex, 0, editor.floors.Count - 1);
-            for (int i = 0; i <= maximum; i++)
-            {
-                scrFloor floor = editor.floors[i];
-                if (floor == null)
-                {
-                    continue;
-                }
-
-                ffxPlusBase[] effects = floor.GetComponentsInChildren<ffxPlusBase>();
-                for (int j = 0; j < effects.Length; j++)
-                {
-                    ffxPlusBase effect = effects[j];
-                    if (effect != null && effect.runOnHit && !(effect is ffxCheckpoint))
-                    {
-                        planet.DoFFX(effect);
-                    }
-                }
-            }
-
-            List<Tween> after = DOTween.PlayingTweens();
-            if (after == null)
-            {
-                return;
-            }
-            for (int i = 0; i < after.Count; i++)
-            {
-                Tween tween = after[i];
-                if (tween != null && tween.active && !existingTweens.Contains(tween))
-                {
-                    tween.Complete(true);
-                }
-            }
         }
 
         private static void AdvanceResidentNativeFloor(scnEditor editor, int floorIndex)
@@ -2435,26 +2281,6 @@ namespace ADOFAIEditorStudio
                     }
                     index++;
                 }
-            }
-        }
-
-        private static void ClearPlanetParticles(scrPlayer player)
-        {
-            if (player == null || player.planetarySystem == null
-                || player.planetarySystem.planetList == null)
-            {
-                return;
-            }
-
-            for (int i = 0; i < player.planetarySystem.planetList.Count; i++)
-            {
-                scrPlanet planet = player.planetarySystem.planetList[i];
-                if (planet == null || planet.planetRenderer == null)
-                {
-                    continue;
-                }
-
-                planet.planetRenderer.ClearParticles();
             }
         }
 
@@ -3360,83 +3186,6 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>
-        /// 临时：头几格的入口时间，这样一个在给定时钟值下报出 seq=N 的球
-        /// 可以被判定为正确或是在抢跑，而不是靠假设。
-        /// </summary>
-        private static void LogFloorEntryTimes(scnEditor editor, int from, int to)
-        {
-            if (editor == null || editor.floors == null)
-            {
-                return;
-            }
-
-            StringBuilder builder = new StringBuilder("[TrackBFloors]");
-            for (int i = from; i <= to && i < editor.floors.Count; i++)
-            {
-                scrFloor floor = editor.floors[i];
-                builder.Append(" f").Append(i).Append('=')
-                    .Append(floor == null ? "null" : floor.entryTime.ToString("0.000"));
-            }
-            Main.Logger.Log(builder.ToString());
-        }
-
-        /// <summary>
-        /// 临时：Track B 重置前后两侧的相机和行星状态，这样
-        /// 「画面显示好几秒处」这条反馈可以归因到某个字段，
-        /// 而不是靠猜。
-        /// </summary>
-        private static void LogTrackBState(string phase)
-        {
-            scrCamera camera = scrCamera.instance;
-            scnGame level = scnGame.instance;
-            StringBuilder builder = new StringBuilder("[TrackBState] " + phase);
-            if (camera != null)
-            {
-                builder.Append(" cam.pos=").Append(camera.transform.position.x.ToString("0.00"))
-                    .Append(',').Append(camera.transform.position.y.ToString("0.00"))
-                    .Append(" local=").Append(camera.transform.localPosition.x.ToString("0.00"))
-                    .Append(',').Append(camera.transform.localPosition.y.ToString("0.00"))
-                    .Append(" zoom=").Append(camera.zoomSize.ToString("0.000"))
-                    .Append(" tosize=").Append(camera.tosize.ToString("0.000"))
-                    .Append(" fromsize=").Append(camera.fromsize.ToString("0.000"))
-                    .Append(" follow=").Append(camera.followMode)
-                    .Append(" lastRel=").Append(camera.lastEventRelativePosition.x.ToString("0.00"))
-                    .Append(',').Append(camera.lastEventRelativePosition.y.ToString("0.00"))
-                    .Append(" lastMode=").Append(camera.lastUsedMovementType);
-            }
-            builder.Append(" camParent=").Append(level == null || level.camParent == null
-                ? "n/a"
-                : level.camParent.position.x.ToString("0.00") + ","
-                    + level.camParent.position.y.ToString("0.00"));
-
-            scrPlayerManager playerManager = scrPlayerManager.instance;
-            if (playerManager != null && playerManager.players != null && playerManager.players.Length > 0)
-            {
-                scrPlayer player = playerManager.players[0];
-                if (player != null && player.planetarySystem != null)
-                {
-                    scrPlanet chosen = player.planetarySystem.chosenPlanet;
-                    scrPlanet red = player.planetarySystem.planetRed;
-                    builder.Append(" chosen=").Append(chosen == null
-                            ? "null"
-                            : (chosen == red ? "Red" : "Blue"))
-                        .Append(" isCW=").Append(player.planetarySystem.isCW)
-                        .Append(" speed=").Append(player.planetarySystem.speed.ToString("0.000"))
-                        .Append(" lastHit=").Append(player.lastHit.ToString("0.000"));
-                    if (chosen != null)
-                    {
-                        builder.Append(" ballPos=").Append(chosen.transform.position.x.ToString("0.00"))
-                            .Append(',').Append(chosen.transform.position.y.ToString("0.00"))
-                            .Append(" seqID=").Append(chosen.currfloor == null ? -1 : chosen.currfloor.seqID)
-                            .Append(" angle=").Append(chosen.angle.ToString("0.000"));
-                    }
-                }
-            }
-
-            Main.Logger.Log(builder.ToString());
-        }
-
-        /// <summary>
         /// 临时：计算落地球必须达到的角度所需的一切。球
         /// 每 crotchet 推进 pi*speed，所以能让它正好在下一格
         /// 入口时间落地的角度可以从这些字段推出来，而不是靠猜一个公式；
@@ -3760,7 +3509,6 @@ namespace ADOFAIEditorStudio
                 timelineScrubActive = false;
                 nativeScrubPrepared = false;
                 nativeScrubBoundaries.Clear();
-                lastStartAttemptFrame = -100;
                 restartPlayIssued = false;
                 restartAbortStableFrames = 0;
                 EditorSceneInteraction.Reset();
@@ -3828,125 +3576,6 @@ namespace ADOFAIEditorStudio
             }
         }
 
-        private static void ContinueNativePlaybackAfterHandoff(float targetTime)
-        {
-            if (!nativeHandoffPending)
-            {
-                return;
-            }
-
-            nativeHandoffPending = false;
-            evaluatorBackend.End();
-            staticPreviewFrameActive = false;
-            RestoreStaticPreviewNativeUpdates();
-            string status;
-            if (!TryBeginPreviewRestart(targetTime, true, out status, true))
-            {
-                EditorStudioOverlay overlay = Main.Overlay;
-                if (overlay != null)
-                {
-                    overlay.HidePreviewHandoffImmediate();
-                }
-            }
-        }
-
-        private static bool TryCommitStaticPreviewToResidentRuntime(float targetTime, out string status)
-        {
-            status = "正在提交到原生预览";
-            scnEditor editor = scnEditor.instance;
-            scrController controller = scrController.instance;
-            scrConductor conductor = scrConductor.instance;
-            if (!staticPreviewFrameActive || editor == null || controller == null || conductor == null
-                || !editor.playMode || editor.inStrictlyEditingMode)
-            {
-                status = "常驻原生预览尚未就绪";
-                return false;
-            }
-
-            try
-            {
-                float commitStartedAt = Time.realtimeSinceStartup;
-                targetTime = Mathf.Max(0f, targetTime);
-                Main.Logger.Log("[NativeHotCommit] begin target="
-                    + FormatTimelineTime(targetTime) + ".");
-                AudioListener.pause = true;
-                desiredPaused = true;
-                editor.pausedInPlayMode = true;
-                if (!TryApplyNativePause(controller, true, false))
-                {
-                    throw new InvalidOperationException("The resident native controller could not be paused.");
-                }
-
-                evaluatorBackend.End();
-                RestoreStaticPreviewNativeUpdates();
-
-                int floorIndex = FindFloorAtOrBefore(editor.floors, targetTime);
-                if (editor.customLevel == null)
-                {
-                    throw new InvalidOperationException("The editor custom level runtime is unavailable.");
-                }
-
-                // 重新武装原来的特效队列并还原装饰物，而不
-                // 重做编辑器那条路径。这是和 scnGame.Play()
-                // 相同的原生准备，但它不重启音乐也不进入倒计时。
-                GCS.checkpointNum = floorIndex;
-                editor.customLevel.FinishCustomLevelLoading(floorIndex, false);
-                controller.currentSeqID = floorIndex;
-                controller.startedFromCheckpoint = floorIndex > 0;
-                controller.forceNoCountdown = true;
-                conductor.fastTakeoff = true;
-                CommitRestartAtExactTime(editor, controller, conductor, targetTime);
-
-                nativePlaybackStarted = true;
-                previewRequested = true;
-                heldPreviewTime = targetTime;
-                nativeTransportHeld = false;
-                pauseTransitionPending = false;
-                pauseReapplyRequested = false;
-                staticPreviewFrameActive = false;
-
-                controller.ChangeState(States.PlayerControl);
-                editor.pausedInPlayMode = false;
-                SetExactConductorTime(conductor, targetTime, true);
-                ResumeScrubbedVfxTweens();
-                conductor.PlayHitTimes();
-                desiredPaused = false;
-                heldPreviewTime = float.NaN;
-                ApplyPlayingState(editor, controller);
-                RestoreEditorClickability();
-                int effectCount = scrVfxPlus.instance == null || scrVfxPlus.instance.effects == null
-                    ? 0
-                    : scrVfxPlus.instance.effects.Count;
-                int elapsedMilliseconds = Mathf.RoundToInt(
-                    (Time.realtimeSinceStartup - commitStartedAt) * 1000f);
-                Main.Logger.Log("[NativeHotCommit] resumed resident native runtime at "
-                    + FormatTimelineTime(targetTime) + " without scnEditor.Play(); floor="
-                    + floorIndex + " pendingEffects=" + effectCount + " elapsedMs="
-                    + elapsedMilliseconds + ".");
-                status = "从 " + FormatTimelineTime(targetTime) + " 原生播放";
-                return true;
-            }
-            catch (Exception exception)
-            {
-                ReportError("Failed to hot-commit static preview into the resident native runtime", exception);
-                string fallbackStatus;
-                if (TryBeginPreviewRestart(targetTime, true, out fallbackStatus, true))
-                {
-                    Main.Logger.Log("[NativeHotCommit] falling back to guarded native restart at "
-                        + FormatTimelineTime(targetTime) + ".");
-                    status = "热提交失败，已回退原生重建";
-                    return true;
-                }
-
-                desiredPaused = true;
-                heldPreviewTime = targetTime;
-                nativeTransportHeld = false;
-                ApplyPausedState(editor, controller, conductor);
-                status = "原生热提交失败，详情见 Mod 日志";
-                return false;
-            }
-        }
-
         private static void TickPreviewRestart()
         {
             try
@@ -3981,6 +3610,7 @@ namespace ADOFAIEditorStudio
                     }
 
                     int targetFloor = FindFloorAtOrBefore(editor.floors, restartTargetTime);
+                    MarkNextFloorSelect(FloorSelectPreviewRestart);
                     editor.SelectFloor(editor.floors[targetFloor], cameraJump: false);
                     editor.DeselectAnyUIGameObject();
                     restartPhase = PreviewRestartPhase.WaitingToPlay;
@@ -4001,6 +3631,7 @@ namespace ADOFAIEditorStudio
 
                     EnableAutoMode();
                     int targetFloor = FindFloorAtOrBefore(editor.floors, restartTargetTime);
+                    MarkNextFloorSelect(FloorSelectPreviewRestart);
                     editor.SelectFloor(editor.floors[targetFloor], cameraJump: false);
                     editor.DeselectAnyUIGameObject();
                     Time.timeScale = 1f;
@@ -4732,67 +4363,6 @@ namespace ADOFAIEditorStudio
             }
         }
 
-        internal static void ResetPreviewCameraPosition()
-        {
-            scnEditor editor = scnEditor.instance;
-            scrCamera camera = scrCamera.instance;
-            if (camera == null)
-            {
-                return;
-            }
-
-            // 选中一块砖会把相机 tween 到那块砖。scnGame.Play 只
-            // 清 camParent，所以相机自己的本地位置也必须清掉，
-            // 否则预览从屏幕外开始。
-            camera.transform.DOKill();
-            camera.transform.localPosition = new Vector3(0f, 0f, -10f);
-            camera.topos = Vector2.zero;
-            camera.pos = Vector2.zero;
-            camera.frompos = Vector2.zero;
-            camera.shake = Vector2.zero;
-            camera.timer = 0f;
-            camera.skipUpdate = false;
-            camera.enabled = true;
-            camera.followMode = true;
-            camera.lastEventRelativePosition = Vector2.zero;
-            camera.lastUsedMovementType = CamMovementType.Player;
-            camera.lastTileCamFloor = 0;
-            camera.offset = Vector2.zero;
-            camera.holdOffset = Vector2.zero;
-
-            Transform camParent = editor == null || editor.customLevel == null
-                ? camera.transform.parent
-                : editor.customLevel.camParent;
-            if (camParent != null)
-            {
-                camParent.position = Vector3.zero;
-            }
-
-            if (camera.camobj != null)
-            {
-                camera.UpdateSize();
-            }
-
-            // 针对「选中一个非首块砖后按 F8 变黑」这条反馈的诊断。
-            // 记录重置刚完成后相机栈长什么样，
-            // 这样下一次日志能告诉我们哪个变换还在屏幕外。
-            if (VerboseDiagnostics)
-            {
-                Main.Logger.Log("[PreviewCameraReset] camParent="
-                    + (camParent == null ? "null" : camParent.position.ToString("F3"))
-                    + " local=" + camera.transform.localPosition.ToString("F3")
-                    + " world=" + camera.transform.position.ToString("F3")
-                    + " ortho=" + (camera.camobj == null ? "null" : camera.camobj.orthographicSize.ToString("F3"))
-                    + " zoomSize=" + camera.zoomSize.ToString("F3")
-                    + " follow=" + camera.followMode
-                    + " camobjEnabled=" + (camera.camobj != null && camera.camobj.enabled)
-                    + " playMode=" + (editor != null && editor.playMode)
-                    + " strictEdit=" + (editor != null && editor.inStrictlyEditingMode)
-                    + " selectedFloors=" + (editor == null ? -1 : editor.selectedFloors.Count)
-                    + ".");
-            }
-        }
-
         internal static void EnforcePreviewZoomLock()
         {
             EditorStudioOverlay overlay = Main.Overlay;
@@ -4900,26 +4470,68 @@ namespace ADOFAIEditorStudio
         /// 都在不同的位置重新出现。
         /// </summary>
         /// <summary>Called by the SelectFloor patch; see FollowSelectedFloor.</summary>
+        /// <summary>
+        /// 「这次 `SelectFloor` 是谁发起的」。一次性，`OnFloorSelected` 读完立刻复位。
+        ///
+        /// **为什么需要它**：`scnEditor.SelectFloor` 是所有人共用的入口 ——
+        /// 用户点轨道、点事件块（我们要同步原生选中）、把选中挪到播放头、
+        /// 预览重启定位，走的都是它。原来只靠 `LocateOnTrackClick` /
+        /// `FollowSelectionOnClick` 两个开关在补丁里猜来源，结果两个开关**互相串**：
+        /// 开了「定位」点事件块也会 1 秒加速走过去，开了「选中跟随」点轨道也会跳。
+        /// </summary>
+        internal const int FloorSelectNative = 0;
+        internal const int FloorSelectTimelineEvent = 1;
+        internal const int FloorSelectPlayheadSync = 2;
+        internal const int FloorSelectPreviewRestart = 3;
+
+        private static int nextFloorSelectKind;
+
+        /// <summary>在调用 `SelectFloor` **之前**标一下来源。</summary>
+        internal static void MarkNextFloorSelect(int kind)
+        {
+            nextFloorSelectKind = kind;
+        }
+
         internal static void OnFloorSelected(scrFloor floor)
         {
-            // 定位模式（`LocateOnTrackClick`）打开时，选格一律带动播放头。
-            // 预览里点轨道走的就是这条路：点击 → `scnEditor.SelectFloor`
-            // → SelectFloor 补丁 → 这里。所以「点轨道跳画面」不需要第二套拾取。
+            int kind = nextFloorSelectKind;
+            nextFloorSelectKind = FloorSelectNative;
+
             bool locate = Main.Settings != null && Main.Settings.LocateOnTrackClick;
-            if (floor != null && Main.VerboseLog
-                && (locate || (Main.Settings != null && Main.Settings.FollowSelectionOnClick)))
+            bool follow = Main.Settings != null && Main.Settings.FollowSelectionOnClick;
+            if (floor != null && Main.VerboseLog && (locate || follow))
             {
                 // 一行一拍。这个入口只在"选中项真的变了"时进来（方向键、点轨道、
                 // 原生格子面板），不是每帧，留着能直接看出点轨道到底有没有走到这里。
                 Main.Logger.Log("[定位] 选格 f" + floor.seqID
                     + " t=" + ((float)floor.entryTime).ToString("0.000")
-                    + " 定位=" + locate
-                    + " 选中跟随=" + (Main.Settings != null && Main.Settings.FollowSelectionOnClick)
-                    + ".");
+                    + " 来源=" + kind + " 定位=" + locate + " 选中跟随=" + follow + ".");
             }
-            // 点轨道这条**只有它**要"加速走过去"（用户明确要求：1 秒内加速）。
-            // 其它路（打开工作台落选中格、点事件块跟随）一律瞬跳，见各自调用点。
-            FollowSelectedFloor(floor, locate, locate);
+
+            // **自己人同步选中，不带动画面。**
+            // 把选中挪到播放头、预览重启定位这两条都是"状态跟随"，反过来再让
+            // 画面跟着跳会形成回环（尤其定位开着时：选格 → 走位 → 又改选格）。
+            if (kind == FloorSelectPlayheadSync || kind == FloorSelectPreviewRestart)
+            {
+                return;
+            }
+
+            // 点事件块：只听「点事件跟随」，**和点轨道一样 1 秒加速走过去**
+            // （两处手感统一，用户不用记哪边是瞬跳哪边是走位）。
+            if (kind == FloorSelectTimelineEvent)
+            {
+                FollowSelectedFloor(floor, false, true);
+                return;
+            }
+
+            // 用户真的点了轨道（或按方向键）：**只听「定位」**。
+            // 定位关着就什么都不动 —— 否则「选中跟随」会连带把点轨道也变成跳画面，
+            // 两个开关就又串回去了。
+            if (!locate)
+            {
+                return;
+            }
+            FollowSelectedFloor(floor, true, true);
         }
 
         /// <summary>
@@ -5138,71 +4750,6 @@ namespace ADOFAIEditorStudio
                 && !allowNativeExit
                 && overlay != null
                 && overlay.IsVisible;
-        }
-
-        private static bool EnsureNativePlayback(scnEditor editor)
-        {
-            if (editor.playMode && !editor.inStrictlyEditingMode)
-            {
-                nativePlaybackStarted = true;
-                return true;
-            }
-            if (Time.frameCount - lastStartAttemptFrame < 4)
-            {
-                return false;
-            }
-
-            lastStartAttemptFrame = Time.frameCount;
-            try
-            {
-                EnableAutoMode();
-                scrController controller = scrController.instance;
-                scrConductor conductor = scrConductor.instance;
-                if (controller != null)
-                {
-                    controller.forceNoCountdown = true;
-                }
-                if (conductor != null)
-                {
-                    conductor.fastTakeoff = true;
-                }
-                AudioListener.pause = true;
-                editor.Play();
-                // 不要在这里取消音乐协程。StartMusicCo 是唯一
-                // 会排程歌曲的路径，所以第一次启动时取消它
-                // 会让预览无声。精确时间 seek 会在
-                // SetExactConductorTime 内部单独取消它，只有当先前的拖动
-                // 真有可能与协程竞争时才取消。
-                if (controller != null)
-                {
-                    controller.forceNoCountdown = true;
-                    if (controller.currentState != States.PlayerControl)
-                    {
-                        controller.ChangeState(States.PlayerControl);
-                    }
-                }
-
-                // 两个旗标都必须还原，不只是 forceNoCountdown。scnGame
-                // 把它们一起赋成「RDC.auto && seqID == 0」，所以从
-                // 第一块以外的任何砖开始播放，会把两者都重置为 false。留着
-                // fastTakeoff 为 false 会启动倒计时，预览就会开在
-                // 倒计时的黑屏上，直到玩家按空格。
-                if (conductor != null)
-                {
-                    conductor.fastTakeoff = true;
-                }
-
-                Main.Logger.Log("[NativeScrub] resident native scene ready; countdown suppressed.");
-                RestoreEditorClickability();
-                Cursor.visible = true;
-                nativePlaybackStarted = editor.playMode;
-                return nativePlaybackStarted;
-            }
-            catch (Exception exception)
-            {
-                ReportError("Failed to start persistent native preview", exception);
-                return false;
-            }
         }
 
         private static int FindFloorAtOrBefore(System.Collections.Generic.List<scrFloor> floors, float time)
@@ -5608,59 +5155,6 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>
-        /// 针对「预览打开就是黑屏」的只读诊断。它报告那几种
-        /// 各自都能单独让屏幕变黑的状态，所以一次采样就能说明是哪个
-        /// 机制在起作用，而不是靠猜：控制器是否还
-        /// 处在倒计时状态、倒计时是否真的被压制了、
-        /// 全屏擦除面板是否不透明、以及有多少格不可见。
-        /// </summary>
-        private static void LogBlackScreenState(string phase)
-        {
-            if (!VerboseDiagnostics)
-            {
-                return;
-            }
-
-            scnEditor editor = scnEditor.instance;
-            scrController controller = scrController.instance;
-            scrConductor conductor = scrConductor.instance;
-            scrUIController ui = scrUIController.instance;
-
-            int invisible = 0;
-            float lowestOpacity = 1f;
-            if (editor != null && editor.floors != null)
-            {
-                for (int i = 0; i < editor.floors.Count; i++)
-                {
-                    scrFloor floor = editor.floors[i];
-                    if (floor == null)
-                    {
-                        continue;
-                    }
-                    if (floor.opacity < 0.01f)
-                    {
-                        invisible++;
-                    }
-                    lowestOpacity = Mathf.Min(lowestOpacity, floor.opacity);
-                }
-            }
-
-            Main.Logger.Log("[BlackScreen] " + phase
-                + " state=" + (controller == null ? "-" : controller.currentState.ToString())
-                + " forceNoCountdown=" + (controller == null ? "-" : controller.forceNoCountdown.ToString())
-                + " fastTakeoff=" + (conductor == null ? "-" : conductor.fastTakeoff.ToString())
-                + " goShown=" + (controller == null ? "-" : controller.goShown.ToString())
-                + " timeScale=" + Time.timeScale.ToString("0.00")
-                + " wipeColor=" + (ui == null || ui.transitionPanel == null
-                    ? "-"
-                    : ui.transitionPanel.color.ToString())
-                + " invisibleFloors=" + invisible
-                + " lowestOpacity=" + lowestOpacity.ToString("0.00")
-                + ".");
-        }
-
-
-        /// <summary>
         /// 只读诊断。原生播放期间它周期性比较
         /// 场景时钟和音频片段位置，这样音画漂移能
         /// 以数字呈现，而不是「感觉不同步」。
@@ -6019,24 +5513,6 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>
-        private static bool HasActiveConditional(ffxPlusBase effect)
-        {
-            if (effect == null || effect.conditionalInfo == null)
-            {
-                return false;
-            }
-
-            for (int i = 0; i < effect.conditionalInfo.Length; i++)
-            {
-                if (effect.conditionalInfo[i])
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        /// <summary>
         /// 杀掉动画特效启动的逐格 tween。
         ///
         /// ffxFloorAppearPlus / ffxFloorDisappearPlus 用普通（非
@@ -6119,7 +5595,6 @@ namespace ADOFAIEditorStudio
             return Math.Max(0d,
                 conductor.crotchetAtStart * (double)conductor.adjustedCountdownTicks);
         }
-
 
         private static void AlignConductorBeatCursor(scrConductor conductor, float targetTime)
         {
@@ -7137,12 +6612,9 @@ namespace ADOFAIEditorStudio
         /// 以及打开工作台时落到原生选中的那一格。
         /// </param>
         /// <param name="animate">
-        /// true = 用 1 秒内的加速走位过去（**只有"在 AES 里点轨道"这一条**）；
-        /// false = 瞬跳。
-        ///
-        /// 为什么只有点轨道走位：打开工作台那一刻画面应该**已经在**选中的格上
-        /// （用户是从原生编辑器切过来的，等 1 秒没有任何信息量）；
-        /// 点事件块跟随同理，那是"检查下一个事件"，不是"飞到别处去"。
+        /// true = 用 1 秒内的加速走位过去（**点轨道、点事件块这两条都走它**）。
+        /// false = 瞬跳（打开工作台落选中格那条：那一刻画面应该**已经**在目标格上，
+        /// 用户是从原生编辑器切过来的，等 1 秒没有任何信息量）。
         /// </param>
         private static void FollowSelectedFloor(scrFloor floor, bool force, bool animate)
         {
@@ -7538,12 +7010,10 @@ namespace ADOFAIEditorStudio
             }
         }
 
-
         // 周期性复查按这个节奏跑。足够频繁，让一次错误修正能在
         // 零点几秒内被撤掉；又足够稀疏，不会每帧都重建打击音队列。
         // every frame.
         private const int DesyncCheckIntervalFrames = 30;
-        private static int lastDesyncCheckFrame = -100000;
 
         private static void StopEvaluatorPreviewAudio()
         {
@@ -7857,8 +7327,11 @@ namespace ADOFAIEditorStudio
             // 工作台可见时命中就整帧吃掉（返回 false）。
             bool ctrlOnly = controlHeld && !altHeld && !shiftHeld;
             bool locateToggle = ctrlOnly && Input.GetKeyDown(KeyCode.J);
-            bool autoPageToggle = ctrlOnly && Input.GetKeyDown(KeyCode.K);
-            bool featureToggle = locateToggle || autoPageToggle;
+            // Ctrl+K 现在是「定位到播放头」（一次性动作），不再是自动翻页开关。
+            bool locatePlayhead = ctrlOnly && Input.GetKeyDown(KeyCode.K);
+            // Ctrl+L：切换「固定排版 / 自由排版」。
+            bool layoutToggle = ctrlOnly && Input.GetKeyDown(KeyCode.L);
+            bool featureToggle = locateToggle || locatePlayhead || layoutToggle;
 
             // 探针：只记 Ctrl+J / Ctrl+K（上限 20 行）。判读：J/K 为 True 即通；
             // 都是 False 且 input="" 说明这组键也在进 Unity 之前被吃掉。
@@ -7898,17 +7371,6 @@ namespace ADOFAIEditorStudio
                 return true;
             }
 
-            // **ImGui 的输入框也要让开。**
-            //
-            // `IsTextInputFocused` 只认 uGUI 的 TMP 输入框，而工作台里绝大多数
-            // 输入框现在是 ImGui 的 —— 在那些框里打字，Delete、Space、Ctrl+S
-            // 这些会一并落到谱面上。`WantTextInput` 是 ImGui 自己报的
-            // "这会儿有人在打字"。
-            if (EditorImGuiBridge.WantsTextInput)
-            {
-                return true;
-            }
-
             if (overlay.IsTextInputFocused())
             {
                 // 走到这儿说明**已经按下了**一个该生效的快捷键，却被焦点挡掉了。
@@ -7929,7 +7391,7 @@ namespace ADOFAIEditorStudio
                 return false;
             }
 
-            // 定位 / 自动翻页。状态与提示都在时间轴那边（它负责写设置和报状态），
+            // 定位（开关）/ 定位到播放头（动作）。状态与提示都在时间轴那边，
             // 这里只负责把键接住、别让它落到原生编辑器上。
             if (featureToggle)
             {
@@ -7940,9 +7402,13 @@ namespace ADOFAIEditorStudio
                     {
                         featureTimeline.ToggleLocateOnTrackClick();
                     }
-                    if (autoPageToggle)
+                    if (locatePlayhead)
                     {
-                        featureTimeline.ToggleAutoPageTimeline();
+                        featureTimeline.LocateToPlayhead();
+                    }
+                    if (layoutToggle)
+                    {
+                        featureTimeline.ToggleFixedTimelineLayout();
                     }
                 }
                 return false;
@@ -7961,8 +7427,12 @@ namespace ADOFAIEditorStudio
                         // 自己的顶栏读数。
                         bool hadPath = !string.IsNullOrEmpty(ADOBase.levelPath);
                         saveEditor.SaveLevel();
+                        // **一次 Ctrl+S 存两样**：谱面（原生 SaveLevel）+ 工程排版
+                        // （行号写进 .aesprj）。排版以前单独挂在 Ctrl+Alt+S 上，
+                        // 所以按完 Ctrl+S 关工作台还会被问"布局还没保存"。
                         if (Main.Overlay != null)
                         {
+                            Main.Overlay.SaveLayoutIfDirty();
                             Main.Overlay.SetTransientStatus(hadPath
                                 ? "已保存  " + System.IO.Path.GetFileName(ADOBase.levelPath)
                                 : "另存为…（在弹出的对话框里选位置）", 5f);

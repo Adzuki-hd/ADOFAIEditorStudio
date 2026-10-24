@@ -125,7 +125,6 @@ namespace ADOFAIEditorStudio
         private static volatile string pendingManifest;
         private static volatile byte[] pendingZip;
         private static volatile bool workDone;
-        private static volatile bool needZipDownload;
         private static volatile string pendingZipUrl;
         // 这一轮要试的下载地址（主 + 备用）。
         private static List<string> pendingZipUrls = new List<string>();

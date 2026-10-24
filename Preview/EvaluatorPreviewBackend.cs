@@ -89,11 +89,6 @@ namespace ADOFAIEditorStudio.Preview
             get { return lastEvaluatedTime; }
         }
 
-        internal IList<PreviewDomainCoverage> GetCoverage()
-        {
-            return Coverage;
-        }
-
         internal bool TryBegin(scnEditor editor, out string error)
         {
             error = null;
@@ -133,6 +128,19 @@ namespace ADOFAIEditorStudio.Preview
             }
 
             float targetTime = Math.Max(0f, time);
+
+            // **工作台不可见时不求值。**
+            //
+            // 求值器每帧把整张谱的状态推给场景（本谱 105 件装饰物 × 6 个 setter、
+            // 378 个事件块、541 件装饰物的可见性），这些开销只在有人看的时候有意义。
+            // 实测关面板那一刻平均帧时仍是 37ms，说明它在后台照跑。
+            // 不推进求值不影响正确性：重新打开时下一帧会按当前时间重新算一遍。
+            if (Main.Overlay != null && !Main.Overlay.IsVisible)
+            {
+                lastEvaluatedTime = targetTime;
+                return true;
+            }
+
             if (!PreviewEvaluationEngine.TryEvaluate(targetTime, out error))
             {
                 // 快照为每个格、事件、装饰物各缓存一个引用，因此任何

@@ -10,24 +10,11 @@
     <Version>0.29.2</Version>
     <Nullable>disable</Nullable>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
-    <!-- ImGui 桥接要直接读原生顶点缓冲（ImDrawVert*），必须开不安全代码。 -->
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- ImGui 已整体删除（2026-10-24），不再需要 unsafe 代码。 -->
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
-    <!-- ImGui。运行时和 cimgui.dll 一起随包分发，所以引用的是打包目录里那份，
-         保证编译用的和发出去的是同一个二进制。
-         版本必须和 cimgui.dll 配套：ImGui.NET 1.91.6.1 ↔ cimgui 1.91.6。 -->
-    <Reference Include="ImGui.NET">
-      <HintPath>$(MSBuildProjectDirectory)\dist\ADOFAIEditorStudio\ImGui.NET.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <!-- ImGui.NET 的顶点类型用的是 System.Numerics.Vector2/Vector4，
-         不引这个，所有 ImGui 的签名都解析不出来（而且会连带报出一堆
-         看起来无关的错，比如找不到 CanvasScaler）。游戏自带这份。 -->
-    <Reference Include="System.Numerics.Vectors">
-      <HintPath>D:\SteamLibrary\steamapps\common\A Dance of Fire and Ice\A Dance of Fire and Ice_Data\Managed\System.Numerics.Vectors.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
+
     <Reference Include="Assembly-CSharp">
       <HintPath>D:\SteamLibrary\steamapps\common\A Dance of Fire and Ice\A Dance of Fire and Ice_Data\Managed\Assembly-CSharp.dll</HintPath>
       <Private>false</Private>

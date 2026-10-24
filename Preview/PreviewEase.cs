@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using DG.Tweening;
 
 namespace ADOFAIEditorStudio.Preview
@@ -81,14 +82,70 @@ namespace ADOFAIEditorStudio.Preview
         /// 按原生 tween 的方式求缓动值。Flash 家族会先把振幅截断成整数，
         /// 与 <c>SetEase</c> 的行为一致。
         /// </summary>
+        /// <summary>
+        /// 缓动查表的分辨率。1/512 的量化误差在动画上不可见，
+        /// 但能把每帧几万次 `DOVirtual.EasedValue`（内部是 pow/sin/exp）
+        /// 压成一次数组索引。
+        /// </summary>
+        private const int EaseLutSize = 512;
+
+        /// <summary>每种 Ease 一张 0..1 的归一化表，按需生成，之后只读。</summary>
+        private static readonly Dictionary<Ease, float[]> EaseLut
+            = new Dictionary<Ease, float[]>();
+
+        /// <summary>
+        /// 按原生 tween 的方式求缓动值（带查表缓存）。
+        ///
+        /// **为什么必须缓存**：装饰物域每帧对每件装饰物的每个已开始事件都求一次
+        /// 缓动，本谱（星相运轨）105 件装饰物 × 数百事件就是几万次，
+        /// 而 `DOVirtual.EasedValue` 内部走 pow / sin / exp，单次约 1µs ——
+        /// 正好是实测 DecorationCore 单帧 15~70ms 的量级。
+        /// 缓动只依赖 (ease, ratio)，把 ratio 量化成 1/512 后查表即可。
+        /// </summary>
         internal static float EasedValue(float origin, float target, float ratio, Ease ease)
         {
-            float amplitude = DOTween.defaultEaseOvershootOrAmplitude;
-            if (IsFlashEase(ease))
+            float normalized = SampleEase(ease, ratio);
+            return origin + (target - origin) * normalized;
+        }
+
+        private static float SampleEase(Ease ease, float ratio)
+        {
+            float clamped = ratio < 0f ? 0f : (ratio > 1f ? 1f : ratio);
+            int index = (int)(clamped * EaseLutSize + 0.5f);
+            if (index < 0)
             {
-                amplitude = (int)amplitude;
+                index = 0;
             }
-            return DOVirtual.EasedValue(origin, target, ratio, ease, amplitude);
+            else if (index > EaseLutSize)
+            {
+                index = EaseLutSize;
+            }
+
+            float[] table;
+            if (!EaseLut.TryGetValue(ease, out table))
+            {
+                table = new float[EaseLutSize + 1];
+                for (int i = 0; i < table.Length; i++)
+                {
+                    table[i] = float.NaN;
+                }
+                EaseLut[ease] = table;
+            }
+
+            float cached = table[index];
+            // 0 是合法值（Linear / In 的起点），所以用"是否算过"另存一位：
+            // 把未计算标记成 NaN，NaN != NaN 即可判断。
+            if (cached.Equals(float.NaN) || float.IsNaN(cached))
+            {
+                float amplitude = DOTween.defaultEaseOvershootOrAmplitude;
+                if (IsFlashEase(ease))
+                {
+                    amplitude = (int)amplitude;
+                }
+                cached = DOVirtual.EasedValue(0f, 1f, (float)index / EaseLutSize, ease, amplitude);
+                table[index] = cached;
+            }
+            return cached;
         }
 
         /// <summary>

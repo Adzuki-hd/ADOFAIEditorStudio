@@ -851,10 +851,14 @@ namespace ADOFAIEditorStudio
 
         private static bool BeginDecorationDrag()
         {
+            // 开关是 `const false`，编译器会说这个分支「无法访问」—— 那是刻意的，
+            // 关键帧那套留在这儿等设计定了再打开。
+#pragma warning disable CS0162
             if (DecorationKeyframesEnabled)
             {
                 return BeginDecorationKeyframeDrag();
             }
+#pragma warning restore CS0162
 
             // 关键帧那套关着的时候，拖已放好的装饰物走"静态拖动"这条路 ——
             // 只改它自己事件的格内偏移，不新建任何事件。

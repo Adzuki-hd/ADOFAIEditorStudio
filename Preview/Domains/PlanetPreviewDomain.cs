@@ -1401,26 +1401,6 @@ namespace ADOFAIEditorStudio.Preview.Domains
         }
 
         /// <summary>
-        /// 从 `from` 到 `to` 走最短路径的有符号差，对齐原生角度修正
-        /// 用的方向判断。暂停格最多只接受半圈的
-        /// 修正，所以走最短路径才是对的。
-        /// </summary>
-        private static double ShortestDelta(double from, double to)
-        {
-            double delta = to - from;
-            const double twoPi = Math.PI * 2d;
-            while (delta > Math.PI)
-            {
-                delta -= twoPi;
-            }
-            while (delta < -Math.PI)
-            {
-                delta += twoPi;
-            }
-            return delta;
-        }
-
-        /// <summary>
         /// 长按那条线：球走过多少就填多少颜色。
         ///
         /// 原生在 hold 分支里每帧做两件事——把 touchColor 设成**当前这颗球**的

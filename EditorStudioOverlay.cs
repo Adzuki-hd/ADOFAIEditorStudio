@@ -64,8 +64,8 @@ namespace ADOFAIEditorStudio
         private const float HeadingRowY =
             (PanelHeadingHeight - HeadingRowBoxHeight) * 0.5f - HeadingTextLift;
 
-        internal const float CornerLarge = 9f;
-        internal const float CornerSmall = 6f;
+        internal const float CornerLarge = 0f;
+        internal const float CornerSmall = 0f;
 
         private const float DesignWidth = 1920f;
         private const float DesignHeight = 1080f;
@@ -85,8 +85,18 @@ namespace ADOFAIEditorStudio
         // 面板之间、面板与屏幕边、标题与内容全是同一个数，没有呼吸。
         // 提到 16 之后同样的内容从容很多，这是最容易见效、
         // 又不改任何结构的一档调整。
-        private const float OuterMargin = 16f;
-        private const float PanelGap = 16f;
+        private const float OuterMargin = 4f;
+        private const float PanelGap = 4f;
+
+        /// <summary>
+        /// 模块背景块之间的净间距，同时也是块与顶栏、块与屏幕边缘的间距。
+        ///
+        /// 它不是 PanelGap 的替代：面板内容仍按 OuterMargin / PanelGap 排，
+        /// 块是把面板矩形往外"吃"掉一部分间距换来的 —— 这样内容一行都不用挪，
+        /// 块之间恰好剩 6。取 6 是"细而不糊"的一档（4 在 1080p 下只有 4 像素，
+        /// 缩放后容易糊成一条；8 又比现在的分组间距粗）。
+        /// </summary>
+        private const float BlockGap = 4f;
 
         /// <summary>
         /// 面板自己的内边距（内容离面板边缘的距离）。
@@ -114,6 +124,15 @@ namespace ADOFAIEditorStudio
         private const float MaximumTimelineHeight = 520f;
         private const float TimelinePanelWidth = DesignWidth - OuterMargin * 2f;
         private const float PreviewPanelY = LayoutTop + 12f;
+
+        /// <summary>时间轴面板（也是标题行）的上沿。原来这算式在四处各写一遍，容易改漏。</summary>
+        internal float TimelinePanelTop { get { return DesignHeight - timelineHeight + 4f; } }
+
+        /// <summary>上排（左栏 / 舞台工具条 / 参数栏）背景块的顶。</summary>
+        private float BlockRowTop { get { return TopBandHeight + BlockGap; } }
+
+        /// <summary>上排背景块的底 —— 让它与时间轴块之间也只剩 BlockGap。</summary>
+        private float BlockRowBottom { get { return TimelinePanelTop - BlockGap; } }
         private const float PreviewStageInsetY = 58f;
         // 目标列数。实际列数由当前面板宽度算出来，不是钉死的——
         // 面板变窄时宁可少一列，也不要把格子压到看不清缩略图。
@@ -242,6 +261,13 @@ namespace ADOFAIEditorStudio
         // 于是「板子凸起、里面的内容凹下去」用两档就说清了。
         private static Color Background { get { return UiTheme.Current.SurfacePage; } }
         private static Color Header { get { return UiTheme.Current.SurfacePanel; } }
+
+        /// <summary>
+        /// **所有模块的唯一底色。** 直接取顶栏那条（SurfaceTopBand），
+        /// 于是顶栏、左栏、右栏、预览、时间轴是同一种不纯黑 —— 用户要求
+        /// 「每个模块一个大色块，颜色和顶上一致」。
+        /// </summary>
+        private static Color ModuleFill { get { return Color.clear; } }
         private static Color Panel { get { return UiTheme.Current.SurfacePanel; } }
         private static Color PanelAlt { get { return UiTheme.Current.SurfaceWell; } }
         private static Color ButtonNormal { get { return UiTheme.Current.SurfaceRaised; } }
@@ -350,26 +376,6 @@ namespace ADOFAIEditorStudio
         /// <summary>工作台 uGUI 那层的排序（ImGui 那层是 32000，见桥接）。</summary>
         private const int CanvasSortingOrder = 30000;
 
-        /// <summary>
-        /// 原版粒子编辑器开着时，把 **uGUI 这层也压到底**。
-        ///
-        /// 只压 ImGui 那层不够 —— 工作台还有一层 uGUI 画布（预览遮罩、
-        /// 时间轴残件）排在 30000，比原生粒子编辑器（`levelEditorScene`
-        /// 的 order=1）高得多，正好盖在屏幕中间。
-        /// 实测症状就是「点了编辑，工作台消失了一半、面板没出来」。
-        /// </summary>
-        internal void SetCanvasSuppressed(bool suppressed)
-        {
-            if (canvas == null)
-            {
-                return;
-            }
-            int wanted = suppressed ? 0 : CanvasSortingOrder;
-            if (canvas.sortingOrder != wanted)
-            {
-                canvas.sortingOrder = wanted;
-            }
-        }
         private TMP_FontAsset uiFont;
         private TMP_FontAsset generatedTmpFont;
         private GameObject ownedEventSystem;
@@ -401,8 +407,7 @@ namespace ADOFAIEditorStudio
         {
             get
             {
-                EditorImGuiBridge bridge = EditorImGuiBridge.Instance;
-                if (bridge != null && bridge.ProjectCreateVisible)
+                if (ProjectCreateVisible)
                 {
                     return false;
                 }
@@ -463,13 +468,13 @@ namespace ADOFAIEditorStudio
             {
                 return false;
             }
-            EditorImGuiBridge bridge = EditorImGuiBridge.Instance;
-            if (bridge == null)
+            if (confirmSaveWindow == null)
             {
+                // UI 还没建起来（没开过工作台）：没有弹窗可问，按"不拦"处理。
                 return false;
             }
             pendingExit = action;
-            bridge.OpenConfirmSave();
+            OpenConfirmSave();
             return true;
         }
 
@@ -480,13 +485,8 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private void UpdateConfirmSave()
         {
-            EditorImGuiBridge bridge = EditorImGuiBridge.Instance;
-            if (bridge == null)
-            {
-                return;
-            }
             int answer;
-            if (!bridge.TakeConfirmSaveAnswer(out answer))
+            if (!TakeConfirmSaveAnswer(out answer))
             {
                 return;
             }
@@ -570,12 +570,7 @@ namespace ADOFAIEditorStudio
             {
                 return;
             }
-            EditorImGuiBridge bridge = EditorImGuiBridge.Instance;
-            if (bridge == null)
-            {
-                return;
-            }
-            bridge.OpenProjectCreate(
+            OpenProjectCreate(
                 Path.GetFileNameWithoutExtension(chartPath),
                 EditorProjectFile.GetProjectDirectory(chartPath));
         }
@@ -587,14 +582,9 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private void UpdateProjectCreate()
         {
-            EditorImGuiBridge bridge = EditorImGuiBridge.Instance;
-            if (bridge == null)
-            {
-                return;
-            }
             string name;
             bool confirmed;
-            if (!bridge.TakeProjectCreateResult(out name, out confirmed))
+            if (!TakeProjectCreateResult(out name, out confirmed))
             {
                 return;
             }
@@ -649,29 +639,14 @@ namespace ADOFAIEditorStudio
         private PreviewLayout previewLayout;
         private RectTransform designRoot;
         private RectTransform browserPanel;
-        /// <summary>左栏的装饰物页。建好后交给时间轴去通知刷新。</summary>
+        /// <summary>左栏模块底色（uGUI 自己铺，见 BuildBrowser）。跟着块行一起重算。</summary>
+        private RectTransform browserBlockFill;
+        /// <summary>左栏的装饰物列表数据层。建好后交给时间轴去通知刷新。</summary>
         private EditorDecorationList decoList;
-        /// <summary>装饰物页的根。切标签时按它整页开关。</summary>
-        private RectTransform decoView;
-        // 左栏顶部那排标签：装饰物 / 媒体 / 原生每一个设置页。
-        //
-        // 它是一条**可横滚的带子**（见 HorizontalButtonStrip）：原生那七个
-        // 设置页加上前两项，横着排不下这 357px 的栏宽，所以内容比可视区宽时
-        // 滚轮和左键拖动都能滚。
-        private RectTransform browserTabStripHost;
-        private RectTransform browserTabStripContent;
-        private HorizontalButtonStrip browserTabStrip;
-        private readonly List<Button> browserTabButtons = new List<Button>();
-        private readonly List<TextMeshProUGUI> browserTabLabels = new List<TextMeshProUGUI>();
-        /// <summary>每个按钮对应哪个设置页；前两个（装饰物 / 媒体）是 None。</summary>
-        private readonly List<LevelEventType> browserTabPages = new List<LevelEventType>();
-        // 原生有哪些设置页、各叫什么。布局时从 settingsPanel 现读 ——
-        // 页数或名字变了这里会跟着变，不用我们维护一份名单。
-        /// <summary>这排按钮当前的宽度。不满 80 是常态，见 LayoutBrowserTabs 的排法。</summary>
-        private float browserTabWidth = BrowserTabWidth;
 
         /// <summary>左栏当前显示哪一页。</summary>
-        private enum BrowserPane
+        // internal：新的 uGUI 左栏（UiBrowserPane）要拿它当切页参数。
+        internal enum BrowserPane
         {
             /// <summary>装饰物列表。</summary>
             Decorations,
@@ -680,10 +655,9 @@ namespace ADOFAIEditorStudio
             /// <summary>
             /// 游戏原生的某一个设置页。
             ///
-            /// 内容**不是我们建的** —— 是把原生那个侧栏借过来摆在左栏这个
-            /// 位置，具体是哪一页由 <see cref="selectedSettingsPage"/> 决定，
-            /// 内容由另一份 <see cref="EditorPropertyPanel"/> 渲染，
-            /// 见 <see cref="ShowSettingsPane"/>。
+            /// 具体是哪一页由 <see cref="selectedSettingsPage"/> 决定。正文目前仍由
+            /// ImGui 参数栏渲染器画（它和右栏共用同一条写入路径），等右栏迁完
+            /// uGUI 一起换掉；左栏这一侧只负责标签与切页。
             /// </summary>
             Settings
         }
@@ -692,12 +666,6 @@ namespace ADOFAIEditorStudio
         /// <summary>设置页在前台时，正显示的是哪一页。</summary>
         private LevelEventType selectedSettingsPage = LevelEventType.SongSettings;
 
-        /// <summary>
-        /// 设置页那一份参数栏的外壳、容器和实例，见 <see cref="EnsureSettingsPane"/>。
-        ///
-        /// **显隐一律动 `settingsPaneRoot`**，不动 `settingsPane`：描边和投影
-        /// 是面板的**同级**兄弟（见 AddPanelBorder），只藏面板藏不干净。
-        /// </summary>
         /// <summary>
         /// 一扇「文本窗口」的两个把手：整层（显隐看它）和正文。
         ///
@@ -712,11 +680,49 @@ namespace ADOFAIEditorStudio
         private TextWindow helpWindow;
         private TextWindow versionWindow;
 
-        private RectTransform settingsPaneRoot;
-        private Image settingsPane;
-        private EditorPropertyPanel settingsPropertyPanel;
-        /// <summary>设置页被 ImGui 版接管了（见 SuppressSettings / ShowSettingsPane）。</summary>
-        private bool settingsPaneTakenOver;
+        /// <summary>
+        /// 「创建工程」那一屏。用户答完（建 / 不建）才把结果交给
+        /// <see cref="UpdateProjectCreate"/> —— 它是**要答复的问题**，不是普通窗口。
+        /// </summary>
+        internal sealed class ProjectCreateWindow
+        {
+            internal RectTransform Layer;
+            internal TMP_InputField NameField;
+            internal TextMeshProUGUI PathLabel;
+            internal bool Confirmed;
+            internal bool Cancelled;
+
+            internal bool IsOpen
+            {
+                get { return Layer != null && Layer.gameObject.activeSelf; }
+            }
+        }
+
+        /// <summary>「布局还没存」那一屏。答复记在 <see cref="Answer"/>：1 存 / 2 不存 / 3 取消。</summary>
+        internal sealed class ConfirmSaveWindow
+        {
+            internal RectTransform Layer;
+            internal int Answer;
+
+            internal bool IsOpen
+            {
+                get { return Layer != null && Layer.gameObject.activeSelf; }
+            }
+        }
+
+        private ProjectCreateWindow projectCreateWindow;
+        private ConfirmSaveWindow confirmSaveWindow;
+
+        /// <summary>新的左栏（标签条 + 装饰物页 + 媒体页），见 UiBrowserPane。</summary>
+        private UiBrowserPane browserPaneView;
+        /// <summary>左栏设置页正文（和右栏共用一个写入层）。</summary>
+        private UiInspectorPane settingsPaneView;
+        /// <summary>右栏新的 uGUI 参数栏。</summary>
+        private UiInspectorPane inspectorPane;
+        /// <summary>右栏模块底色。</summary>
+        private RectTransform inspectorBlockFill;
+        /// <summary>时间轴模块底色（随拖拽改高度）。</summary>
+        private RectTransform timelineBlockFill;
         private RectTransform mediaPanel;
         private RectTransform mediaViewport;
         private RectTransform mediaContent;
@@ -729,8 +735,6 @@ namespace ADOFAIEditorStudio
         private RectTransform previewHeading;
         private RectTransform previewViewport;
         /// <summary>预览面板页眉的那条彩色竖条和那条分隔线。ImGui 版接管时一起藏。</summary>
-        private Image previewHeadingBar;
-        private Image previewHeadingRule;
         private RawImage previewHandoffImage;
         private Texture2D previewHandoffTexture;
         private Coroutine previewHandoffCoroutine;
@@ -822,73 +826,55 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>
-        /// 装饰物列表在屏幕上的矩形（1920x1080 设计坐标）。
-        ///
-        /// **必须加上左栏面板自己的原点。** `BrowserContentX/ViewY` 是相对
-        /// 「ProjectWorkspace」那块面板量的（见 BuildBrowser），不是相对整个
-        /// 设计区；直接把它们交给 ImGui 会整体偏到左上角去。
-        /// </summary>
-        internal void GetDecorationListRect(out float x, out float y, out float width, out float height)
-        {
-            x = OuterMargin + BrowserContentX;
-            y = PreviewPanelY + BrowserViewY;
-            width = previewLayout.LeftPanelWidth - BrowserContentX - PanelHeadingInset;
-            height = Mathf.Max(64f, PreviewPanelHeight - BrowserViewY - PanelInnerInset);
-        }
-
-        /// <summary>
         /// 参数栏在屏幕上的矩形（1920x1080 设计坐标）。
         ///
         /// ImGui 那版参数栏要占**同一个坑**。坐标不用换算，是因为两边已经统一到
         /// 同一个设计空间了（见 EditorImGuiBridge 里对 `_scale` 的说明）。
         /// </summary>
-        internal void GetInspectorRect(out float x, out float y, out float width, out float height)
-        {
-            x = previewLayout.InspectorX;
-            y = PreviewPanelY;
-            width = previewLayout.RightPanelWidth;
-            height = PreviewPanelHeight;
-        }
+        /// <summary>设计画布尺寸（1920×1080）。给背景块日志反算边距用。</summary>
+        internal float CanvasWidth { get { return DesignWidth; } }
+        internal float CanvasHeight { get { return DesignHeight; } }
 
-        /// <summary>
-        /// 装饰物列表这个坑让不让 ImGui 那版接管。
-        ///
-        /// 和 <see cref="SuppressInspector"/> 同一个套路：桥接每帧调用，幂等。
-        /// 但**只在左栏停在装饰物页时**才压 —— 切到媒体页时 ImGui 什么都不画，
-        /// 这里必须把 uGUI 那扇还回去，否则媒体页整个是空的。
-        /// </summary>
-        internal void SuppressDecorations(bool suppressed)
-        {
-            if (decoView == null)
-            {
-                return;
-            }
-            bool wanted = !suppressed;
-            if (decoView.gameObject.activeSelf != wanted)
-            {
-                decoView.gameObject.SetActive(wanted);
-            }
-        }
+        /// <summary>顶栏带的高度：标题行 + 菜单行（到「工程」那一行下沿为止，不含标签条）。</summary>
+        internal float TopBandHeight { get { return HeaderHeight + MenuBarHeight; } }
 
-        // -------------------------------------------------- ImGui 版媒体页的口子
+        // -------------------------------------------------- 模块背景块矩形
         //
-        // 和装饰物列表那组同一种做法：**界面逻辑留在 ImGui 那边，这里只开数据、
-        // 几何和副作用的口子**。筛选、缩略图缓存、选中都有且只有这一份实现 ——
-        // 往 ImGui 那边复制一份，两边迟早就不是一个意思了。
+        // 四块（左栏 / 预览工具条 / 参数栏 / 时间轴）的底色区。它们比面板矩形
+        // 往外多吃掉一部分间距，于是块与块、块与顶栏/屏幕边之间恒为 BlockGap。
+        // 全部由 previewLayout 与 timelineHeight 现算，切分辨率、拖时间轴高度都不漂。
+
+        /// <summary>左栏背景块。装饰物 / 媒体 / 设置三页共用同一块。</summary>
+        internal void GetBrowserBlockRect(out float x, out float y, out float width, out float height)
+        {
+            x = BlockGap;
+            y = BlockRowTop;
+            width = previewLayout.StageX - BlockGap * 2f;   // 右缘 = 舞台左缘 - BlockGap
+            height = BlockRowBottom - y;
+        }
+
+        /// <summary>参数栏背景块。</summary>
+        internal void GetInspectorBlockRect(out float x, out float y, out float width, out float height)
+        {
+            x = previewLayout.StageX + previewLayout.StageWidth + BlockGap;
+            y = BlockRowTop;
+            width = DesignWidth - BlockGap - x;
+            height = BlockRowBottom - y;
+        }
+
+        /// <summary>时间轴背景块：从时间轴顶一直到屏幕底上方 BlockGap。</summary>
+        internal void GetTimelineBlockRect(out float x, out float y, out float width, out float height)
+        {
+            x = BlockGap;
+            y = TimelinePanelTop;
+            width = DesignWidth - BlockGap * 2f;
+            height = DesignHeight - BlockGap - y;
+        }
 
         /// <summary>当前左栏是不是媒体页。</summary>
         internal bool IsMediaPane
         {
             get { return browserPane == BrowserPane.Media; }
-        }
-
-        /// <summary>媒体页在屏幕上的矩形（1920x1080 设计坐标）。和装饰物页同一个坑。</summary>
-        internal void GetMediaRect(out float x, out float y, out float width, out float height)
-        {
-            x = OuterMargin + BrowserContentX;
-            y = PreviewPanelY + BrowserViewY;
-            width = previewLayout.LeftPanelWidth - BrowserContentX - PanelHeadingInset;
-            height = Mathf.Max(64f, PreviewPanelHeight - BrowserViewY - PanelInnerInset);
         }
 
         /// <summary>筛选之后的媒体列表。**只读，别改。**</summary>
@@ -995,40 +981,16 @@ namespace ADOFAIEditorStudio
             return false;
         }
 
-        /// <summary>把 uGUI 那扇媒体页藏掉（ImGui 版接管时）。切回别的页要还回来。</summary>
-        internal void SuppressMedia(bool suppressed)
-        {
-            if (mediaPanel == null)
-            {
-                return;
-            }
-            bool wanted = !suppressed;
-            if (mediaPanel.gameObject.activeSelf != wanted)
-            {
-                mediaPanel.gameObject.SetActive(wanted);
-            }
-        }
-
-        // -------------------------------------------------- ImGui 版设置页的口子
+        // -------------------------------------------------- 设置页
         //
-        // 左边那几页设置（歌曲/关卡/轨道/……）也是 ImGui 版接管的。
-        // **它们本身就是一个 `LevelEvent`**（原生把八页挂在 levelData 上，
-        // 见 FindSettingsPage），所以 ImGui 参数栏那套"渲染一个 LevelEvent"
-        // 直接拿来用 —— 行怎么排、值怎么改、撤销怎么走，全是同一份实现。
+        // 左边那几页设置（歌曲/关卡/轨道/……）**本身就是一个 `LevelEvent`**
+        // （原生把八页挂在 levelData 上，见 FindSettingsPage），正文由参数栏
+        // 渲染器画；uGUI 旧的那份设置面板已经删掉，不再有两套窗口叠在一起。
 
         /// <summary>当前左栏是不是某个设置页。</summary>
         internal bool IsSettingsPane
         {
             get { return browserPane == BrowserPane.Settings; }
-        }
-
-        /// <summary>
-        /// 设置页在屏幕上的矩形。**和媒体页、装饰物页是同一个坑** ——
-        /// 三页轮流占满整宽（见 BuildBrowser 里那段说明），所以直接借媒体页的。
-        /// </summary>
-        internal void GetSettingsRect(out float x, out float y, out float width, out float height)
-        {
-            GetMediaRect(out x, out y, out width, out height);
         }
 
         /// <summary>当前设置页对应的那个 <see cref="LevelEvent"/>。不在设置页时是 null。</summary>
@@ -1059,41 +1021,9 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>
-        /// 告诉 uGUI 那份参数栏"现在这一页是设置页"。
-        ///
-        /// ImGui 版自己画行，但**设置页特有的那几步副作用只能由它补**
-        /// （路径/格位重算、背景重铺 —— 见 EditorPropertyPanel 里那两处
-        /// `ReferenceEquals(..., settingsPage)`）。不打这个标记，ImGui 那边
-        /// 改设置就会"值变了、画面不跟"。
-        /// </summary>
-        internal void MarkSettingsTarget(LevelEvent page)
-        {
-            if (settingsPropertyPanel != null)
-            {
-                settingsPropertyPanel.MarkSettingsPage(page);
-            }
-        }
-
-        /// <summary>
         /// 顶栏那个 Image。ImGui 版接管时整个藏掉（见 SuppressHeader）。
         /// </summary>
         private Image headerRoot;
-
-        // -------------------------------------------------- ImGui 版顶栏的口子
-
-        /// <summary>
-        /// 顶栏在屏幕上的矩形（1920x1080 设计坐标）。
-        ///
-        /// 顶栏是 `designRoot` 的**第一个直接子物体**，就摆在设计原点，
-        /// 所以是整整一块 (0,0,1920,54) —— 不像左栏那几页要先加面板自己的原点。
-        /// </summary>
-        internal void GetHeaderRect(out float x, out float y, out float width, out float height)
-        {
-            x = 0f;
-            y = 0f;
-            width = DesignWidth;
-            height = HeaderHeight;
-        }
 
         /// <summary>
         /// 顶栏中段那条状态读数的当前文字（滚轮微调、存档提示、报错都走它）。
@@ -1114,25 +1044,6 @@ namespace ADOFAIEditorStudio
         /// <summary>状态读数底衬的填充色（极淡的白）。</summary>
         internal Color StatusPillColor { get { return StatusPillFill; } }
 
-        /// <summary>
-        /// 把 uGUI 那条顶栏藏掉（ImGui 版接管时）。
-        ///
-        /// 藏的不只是底衬 —— 版本号、联机、帮助那三颗能点的也一起没了，
-        /// 它们的点击由 ImGui 那边接管（走桥的 SetVersionVisible / ToggleHelp）。
-        /// </summary>
-        internal void SuppressHeader(bool suppressed)
-        {
-            if (headerRoot == null)
-            {
-                return;
-            }
-            bool wanted = !suppressed;
-            if (headerRoot.gameObject.activeSelf != wanted)
-            {
-                headerRoot.gameObject.SetActive(wanted);
-            }
-        }
-
         /// <summary>预览面板页眉那一行有多高 —— 工具栏那一条。</summary>
         internal const float PreviewToolbarHeight = 52f;
 
@@ -1143,53 +1054,10 @@ namespace ADOFAIEditorStudio
         // 那 42 像素**：事件面板从 y=44 起，紧贴在它下面，所以这一条能单独接管，
         // 下面照旧。
 
-        /// <summary>时间轴标题行（最上面 42 像素）在屏幕上的矩形。</summary>
-        internal void GetTimelineHeaderRect(out float x, out float y, out float width, out float height)
-        {
-            x = 12f;
-            y = DesignHeight - timelineHeight + 4f;
-            width = TimelinePanelWidth;
-            height = EditorTimelineView.TitleRowHeight;
-        }
-
-        /// <summary>
-        /// 事件面板那排（时间轴第二行）在屏幕上的矩形。
-        ///
-        /// 它紧贴在标题行下面：顶端 = 标题行顶端 + `PaletteRowY`；**高度由时间轴
-        /// 按换行后的行数给** —— 事件多的时候这一排会往下排好几行，工具区跟着变高、
-        /// 可视区相应变矮（那套高度是 `LayoutPaletteRows` 定的，不要在这儿另算）。
-        /// </summary>
-        internal void GetTimelinePaletteRect(out float x, out float y, out float width,
-            out float height)
-        {
-            float titleHeight;
-            GetTimelineHeaderRect(out x, out y, out width, out titleHeight);
-            y += EditorTimelineView.PaletteRowYOffset;
-            height = timelineView == null ? 0f : timelineView.PaletteBandHeight;
-        }
-
         /// <summary>时间轴视图（标题行上的按钮都转发到它）。</summary>
         internal EditorTimelineView TimelineView
         {
             get { return timelineView; }
-        }
-
-        /// <summary>
-        /// 时间轴内容区（那条卡片）在屏幕上的矩形。
-        ///
-        /// 面板原点 + 相对量：`root` 就是面板根节点，所以相对量直接加。
-        /// 面板高度跟着拖拽走，内容区的位置也跟着变 —— 所以每次都现算。
-        /// </summary>
-        /// <summary>
-        /// 菜单栏那一条的位置（设计空间）。紧贴在品牌行下面，
-        /// 横跨整个设计宽度 —— 它是全屏级的一条，不属于某个面板。
-        /// </summary>
-        internal void GetMenuBarRect(out float x, out float y, out float width, out float height)
-        {
-            x = 0f;
-            y = HeaderHeight;
-            width = DesignWidth;
-            height = MenuBarHeight;
         }
 
         /// <summary>
@@ -1227,6 +1095,11 @@ namespace ADOFAIEditorStudio
 
         internal void MenuUndo()
         {
+            // 撤销会改谱面 —— 只读模式下和改参数一样要拦。
+            if (!AllowEdit())
+            {
+                return;
+            }
             // **先走工作台自己的撤销栈。**
             //
             // 拖块换行、装饰物、批量改参这些都只记在 `EditorCommandHistory` 里，
@@ -1248,6 +1121,10 @@ namespace ADOFAIEditorStudio
 
         internal void MenuRedo()
         {
+            if (!AllowEdit())
+            {
+                return;
+            }
             string status;
             if (EditorCommandHistory.TryRedo(out status))
             {
@@ -1302,6 +1179,41 @@ namespace ADOFAIEditorStudio
             }
         }
 
+        /// <summary>
+        /// **Ctrl+S 的第二半**：把排版（行号 / 事件块 Y 位置）写进 `.aesprj`。
+        ///
+        /// 之前这条路只挂在 `Ctrl+Alt+S` 上，于是用户按完 Ctrl+S（只存了谱面）、
+        /// 关工作台时还会被问一句"布局还没保存" —— 因为排版那次根本没写。
+        /// 现在并进 Ctrl+S：一次按键同时存谱面和排版。
+        ///
+        /// 没有工程（还是只读状态）、或者排版没改过时，什么都不做。
+        /// </summary>
+        internal void SaveLayoutIfDirty()
+        {
+            if (Timeline == null || !Timeline.ProjectDirty)
+            {
+                return;
+            }
+            string chartPath = EditorProjectSession.GetCurrentLevelPath();
+            if (string.IsNullOrEmpty(chartPath))
+            {
+                return;
+            }
+            if (EditorProjectFile.FindProjectFile(chartPath) == null)
+            {
+                return;
+            }
+            string directory = EditorProjectFile.GetProjectDirectory(chartPath);
+            string fileName = Path.GetFileNameWithoutExtension(chartPath)
+                + EditorProjectFile.FileExtension;
+            string error = Timeline.SaveProjectRows(
+                Path.Combine(directory, fileName), Path.GetFileName(chartPath));
+            if (!string.IsNullOrEmpty(error))
+            {
+                Main.Logger.Error("[Save] 工程排版保存失败：" + error);
+            }
+        }
+
         internal void MenuSaveProject()
         {
             string chartPath = EditorProjectSession.GetCurrentLevelPath();
@@ -1325,162 +1237,12 @@ namespace ADOFAIEditorStudio
                 : "保存工程失败：" + error);
         }
 
-        internal void GetTimelineBodyRect(out float x, out float y, out float width, out float height)
-        {
-            float localX, localY, localWidth, localHeight;
-            if (timelineView == null)
-            {
-                x = y = width = height = 0f;
-                return;
-            }
-            timelineView.GetViewportLocalRect(out localX, out localY, out localWidth, out localHeight);
-            x = 12f + localX;
-            y = DesignHeight - timelineHeight + 4f + localY;
-            width = localWidth;
-            height = localHeight;
-        }
-
-        /// <summary>
-        /// 把时间轴那排 uGUI 的标题行藏掉（ImGui 版接管时）。
-        ///
-        /// **只藏标题行**，下面的事件面板和车道区照旧 —— 事件面板从 y=44 起，
-        /// 紧贴在标题行下面，是独立的一块。
-        /// </summary>
-        internal void SuppressTimelineTitleRow(bool suppressed)
-        {
-            if (timelineView != null)
-            {
-                timelineView.SuppressTitleRow(suppressed);
-            }
-        }
-
-        /// <summary>
-        /// 把时间轴那排 uGUI 的**事件面板**藏掉（ImGui 版接管时）。
-        ///
-        /// 和第 1 行的开关分开：那排是"第 2 行"，换行行数、按钮位置都由
-        /// `LayoutPaletteRows` 现算，所以它有自己的一套快照（见 `EditorTimelineView`）。
-        /// </summary>
-        internal void SuppressTimelinePalette(bool suppressed)
-        {
-            if (timelineView != null)
-            {
-                timelineView.SuppressPalette(suppressed);
-            }
-        }
-
-        /// <summary>
-        /// 把时间轴那排 uGUI 的标尺（刻号和格线）藏掉（ImGui 版接管时）。
-        ///
-        /// **只藏标尺** —— 事件块还是 uGUI 画的（堆叠方案还没定），
-        /// 两者叠在同一块区域上，正好用来对坐标。
-        /// </summary>
-        internal void SuppressTimelineRuler(bool suppressed)
-        {
-            if (timelineView != null)
-            {
-                timelineView.SuppressRuler(suppressed);
-            }
-        }
-
-        /// <summary>把时间轴那批 uGUI 的事件块藏掉（ImGui 版接管时）。</summary>
-        internal void SuppressTimelineBlocks(bool suppressed)
-        {
-            if (timelineView != null)
-            {
-                timelineView.SuppressBlocks(suppressed);
-            }
-        }
-
-        // -------------------------------------------------- ImGui 版预览区的口子
+        // -------------------------------------------------- 预览区
 
         /// <summary>预览区现在有没有地方可画（窗口太小的时候舞台会被收掉）。</summary>
         internal bool PreviewVisible
         {
             get { return previewLayout.StageWidth > 1f && previewLayout.StageHeight > 1f; }
-        }
-
-        /// <summary>预览工具栏那一条在屏幕上的矩形（1920x1080 设计坐标）。</summary>
-        internal void GetPreviewToolbarRect(out float x, out float y, out float width, out float height)
-        {
-            x = previewLayout.StageX;
-            y = PreviewPanelY;
-            width = previewLayout.StageWidth;
-            height = PreviewToolbarHeight;
-        }
-
-        /// <summary>
-        /// 把预览面板**页眉那几件**藏掉（工具栏底衬、页眉竖条、页眉线、标题）。
-        ///
-        /// **整块面板不能藏。** 它自己是透明的，游戏画面从它下面透上来 ——
-        /// 藏了就把预览整个挡没了；而且舞台里还挂着交接用的那层画面。
-        /// 所以只藏页眉这几件；舞台那圈描边暂时仍由 uGUI 画（静态四条线，
-        /// ImGui 再画一遍只是重复）。
-        /// </summary>
-        internal void SuppressPreviewChrome(bool suppressed)
-        {
-            bool active = !suppressed;
-            SetActiveIfChanged(previewToolbar, active);
-            SetActiveIfChanged(previewHeading, active);
-            SetActiveIfChanged(previewHeadingBar, active);
-            SetActiveIfChanged(previewHeadingRule, active);
-        }
-
-        private static void SetActiveIfChanged(Component component, bool active)
-        {
-            if (component == null || component.gameObject.activeSelf == active)
-            {
-                return;
-            }
-            component.gameObject.SetActive(active);
-        }
-
-        /// <summary>
-        /// ImGui 版要不要接管设置页。
-        ///
-        /// `true` 时把那扇已经借来的原生页**还回去**（不还的话它会留在
-        /// 我们隐藏掉的界面里，原生编辑器那边反倒没有了）；`false` 时只清标记，
-        /// **不主动显示** —— 该不该显示由 <see cref="SetBrowserTab"/> 决定。
-        /// </summary>
-        internal void SuppressSettings(bool suppressed)
-        {
-            if (settingsPaneTakenOver == suppressed)
-            {
-                return;
-            }
-            settingsPaneTakenOver = suppressed;
-            if (suppressed)
-            {
-                if (settingsPaneRoot != null)
-                {
-                    HideSettingsPane();
-                }
-            }
-            else if (settingsPropertyPanel != null)
-            {
-                // 交还时把标记清掉。留着的话，之后在右边参数栏改**事件**
-                // 也会被当成"改设置"，多跑一遍不该跑的副作用。
-                settingsPropertyPanel.MarkSettingsPage(null);
-            }
-        }
-
-        /// <summary>
-        /// 参数栏这个坑让不让 ImGui 那版接管。
-        ///
-        /// 接管时把 uGUI 这扇**整个藏掉**（`inspectorPanel` 是那扇面板的根，
-        /// 标题条和描边都是它的子物体，藏它就够），否则两扇会叠在一起。
-        /// 桥接每帧调用，所以这里写成幂等的：状态没变就什么都不做。
-        /// </summary>
-        internal void SuppressInspector(bool suppressed)
-        {
-            if (inspectorPanel == null)
-            {
-                return;
-            }
-            bool wanted = !suppressed;
-            if (inspectorPanel.gameObject.activeSelf != wanted)
-            {
-                inspectorPanel.gameObject.SetActive(wanted);
-            }
         }
 
         /// <summary>
@@ -1634,9 +1396,17 @@ namespace ADOFAIEditorStudio
             get { return DesignHeight - LayoutTop - timelineHeight - 28f; }
         }
 
+        /// <summary>
+        /// 舞台可用高度：**只扣顶部的工具栏（58），底部不预留**。
+        ///
+        /// 原来扣 64（顶 58 + 底 6），窗口拉满时底下会留一条 6px 的面板色带 ——
+        /// 看起来就像描边下面多了一条粗横线、框没包紧。现在底部留 0，
+        /// 窗口最大时底边正好贴住面板底；窗口因长宽比变小时由居中算法
+        /// 上下平分剩余空间，那时才会有垫边。
+        /// </summary>
         private float PreviewStageAvailableHeight
         {
-            get { return PreviewPanelHeight - 64f; }
+            get { return PreviewPanelHeight - PreviewStageInsetY; }
         }
 
         public void Configure(Settings value)
@@ -1746,6 +1516,15 @@ namespace ADOFAIEditorStudio
 
         private void LateUpdate()
         {
+            long __watch = System.Diagnostics.Stopwatch.GetTimestamp();
+            LateUpdateCore();
+            PreviewDiagnostics.RecordPart("Overlay.L",
+                (System.Diagnostics.Stopwatch.GetTimestamp() - __watch)
+                * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+        }
+
+        private void LateUpdateCore()
+        {
             if (visible && built)
             {
                 ApplyPreviewViewport();
@@ -1761,11 +1540,65 @@ namespace ADOFAIEditorStudio
             }
         }
 
+        /// <summary>
+        /// 只**记录**、不修改：把画布上面积较大的 uGUI Image 名字/尺寸/颜色写进日志，
+        /// 用来确认那几块底色到底是哪几个对象画的。
+        ///
+        /// 之前这里会直接把颜色清成透明，结果把整个工作台的底板也清掉了 ——
+        /// 画面变成半透明、背后游戏一动就跟着闪。这里改成纯读取。
+        /// </summary>
+        private bool loggedSurfaces;
+
+        private void LogLargeSurfacesOnce()
+        {
+            if (loggedSurfaces)
+            {
+                return;
+            }
+            loggedSurfaces = true;
+            Image[] images = GetComponentsInChildren<Image>(true);
+            int found = 0;
+            for (int i = 0; i < images.Length; i++)
+            {
+                Image image = images[i];
+                if (image == null || image.rectTransform == null)
+                {
+                    continue;
+                }
+                Rect rect = image.rectTransform.rect;
+                if (Mathf.Abs(rect.width * rect.height) < 40000f)
+                {
+                    continue;
+                }
+                found++;
+                Main.Logger.Log("[底色清单] " + image.gameObject.name
+                    + " " + rect.width.ToString("0") + "x" + rect.height.ToString("0")
+                    + " 色=" + image.color.ToString("0.00")
+                    + " 父=" + (image.transform.parent == null ? "-" : image.transform.parent.name));
+            }
+            Main.Logger.Log("[底色清单] 共 " + found + " 块大面积 Image。");
+        }
+
         private void Update()
+        {
+            long __watch = System.Diagnostics.Stopwatch.GetTimestamp();
+            UpdateCore();
+            PreviewDiagnostics.RecordPart("Overlay.U",
+                (System.Diagnostics.Stopwatch.GetTimestamp() - __watch)
+                * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+        }
+
+        private void UpdateCore()
         {
             if (settings == null)
             {
                 return;
+            }
+            // 帧耗时诊断：开关关着时它内部第一行就返回。
+            PreviewDiagnostics.Tick();
+            if (visible)
+            {
+                LogLargeSurfacesOnce();
             }
 
             // 临时状态到期就撤掉。见 SetTransientStatus。
@@ -1774,7 +1607,6 @@ namespace ADOFAIEditorStudio
                 statusTransient = false;
                 SetSceneSelectionStatus(string.Empty);
             }
-
 
             if (!EditorBridge.IsEditorActive() && !EditorPlaybackBridge.IsRestartingPreview)
             {
@@ -1832,15 +1664,10 @@ namespace ADOFAIEditorStudio
                 }
             }
 
-            // 搬过来的版本说明窗口是用它自己的标题栏 × 关的，uGUI 这边收不到通知，
-            // 所以每帧问一句"它是不是刚被用户关掉了"—— 关掉了才把更新内容记成已读。
-            EditorImGuiBridge imgui = EditorImGuiBridge.Instance;
-            if (imgui != null && imgui.TakeVersionClosed())
-            {
-                MarkVersionNotesSeen();
-            }
+            // 说明窗口 / 版本说明现在都是 uGUI：关掉时由 `ShowWindow` 自己把
+            // 「这个版本的更新内容看过了」记下来，不必再轮询。
 
-            // 同一个套路：「创建工程」那一屏的答复也是它自己收的。
+            // 「创建工程」那一屏的答复由它自己收。
             UpdateProjectCreate();
 
             // 「布局还没存」那扇窗同理 —— 答复决定要不要真的关掉/切模式。
@@ -1850,6 +1677,52 @@ namespace ADOFAIEditorStudio
             UpdateMediaPreload();
 
             // 打开工作台时"落到原生选中格"的待办，落地一次就撤。
+            if (layoutRefreshPending > 0)
+            {
+                layoutRefreshPending--;
+                if (layoutRefreshPending == 0)
+                {
+                    ApplyWorkspaceLayout();
+                }
+            }
+
+            UiPreviewChrome.Refresh(previewChrome, StatusText);
+            RefreshModeSwitch();
+
+            // 面板状态取证（临时）：每 2 秒一次，看左右两栏到底有没有内容。
+            if (Time.frameCount - lastPanelProbeFrame >= 120)
+            {
+                lastPanelProbeFrame = Time.frameCount;
+                try
+                {
+                    RectTransform decoRect = browserPanel;
+                    RectTransform mediaRect = browserPanel;
+                    RectTransform inspRect = inspectorPanel;
+                    Main.Logger.Log("[面板] 左栏=" + DescribePane(browserPanel, decoRect)
+                        + " 媒体同栏=" + DescribePane(browserPanel, mediaRect)
+                        + " inspector=" + DescribePane(inspectorPanel, inspRect)
+                        + " 列表子物体=" + (browserPanel != null ? browserPanel.childCount : -1)
+                        + " 探针:左=" + ProbeDrawn(120f, 300f)
+                        + " 右=" + ProbeDrawn(DesignWidth - 120f, 300f)
+                        + " 轴=" + ProbeDrawn(600f, DesignHeight - 60f)
+                        + " 色:左=" + PaneColor(browserPanel)
+                        + " 右上=" + PaneColor(inspectorPanel)
+                        + " 时间轴=" + PaneColor(timelinePanel)
+                        + " 预览=" + PaneColor(previewPanel));
+                }
+                catch (System.Exception exception)
+                {
+                    Main.Logger.Warning("[面板] 取证失败：" + exception.Message);
+                }
+
+            }
+
+            // 点击取证（临时）：可见期间每次左键按下，打一行命中链。
+            if (Input.GetMouseButtonDown(0))
+            {
+                StartCoroutine(LogRaycastPeek());
+            }
+
             TickPendingSelectionJump();
 
             // 跳转的走位：定位点轨道、打开落格都靠它"加速过去"而不是硬切。
@@ -1860,28 +1733,24 @@ namespace ADOFAIEditorStudio
                 // 有窗口开着时 Esc **先关它**：否则开着一层窗口按 Esc，整个
                 // 工作台一起消失，正看着的东西也没了 —— 那是两件事，退出得逐层来。
                 //
-                // 已经搬到 ImGui 的那两扇也要算进来：它们不挂在 uGUI 这棵树上
-                // （`OpenWindow` 遍历的是 uGUI 的窗口层），所以得单独问一句。
-                // 顺序和 `OpenWindow` 一致：先说明窗口，再版本说明。
+                // 顺序按「谁在最上面」：粒子浮窗 → 创建工程 → 保存提示 →
+                // 说明 / 版本说明 → 关工作台。
                 //
-                // 「创建工程」排最前 —— 它是最新推开的一层，而且它是个要答复的
-                // 问题，Esc 关掉就等于回答「不建」（退回只读）。
-                // 「粒子编辑器」排最前 —— 它是最新推开的一层（从参数栏点「编辑」打开的）。
-                if (imgui != null && imgui.ParticleEditor.Visible)
+                // 前三个都不在 uGUI 那棵窗口树上（`OpenWindow` 只认说明与版本
+                // 两扇），所以得单独问一句。
+                if (UiParticleWindow.CloseIfOpen())
                 {
-                    imgui.ParticleEditor.Close();
+                    // 关掉了，这一下 Esc 到此为止。
                 }
-                else if (imgui != null && imgui.ProjectCreateVisible)
+                else if (ProjectCreateVisible)
                 {
-                    imgui.CancelProjectCreate();
+                    // 要答复的问题：关掉 = 回答「不建」（退回只读）。
+                    CancelProjectCreate();
                 }
-                else if (imgui != null && imgui.HelpVisible)
+                else if (ConfirmSaveVisible)
                 {
-                    imgui.SetHelpVisible(false);
-                }
-                else if (imgui != null && imgui.VersionVisible)
-                {
-                    imgui.SetVersionVisible(false);
+                    // 同理：Esc 等于「取消」，那个动作就不做了。
+                    AnswerConfirmSave(3);
                 }
                 else
                 {
@@ -1910,7 +1779,6 @@ namespace ADOFAIEditorStudio
             // 工作台一直用就会一直复发。每帧清一次是标准做法，
             // 代价只是把已经是 null 的引用再写一遍 null。
             ClearUiButtonSelection();
-
 
             if (!visible)
             {
@@ -1998,6 +1866,11 @@ namespace ADOFAIEditorStudio
             scaler.screenMatchMode = CanvasScaler.ScreenMatchMode.Expand;
             scaler.referencePixelsPerUnit = 100f;
 
+            // **总背景保持透明。**
+            //
+            // 试过铺一层不透明的 #0B0B0B：预览那块立刻被整片盖住（画面直接没了）。
+            // 原因是预览不是纹理，而是"透着看游戏"的一扇窗——底不透，窗就没了。
+            // 所以「一层」靠的是**各模块都不画底**，而不是再铺一张更大的底。
             Image backdrop = CreateStretchImage("Backdrop", rootRect, Color.clear);
             backdrop.raycastTarget = false;
 
@@ -2012,6 +1885,7 @@ namespace ADOFAIEditorStudio
 
             BuildViewportMatte(designRoot);
             BuildHeader(designRoot);
+            BuildLayer("菜单栏", delegate { BuildMenuBar(designRoot); });
             BuildBrowser(designRoot);
             BuildPreview(designRoot);
             BuildInspector(designRoot);
@@ -2022,9 +1896,17 @@ namespace ADOFAIEditorStudio
             BuildLayer("联机面板", delegate { BuildMultiplayer(designRoot); });
             BuildLayer("说明窗口", delegate { BuildHelpPanel(designRoot); });
             BuildLayer("更新窗口", delegate { BuildVersionWindow(designRoot); });
+            BuildLayer("创建工程", delegate { BuildProjectCreateWindow(designRoot); });
+            BuildLayer("保存提示", delegate { BuildConfirmSaveWindow(designRoot); });
 
             built = true;
-            uiRoot.SetActive(false);
+            // **按当前可见性决定激活，不要无条件关掉。**
+            //
+            // 原来这里写死 `SetActive(false)`：如果工作台是先「打开」再「建 UI」
+            // （悬浮球那条路就是这样），`SetVisible(true)` 里那次激活因为
+            // uiRoot 还不存在而被跳过，随后这里又把它关掉 —— 结果 uGUI 整块
+            // 画布一直是关的，看起来就是「界面画出来了但点不动」。
+            uiRoot.SetActive(visible);
             projectDataDirty = true;
             RefreshProjectWorkspace(true);
         }
@@ -2059,9 +1941,406 @@ namespace ADOFAIEditorStudio
             }
         }
 
+        // ── 顶栏菜单（uGUI 版）──────────────────────────────────────────────
+        //
+        // ImGui 那版菜单栏（EditorImGuiMenuBar）现在是唯一入口，迁移后顶栏
+        // 必须自带菜单。结构刻意做得简单：一条文字按钮 + 一个懒建的浮层，
+        // 浮层里的条目都是普通 Button，不引入任何布局组件（全场禁 LayoutGroup）。
+
+        /// <summary>一个菜单条目。`SeparatorBefore` 用来分段，`Placeholder` 是「开发中」占位项。</summary>
+        private sealed class MenuEntry
+        {
+            internal string Label;
+            internal string Shortcut;
+            internal System.Action Action;
+            internal System.Func<bool> EnabledWhen;
+            internal System.Func<bool> CheckedWhen;
+            internal bool SeparatorBefore;
+            internal bool Placeholder;
+        }
+
+        private Image menuBarRoot;
+        private RectTransform menuBlocker;
+        private readonly System.Collections.Generic.Dictionary<string, RectTransform> menuDropdowns
+            = new System.Collections.Generic.Dictionary<string, RectTransform>();
+        private string openMenuName;
+
+        /// <summary>菜单行底色：和顶栏同一条带子（ImGui 那层已经不画了）。</summary>
+        private static Color MenuStripFill { get { return UiTheme.Current.SurfaceTopBand; } }
+        private static Color MenuDropdownFill { get { return UiTheme.Current.SurfacePanel; } }
+
+        /// <summary>建菜单条本身。位置与 ImGui 版一致：紧贴品牌行下沿，横跨整个设计宽度。</summary>
+        private void BuildMenuBar(RectTransform parent)
+        {
+            float y = HeaderHeight;
+            menuBarRoot = CreateImage("MenuBar", parent, 0f, y, DesignWidth, MenuBarHeight, MenuStripFill);
+            menuBarRoot.raycastTarget = true;
+
+            // **菜单条下面不再画分隔线。**
+            //
+            // 那条线是 1px 的 Image（`MenuRule`），不是块 —— 用户看到的就是它。
+            // 现在整块工作台只有一层底色、没有模块边界，这条线反而成了唯一的
+            // 一条"多余横线"，去掉。
+
+            float x = 18f;
+            x = AddMenuButton(parent, "文件", x, y, FileMenuEntries());
+            x = AddMenuButton(parent, "工程", x, y, ProjectMenuEntries());
+            x = AddMenuButton(parent, "偏好", x, y, PreferenceMenuEntries());
+            AddMenuButton(parent, "设置", x, y, SettingsMenuEntries());
+        }
+
+        private float AddMenuButton(RectTransform parent, string name, float x, float y,
+            System.Collections.Generic.List<MenuEntry> entries)
+        {
+            const float width = 68f;
+            TextMeshProUGUI label;
+            Button button = CreateButton(name, parent, x, y + 3f, width, MenuBarHeight - 6f,
+                name, false, delegate { ToggleMenu(name, buttonRectOf[name], entries); }, out label);
+            label.fontSize = 13f;
+            label.color = TextPrimary;
+            buttonRectOf[name] = button.GetComponent<RectTransform>();
+            menuEntries[name] = entries;
+            return x + width + 2f;
+        }
+
+        private readonly System.Collections.Generic.Dictionary<string, RectTransform> buttonRectOf
+            = new System.Collections.Generic.Dictionary<string, RectTransform>();
+        private readonly System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<MenuEntry>> menuEntries
+            = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<MenuEntry>>();
+
+        private void ToggleMenu(string name, RectTransform anchor,
+            System.Collections.Generic.List<MenuEntry> entries)
+        {
+            Main.Logger.Log("[菜单] 进入 ToggleMenu name=" + name
+                + " openMenuName=" + (openMenuName ?? "null")
+                + " this=" + GetInstanceID());
+            if (openMenuName == name)
+            {
+                CloseMenu();
+                return;
+            }
+            CloseMenu();
+
+            RectTransform dropdown;
+            if (!menuDropdowns.TryGetValue(name, out dropdown) || dropdown == null)
+            {
+                dropdown = BuildDropdown(name, entries);
+                menuDropdowns[name] = dropdown;
+            }
+            RefreshDropdown(dropdown, entries);
+            dropdown.gameObject.SetActive(true);
+            dropdown.SetAsLastSibling();
+            if (menuBlocker != null)
+            {
+                menuBlocker.gameObject.SetActive(true);
+                menuBlocker.SetSiblingIndex(dropdown.GetSiblingIndex() - 1);
+            }
+            openMenuName = name;
+            Vector3[] corners = new Vector3[4];
+            dropdown.GetWorldCorners(corners);
+            Canvas layer = dropdown.GetComponentInParent<Canvas>();
+            Main.Logger.Log("[菜单] 打开 " + name + "，浮层=" + dropdown.name
+                + " rect=" + dropdown.anchoredPosition + " size=" + dropdown.sizeDelta
+                + " active=" + dropdown.gameObject.activeInHierarchy
+                + " 世界左下=" + corners[0] + " 右上=" + corners[2]
+                + " 屏幕=" + Screen.width + "x" + Screen.height
+                + " 画布=" + (layer != null ? layer.name + "#" + layer.sortingOrder : "无")
+                + " 兄弟序=" + dropdown.GetSiblingIndex() + "/" + dropdown.parent.childCount
+                + " 媒体层=" + MediaLayerOrder()
+                + " 面板色=" + (dropdown.GetComponent<Image>() != null
+                    ? dropdown.GetComponent<Image>().color.ToString() : "无图"));
+        }
+
+        private void CloseMenu()
+        {
+            Main.Logger.Log("[菜单] CloseMenu 之前 open=" + (openMenuName ?? "null"));
+            if (!string.IsNullOrEmpty(openMenuName))
+            {
+                RectTransform open;
+                if (menuDropdowns.TryGetValue(openMenuName, out open) && open != null)
+                {
+                    open.gameObject.SetActive(false);
+                }
+            }
+            openMenuName = null;
+            if (menuBlocker != null)
+            {
+                menuBlocker.gameObject.SetActive(false);
+            }
+        }
+
+        /// <summary>懒建浮层：一块圆角底 + 每条目一个按钮。条目内容每次打开时刷新。</summary>
+        /// <summary>
+        /// 浮层专用画布（sortingOrder = 工作台 + 90）。
+        ///
+        /// **不能靠兄弟序抢层级**：面板在布局刷新时会被重新 SetAsLastSibling，
+        /// 浮层很容易被装饰物列表重新盖住（实测就是这个现象）。
+        /// 独立的 overrideSorting 画布按 sortingOrder 排序，跟层级顺序无关。
+        /// </summary>
+        /// <summary>
+        /// 浮层画布（sortingOrder 32000）：菜单下拉、参数栏的枚举/调色盘共用。
+        /// 它比 uGUI 工作台（30000）和 ImGui 层（31000）都高，弹层才不会被盖。
+        /// </summary>
+        internal RectTransform PopupLayer { get { return EnsurePopupCanvas(); } }
+
+        /// <summary>工作台统一字体 —— 临时建的提示/弹层要用它，否则会退回默认字体。</summary>
+        internal TMP_FontAsset UiFont { get { return uiFont; } }
+
+        private RectTransform EnsurePopupCanvas()
+        {
+            if (popupCanvasRoot != null)
+            {
+                return popupCanvasRoot;
+            }
+            GameObject popupObject = new GameObject(
+                "AES.Popup",
+                typeof(RectTransform),
+                typeof(Canvas),
+                typeof(GraphicRaycaster));
+            popupObject.transform.SetParent(uiRoot.transform, false);
+            Canvas popupLayer = popupObject.GetComponent<Canvas>();
+            popupLayer.overrideSorting = true;
+            // 32000：工作台 30000 → ImGui 31000 → 浮层 32000 → 加载页 32767。
+            // 浮层必须高于 ImGui 那层，否则 ImGui 的全屏铺底会把下拉菜单盖住
+            // （这就是「文件下拉被盖住」的真正原因）。
+            popupLayer.sortingOrder = 32000;
+            RectTransform rect = popupObject.GetComponent<RectTransform>();
+            rect.anchorMin = new Vector2(0.5f, 0.5f);
+            rect.anchorMax = new Vector2(0.5f, 0.5f);
+            rect.pivot = new Vector2(0.5f, 0.5f);
+            rect.anchoredPosition = Vector2.zero;
+            rect.sizeDelta = new Vector2(DesignWidth, DesignHeight);
+            popupCanvasRoot = rect;
+            return rect;
+        }
+
+        private RectTransform popupCanvasRoot;
+
+        private RectTransform BuildDropdown(string name,
+            System.Collections.Generic.List<MenuEntry> entries)
+        {
+            // 全屏点击拦截层：点空白处关菜单，同时挡住下面板子的点击。
+            if (menuBlocker == null)
+            {
+                // **让开菜单条本身。** 全屏拦截面如果盖住菜单条，第二次点
+                // 别的菜单会先被它接住（表现为「点了没反应、要再点一下」）。
+                float blockTop = HeaderHeight + MenuBarHeight;
+                Image blocker = CreateImage("MenuBlocker", EnsurePopupCanvas(),
+                    0f, blockTop, DesignWidth, DesignHeight - blockTop,
+                    new Color(0f, 0f, 0f, 0f));
+                blocker.raycastTarget = true;
+                Button blockerButton = blocker.gameObject.AddComponent<Button>();
+                blockerButton.transition = Selectable.Transition.None;
+                blockerButton.onClick.AddListener(CloseMenu);
+                menuBlocker = blocker.rectTransform;
+                menuBlocker.gameObject.SetActive(false);
+            }
+
+            float width = 240f;
+            float rowHeight = 28f;
+            float pad = 6f;
+            float height = pad * 2f;
+            for (int i = 0; i < entries.Count; i++)
+            {
+                height += entries[i].SeparatorBefore ? rowHeight + 9f : rowHeight;
+            }
+
+            Image panel = CreateImage("Menu_" + name, EnsurePopupCanvas(),
+                0f, 0f, width, height, MenuDropdownFill);
+            panel.raycastTarget = true;
+            panel.sprite = GetRoundedSprite(20, 8f, false, 0f);
+            panel.type = Image.Type.Sliced;
+            RectTransform rect = panel.rectTransform;
+            rect.SetAsLastSibling();
+            rect.gameObject.SetActive(false);
+
+            float rowY = pad;
+            for (int i = 0; i < entries.Count; i++)
+            {
+                MenuEntry entry = entries[i];
+                if (entry.SeparatorBefore)
+                {
+                    CreateImage("MenuSep_" + i, rect, 8f, rowY + 4f, width - 16f, 1f, PanelRule)
+                        .raycastTarget = false;
+                    rowY += 9f;
+                }
+
+                TextMeshProUGUI label;
+                MenuEntry captured = entry;
+                Button row = CreateButton("MenuRow_" + i, rect, 4f, rowY, width - 8f,
+                    rowHeight, entry.Label, false, delegate
+                    {
+                        Main.Logger.Log("[菜单] 点击条目 " + captured.Label
+                            + " action=" + (captured.Action != null));
+                        if (captured.Action != null)
+                        {
+                            CloseMenu();
+                            captured.Action();
+                        }
+                    }, out label);
+                label.fontSize = 13f;
+                label.alignment = TextAlignmentOptions.MidlineLeft;
+                label.color = entry.Placeholder ? TextMuted : TextPrimary;
+                row.gameObject.name = "MenuRow_" + i;
+
+                if (!string.IsNullOrEmpty(entry.Shortcut))
+                {
+                    CreateText("MenuKey_" + i, rect, width - 96f, rowY, 88f, rowHeight,
+                        entry.Shortcut, 12f, TextMuted, TextAlignmentOptions.MidlineRight, false);
+                }
+                rowY += rowHeight;
+            }
+
+            return rect;
+        }
+
+        private void RefreshDropdown(RectTransform dropdown,
+            System.Collections.Generic.List<MenuEntry> entries)
+        {
+            if (dropdown == null || entries == null)
+            {
+                return;
+            }
+            // 位置跟着按钮走：按钮的矩形在设计空间里就是它自己的位置。
+            RectTransform anchor = null;
+            string menuName = dropdown.name.StartsWith("Menu_")
+                ? dropdown.name.Substring(5) : null;
+            if (menuName != null)
+            {
+                buttonRectOf.TryGetValue(menuName, out anchor);
+            }
+            if (anchor != null)
+            {
+                dropdown.anchoredPosition = new Vector2(
+                    anchor.anchoredPosition.x,
+                    -(HeaderHeight + MenuBarHeight));
+            }
+
+            // 可用性与勾选状态每次打开时重算：只读模式、开关值都会变。
+            for (int i = 0; i < entries.Count; i++)
+            {
+                Transform row = dropdown.Find("MenuRow_" + i);
+                if (row == null)
+                {
+                    continue;
+                }
+                Button button = row.GetComponent<Button>();
+                if (button == null)
+                {
+                    continue;
+                }
+                MenuEntry entry = entries[i];
+                bool enabled = !entry.Placeholder
+                    && (entry.EnabledWhen == null || entry.EnabledWhen());
+                button.interactable = enabled;
+
+                TextMeshProUGUI label = row.GetComponentInChildren<TextMeshProUGUI>();
+                if (label != null)
+                {
+                    label.color = enabled ? TextPrimary : TextMuted;
+                    bool on = entry.CheckedWhen != null && entry.CheckedWhen();
+                    label.text = on ? "✓ " + entry.Label : entry.Label;
+                }
+            }
+        }
+
+        private System.Collections.Generic.List<MenuEntry> FileMenuEntries()
+        {
+            System.Func<bool> edit = delegate { return IsEditMode; };
+            return new System.Collections.Generic.List<MenuEntry>
+            {
+                new MenuEntry { Label = "打开", Shortcut = "Ctrl+O", EnabledWhen = edit,
+                    Action = delegate { MenuOpenLevel(); } },
+                new MenuEntry { Label = "撤销", Shortcut = "Ctrl+Z", SeparatorBefore = true,
+                    EnabledWhen = edit, Action = delegate { MenuUndo(); } },
+                new MenuEntry { Label = "重做", Shortcut = "Ctrl+Y", EnabledWhen = edit,
+                    Action = delegate { MenuRedo(); } },
+                new MenuEntry { Label = "保存", Shortcut = "Ctrl+S", SeparatorBefore = true,
+                    EnabledWhen = edit, Action = delegate { MenuSaveLevel(); } },
+                new MenuEntry { Label = "另存为", Shortcut = "Ctrl+Shift+S", EnabledWhen = edit,
+                    Action = delegate { MenuSaveLevelAs(); } },
+            };
+        }
+
+        private System.Collections.Generic.List<MenuEntry> ProjectMenuEntries()
+        {
+            System.Func<bool> edit = delegate { return IsEditMode; };
+            return new System.Collections.Generic.List<MenuEntry>
+            {
+                new MenuEntry { Label = "重置时间轴排版", EnabledWhen = edit,
+                    Action = delegate { MenuResetTimelineLayout(); } },
+                new MenuEntry { Label = "保存工程", SeparatorBefore = true, EnabledWhen = edit,
+                    Action = delegate { MenuSaveProject(); } },
+                new MenuEntry { Label = "另存工程（开发中）", Placeholder = true },
+            };
+        }
+
+        private System.Collections.Generic.List<MenuEntry> PreferenceMenuEntries()
+        {
+            return new System.Collections.Generic.List<MenuEntry>
+            {
+                new MenuEntry { Label = "（开发中）", Placeholder = true },
+            };
+        }
+
+        private System.Collections.Generic.List<MenuEntry> SettingsMenuEntries()
+        {
+            var list = new System.Collections.Generic.List<MenuEntry>
+            {
+                new MenuEntry { Label = "默认设置（开发中）", Placeholder = true },
+                new MenuEntry { Label = "开发者：探针总闸", SeparatorBefore = true,
+                    CheckedWhen = delegate { return SettingOn("VerboseDiagnostics"); },
+                    Action = delegate { ToggleSetting("VerboseDiagnostics"); } },
+                new MenuEntry { Label = "开发者：简化装饰物遮罩",
+                    CheckedWhen = delegate { return SettingOn("SimplifyDecorationMasks"); },
+                    Action = delegate { ToggleSetting("SimplifyDecorationMasks"); } },
+                new MenuEntry { Label = "清空媒体缓存", SeparatorBefore = true,
+                    Action = delegate { ClearMediaCacheEverywhere(); } },
+            };
+            return list;
+        }
+
+        private static bool SettingOn(string key)
+        {
+            Settings settings = Main.Settings;
+            if (settings == null)
+            {
+                return false;
+            }
+            switch (key)
+            {
+                case "VerboseDiagnostics": return settings.VerboseDiagnostics;
+                case "SimplifyDecorationMasks": return settings.SimplifyDecorationMasks;
+            }
+            return false;
+        }
+
+        private void ToggleSetting(string key)
+        {
+            Settings settings = Main.Settings;
+            if (settings == null)
+            {
+                return;
+            }
+            switch (key)
+            {
+                case "VerboseDiagnostics":
+                    settings.VerboseDiagnostics = !settings.VerboseDiagnostics;
+                    break;
+                case "SimplifyDecorationMasks":
+                    settings.SimplifyDecorationMasks = !settings.SimplifyDecorationMasks;
+                    break;
+            }
+            Main.SaveSettings();
+        }
+
         private void BuildHeader(RectTransform parent)
         {
-            Image header = CreateImage("Header", parent, 0f, 0f, DesignWidth, HeaderHeight, Header);
+            // 顶栏现在**只有 uGUI 这一份**（ImGui 那条带子已经删掉），
+            // 所以底色也必须自己铺：取和模块块同一档的 SurfaceTopBand，
+            // 否则只剩文字浮在游戏画面上。
+            Image header = CreateImage("Header", parent, 0f, 0f, DesignWidth, HeaderHeight,
+                UiTheme.Current.SurfaceTopBand);
             header.raycastTarget = true;
             headerRoot = header;
 
@@ -2097,30 +2376,21 @@ namespace ADOFAIEditorStudio
             versionButton.onClick.AddListener(delegate { ShowVersionWindow(); });
             CreateText("Subtitle", header.rectTransform, 390f + BrandMarkShift, 13f, 220f, 28f, "剪辑器工作台", 13f, TextMuted, TextAlignmentOptions.MidlineLeft, false);
 
-            // 实时状态读数。夹在副标题和快捷键提示之间，这样它有
-            // 喘息的空间、也不撞上任何一边，宽度也够
-            // longest adjustment line ("深度 +120" style plus a label).
-            // 状态读数的底衬。
+            // 状态读数**不在顶栏画了**。
             //
-            // 读数在顶栏中段、小字、又没有边界 —— 有东西临时报上来的时候
-            // 等于没显示（实测：Ctrl+S 存完根本没人看得见）。垫一块圆角
-            // 底衬，它才读得成"一块状态"，而不是一串飘在顶栏中间的字。
-            // 它按**文字实际宽度**贴合，见 RefreshStatusPill。
-            statusPill = CreateImage("StatusPill", header.rectTransform,
-                StatusLabelX - 10f, StatusPillY, 120f, StatusPillHeight, StatusPillFill);
-            statusPill.sprite = GetRoundedSprite(24, StatusPillRadius, false, 0f);
-            statusPill.type = Image.Type.Sliced;
-            statusPill.raycastTarget = false;
-            statusPill.gameObject.SetActive(false);
-
+            // ImGui 版早就把它挪进预览标题行（顶栏中段被「编辑/只读」占着，
+            // 长文本会被压掉半截），uGUI 这边由 `UiPreviewChrome` 显示同一份
+            // `StatusText`。这里只保留这颗文本当**数据源**，节点本身不显示 ——
+            // 留着会变成两份状态、位置还不对。
             statusLabel = CreateText(
                 "Status", header.rectTransform, StatusLabelX, 13f, 900f, 28f,
                 string.Empty, 13f, Accent, TextAlignmentOptions.MidlineLeft, false);
             statusLabel.color = Accent;
+            statusLabel.gameObject.SetActive(false);
 
-            // 提示改成"点悬浮球" —— 快捷键已经取消（见 `DrawFloatingBall`）。
+            // 提示改成"点左下角按钮" —— 快捷键已经取消（见 AesOpenButton）。
             CreateText("Shortcut", header.rectTransform, DesignWidth - 230f, 13f, 206f, 28f,
-                "悬浮球  打开工作台  ·  Esc  关闭",
+                "左下角按钮  打开工作台  ·  Esc  关闭",
                 13f, TextMuted, TextAlignmentOptions.MidlineRight, false);
 
             // 联机入口。放在状态读数和快捷键提示之间那段空档里——
@@ -2163,6 +2433,132 @@ namespace ADOFAIEditorStudio
             helpButton.transition = Selectable.Transition.None;
             helpLabel.fontSize = 26f;
             helpLabel.color = Color.white;
+
+            BuildModeSwitch(header.rectTransform);
+        }
+
+        /// <summary>
+        /// 顶栏正中的模式切换（编辑 / 只读）。
+        ///
+        /// 这一颗是 ImGui 顶栏里唯一一处「状态本身就是入口」的控件：
+        /// 文字写当前模式，点一下切另一档。迁移时照搬这个语义 ——
+        /// 编辑模式下底色换成强调色，扫一眼就知道现在能改。
+        /// </summary>
+        private void BuildModeSwitch(RectTransform parent)
+        {
+            // **贴住顶边、去掉顶边那条描边。**
+            // 于是它读起来是「从顶栏上沿垂下来的一枚梯形标签」，
+            // 而不是一颗浮在带子中间的按钮。
+            const float height = 40f;
+            const float width = 150f;
+            float x = (DesignWidth - width) * 0.5f;
+            float y = 0f;
+
+            // **倒梯形、纯黑填充、纯黑描边、没有别的颜色。**
+            //
+            // 形状用运行时生成的贴图（四边形 + 一圈描边）而不是矩形按钮：
+            // 用户明确要梯形，而 uGUI 的 Image 只能画矩形，除非自带网格。
+            // 一格 4 像素的贴图按原尺寸绘制，不会因为缩放糊掉。
+            RectTransform rect = CreateTopLeftRect("ModeSwitch", parent, x, y, width, height);
+            Image face = rect.gameObject.AddComponent<Image>();
+            // **只描边、不填充**：梯形内部透空，只有一圈纯黑描边。
+            face.sprite = GetTrapezoidSprite(
+                Mathf.RoundToInt(width), Mathf.RoundToInt(height), 11, 3,
+                Color.clear, Color.black);
+            face.type = Image.Type.Simple;
+            face.raycastTarget = true;
+            Button button = rect.gameObject.AddComponent<Button>();
+            button.targetGraphic = face;
+            button.transition = Selectable.Transition.None;
+            button.navigation = new Navigation { mode = Navigation.Mode.None };
+            button.onClick.AddListener(delegate { SetEditMode(!IsEditMode); });
+            modeSwitchButton = button;
+
+            TextMeshProUGUI label = CreateText("Label", rect, 0f, 0f, width, height,
+                "编辑模式", UiType.Body, TextPrimary, TextAlignmentOptions.Center, false);
+            modeSwitchLabel = label;
+            modeSwitchState = null;
+            RefreshModeSwitch();
+        }
+
+        /// <summary>倒梯形贴图（填充 + 一圈描边），按参数缓存，只生成一次。</summary>
+        private static readonly System.Collections.Generic.Dictionary<string, Sprite> trapezoidSprites
+            = new System.Collections.Generic.Dictionary<string, Sprite>();
+
+        private static Sprite GetTrapezoidSprite(int width, int height, int slant,
+            int thickness, Color fill, Color border)
+        {
+            string key = width + "x" + height + "/" + slant + "/" + thickness
+                + "/" + fill + "/" + border;
+            Sprite cached;
+            if (trapezoidSprites.TryGetValue(key, out cached) && cached != null)
+            {
+                return cached;
+            }
+
+            Texture2D texture = new Texture2D(width, height, TextureFormat.RGBA32, false);
+            texture.filterMode = FilterMode.Point;
+            Color32 clear = new Color32(0, 0, 0, 0);
+            Color32 fillColor = fill;
+            Color32 borderColor = border;
+            Color32[] pixels = new Color32[width * height];
+
+            for (int py = 0; py < height; py++)
+            {
+                // py 从下往上：底边窄、顶边宽（倒梯形）。
+                float t = height <= 1 ? 0f : py / (float)(height - 1);
+                float inset = slant * (1f - t);
+                int left = Mathf.RoundToInt(inset);
+                int right = width - 1 - Mathf.RoundToInt(inset);
+                for (int px = 0; px < width; px++)
+                {
+                    bool inside = px >= left && px <= right;
+                    if (!inside)
+                    {
+                        pixels[py * width + px] = clear;
+                        continue;
+                    }
+                    // 描边按 thickness 向内长，外侧不额外偏移 ——
+                    // 这样「梯形外边到顶栏边缘的留白」与描边粗细一致。
+                    // **顶边不画**：这条边贴着顶栏上沿，画出来就是一条
+                    // 横穿画面的黑线。只留左、右、下三条。
+                    bool onEdge = py < thickness
+                        || (px - left) < thickness || (right - px) < thickness;
+                    pixels[py * width + px] = onEdge ? borderColor : fillColor;
+                }
+            }
+
+            texture.SetPixels32(pixels);
+            texture.Apply(false, false);
+            Sprite sprite = Sprite.Create(texture,
+                new Rect(0f, 0f, width, height), new Vector2(0.5f, 0.5f), 100f);
+            trapezoidSprites[key] = sprite;
+            return sprite;
+        }
+
+        private UiPreviewChrome.Parts previewChrome;
+
+        private Button modeSwitchButton;
+        private TextMeshProUGUI modeSwitchLabel;
+        private string modeSwitchState;
+
+        /// <summary>模式按钮的显示：文字写「当前模式」，编辑态用强调色底。</summary>
+        private void RefreshModeSwitch()
+        {
+            if (modeSwitchButton == null || modeSwitchLabel == null)
+            {
+                return;
+            }
+            bool edit = IsEditMode;
+            string state = edit ? "编辑模式" : "只读模式";
+            if (state == modeSwitchState)
+            {
+                return;
+            }
+            modeSwitchState = state;
+            modeSwitchLabel.text = state;
+            // **编辑模式也不给黑字。** 只读态用灰字区分，编辑态用白字。
+            modeSwitchLabel.color = edit ? TextPrimary : TextMuted;
         }
 
         // 顶栏品牌标记的度量。金线 + 缝隙，然后才是标题。
@@ -2281,26 +2677,10 @@ namespace ADOFAIEditorStudio
 
             loadingScreen = screenRoot.gameObject.AddComponent<Multiplayer.MultiplayerLoadingScreen>();
             loadingScreen.Initialize(screenRoot, uiFont, GetRoundedSprite(24, CornerLarge, false, 0f));
-            // 遮罩一露头就把工作台那层 ImGui 压下去，收起来再抬回来。
-            // 挂回调而不是每帧轮询 `IsShowing`：轮询会晚一帧，那一帧工作台
-            // 会从黑屏后面漏出来。
-            loadingScreen.VisibilityChanged = SetImGuiSuppressedForLoading;
+            // 加载页自己站在 32767 这一档（见上面那段分层说明），压层那套
+            // 是给已经删掉的 ImGui 画布用的，现在不需要了。
         }
 
-        /// <summary>
-        /// 加载页显隐时压 / 抬工作台那层 ImGui。参数就是「加载页现在显示着没有」。
-        ///
-        /// 桥还没建出来（工作台一次都没开过）时是空操作 —— 那种情况下本来也没有
-        /// 工作台需要遮。
-        /// </summary>
-        private void SetImGuiSuppressedForLoading(bool suppressed)
-        {
-            EditorImGuiBridge bridge = EditorImGuiBridge.Instance;
-            if (bridge != null)
-            {
-                bridge.SetOverlaySuppressedForLoading(suppressed);
-            }
-        }
 
         /// <summary>
         /// 加入房间期间的加载遮罩。会话层只描述状态，显示由这里做。
@@ -2396,9 +2776,12 @@ namespace ADOFAIEditorStudio
             "",
             "<b>新增</b>",
             "<b>· 打开落格</b>：打开工作台时，播放头直接落到原生编辑器当前选中的那一格。",
-            "<b>· 定位</b>：打开后点轨道，画面在 1 秒内加速走过去（标题行「定位」按钮，Ctrl+J）。",
-            "<b>· 自动翻页</b>：播放或拖播放头时视图跟着翻页（标题行「翻页」按钮，Ctrl+K）；",
-            "   关掉就完全不自动滚，横向滚动完全归你。",
+            "<b>· 点轨道跟随</b>（标题行准星按钮，Ctrl+J）：打开后在预览里点轨道，画面 1 秒内加速走过去；"
+                + "关着就只改选中、不动画面。",
+            "<b>· 点事件跟随</b>（标题行「指针指块」那颗）：打开后在时间轴上点事件块，画面 1 秒内加速走过去。"
+                + "和上面那颗是两件事：一个管轨道、一个管事件块，手感一致。",
+            "<b>· 定位到播放头</b>：把时间轴横向滚到播放头位置（标题行那颗按钮，Ctrl+K）。",
+            "   自动翻页已取消 —— 视图不再跟着播放头跑，横向滚动完全归你。",
             "",
             "<b>修好的</b>",
             "<b>· 行星相对装饰物</b>：relativeTo 红 / 蓝 / 绿球的装饰物在工作台里塌到世界原点，已修正。",
@@ -2415,7 +2798,7 @@ namespace ADOFAIEditorStudio
             "<b>· 加载遮罩</b>：遮罩期间按空格会在黑屏底下播歌，已修正。",
             "<b>· 镜头偏移</b>：relativeTo: Player + position: [null,null] 的运镜没有归零，已修正。",
             "<b>· 镜厅段</b>：相机甩远的那一段出现重影 / 抽搐 / 黑闪 / 节奏不均，已修正。",
-            "<b>· 功能快捷键</b>：定位和自动翻页的快捷键在工作台里失效，已改为 Ctrl+J / Ctrl+K。",
+            "<b>· 功能快捷键</b>：点轨道跟随 / 定位到播放头，工作台里改用 Ctrl+J / Ctrl+K。",
             "<b>· 自动翻页开关</b>：关不掉、以及开着时抢手动横向滚动，已修正。",
         });
 
@@ -2561,6 +2944,254 @@ namespace ADOFAIEditorStudio
             versionWindow = BuildTextWindow(parent, "VersionNotes",
                 "v" + ModVersion + " 更新内容", VersionNotes, null,
                 "点这里进 Q 群交流：" + QqGroupNumber, OpenQqGroup);
+        }
+
+        // ---------------------------------------------------------- 两个要答复的弹窗
+
+        /// <summary>
+        /// 遮罩 + 居中卡片的外壳。两个弹窗共用 —— 它们的差别只有正文和按钮，
+        /// 而遮罩必须吃点击（否则点下去会穿到后面的工作台上偷偷改东西）。
+        /// </summary>
+        private RectTransform BuildDialogShell(string name, RectTransform parent,
+            float cardWidth, float cardHeight, out RectTransform card)
+        {
+            RectTransform layer = CreateTopLeftRect(name + "Layer", parent,
+                0f, 0f, DesignWidth, DesignHeight);
+            layer.gameObject.SetActive(false);
+
+            Image shade = CreateTopLeftRect(name + "Shade", layer,
+                0f, 0f, DesignWidth, DesignHeight).gameObject.AddComponent<Image>();
+            shade.color = new Color(0f, 0f, 0f, 0.55f);
+            shade.raycastTarget = true;
+
+            card = CreateRoundedPanel(name + "Card", layer,
+                (DesignWidth - cardWidth) * 0.5f, (DesignHeight - cardHeight) * 0.5f,
+                cardWidth, cardHeight, Panel, CornerLarge).rectTransform;
+            Image cardImage = card.GetComponent<Image>();
+            AddPanelBorder(cardImage, CornerLarge);
+            cardImage.raycastTarget = true;
+            return layer;
+        }
+
+        /// <summary>
+        /// 「创建工程」：切到编辑模式但这张谱还没有工程时推开。
+        ///
+        /// 名字给一个默认值（谱面文件名），用户可以改；路径只读展示，
+        /// 让人知道东西会落在哪。**Esc / × 都算「不建」**。
+        /// </summary>
+        private void BuildProjectCreateWindow(RectTransform parent)
+        {
+            const float cardWidth = 620f;
+            const float cardHeight = 300f;
+            RectTransform card;
+            projectCreateWindow = new ProjectCreateWindow();
+            projectCreateWindow.Layer = BuildDialogShell("ProjectCreate", parent,
+                cardWidth, cardHeight, out card);
+
+            CreateText("Title", card, 28f, 18f, cardWidth - 90f, 30f, "创建工程",
+                UiType.Title, AccentSecondary, TextAlignmentOptions.MidlineLeft, true);
+            CreateHeadingRule("Rule", card, PanelHeadingRule);
+
+            CreateButton("Close", card, cardWidth - 52f, 18f, 30f, 30f, "×", false,
+                delegate { CancelProjectCreate(); }, out TextMeshProUGUI closeLabel);
+            closeLabel.fontSize = UiType.Body;
+
+            CreateText("Intro", card, 28f, 66f, cardWidth - 56f, 44f,
+                "这张谱还没有工作台工程。起个名字就行 —— 布局、时间轴摆放都会存在工程目录里。",
+                14f, TextSecondary, TextAlignmentOptions.TopLeft, false);
+
+            // 输入框：和媒体搜索框同一套搭法（对象先关掉再接 TMP_InputField，
+            // 否则光标建不出来）。
+            RectTransform fieldRect = CreateTopLeftRect("NameField", card, 28f, 118f,
+                cardWidth - 56f, 44f);
+            fieldRect.gameObject.SetActive(false);
+            Image fieldBackground = fieldRect.gameObject.AddComponent<Image>();
+            fieldBackground.color = FieldWell;
+            fieldBackground.raycastTarget = true;
+            CreateImage("FieldRule", fieldRect, 0f, 43f, cardWidth - 56f, 1f, PanelRule)
+                .raycastTarget = false;
+
+            TMP_InputField field = fieldRect.gameObject.AddComponent<TMP_InputField>();
+            field.targetGraphic = fieldBackground;
+            field.lineType = TMP_InputField.LineType.SingleLine;
+            field.navigation = new Navigation { mode = Navigation.Mode.None };
+            field.customCaretColor = true;
+            field.caretColor = new Color(0.96f, 0.96f, 0.96f, 1f);
+            field.caretWidth = 2;
+            field.caretBlinkRate = 0.85f;
+            field.textViewport = fieldRect;
+            field.textComponent = CreateStretchedFieldText("Text", fieldRect, 10f,
+                string.Empty, 16f, TextPrimary, uiFont);
+            field.placeholder = CreateStretchedFieldText("Placeholder", fieldRect, 10f,
+                "工程名", 16f, TextSecondary, uiFont);
+            field.characterLimit = 60;
+            fieldRect.gameObject.SetActive(true);
+            projectCreateWindow.NameField = field;
+
+            TextMeshProUGUI pathLabel = CreateText("PathLabel", card, 28f, 168f,
+                cardWidth - 56f, 40f, string.Empty, 12.5f, TextMuted,
+                TextAlignmentOptions.TopLeft, false);
+            pathLabel.overflowMode = TextOverflowModes.Ellipsis;
+            projectCreateWindow.PathLabel = pathLabel;
+
+            CreateButton("Create", card, cardWidth - 28f - 100f - 12f - 100f, cardHeight - 68f,
+                100f, 40f, "创建", true, ConfirmProjectCreate, out _);
+            CreateButton("Cancel", card, cardWidth - 28f - 100f, cardHeight - 68f,
+                100f, 40f, "取消", false, CancelProjectCreate, out _);
+        }
+
+        /// <summary>
+        /// 「布局还没存」：关工作台 / 切只读之前拦一下。
+        ///
+        /// 三个回答：保存（存完继续那个动作）、不保存（直接继续）、取消（什么都不做）。
+        /// </summary>
+        private void BuildConfirmSaveWindow(RectTransform parent)
+        {
+            const float cardWidth = 640f;
+            const float cardHeight = 260f;
+            RectTransform card;
+            confirmSaveWindow = new ConfirmSaveWindow();
+            confirmSaveWindow.Layer = BuildDialogShell("ConfirmSave", parent,
+                cardWidth, cardHeight, out card);
+
+            CreateText("Title", card, 28f, 18f, cardWidth - 90f, 30f,
+                "布局还没保存", UiType.Title, AccentSecondary,
+                TextAlignmentOptions.MidlineLeft, true);
+            CreateHeadingRule("Rule", card, PanelHeadingRule);
+
+            CreateText("Body", card, 28f, 68f, cardWidth - 56f, 60f,
+                "时间轴的摆放改过、还没存进工程。现在离开，这次的调整会丢。",
+                15f, TextSecondary, TextAlignmentOptions.TopLeft, false);
+
+            float y = cardHeight - 68f;
+            CreateButton("Cancel", card, cardWidth - 28f - 96f, y, 96f, 40f, "取消", false,
+                delegate { AnswerConfirmSave(3); }, out _);
+            CreateButton("Discard", card, cardWidth - 28f - 96f - 12f - 96f, y, 96f, 40f,
+                "不保存", false, delegate { AnswerConfirmSave(2); }, out _);
+            CreateButton("Save", card, cardWidth - 28f - 96f - 12f - 96f - 12f - 96f, y,
+                96f, 40f, "保存", true, delegate { AnswerConfirmSave(1); }, out _);
+        }
+
+        /// <summary>
+        /// 推开「创建工程」。默认名和路径由工作台算好传进来 ——
+        /// 只有它知道谱面在哪、目录按哪套约定拼。
+        /// </summary>
+        private void OpenProjectCreate(string defaultName, string path)
+        {
+            if (projectCreateWindow == null || projectCreateWindow.Layer == null)
+            {
+                return;
+            }
+            projectCreateWindow.Confirmed = false;
+            projectCreateWindow.Cancelled = false;
+            string name = string.IsNullOrEmpty(defaultName) ? "新建工程" : defaultName;
+            if (projectCreateWindow.NameField != null)
+            {
+                projectCreateWindow.NameField.SetTextWithoutNotify(name);
+            }
+            if (projectCreateWindow.PathLabel != null)
+            {
+                projectCreateWindow.PathLabel.text = "会建到：" + (path ?? string.Empty);
+            }
+            projectCreateWindow.Layer.SetAsLastSibling();
+            projectCreateWindow.Layer.gameObject.SetActive(true);
+            if (EventSystem.current != null)
+            {
+                EventSystem.current.SetSelectedGameObject(null);
+                if (projectCreateWindow.NameField != null)
+                {
+                    projectCreateWindow.NameField.ActivateInputField();
+                }
+            }
+        }
+
+        /// <summary>把这一屏当「取消」关掉 —— Esc、×、取消按钮都走这里。</summary>
+        private void CancelProjectCreate()
+        {
+            if (projectCreateWindow == null || !projectCreateWindow.IsOpen)
+            {
+                return;
+            }
+            projectCreateWindow.Cancelled = true;
+            projectCreateWindow.Layer.gameObject.SetActive(false);
+        }
+
+        private void ConfirmProjectCreate()
+        {
+            if (projectCreateWindow == null || !projectCreateWindow.IsOpen)
+            {
+                return;
+            }
+            projectCreateWindow.Confirmed = true;
+            projectCreateWindow.Layer.gameObject.SetActive(false);
+        }
+
+        private bool ProjectCreateVisible
+        {
+            get { return projectCreateWindow != null && projectCreateWindow.IsOpen; }
+        }
+
+        /// <summary>
+        /// 取一次用户在「创建工程」上的答复（取完就清）。返回 true 表示确实有答复：
+        /// `confirmed` 为真 = 建（`name` 是他填的名字），为假 = 取消。
+        /// </summary>
+        private bool TakeProjectCreateResult(out string name, out bool confirmed)
+        {
+            name = projectCreateWindow != null && projectCreateWindow.NameField != null
+                ? projectCreateWindow.NameField.text
+                : string.Empty;
+            confirmed = projectCreateWindow != null && projectCreateWindow.Confirmed;
+            if (projectCreateWindow == null
+                || (!projectCreateWindow.Confirmed && !projectCreateWindow.Cancelled))
+            {
+                return false;
+            }
+            projectCreateWindow.Confirmed = false;
+            projectCreateWindow.Cancelled = false;
+            return true;
+        }
+
+        /// <summary>推开「布局还没存」。</summary>
+        private void OpenConfirmSave()
+        {
+            if (confirmSaveWindow == null || confirmSaveWindow.Layer == null)
+            {
+                return;
+            }
+            confirmSaveWindow.Answer = 0;
+            confirmSaveWindow.Layer.SetAsLastSibling();
+            confirmSaveWindow.Layer.gameObject.SetActive(true);
+            if (EventSystem.current != null)
+            {
+                EventSystem.current.SetSelectedGameObject(null);
+            }
+        }
+
+        private bool ConfirmSaveVisible
+        {
+            get { return confirmSaveWindow != null && confirmSaveWindow.IsOpen; }
+        }
+
+        private void AnswerConfirmSave(int answer)
+        {
+            if (confirmSaveWindow == null || !confirmSaveWindow.IsOpen)
+            {
+                return;
+            }
+            confirmSaveWindow.Answer = answer;
+            confirmSaveWindow.Layer.gameObject.SetActive(false);
+        }
+
+        /// <summary>取一次那扇窗的答复（取完就清）。返回 true 表示确实答了。</summary>
+        private bool TakeConfirmSaveAnswer(out int answer)
+        {
+            answer = confirmSaveWindow != null ? confirmSaveWindow.Answer : 0;
+            if (confirmSaveWindow == null || confirmSaveWindow.Answer == 0)
+            {
+                return false;
+            }
+            confirmSaveWindow.Answer = 0;
+            return true;
         }
 
         /// <summary>
@@ -2731,21 +3362,9 @@ namespace ADOFAIEditorStudio
             return window;
         }
 
-        /// <summary>
-        /// 「?」那颗按钮：开 / 关说明窗口。
-        ///
-        /// **说明窗口是第一个搬到 ImGui 的面板。** 桥接起来了就走它；
-        /// 桥接没起来（cimgui 加载失败之类）时退回 uGUI 那扇 —— 老的留着
-        /// 就是为了这条路断了也有得用，正常不会再走到。
-        /// </summary>
+        /// <summary>「?」那颗按钮：开 / 关说明窗口。</summary>
         private void ToggleHelpPanel()
         {
-            EditorImGuiBridge bridge = EditorImGuiBridge.Instance;
-            if (bridge != null && bridge.IsReady)
-            {
-                bridge.ToggleHelp();
-                return;
-            }
             if (helpWindow != null)
             {
                 ToggleWindow(helpWindow);
@@ -2755,17 +3374,10 @@ namespace ADOFAIEditorStudio
         /// <summary>
         /// 打开版本说明窗口。两个入口：左上角那串版本号，以及换了版本后第一次开工作台。
         ///
-        /// 它也已经搬到 ImGui（和说明窗口共用同一套文本窗口）。桥接起不来时
-        /// 退回 uGUI 那扇，理由同 <see cref="ToggleHelpPanel"/>。
+        /// 关掉时由 <see cref="ShowWindow"/> 记「这个版本看过了」。
         /// </summary>
         private void ShowVersionWindow()
         {
-            EditorImGuiBridge bridge = EditorImGuiBridge.Instance;
-            if (bridge != null && bridge.IsReady)
-            {
-                bridge.SetVersionVisible(true);
-                return;
-            }
             if (versionWindow != null && !versionWindow.Layer.gameObject.activeSelf)
             {
                 ShowWindow(versionWindow, true);
@@ -2861,71 +3473,58 @@ namespace ADOFAIEditorStudio
 
         private void BuildBrowser(RectTransform parent)
         {
-            float height = PreviewPanelHeight;
-            Image panel = CreateRoundedPanel("ProjectWorkspace", parent, OuterMargin, PreviewPanelY, previewLayout.LeftPanelWidth, height, Panel, CornerLarge);
+            float height = BlockRowBottom - BlockRowTop;
+
+            // **左栏这块模块底色自己铺。**
+            //
+            // 交给 uGUI 之后 `DrawModuleBlocks` 就不再给浏览器块垫底（见那边对
+            // UguiBrowser 的判断），不铺的话整块面板是透明的 —— 表现就是
+            // 「文字浮在游戏画面上」。
+            float blockX, blockY, blockWidth, blockHeight;
+            GetBrowserBlockRect(out blockX, out blockY, out blockWidth, out blockHeight);
+            Image blockFill = CreateImage("BrowserBlockFill", parent,
+                blockX, blockY, blockWidth, blockHeight, UiTheme.Current.SurfaceTopBand);
+            blockFill.raycastTarget = false;
+            browserBlockFill = blockFill.rectTransform;
+
+            // **顶底与预览块对齐**（用户要求：以预览窗口到顶栏的间距为准）。
+            // 原来这里用 PreviewPanelY（LayoutTop + 12），比块行低 8px，
+            // 于是左栏看着比预览"更贴顶"，三块的上沿不在一条线上。
+            Image panel = CreateRoundedPanel("ProjectWorkspace", parent, OuterMargin,
+                BlockRowTop, previewLayout.LeftPanelWidth, BlockRowBottom - BlockRowTop,
+                ModuleFill, CornerLarge);
             panel.raycastTarget = true;
             AddPanelBorder(panel, CornerLarge);
             RectTransform root = panel.rectTransform;
             browserPanel = root;
+
             float innerWidth = previewLayout.LeftPanelWidth - BrowserContentX - PanelHeadingInset;
-            float viewHeight = height - BrowserViewY - PanelInnerInset;
+            float viewHeight = Mathf.Max(64f, height - BrowserViewY - PanelInnerInset);
 
-            // 左栏只留一列，顶部两个标签在「装饰物」和「媒体」之间切换。
-            //
-            // 原来是并排两列：装饰物占四成，媒体占剩下的。左栏本来就只有三百来
-            // 像素，劈成两半之后两边都太窄——装饰物一行塞不下名字加三个按钮，
-            // 媒体格只看得见两小格。而这两样东西不会同时用：要么在摆装饰物，
-            // 要么在挑图。让它们轮流占满整宽，比同时挤着强。
-            BuildBrowserTabs(root);
+            // 数据层：装饰物列表只保留数据与副作用入口，UI 全部由新的左栏画
+            // （见 UiBrowserPane）。**不要再调 Initialize**，那会把旧骨架建出来。
+            RectTransform modelHost = CreateTopLeftRect("DecorationModel", root,
+                BrowserContentX, BrowserViewY, innerWidth, viewHeight);
+            decoList = modelHost.gameObject.AddComponent<EditorDecorationList>();
+            decoList.InitializeModel();
 
-            // 媒体页
-            Image mediaImage = CreateImage("MediaView", root, BrowserContentX, BrowserViewY, innerWidth, viewHeight, Color.clear);
-            mediaImage.raycastTarget = true;
-            mediaPanel = mediaImage.rectTransform;
-            CreateMediaSearchControls(mediaPanel, innerWidth, BrowserSearchY);
+            // 新左栏：标签条 + 装饰物页 + 媒体页，三件都在 UiBrowserPane 里。
+            browserPaneView = UiBrowserPane.Build(root, this, decoList, uiFont,
+                BrowserContentX, BrowserViewY, innerWidth, viewHeight);
 
-            float mediaListY = BrowserListY;
-            float mediaListHeight = Mathf.Max(32f, viewHeight - mediaListY - 8f);
-            mediaScroll = CreateProjectScroll("MediaScroll", mediaPanel, 8f, mediaListY, innerWidth - 16f, mediaListHeight, out mediaViewport, out mediaContent);
-            mediaScroll.onValueChanged.AddListener(OnMediaScrollChanged);
-            // 张数不再占一整行标题——标签已经写明这里是媒体，标题只剩一个计数，
-            // 放在搜索行右端就够，还省下一行高度给网格。
-            mediaTitle = CreateText("MediaCount", mediaPanel, 0f, BrowserSearchY + 2f, MediaCountWidth, 20f,
-                string.Empty, UiType.Caption, AccentSecondary, TextAlignmentOptions.MidlineRight, false);
-
-            EnsureMediaCards(24);
             RefreshProjectWorkspace(true);
-
-            // 装饰物页 —— 和媒体页同一块位置、同一个尺寸，同一时刻只显示一个。
-            // 依然只是一块透明可点击区域，不是「面板里的面板」：层次靠标签和
-            // 那条页眉线给出，不靠再套一层背景和边框。
-            Image decoImage = CreateImage("DecorationView", root, BrowserContentX, BrowserViewY, innerWidth, viewHeight, Color.clear);
-            decoImage.raycastTarget = true;
-            decoView = decoImage.rectTransform;
-            decoList = decoImage.gameObject.AddComponent<EditorDecorationList>();
-            decoList.Initialize(decoImage.rectTransform, uiFont, GetRoundedSprite(24, CornerSmall, false, 0f), innerWidth);
-            // 这里必须传**它相对面板的绝对坐标**，不能传 (0,0)：SetPaneRect 会把
-            // 面板直接摆到给定位，传 (0,0) 等于把装饰物页顶到面板左上角，
-            // 正好压在标签行上。坐标只在这里给一次，CreateImage 那个位置随即被覆盖。
-            decoList.SetPaneRect(BrowserContentX, BrowserViewY, innerWidth, viewHeight);
-
             SetBrowserTab(BrowserPane.Decorations, LevelEventType.None);
         }
 
-        private const float BrowserTabWidth = 80f;
-        /// <summary>
-        /// 右缘那条「还有东西」的提示留多宽。
-        ///
-        /// 要**细**：留着是为了让人看出这条能横滚，宽了就变成一大块半拉按钮，
-        /// 比不留还难看。见 LayoutBrowserTabs 的排法。
-        /// </summary>
-        private const float TabSliverWidth = 12f;
-        private const float BrowserTabGap = 4f;
         /// <summary>
         /// 左栏内容的左缘。和别的面板同一条规矩：竖条之后才是内容，
         /// 所以标签和下面两页都从这个 x 起，而不是面板内边距那个 x。
         /// </summary>
-        private const float BrowserContentX = HeadingTextInset;
+        // **左栏内容左移贴边。** 原来等于 HeadingTextInset（四十来像素），
+        // 于是装饰物行、标签、搜索框都从面板内侧很远的地方开始，
+        // 左边空出一条看着很别扭。统一改成一个内缩 12px，和面板自身的
+        // 内边距一致。
+        private const float BrowserContentX = PanelInnerInset;
         /// <summary>
         /// 标签行之下、内容起点的纵坐标。
         ///
@@ -2939,172 +3538,6 @@ namespace ADOFAIEditorStudio
         private const float MediaSearchInset = 12f;
         private const float MediaRefreshWidth = 30f;
         private const float MediaCountWidth = 48f;
-
-        private void BuildBrowserTabs(RectTransform root)
-        {
-            CreateHeadingBand("HeadingBand", root, PanelHeadingHeight);
-            CreateHeadingBar("HeadingBar", root, PanelHeadingInset);
-
-            // 这排标签是一条**可横滚的带子**：装饰物 / 媒体 / 原生那七个设置页，
-            // 一共九项，横着排不下这 357px 的栏宽。
-            //
-            // 裁剪靠宿主上的 RectMask2D —— 没有它就不叫"滚"，内容会直接
-            // 画到面板外面去。
-            browserTabStripHost = CreateTopLeftRect("BrowserTabStrip", root,
-                BrowserContentX, 0f, BrowserTabWidth, PanelHeadingHeight);
-            browserTabStripHost.gameObject.AddComponent<RectMask2D>();
-
-            browserTabStripContent = CreateTopLeftRect("Content", browserTabStripHost,
-                0f, 0f, BrowserTabWidth, PanelHeadingHeight);
-
-            browserTabStrip = browserTabStripHost.gameObject.AddComponent<HorizontalButtonStrip>();
-            browserTabStrip.Configure(browserTabStripContent);
-
-            CreateHeadingRule("BrowserRule", root, PanelHeadingRule);
-            LayoutBrowserTabs();
-        }
-
-        /// <summary>
-        /// 重建那排标签按钮：装饰物 / 媒体 / <see cref="SettingsPages"/> 那七页。
-        ///
-        /// 名字是**写死的中文常量**，不去原生那排页签上抠 —— 抠过，抠出来
-        /// 全是「1」：那排页签里的第一个文本子物体是**计数徽标**（这类事件有几个），
-        /// 不是标题。
-        /// </summary>
-        private void RebuildBrowserTabs()
-        {
-            if (browserTabButtons.Count == 2 + SettingsPages.Length)
-            {
-                return;
-            }
-
-            for (int i = 0; i < browserTabButtons.Count; i++)
-            {
-                if (browserTabButtons[i] != null)
-                {
-                    Destroy(browserTabButtons[i].gameObject);
-                }
-            }
-            browserTabButtons.Clear();
-            browserTabLabels.Clear();
-            browserTabPages.Clear();
-
-            AddBrowserTab("装饰物", BrowserPane.Decorations, LevelEventType.None);
-            AddBrowserTab("媒体", BrowserPane.Media, LevelEventType.None);
-            for (int i = 0; i < SettingsPages.Length; i++)
-            {
-                AddBrowserTab(SettingsPageNames[i], BrowserPane.Settings, SettingsPages[i]);
-            }
-        }
-
-        private void AddBrowserTab(string title, BrowserPane pane, LevelEventType page)
-        {
-            BrowserPane capturedPane = pane;
-            LevelEventType capturedPage = page;
-
-            TextMeshProUGUI label;
-            Button button = CreateButton("BrowserTab" + browserTabButtons.Count, browserTabStripContent,
-                0f, 0f, BrowserTabWidth, PanelHeadingHeight, title, false,
-                delegate { SetBrowserTab(capturedPane, capturedPage); }, out label);
-            label.fontSize = UiType.Body;
-            // 和别的面板标题一样上提：中文标题在拉丁度量的字体里会往下坐，
-            // 不提的话它和左边那条竖条的几何中心差一两个像素。
-            SetTopLeftRect(label.rectTransform, 0f, -HeadingTextLift, BrowserTabWidth, PanelHeadingHeight);
-
-            // **圆角矩形。** `CreateButton` 默认给的是方角贴图，而工作台里
-            // 别的控件（输入框、开关、面板）全是圆角 —— 这排方角是唯一一处，
-            // 看着像没画完。九宫格切好的贴图，圆角半径不会跟着按钮一起拉伸。
-            Image face = button.targetGraphic as Image;
-            if (face != null)
-            {
-                face.sprite = GetRoundedSprite(24, CornerSmall, false, 0f);
-                face.type = Image.Type.Sliced;
-            }
-
-            browserTabButtons.Add(button);
-            browserTabLabels.Add(label);
-            browserTabPages.Add(page);
-        }
-
-        private void LayoutBrowserTabs()
-        {
-            if (browserTabStripHost == null || browserTabStripContent == null)
-            {
-                return;
-            }
-
-            // 按钮按原生那几页现建。放在这里而不是只在构建时建一次：工作台是
-            // F8 时建的，那一刻原生设置面板未必已经 Init 完 —— 只在构建时建的话
-            // 会把"只有装饰物、媒体两个按钮"这个状态定死，之后再也补不上。
-            // 数量没变时这一步只做一次比较。
-            RebuildBrowserTabs();
-
-            // 构建那一刻 browserPanel 还是零尺寸，量不到宽度。这时现算一次 ——
-            // CalculatePreviewLayout 是纯函数，只依赖屏幕尺寸和那几个常量，
-            // 任何时候调都安全。不这么兜的话，首次进来这条带子会停在
-            // 一个 40px 宽的壳里，要等用户拖一次时间轴高度才恢复。
-            float panelWidth = browserPanel != null && browserPanel.rect.width > 1f
-                ? browserPanel.rect.width
-                : CalculatePreviewLayout().LeftPanelWidth;
-            if (panelWidth < 1f)
-            {
-                return;
-            }
-
-            // **让「N 颗完整的 + 一条很细的」正好铺满可用宽度。**
-            //
-            // 两个要求合起来只能这么做：
-            //   · 右边要留一条**细边**，用户才知道这条能横着滚 —— 整好排满
-            //     就是"排到头了"，看不出来还有东西。
-            //   · 而那条边**不能宽**：切半颗会留下一大块半拉按钮，比不留还难看。
-            //
-            // 所以不是把按钮钉死在 80，而是**反过来解按钮宽度**：先按当前宽度
-            // 定下能有几颗完整的，再把宽度摊平到正好铺满，只留一条
-            // TabSliverWidth 的缝给下一颗。
-            //
-            // 内容是左对齐的，所以停在最左时第一颗永远完整，切开的那颗只出现在右边。
-            float available = Mathf.Max(48f + BrowserTabGap,
-                panelWidth - BrowserContentX - PanelHeadingInset);
-
-            // **数「放得下几颗」用的是常量 80，不是上一次算出来的宽度。**
-            //
-            // 原来拿 `browserTabWidth` 当步长，而它又是从这里反解出来的 ——
-            // 成了个反馈环，存在好几个稳定不动点。其中一个是"只放得下一颗"：
-            // 一旦落进去，宽度变成 (可用宽-12)/1-6，而那个宽度又正好只容得下
-            // 一颗，于是自己把自己锁死在那儿（表现就是第一颗按钮长得离谱）。
-            // 步长取常量之后没有反馈，也就没有第二个不动点。
-            const float nominalStep = BrowserTabWidth + BrowserTabGap;
-            int wholeButtons = Mathf.Max(1,
-                Mathf.FloorToInt((available - TabSliverWidth + BrowserTabGap) / nominalStep));
-            browserTabWidth = Mathf.Max(48f,
-                (available - TabSliverWidth) / wholeButtons - BrowserTabGap);
-
-            SetTopLeftRect(browserTabStripHost, BrowserContentX, 0f, available, PanelHeadingHeight);
-
-            float x = 0f;
-            for (int i = 0; i < browserTabButtons.Count; i++)
-            {
-                if (browserTabButtons[i] != null)
-                {
-                    SetTopLeftRect(browserTabButtons[i].GetComponent<RectTransform>(),
-                        x, 0f, browserTabWidth, PanelHeadingHeight);
-                    if (i < browserTabLabels.Count && browserTabLabels[i] != null)
-                    {
-                        // 标签宽度要跟着按钮一起变，不然文字会在窄按钮里被挤掉。
-                        SetTopLeftRect(browserTabLabels[i].rectTransform, 0f, -HeadingTextLift,
-                            browserTabWidth, PanelHeadingHeight);
-                    }
-                }
-                x += browserTabWidth + BrowserTabGap;
-            }
-
-            RefreshBrowserTabPalette();
-
-            if (browserTabStrip != null)
-            {
-                browserTabStrip.SetBounds(available, Mathf.Max(0f, x - BrowserTabGap));
-            }
-        }
 
         /// <summary>
         /// 左栏那排按钮要列哪几页，**按用户要的顺序**。
@@ -3132,15 +3565,63 @@ namespace ADOFAIEditorStudio
             "摄像头设置", "杂项设置"
         };
 
-        /// <summary>
-        /// 切换左栏显示哪一页。
-        ///
-        /// 两页各自整块开关，而不是挪到看不见的地方：面板没有遮罩，挪出去的
-        /// 内容照样会画到面板外面去。
-        /// </summary>
+        /// <summary>标签清单：装饰物 / 媒体 / 六个设置页。</summary>
+        internal static string[] BrowserTabTitles()
+        {
+            string[] titles = new string[2 + SettingsPageNames.Length];
+            titles[0] = "装饰物";
+            titles[1] = "媒体";
+            for (int i = 0; i < SettingsPageNames.Length; i++)
+            {
+                titles[2 + i] = SettingsPageNames[i];
+            }
+            return titles;
+        }
+
+        /// <summary>当前选中的标签序号（与 BrowserTabTitles / SwitchBrowserTabByIndex 同序）。</summary>
+        internal int CurrentBrowserTabIndex()
+        {
+            if (browserPane == BrowserPane.Media)
+            {
+                return 1;
+            }
+            if (browserPane == BrowserPane.Settings)
+            {
+                for (int i = 0; i < SettingsPages.Length; i++)
+                {
+                    if (SettingsPages[i] == selectedSettingsPage)
+                    {
+                        return 2 + i;
+                    }
+                }
+                return 2;
+            }
+            return 0;
+        }
+
+        /// <summary>第 index 个标签对应的页与事件类型（与 BrowserTabTitles 同序）。</summary>
+        internal void SwitchBrowserTabByIndex(int index)
+        {
+            if (index <= 0)
+            {
+                SetBrowserTab(BrowserPane.Decorations, LevelEventType.None);
+            }
+            else if (index == 1)
+            {
+                SetBrowserTab(BrowserPane.Media, LevelEventType.None);
+            }
+            else
+            {
+                int page = index - 2;
+                if (page >= 0 && page < SettingsPages.Length)
+                {
+                    SetBrowserTab(BrowserPane.Settings, SettingsPages[page]);
+                }
+            }
+        }
+
         private void SetBrowserTab(BrowserPane pane, LevelEventType page)
         {
-            BrowserPane previous = browserPane;
             browserPane = pane;
             if (pane == BrowserPane.Settings)
             {
@@ -3150,34 +3631,33 @@ namespace ADOFAIEditorStudio
             bool showMedia = pane == BrowserPane.Media;
             bool showSettings = pane == BrowserPane.Settings;
 
-            if (mediaPanel != null)
+            // 装饰物页 / 媒体页都由新的左栏自己管显隐（见 UiBrowserPane）。
+            // 数据层那个 MonoBehaviour 一直活着：批量隐藏/锁定是运行时状态，
+            // 切页不该把它收掉，只有工作台整个关掉才轮到 ReleaseBatch。
+            if (browserPaneView != null)
             {
-                mediaPanel.gameObject.SetActive(showMedia);
-            }
-            if (decoView != null)
-            {
-                if (decoList != null)
-                {
-                    // 被标签切走只是暂时隐藏——用户是去看一眼媒体，切回来时
-                    // 「全部隐藏/锁定」该还在。工作台整个关掉才轮到正常收尾。
-                    decoList.KeepBatchOnDisable = pane != BrowserPane.Decorations;
-                }
-                decoView.gameObject.SetActive(pane == BrowserPane.Decorations);
+                browserPaneView.ShowPage(pane);
             }
 
-            // **设置页是把原生面板借进来摆着**，不是我们自己画的一页，所以进出
-            // 这一页要成对地借 / 还。离开时不还的话，工作台一关那个面板还留在
-            // 我们（已经隐藏的）界面里 —— 原生编辑器那边它就没了。
+            // 设置页正文：和右栏共用同一个 uGUI 渲染器（单独的实例），
+            // 只在停在这一页时显示。
             if (showSettings)
             {
-                ShowSettingsPane();
+                EnsureSettingsPaneView();
+                if (settingsPaneView != null)
+                {
+                    settingsPaneView.gameObject.SetActive(true);
+                    settingsPaneView.SetSettingsMode(true);
+                    settingsPaneView.SetPaneRect(BrowserContentX, BrowserViewY,
+                        previewLayout.LeftPanelWidth - BrowserContentX - PanelHeadingInset,
+                        Mathf.Max(64f, browserPanel.rect.height - BrowserViewY - PanelInnerInset));
+                }
             }
-            else if (previous == BrowserPane.Settings)
+            else if (settingsPaneView != null)
             {
-                HideSettingsPane();
+                settingsPaneView.SetSettingsMode(false);
+                settingsPaneView.gameObject.SetActive(false);
             }
-
-            RefreshBrowserTabPalette();
 
             // 媒体页刚从隐藏里回来：它在隐藏期间不推进缩略图队列，卡片位置也
             // 是按隐藏时的视口算的。这里重排一次，把位置和要加载的图都补上。
@@ -3188,135 +3668,21 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>
-        /// 把那排按钮的高亮刷一遍。
-        ///
-        /// 选中的那一个是实心紫、文字反过来用深色。金色留给标题和竖条——
-        /// 分段控件是"能点的"，按分工该穿紫。
-        ///
-        /// 设置页那一排是**互斥**的：同时只有一个亮着，亮的就是当前显示的那一页。
+        /// 左栏设置页的渲染器。**懒建**：它要和右栏共用同一个写入层
+        /// （`propertyPanel`），而右栏是在 `BuildInspector` 里才建出来的。
         /// </summary>
-        private void RefreshBrowserTabPalette()
+        private void EnsureSettingsPaneView()
         {
-            for (int i = 0; i < browserTabButtons.Count && i < browserTabPages.Count; i++)
-            {
-                bool active = IsBrowserTabActive(i);
-                SetSegmentPalette(browserTabButtons[i], active, Accent);
-                if (browserTabLabels[i] != null)
-                {
-                    browserTabLabels[i].color = active ? TextOnAccent : TextMuted;
-                }
-            }
-        }
-
-        private bool IsBrowserTabActive(int index)
-        {
-            if (index == 0)
-            {
-                return browserPane == BrowserPane.Decorations;
-            }
-            if (index == 1)
-            {
-                return browserPane == BrowserPane.Media;
-            }
-            return browserPane == BrowserPane.Settings
-                && browserTabPages[index] == selectedSettingsPage;
-        }
-
-        /// <summary>
-        /// 设置页那一份参数栏：**同一个 `EditorPropertyPanel`，另开一个实例**，
-        /// 摆在左栏、喂的是一页设置而不是一个事件。
-        ///
-        /// 为什么不用另写一套设置控件：设置页在游戏里**本来就是 `LevelEvent`**
-        /// —— `LevelData.songSettings` 那些字段的类型就是它，元数据取自
-        /// `GCS.settingsInfo`。所以那套行 / 控件 / 撤销一个字都不用改。
-        ///
-        /// 也不去搬原生那个设置面板：它是整块排好的 uGUI，搬进来要跟它的
-        /// 滑出补间、锚点、布局打架，而且搬完还得原样还回去。自己渲染没有这些账。
-        /// </summary>
-        private void EnsureSettingsPane()
-        {
-            if (settingsPropertyPanel != null || browserPanel == null)
+            if (settingsPaneView != null || browserPanel == null || propertyPanel == null)
             {
                 return;
             }
-
-            // **外壳一层容器。**
-            //
-            // AddPanelBorder 那族（投影 + 描边）不是在面板上挂组件，而是在
-            // **同级**垫几个跟着面板走的兄弟物体（BorderFollower）。所以只把
-            // 面板 SetActive(false) 是藏不干净的 —— 那几层会留在原地，糊在
-            // 装饰物/媒体页上，看起来就是"整页多了一层灰"。套一层容器，
-            // 藏容器就等于全藏。
-            settingsPaneRoot = CreateTopLeftRect("SettingsPaneRoot", browserPanel,
-                BrowserContentX, BrowserViewY, 100f, 100f);
-
-            settingsPane = CreateRoundedPanel("SettingsPane", settingsPaneRoot,
-                0f, 0f, 100f, 100f, Panel, CornerLarge);
-            settingsPane.raycastTarget = true;
-            AddPanelBorder(settingsPane, CornerLarge);
-
-            settingsPropertyPanel = settingsPane.gameObject.AddComponent<EditorPropertyPanel>();
-            settingsPropertyPanel.Initialize(settingsPane.rectTransform, uiFont, this);
-            settingsPaneRoot.gameObject.SetActive(false);
-        }
-
-        private void ShowSettingsPane()
-        {
-            // **被 ImGui 版接管时整个不摆。**
-            //
-            // 拦在这里而不是只拦 SetBrowserTab：借/还的配对有好几个入口，
-            // 漏一个就会把原生设置页留在我们（已经隐藏的）界面里，
-            // 而原生编辑器那边它反倒没了。
-            if (settingsPaneTakenOver)
-            {
-                return;
-            }
-
-            EnsureSettingsPane();
-            if (settingsPropertyPanel == null)
-            {
-                return;
-            }
-
-            settingsPaneRoot.gameObject.SetActive(true);
-            LayoutSettingsPane();
-            settingsPropertyPanel.ShowSettingsPage(FindSettingsPage(selectedSettingsPage));
-        }
-
-        private void HideSettingsPane()
-        {
-            if (settingsPropertyPanel == null || settingsPaneRoot == null)
-            {
-                return;
-            }
-
-            settingsPropertyPanel.ClearSettingsPage();
-            settingsPaneRoot.gameObject.SetActive(false);
-        }
-
-        /// <summary>
-        /// 把设置页那一步重摆一次。
-        ///
-        /// 尺寸一律从 `browserPanel` 现读，和 <see cref="RelayoutProjectWorkspace"/>
-        /// 给另外两页用的是同一份来源 —— 在这里再抄一遍那串常量，
-        /// 改一处漏一处的时候两个页的宽度就会不一致。
-        /// </summary>
-        private void LayoutSettingsPane()
-        {
-            if (settingsPane == null || browserPanel == null)
-            {
-                return;
-            }
-
-            float innerWidth = Mathf.Max(64f, browserPanel.rect.width - BrowserContentX - PanelHeadingInset);
-            float viewHeight = Mathf.Max(64f, browserPanel.rect.height - BrowserViewY - PanelInnerInset);
-            SetTopLeftRect(settingsPaneRoot, BrowserContentX, BrowserViewY, innerWidth, viewHeight);
-            SetTopLeftRect(settingsPane.rectTransform, 0f, 0f, innerWidth, viewHeight);
-
-            if (settingsPropertyPanel != null)
-            {
-                settingsPropertyPanel.Relayout(innerWidth, viewHeight);
-            }
+            settingsPaneView = UiInspectorPane.Build(browserPanel, this, propertyPanel,
+                uiFont, BrowserContentX, BrowserViewY,
+                previewLayout.LeftPanelWidth - BrowserContentX - PanelHeadingInset,
+                Mathf.Max(64f, browserPanel.rect.height - BrowserViewY - PanelInnerInset),
+                true);
+            settingsPaneView.gameObject.SetActive(false);
         }
 
         /// <summary>
@@ -3355,50 +3721,6 @@ namespace ADOFAIEditorStudio
                 default:
                     return null;
             }
-        }
-
-        private ScrollRect CreateProjectScroll(
-            string name,
-            RectTransform parent,
-            float x,
-            float y,
-            float width,
-            float height,
-            out RectTransform viewport,
-            out RectTransform content)
-        {
-            RectTransform scrollRect = CreateTopLeftRect(name, parent, x, y, width, height);
-            Image background = scrollRect.gameObject.AddComponent<Image>();
-            background.color = new Color(PanelAlt.r, PanelAlt.g, PanelAlt.b, 0.88f);
-            background.raycastTarget = true;
-            ScrollRect scroll = scrollRect.gameObject.AddComponent<ScrollRect>();
-            scroll.horizontal = false;
-            scroll.vertical = true;
-            scroll.movementType = ScrollRect.MovementType.Clamped;
-            scroll.inertia = true;
-            scroll.decelerationRate = 0.12f;
-            scroll.scrollSensitivity = 28f;
-
-            GameObject viewportObject = new GameObject(name + ".Viewport", typeof(RectTransform), typeof(Image), typeof(RectMask2D));
-            viewportObject.transform.SetParent(scrollRect, false);
-            viewport = viewportObject.GetComponent<RectTransform>();
-            SetStretch(viewport, 1f, 1f, 1f, 1f);
-            Image viewportImage = viewportObject.GetComponent<Image>();
-            viewportImage.color = new Color(PanelAlt.r, PanelAlt.g, PanelAlt.b, 0.01f);
-            viewportImage.raycastTarget = true;
-
-            GameObject contentObject = new GameObject(name + ".Content", typeof(RectTransform));
-            contentObject.transform.SetParent(viewport, false);
-            content = contentObject.GetComponent<RectTransform>();
-            content.anchorMin = new Vector2(0f, 1f);
-            content.anchorMax = new Vector2(1f, 1f);
-            content.pivot = new Vector2(0.5f, 1f);
-            content.anchoredPosition = Vector2.zero;
-            content.sizeDelta = new Vector2(0f, height);
-
-            scroll.viewport = viewport;
-            scroll.content = content;
-            return scroll;
         }
 
         private void EnsureMediaCards(int count)
@@ -3486,7 +3808,10 @@ namespace ADOFAIEditorStudio
 
         private void TickProjectWorkspace()
         {
-            if (!visible || mediaContent == null)
+            // 左栏换成 UiBrowserPane 之后，媒体页不再有自己的 ScrollRect 尺寸对象；
+            // 这里只按「工作台开着」判断，不再拿 mediaContent 当开关，
+            // 否则缩略图队列永远不消费（表现是媒体页一直空着）。
+            if (!visible)
             {
                 return;
             }
@@ -3516,40 +3841,6 @@ namespace ADOFAIEditorStudio
                 UpdateMediaCards();
             }
             ProcessMediaThumbnailQueue();
-        }
-
-        /// <summary>
-        /// 搜索行（输入框 + 计数 + 刷新）的位置。宽度全部由媒体页宽推出来，
-        /// 而媒体页宽跟着左栏走、左栏又跟着舞台走，所以每次重排都要重跑一遍。
-        /// </summary>
-        private void LayoutMediaSearchControls(float viewWidth, float viewY)
-        {
-            if (mediaSearchField == null)
-            {
-                return;
-            }
-
-            const float searchHeight = 24f;
-            float searchWidth = Mathf.Max(40f,
-                viewWidth - MediaSearchInset * 2f - MediaRefreshWidth - MediaCountWidth - 12f);
-            SetTopLeftRect(mediaSearchField.GetComponent<RectTransform>(), MediaSearchInset, viewY, searchWidth, searchHeight);
-            if (mediaTitle != null)
-            {
-                SetTopLeftRect(mediaTitle.rectTransform,
-                    viewWidth - MediaSearchInset - MediaRefreshWidth - 6f - MediaCountWidth,
-                    viewY + 2f,
-                    MediaCountWidth,
-                    20f);
-            }
-            if (mediaRefreshButton != null)
-            {
-                SetTopLeftRect(
-                    mediaRefreshButton.GetComponent<RectTransform>(),
-                    viewWidth - MediaSearchInset - MediaRefreshWidth,
-                    viewY,
-                    MediaRefreshWidth,
-                    searchHeight);
-            }
         }
 
         /// <summary>
@@ -3640,28 +3931,6 @@ namespace ADOFAIEditorStudio
 
         private EditorProjectMediaItem mediaDragCandidate;
         private Vector2 mediaDragPressScreen;
-
-        private void OnMediaScrollChanged(Vector2 ignored)
-        {
-            mediaThumbnailLoadNotBefore = Time.unscaledTime + MediaThumbnailLoadDelay;
-            if (mediaContent == null)
-            {
-                return;
-            }
-
-            int rowCount = Mathf.Max(1, Mathf.CeilToInt(visibleProjectMedia.Count / (float)GetMediaColumnCount()));
-            int firstRow = Mathf.Clamp(
-                Mathf.FloorToInt(Mathf.Max(0f, mediaContent.anchoredPosition.y) / MediaCardHeight),
-                0,
-                Mathf.Max(0, rowCount - 1)
-            );
-            if (firstRow != mediaCardsBoundFirstRow)
-            {
-                ClearMediaThumbnailQueue();
-                mediaCardsDirty = true;
-                UpdateMediaCards();
-            }
-        }
 
         private void RebuildVisibleMedia(bool resetScroll = true)
         {
@@ -4551,6 +4820,11 @@ namespace ADOFAIEditorStudio
             // 这个面板的 rect 横跨实时预览，在这里填不透明色会盖住
             // 游戏画面，而那正是这个面板存在的唯一理由。AddPanelBorder 画的是
             // 圆环而不是实心块，所以它只描出边缘、不遮挡任何东西。
+            // **预览必须保持不填充。**
+            //
+            // 这个面板的 rect 正好盖在实时画面上，填任何不透明色都会把游戏
+            // 画面挡住（实测：填完之后预览整块变黑）。它的「色块」由
+            // 工具栏与四周留白给出，不是靠填底。
             Image panel = CreateImage("Preview", parent, previewLayout.StageX, PreviewPanelY, width, PreviewPanelHeight, Color.clear);
             RectTransform root = panel.rectTransform;
             previewPanel = root;
@@ -4561,20 +4835,21 @@ namespace ADOFAIEditorStudio
             // 工具栏底色用 Band，和另外三块面板的标题条同一档。
             // 原来用的是面板色加 0.97 不透明度——和面板几乎一样，整条读不出来，
             // 预览画面顶上就是一片平的黑。
-            Image toolbar = CreateRoundedPanel("Toolbar", root, 0f, 0f, width, 52f, Band, CornerLarge);
+            // 工具栏底衬保持透明：ImGui 版的底色由模块块统一给，这里不再自绘。
+            Image toolbar = CreateRoundedPanel("Toolbar", root, 0f, 0f, width, 52f, Color.clear, CornerLarge);
             toolbar.raycastTarget = true;
             previewToolbar = toolbar.rectTransform;
-            previewHeadingBar = CreateHeadingBar("HeadingBar", root, PanelHeadingInset);
-            previewHeading = CreateText("Heading", root, HeadingTextInset, HeadingRowY,
-                220f, HeadingRowBoxHeight, "预览", UiType.Title, AccentSecondary,
-                TextAlignmentOptions.MidlineLeft, true).rectTransform;
-            // 预览面板顶部有一条 52px 的工具栏条，所以这个面板的分隔线该落在
-            // 工具栏的下沿，而不是共用的标题高度——放在 27 会画进
-            // 工具栏里，读起来是横穿它的一条杂线。全宽的理由
-            // 与其他面板相同。
-            previewHeadingRule = CreateHeadingRule("PreviewRule", root, 52f);
+            // 外壳全部交给新实现（见 UiPreviewChrome）：竖条 + 标题 + 状态读数。
+            // 旧骨架里那套 TitleBar/Heading/HeadingRule/车道按钮不再使用。
+            previewChrome = UiPreviewChrome.Build(previewToolbar, uiFont, width, 52f);
+            previewHeading = previewChrome != null ? previewChrome.Title : null;
 
-            BuildLaneFilterButtons(root);
+            // **车道筛选按钮不在这里建。**
+            //
+            // ImGui 版早就把它们搬到时间轴第一行的右边（预览标题行要让给状态
+            // 读数）。这里再建一份就是两套按钮、位置还不对 —— 旧 uGUI 版正是
+            // 这个状态。等时间轴迁过来时再接。
+            // BuildLaneFilterButtons(root);
 
             // 缩放锁定以前放在这里。现在它是时间轴
             // 播放控制带上的一把锁按钮，同时也覆盖相机位置；
@@ -4586,10 +4861,13 @@ namespace ADOFAIEditorStudio
             previewViewport = stage.rectTransform;
             previewHandoffImage = CreateStretchRawImage("NativeHandoffFrame", previewViewport, Color.white);
             previewHandoffImage.gameObject.SetActive(false);
-            // 比面板描边低一档：舞台坐在面板里面，所以它的边框不能
-            // 跟面板自己的边缘抢眼。用四条线而不是一个九宫格框，因为
-            // 舞台是不透明的，而框不是。
-            Color viewportBorder = ThumbWell;
+            // **不给预览面板垫底色**：舞台以外保持纯黑。
+            //
+            // 试过铺 #0B0B0B 与其它面板齐平，结果窗口上下多出两条同色带，
+            // 反而显得"框外面还有一圈"；纯黑把画面衬出来更干净（用户选择）。
+
+            // 框细一点：1px、18% 白。黑底上仍看得出边界，又不抢画面。
+            Color viewportBorder = new Color(1f, 1f, 1f, 0.18f);
             CreateAnchoredLine("Top", stage.rectTransform, new Vector2(0f, 1f), new Vector2(1f, 1f), new Vector2(0f, 1f), viewportBorder);
             CreateAnchoredLine("Bottom", stage.rectTransform, new Vector2(0f, 0f), new Vector2(1f, 0f), new Vector2(0f, 1f), viewportBorder);
             CreateAnchoredLine("Left", stage.rectTransform, new Vector2(0f, 0f), new Vector2(0f, 1f), new Vector2(1f, 0f), viewportBorder);
@@ -4684,6 +4962,12 @@ namespace ADOFAIEditorStudio
 
         private void BuildViewportMatte(RectTransform parent)
         {
+            // **遮沿必须不透明。**
+            //
+            // 它们的作用是挡住"预览窗以外"的游戏原生编辑器界面。刚才把它们
+            // 改透明，native UI 立刻从工作台底下透出来 —— 表现就是满屏重影
+            // （两套面板叠在一起）。它们的矩形在 ApplyWorkspaceLayout 里会跟着
+            // 布局重算，所以「拖时间轴高度」也不会再盖住画面。
             Image top = CreateImage("ViewportMatteTop", parent, 0f, 0f, DesignWidth, previewLayout.StageY, Background);
             Image bottom = CreateImage(
                 "ViewportMatteBottom",
@@ -4717,14 +5001,22 @@ namespace ADOFAIEditorStudio
 
         private void BuildInspector(RectTransform parent)
         {
+            // 右栏的模块底色自己铺（ImGui 那层不再给参数栏垫底）。
+            float blockX, blockY, blockWidth, blockHeight;
+            GetInspectorBlockRect(out blockX, out blockY, out blockWidth, out blockHeight);
+            Image blockFill = CreateImage("InspectorBlockFill", parent,
+                blockX, blockY, blockWidth, blockHeight, UiTheme.Current.SurfaceTopBand);
+            blockFill.raycastTarget = false;
+            inspectorBlockFill = blockFill.rectTransform;
+
             Image panel = CreateRoundedPanel(
                 "Inspector",
                 parent,
                 previewLayout.InspectorX,
-                PreviewPanelY,
+                BlockRowTop,
                 previewLayout.RightPanelWidth,
-                PreviewPanelHeight,
-                Panel,
+                BlockRowBottom - BlockRowTop,
+                ModuleFill,
                 CornerLarge
             );
             panel.raycastTarget = true;
@@ -4736,8 +5028,20 @@ namespace ADOFAIEditorStudio
                 previewLayout.RightPanelWidth - HeadingTextInset - PanelHeadingInset, HeadingRowBoxHeight,
                 "参数", UiType.Title, AccentSecondary, TextAlignmentOptions.MidlineLeft, true).rectTransform;
             CreateHeadingRule("InspectorRule", panel.rectTransform, PanelHeadingRule);
+
+            // 数据/写入层：只接数据，不建旧 UI（见 InitializeModel）。
             propertyPanel = panel.gameObject.AddComponent<EditorPropertyPanel>();
-            propertyPanel.Initialize(panel.rectTransform, uiFont, this);
+            propertyPanel.InitializeModel(this, uiFont);
+
+            // 新的 uGUI 参数栏。
+            float paneTop = PanelHeadingRule + 8f;
+            inspectorPane = UiInspectorPane.Build(panel.rectTransform, this, propertyPanel,
+                uiFont, PanelInnerInset, paneTop,
+                previewLayout.RightPanelWidth - PanelInnerInset * 2f,
+                previewLayout.RightPanelWidth > 0f
+                    ? BlockRowBottom - BlockRowTop - paneTop - PanelInnerInset
+                    : 400f,
+                false);
             LogPropertyMetadataProbe();
         }
 
@@ -4845,9 +5149,17 @@ namespace ADOFAIEditorStudio
 
         private void BuildTimeline(RectTransform parent)
         {
-            float panelY = DesignHeight - timelineHeight + 4f;
+            // 时间轴这块模块底色自己铺（ImGui 那层不再给任何模块垫底）。
+            float blockX, blockY, blockWidth, blockHeight;
+            GetTimelineBlockRect(out blockX, out blockY, out blockWidth, out blockHeight);
+            Image blockFill = CreateImage("TimelineBlockFill", parent,
+                blockX, blockY, blockWidth, blockHeight, UiTheme.Current.SurfaceTopBand);
+            blockFill.raycastTarget = false;
+            timelineBlockFill = blockFill.rectTransform;
+
+            float panelY = TimelinePanelTop;
             float panelHeight = timelineHeight - 12f;
-            Image panel = CreateRoundedPanel("Timeline", parent, OuterMargin, panelY, TimelinePanelWidth, panelHeight, Panel, CornerLarge);
+            Image panel = CreateRoundedPanel("Timeline", parent, OuterMargin, panelY, TimelinePanelWidth, panelHeight, ModuleFill, CornerLarge);
             panel.raycastTarget = true;
             AddPanelBorder(panel, CornerLarge);
             timelinePanel = panel.rectTransform;
@@ -4862,12 +5174,8 @@ namespace ADOFAIEditorStudio
                 timelineView.AttachDecorationPane(decoList);
             }
 
-            // 预览工具栏上的车道按钮要读时间轴，而 BuildPreview 早于本方法执行，
-            // 那一趟拿不到 timelineView 就直接返回了。这里补建。
-            if (previewToolbar != null)
-            {
-                BuildLaneFilterButtons(previewToolbar);
-            }
+            // 车道筛选按钮已经搬进时间轴第一行（见 EditorTimelineView.BuildUi），
+            // 预览工具栏上不再建第二份。
         }
 
         /// <summary>
@@ -5143,15 +5451,15 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>
-        /// 悬浮球点开的入口。
+        /// 编辑器左下角那颗按钮点开的入口。
         ///
         /// **必须先保证运行期 UI 建起来**：快捷键那条路一直有
-        /// `if (!built && !TryBuildRuntimeUi()) return;` 这道门，而悬浮球最初
+        /// `if (!built && !TryBuildRuntimeUi()) return;` 这道门，而按钮这边最初
         /// 直接调了 `SetVisible(true)` —— `uiRoot` 还是 null，一进来就
         /// NullReferenceException，结果只画出顶栏和菜单栏、其余面板全缺，
         /// 原生面板还漏了出来（实测就是这么崩的）。
         /// </summary>
-        internal void OpenFromFloatingBall()
+        internal void OpenFromEditorButton()
         {
             if (visible)
             {
@@ -5159,23 +5467,201 @@ namespace ADOFAIEditorStudio
             }
             if (!built && !TryBuildRuntimeUi())
             {
-                Main.Logger.Log("[工作台] 悬浮球打开失败：运行期 UI 没建起来");
+                Main.Logger.Log("[工作台] 左下角按钮打开失败：运行期 UI 没建起来");
                 return;
             }
             SetVisible(true);
+        }
+
+        /// <summary>临时诊断：把指针下方最上面的几个 uGUI 元素打出来。</summary>
+        private System.Collections.IEnumerator LogRaycastPeek()
+        {
+            yield return null;   // 等这一帧的布局/射线都就绪
+            UnityEngine.EventSystems.EventSystem es =
+                UnityEngine.EventSystems.EventSystem.current;
+            if (es == null)
+            {
+                Main.Logger.Log("[点击取证] EventSystem 为空");
+                yield break;
+            }
+            UnityEngine.EventSystems.PointerEventData eventData =
+                new UnityEngine.EventSystems.PointerEventData(es)
+                {
+                    position = Input.mousePosition
+                };
+            System.Collections.Generic.List<UnityEngine.EventSystems.RaycastResult> hits
+                = new System.Collections.Generic.List<UnityEngine.EventSystems.RaycastResult>();
+            es.RaycastAll(eventData, hits);
+            string text = "[点击取证] 命中 " + hits.Count + " 个：";
+            for (int i = 0; i < hits.Count && i < 4; i++)
+            {
+                text += " [" + i + "]" + hits[i].gameObject.name
+                    + "(canvas=" + (hits[i].module != null ? hits[i].module.name : "?")
+                    + ")";
+            }
+            Main.Logger.Log(text);
+        }
+
+        /// <summary>临时：媒体页所在画布的 sortingOrder，用来确认谁在上面。</summary>
+        private int MediaLayerOrder()
+        {
+            if (mediaPanel == null)
+            {
+                return -1;
+            }
+            Canvas layer = mediaPanel.GetComponentInParent<Canvas>();
+            return layer != null ? layer.sortingOrder : -2;
+        }
+
+        /// <summary>临时：把一个面板上的 Image 颜色写成 RGBA 简写。</summary>
+        private static string PaneColor(RectTransform pane)
+        {
+            if (pane == null)
+            {
+                return "无";
+            }
+            Image image = pane.GetComponent<Image>();
+            if (image == null)
+            {
+                return "无图";
+            }
+            Color c = image.color;
+            return ((int)(c.r * 255f)) + "/" + ((int)(c.g * 255f)) + "/"
+                + ((int)(c.b * 255f)) + "/" + c.a.ToString("0.00");
+        }
+
+        /// <summary>
+        /// 临时：找出「设计坐标处、真正在画不透明深色」的 Image。
+        ///
+        /// 和射线探针的区别很关键：射线只看 `raycastTarget = true` 的 Graphic，
+        /// 而盖住面板的往往是纯装饰层（raycast 全关）——所以必须遍历整棵树、
+        /// 按矩形包含关系自己判断。
+        /// </summary>
+        private static string ProbeDrawn(float designX, float designY)
+        {
+            if (Main.Overlay == null || Main.Overlay.uiRoot == null)
+            {
+                return "无画布";
+            }
+            Image[] images = Main.Overlay.uiRoot.GetComponentsInChildren<Image>(true);
+            string text = string.Empty;
+            int found = 0;
+            for (int i = 0; i < images.Length && found < 4; i++)
+            {
+                Image image = images[i];
+                if (image == null || !image.gameObject.activeInHierarchy)
+                {
+                    continue;
+                }
+                Color c = image.color;
+                if (c.a < 0.3f || c.r > 0.10f || c.g > 0.10f || c.b > 0.10f)
+                {
+                    continue;
+                }
+                RectTransform rect = image.rectTransform;
+                Vector3[] corners = new Vector3[4];
+                rect.GetWorldCorners(corners);
+                float scaleX = Screen.width / DesignWidth;
+                float scaleY = Screen.height / DesignHeight;
+                float px = designX * scaleX;
+                float py = Screen.height - designY * scaleY;
+                if (px < corners[0].x || px > corners[2].x
+                    || py < corners[0].y || py > corners[2].y)
+                {
+                    continue;
+                }
+                text += (found == 0 ? "" : ">") + image.gameObject.name
+                    + "(" + ((int)(c.r * 255f)) + "/" + c.a.ToString("0.00")
+                    + "," + Mathf.RoundToInt(rect.rect.width) + "x"
+                    + Mathf.RoundToInt(rect.rect.height) + ")";
+                found++;
+            }
+            return text.Length == 0 ? "无非透明深色" : text;
+        }
+
+        private int lastPanelProbeFrame = -1000;
+        private int layoutRefreshPending;
+
+        /// <summary>临时：把一个面板的激活状态与矩形写成一行。</summary>
+        private static string DescribePane(Component component, RectTransform rect)
+        {
+            if (component == null)
+            {
+                return "无";
+            }
+            if (rect == null)
+            {
+                return (component.gameObject.activeSelf ? "显示" : "隐藏") + "/无rect";
+            }
+            Vector3[] corners = new Vector3[4];
+            rect.GetWorldCorners(corners);
+            return (component.gameObject.activeSelf ? "显示" : "隐藏")
+                + "/" + Mathf.RoundToInt(rect.sizeDelta.x) + "x" + Mathf.RoundToInt(rect.sizeDelta.y)
+                + "@" + Mathf.RoundToInt(corners[0].x) + "," + Mathf.RoundToInt(corners[0].y);
         }
 
         internal void SetVisible(bool value)
         {
             visible = value;
 
-            // 探针：打开工作台时把"自动翻页 / 定位"两个开关的**运行时值**打出来。
-            // 判断"开关失效"前先看这两行，能直接排除"其实是被关掉了"。
+            // **打开后下一帧重排一次。**
+            //
+            // 建 UI 那一刻面板尺寸还没定（Screen/timelineHeight 都可能读到旧值），
+            // 于是首次进去右侧参数栏是一小块，拖一次时间轴才变正常。
+            // 这里只标一个标志，真正的重排放到 Update 里做 —— 那时布局已经稳了。
+            layoutRefreshPending = 2;
+
+            // 一次性诊断：打开工作台时把「谁在管 UI、谁可能在吃点击」打出来。
+            if (value)
+            {
+                try
+                {
+                    Settings st = Main.Settings;
+                    UnityEngine.EventSystems.EventSystem es =
+                        UnityEngine.EventSystems.EventSystem.current;
+                    int activeBlockers = 0;
+                    GameObject imguiRoot = GameObject.Find("ADOFAIEditorStudio.ImGui");
+                    if (imguiRoot != null)
+                    {
+                        Image[] images = imguiRoot.GetComponentsInChildren<Image>(true);
+                        for (int i = 0; i < images.Length; i++)
+                        {
+                            if (images[i].gameObject.activeInHierarchy && images[i].raycastTarget)
+                            {
+                                activeBlockers++;
+                            }
+                        }
+                    }
+                    Main.Logger.Log("[UI模式] uiRoot=" + (uiRoot != null && uiRoot.activeInHierarchy)
+                        + " canvasEnabled=" + (canvas != null && canvas.enabled)
+                        + " order=" + (canvas != null ? canvas.sortingOrder : -1)
+                        + " eventSystem=" + (es != null)
+                        + " imGuiCanvas=" + (imguiRoot != null)
+                        + " imGuiRaycastFaces=" + activeBlockers);
+                }
+                catch (System.Exception exception)
+                {
+                    Main.Logger.Warning("[UI模式] 诊断失败：" + exception.Message);
+                }
+            }
+
+            // **关掉工作台就把整块画布停掉。**
+            //
+            // 原来只是把可见性标志置 false，画布本身仍然激活 —— 三万多个
+            // uGUI 对象每帧照样参与合批与渲染。实测关闭状态下整帧 17ms
+            // （原版 6ms），其中一大块就是这块「看不见但还在活」的画布。
+            // 停掉根节点只影响渲染，各子物体的 activeSelf 原样保留，
+            // 重新打开时完全恢复到关闭前的状态。
+            if (uiRoot != null && uiRoot.activeSelf != value)
+            {
+                uiRoot.SetActive(value);
+            }
+
+            // 探针：打开工作台时把「点轨道跟随」开关的运行时值打出来。
             if (value && Main.VerboseLog)
             {
-                Main.Logger.Log("[翻页] 打开工作台：自动翻页="
-                    + (Main.Settings.AutoPageTimeline ? "开" : "关")
-                    + "，定位=" + (Main.Settings.LocateOnTrackClick ? "开" : "关") + "。");
+                Main.Logger.Log("[定位] 打开工作台：点轨道跟随="
+                    + (Main.Settings.LocateOnTrackClick ? "开" : "关") + "。");
             }
 
             // 换了版本之后第一次打开才弹更新内容（见 ShowVersionNotesIfNew）。
@@ -5225,10 +5711,6 @@ namespace ADOFAIEditorStudio
                     decoList.ReleaseBatch();
                 }
 
-                // 借来的原生设置面板**必须还回去**。它是原生编辑器的东西，
-                // 我们只是把它摆到这儿显示；工作台一关（界面整棵隐藏），
-                // 不还的话它在原生那边也跟着不见了。
-                HideSettingsPane();
                 if (EventSystem.current != null && EventSystem.current.currentSelectedGameObject != null
                     && uiRoot != null
                     && EventSystem.current.currentSelectedGameObject.transform.IsChildOf(uiRoot.transform))
@@ -5308,7 +5790,8 @@ namespace ADOFAIEditorStudio
         private const float StatusPillY = 14f;
         private const float StatusPillHeight = 26f;
         private const float StatusPillRadius = 8f;
-        private static readonly Color StatusPillFill = new Color(1f, 1f, 1f, 0.06f);
+        // 纯图标：状态胶囊也不再垫圆角底，只留文字。
+        private static readonly Color StatusPillFill = new Color(1f, 1f, 1f, 0f);
 
         /// <summary>
         /// 把状态底衬贴到文字上。
@@ -5353,7 +5836,6 @@ namespace ADOFAIEditorStudio
 
         private bool statusTransient;
         private float statusClearAt;
-
 
         internal bool IsTextInputFocused()
         {
@@ -5404,31 +5886,15 @@ namespace ADOFAIEditorStudio
 
         internal void TogglePlaybackFromShortcut()
         {
+            // 固定播放头下 Shift+滚轮会开一次 scrub 会话来扫时间；会话挂着的时候
+            // 播放起不来（求值器仍在"拖动定位"状态）。按空格先把它收掉。
+            if (Timeline != null)
+            {
+                Timeline.CancelScrollScrub();
+            }
             string ignored;
             EditorPlaybackBridge.TryTogglePlayback(out ignored);
             RefreshPlaybackState();
-        }
-
-        internal bool TryCapturePreviewHandoff(Action onCaptured)
-        {
-            if (!visible || !built || previewViewport == null || previewHandoffImage == null)
-            {
-                return false;
-            }
-
-            previewHandoffGeneration++;
-            int generation = previewHandoffGeneration;
-            if (previewHandoffCoroutine != null)
-            {
-                StopCoroutine(previewHandoffCoroutine);
-            }
-            if (previewHandoffReleaseCoroutine != null)
-            {
-                StopCoroutine(previewHandoffReleaseCoroutine);
-                previewHandoffReleaseCoroutine = null;
-            }
-            previewHandoffCoroutine = StartCoroutine(CapturePreviewHandoff(generation, onCaptured));
-            return true;
         }
 
         internal void ReleasePreviewHandoffAfterNativeFrame()
@@ -5466,62 +5932,6 @@ namespace ADOFAIEditorStudio
             {
                 Destroy(previewHandoffTexture);
                 previewHandoffTexture = null;
-            }
-        }
-
-        private IEnumerator CapturePreviewHandoff(int generation, Action onCaptured)
-        {
-            yield return new WaitForEndOfFrame();
-            previewHandoffCoroutine = null;
-            if (generation != previewHandoffGeneration || previewViewport == null
-                || previewHandoffImage == null || !visible)
-            {
-                yield break;
-            }
-
-            bool captured = false;
-            RenderTexture previousActive = RenderTexture.active;
-            try
-            {
-                previewViewport.GetWorldCorners(previewViewportCorners);
-                int left = Mathf.Clamp(Mathf.RoundToInt(previewViewportCorners[0].x), 0, Screen.width - 1);
-                int bottom = Mathf.Clamp(Mathf.RoundToInt(previewViewportCorners[0].y), 0, Screen.height - 1);
-                int right = Mathf.Clamp(Mathf.RoundToInt(previewViewportCorners[2].x), left + 1, Screen.width);
-                int top = Mathf.Clamp(Mathf.RoundToInt(previewViewportCorners[2].y), bottom + 1, Screen.height);
-                int width = right - left;
-                int height = top - bottom;
-                Texture2D texture = new Texture2D(width, height, TextureFormat.RGB24, false);
-                RenderTexture.active = null;
-                texture.ReadPixels(new Rect(left, bottom, width, height), 0, 0, false);
-                texture.Apply(false, false);
-
-                if (previewHandoffTexture != null)
-                {
-                    Destroy(previewHandoffTexture);
-                }
-                previewHandoffTexture = texture;
-                previewHandoffImage.texture = texture;
-                previewHandoffImage.transform.SetAsLastSibling();
-                previewHandoffImage.gameObject.SetActive(true);
-                captured = true;
-                Main.Logger.Log("[PreviewHandoff] Captured static frame " + width + "x" + height + ".");
-            }
-            catch (Exception exception)
-            {
-                Main.Logger.Error("[PreviewHandoff] Failed to capture static frame: " + exception);
-            }
-            finally
-            {
-                RenderTexture.active = previousActive;
-            }
-
-            if (generation == previewHandoffGeneration && onCaptured != null)
-            {
-                onCaptured();
-            }
-            if (!captured)
-            {
-                HidePreviewHandoffImmediate();
             }
         }
 
@@ -5763,21 +6173,49 @@ namespace ADOFAIEditorStudio
             }
 
             previewLayout = CalculatePreviewLayout();
-            float previewHeight = PreviewPanelHeight;
+            // **统一用「块行」的上下沿。**
+            //
+            // 原来这里写的是 PreviewPanelY / PreviewPanelHeight，于是建 UI 时
+            // 设的 BlockRowTop 会在下一帧被这行覆盖回去 —— 间距常量怎么调都
+            // 看不出变化，这就是原因。
+            float blockTop = BlockRowTop;
+            float previewHeight = BlockRowBottom - blockTop;
 
-            SetTopLeftRect(browserPanel, OuterMargin, PreviewPanelY, previewLayout.LeftPanelWidth, previewHeight);
+            SetTopLeftRect(browserPanel, OuterMargin, blockTop, previewLayout.LeftPanelWidth, previewHeight);
+            // 模块底色跟着块行的下沿走：拖时间轴高度会改 BlockRowBottom，
+            // 不跟着改的话这块底要么留一条缝、要么压到时间轴上。
+            if (browserBlockFill != null)
+            {
+                float blockX, blockY, blockWidth, blockHeight;
+                GetBrowserBlockRect(out blockX, out blockY, out blockWidth, out blockHeight);
+                SetTopLeftRect(browserBlockFill, blockX, blockY, blockWidth, blockHeight);
+            }
             RelayoutProjectWorkspace(previewHeight);
 
-            SetTopLeftRect(previewPanel, previewLayout.StageX, PreviewPanelY, previewLayout.StageWidth, previewHeight);
+            SetTopLeftRect(previewPanel, previewLayout.StageX, blockTop, previewLayout.StageWidth, previewHeight);
             SetTopLeftRect(previewToolbar, 0f, 0f, previewLayout.StageWidth, 52f);
             // 两个标题用**同一个 y**，否则它们不在一条水平线上。
             // 位置由这里唯一负责，创建时给的值会被覆盖，见 HeadingRowY 的说明。
             SetTopLeftRect(previewHeading, HeadingTextInset, HeadingRowY,
                 160f, HeadingRowBoxHeight);
+            // 视口相对预览面板定位：面板顶现在是 blockTop，偏移要跟着换。
+            // 四条遮沿跟着舞台矩形重算：它们是按舞台算的，舞台一变（拖时间轴）
+            // 不重算就会盖住画面或露出游戏原生界面。
+            float stageY = previewLayout.StageY;
+            float stageH = previewLayout.StageHeight;
+            float stageX = previewLayout.StageX;
+            float stageW = previewLayout.StageWidth;
+            SetTopLeftRect(matteTop, 0f, 0f, DesignWidth, stageY);
+            SetTopLeftRect(matteBottom, 0f, stageY + stageH,
+                DesignWidth, DesignHeight - stageY - stageH);
+            SetTopLeftRect(matteLeft, 0f, stageY, stageX, stageH);
+            SetTopLeftRect(matteRight, stageX + stageW, stageY,
+                DesignWidth - stageX - stageW, stageH);
+
             SetTopLeftRect(
                 previewViewport,
                 0f,
-                previewLayout.StageY - PreviewPanelY,
+                previewLayout.StageY - blockTop,
                 previewLayout.StageWidth,
                 previewLayout.StageHeight
             );
@@ -5785,15 +6223,27 @@ namespace ADOFAIEditorStudio
             SetTopLeftRect(
                 inspectorPanel,
                 previewLayout.InspectorX,
-                PreviewPanelY,
+                blockTop,
                 previewLayout.RightPanelWidth,
                 previewHeight
             );
             SetTopLeftRect(inspectorHeading, HeadingTextInset, HeadingRowY,
                 previewLayout.RightPanelWidth - HeadingTextInset - PanelHeadingInset, HeadingRowBoxHeight);
-            if (propertyPanel != null)
+
+            float inspectorBlockX, inspectorBlockY, inspectorBlockW, inspectorBlockH;
+            GetInspectorBlockRect(out inspectorBlockX, out inspectorBlockY,
+                out inspectorBlockW, out inspectorBlockH);
+            if (inspectorBlockFill != null)
             {
-                propertyPanel.Relayout(previewLayout.RightPanelWidth, previewHeight);
+                SetTopLeftRect(inspectorBlockFill, inspectorBlockX, inspectorBlockY,
+                    inspectorBlockW, inspectorBlockH);
+            }
+            if (inspectorPane != null)
+            {
+                float paneTop = PanelHeadingRule + 8f;
+                inspectorPane.SetPaneRect(PanelInnerInset, paneTop,
+                    previewLayout.RightPanelWidth - PanelInnerInset * 2f,
+                    previewHeight - paneTop - PanelInnerInset);
             }
 
             SetTopLeftRect(matteTop, 0f, 0f, DesignWidth, previewLayout.StageY);
@@ -5815,11 +6265,19 @@ namespace ADOFAIEditorStudio
 
             SetTopLeftRect(
                 timelinePanel,
-                12f,
-                DesignHeight - timelineHeight + 4f,
+                OuterMargin,
+                TimelinePanelTop,
                 TimelinePanelWidth,
                 timelineHeight - 12f
             );
+            if (timelineBlockFill != null)
+            {
+                float blockFillX, blockFillY, blockFillW, blockFillH;
+                GetTimelineBlockRect(out blockFillX, out blockFillY,
+                    out blockFillW, out blockFillH);
+                SetTopLeftRect(timelineBlockFill, blockFillX, blockFillY,
+                    blockFillW, blockFillH);
+            }
             if (timelineView != null)
             {
                 timelineView.Relayout();
@@ -5829,7 +6287,7 @@ namespace ADOFAIEditorStudio
 
         private void RelayoutProjectWorkspace(float previewHeight)
         {
-            if (browserPanel == null || mediaPanel == null)
+            if (browserPanel == null)
             {
                 return;
             }
@@ -5837,37 +6295,19 @@ namespace ADOFAIEditorStudio
             float innerWidth = previewLayout.LeftPanelWidth - BrowserContentX - PanelHeadingInset;
             float viewHeight = Mathf.Max(64f, previewHeight - BrowserViewY - PanelInnerInset);
 
-            LayoutBrowserTabs();
-
-            SetTopLeftRect(mediaPanel, BrowserContentX, BrowserViewY, innerWidth, viewHeight);
-            LayoutMediaSearchControls(innerWidth, BrowserSearchY);
-            SetTopLeftRect(mediaScroll.GetComponent<RectTransform>(), 8f, BrowserListY,
-                innerWidth - 16f, Mathf.Max(32f, viewHeight - BrowserListY - 8f));
-
-            // 两页共用同一块位置，谁显示由标签决定；尺寸要一起跟着走，
-            // 否则压扁时间轴之后另一页会停在旧高度上。
-            // 这里也是踩过坑的地方：初始构建按一套尺寸排、拖动重排走另一套时，
-            // 表现就是「首次进来正常，一拖时间轴两页错位」。
-            //
-            // 装饰物页的位置由 SetPaneRect 一并给出（它就是那块页面的尺寸入口），
-            // 不要再单独摆一次 decoView——两份坐标迟早会不一致。
-            if (decoList != null)
+            // 左栏的尺寸入口只有这一个：标签条、装饰物页、媒体页都由它自己重排
+            // （见 UiBrowserPane.SetPaneRect）。**不要再单独摆一次某一件** ——
+            // 两份坐标迟早会不一致。
+            if (browserPaneView != null)
             {
-                decoList.SetPaneRect(BrowserContentX, BrowserViewY, innerWidth, viewHeight);
+                browserPaneView.SetPaneRect(BrowserContentX, BrowserViewY, innerWidth, viewHeight);
+            }
+            if (settingsPaneView != null)
+            {
+                settingsPaneView.SetPaneRect(BrowserContentX, BrowserViewY,
+                    innerWidth, viewHeight);
             }
 
-            // 设置页那一份也要跟着重摆：它不走我们这套 SetPaneRect，
-            // 左栏一改尺寸它就会停在旧大小上。
-            if (browserPane == BrowserPane.Settings)
-            {
-                LayoutSettingsPane();
-            }
-
-            // 卡片池按整个可见区域来备：面板一拉高，行数就变，
-            // 池子要够覆盖当前能看见的那些行。
-            int requiredMediaCards = Mathf.CeilToInt(viewHeight / MediaCardHeight) + 2;
-            EnsureMediaCards(requiredMediaCards);
-            mediaContent.sizeDelta = new Vector2(0f, Mathf.Max(viewHeight, mediaContent.sizeDelta.y));
             RebuildVisibleMedia(false);
         }
 
@@ -5924,22 +6364,12 @@ namespace ADOFAIEditorStudio
             canvas = null;
             designRoot = null;
             browserPanel = null;
+            browserBlockFill = null;
+            browserPaneView = null;
+            settingsPaneView = null;
             decoList = null;
-            decoView = null;
             helpWindow = null;
             versionWindow = null;
-            settingsPaneRoot = null;
-            settingsPane = null;
-            settingsPropertyPanel = null;
-            browserTabStripHost = null;
-            browserTabStripContent = null;
-            browserTabStrip = null;
-            browserTabButtons.Clear();
-            browserTabLabels.Clear();
-            browserTabPages.Clear();
-            // 拆界面之前先把借来的原生面板还回去 —— 再晚一步，我们这边的
-            // 宿主就没了，它会落在一个正在被销毁的层级里。
-            HideSettingsPane();
             browserPane = BrowserPane.Decorations;
             mediaPanel = null;
             mediaViewport = null;
@@ -5959,6 +6389,9 @@ namespace ADOFAIEditorStudio
             previewHandoffImage = null;
             inspectorPanel = null;
             inspectorHeading = null;
+            inspectorPane = null;
+            inspectorBlockFill = null;
+            timelineBlockFill = null;
             propertyPanel = null;
             timelinePanel = null;
             matteTop = null;
@@ -6022,6 +6455,107 @@ namespace ADOFAIEditorStudio
             Main.Logger.Log("No active EventSystem was found; created a legacy-input fallback.");
         }
 
+        private static TMP_FontAsset cachedSystemFont;
+
+        /// <summary>
+        /// 用系统里装的中文字体建一套 TMP 资源，优先级：微软雅黑 UI → 微软雅黑 → 思源黑体 → 黑体。
+        ///
+        /// 为什么不用 `Font.CreateDynamicFontFromOSFont` 的结果直接给 TMP：那是
+        /// 老的 UnityEngine.Font，TMP 要的是自己的 FontAsset，中间得走
+        /// `TMP_FontAsset.CreateFontAsset`。这个版本上后者支持动态图集，
+        /// 缺字形时按需光栅化，中英文都能覆盖。
+        /// </summary>
+        private static TMP_FontAsset TryCreateSystemFont()
+        {
+            if (cachedSystemFont != null)
+            {
+                return cachedSystemFont;
+            }
+            try
+            {
+                string[] installed = Font.GetOSInstalledFontNames();
+                if (installed == null || installed.Length == 0)
+                {
+                    return null;
+                }
+                string[] preferred =
+                {
+                    "Microsoft YaHei UI", "Microsoft YaHei", "微软雅黑",
+                    "Source Han Sans SC", "Noto Sans CJK SC", "SimHei", "SimSun"
+                };
+                string picked = null;
+                for (int i = 0; i < preferred.Length && picked == null; i++)
+                {
+                    for (int j = 0; j < installed.Length; j++)
+                    {
+                        if (string.Equals(installed[j], preferred[i],
+                            System.StringComparison.OrdinalIgnoreCase))
+                        {
+                            picked = installed[j];
+                            break;
+                        }
+                    }
+                }
+                if (picked == null)
+                {
+                    Main.Logger.Log("[字体] 系统里没找到可用中文字体，回退游戏字体");
+                    return null;
+                }
+
+                // **走 TMP 自己的系统字体入口。**
+                //
+                // `Font.CreateDynamicFontFromOSFont` 建出来的 Font 没有字体文件
+                // 引用，`CreateFontAsset(Font, …)` 在这个版本上直接返回 null
+                // （实测日志就是这一条）。TMP 另外有一个「按家族名 + 字形名」
+                // 的入口，它内部用 FontEngine 从系统字体库加载，才能建出
+                // 可用的动态图集资源。用反射调用是为了不依赖具体 TMP 版本
+                // 是否把这个重载编进程序集。
+                TMP_FontAsset asset = null;
+                try
+                {
+                    System.Reflection.MethodInfo byFamily = typeof(TMP_FontAsset).GetMethod(
+                        "CreateFontAsset",
+                        new[] { typeof(string), typeof(string), typeof(int) });
+                    if (byFamily != null)
+                    {
+                        asset = byFamily.Invoke(null, new object[] { picked, "Regular", 32 })
+                            as TMP_FontAsset;
+                    }
+                }
+                catch (System.Exception exception)
+                {
+                    Main.Logger.Log("[字体] 家族名入口失败：" + exception.Message);
+                }
+
+                if (asset == null)
+                {
+                    Font osFont = Font.CreateDynamicFontFromOSFont(picked, 32);
+                    if (osFont != null)
+                    {
+                        asset = TMP_FontAsset.CreateFontAsset(
+                            osFont, 32, 4,
+                            UnityEngine.TextCore.LowLevel.GlyphRenderMode.SDFAA,
+                            1024, 1024,
+                            AtlasPopulationMode.Dynamic, true);
+                    }
+                }
+                if (asset == null)
+                {
+                    Main.Logger.Log("[字体] 两个入口都失败：" + picked);
+                    return null;
+                }
+                asset.name = "AES_System_" + picked;
+                cachedSystemFont = asset;
+                Main.Logger.Log("[字体] 使用系统字体：" + picked);
+                return asset;
+            }
+            catch (System.Exception exception)
+            {
+                Main.Logger.Warning("[字体] 系统字体不可用：" + exception.Message);
+                return null;
+            }
+        }
+
         private TMP_FontAsset ResolveFont()
         {
             // 全程用游戏自己的字体。这里试过系统 UI 字体（走
@@ -6029,6 +6563,13 @@ namespace ADOFAIEditorStudio
             // 工作台读起来像一扇压在游戏上的外来窗口，而不是游戏
             // 的一部分，所以下面的字体链仍然留在游戏自己的字体里。密集
             // 时间轴文字的可读性改用阴影解决——见 ApplyTextShadow。
+            // **优先用系统字体**（用户要求）。失败时再退回游戏字体。
+            TMP_FontAsset systemFont = TryCreateSystemFont();
+            if (systemFont != null)
+            {
+                return systemFont;
+            }
+
             TMP_FontAsset editorFont = FindEditorFont();
             if (editorFont != null)
             {
@@ -6289,15 +6830,11 @@ namespace ADOFAIEditorStudio
         /// 父节点之上，会盖住它本该框住的那块面板。
         /// </summary>
         private void AddPanelBorder(Image panel, float radius)
-        {
-            if (panel == null || panel.rectTransform.parent == null)
-            {
-                return;
-            }
-            // 先阴影、后描边：后建的画在上面，所以描边压在阴影之上，
-            // 阴影只在面板边缘之外露出来那一圈。
-            AddPanelShadow(panel, radius);
-            AddBorderLayer(panel, radius, Border, PanelBorderWidth);
+                {
+            // 纯平背景：面板不描边、不投影。
+            //「参数」那一栏本来就是纯文字窗口，没有边框，观感最干净；
+            // 装饰物 / 预览 / 时间轴三块都走这条 AddPanelBorder，于是只有它们
+            // 外面挂着一条线和一层影子。整体停掉后四块就统一了。
         }
 
         /// <summary>
@@ -6318,6 +6855,12 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private void AddPanelShadow(Image panel, float radius)
         {
+            // 纯平背景：面板不再投影。阴影是 uGUI 画的，不走 ImGui 样式，
+            // 所以前几轮清样式时它一直留着 —— 画面上那些"比背景深一块"的方块就是它。
+            if (PanelShadow.a <= 0.001f)
+            {
+                return;
+            }
             RectTransform target = panel.rectTransform;
             GameObject layerObject = new GameObject("Shadow", typeof(RectTransform), typeof(Image));
             layerObject.transform.SetParent(target.parent, false);
@@ -6363,82 +6906,10 @@ namespace ADOFAIEditorStudio
         /// 整体暗掉四成。透明面板没有投影可画。
         /// </summary>
         private void AddPanelOutline(Image panel, float radius)
-        {
-            if (panel == null || panel.rectTransform.parent == null)
-            {
-                return;
-            }
-            AddOutlineLayer(panel, radius, Border, PanelBorderWidth);
-        }
-
-        private void AddOutlineLayer(Image panel, float radius, Color colour, float band)
-        {
-            RectTransform target = panel.rectTransform;
-            GameObject layerObject = new GameObject("Outline", typeof(RectTransform), typeof(Image));
-            layerObject.transform.SetParent(target.parent, false);
-
-            RectTransform rect = layerObject.GetComponent<RectTransform>();
-            rect.anchorMin = target.anchorMin;
-            rect.anchorMax = target.anchorMax;
-            rect.pivot = target.pivot;
-            // 一条这么宽的环带，贴着比面板大这么多的盒子外缘，
-            // 正好落在面板自己的边缘上——几何与 AddBorderLayer 相同，
-            // 只是填充用的是 frame，中间留空。
-            rect.anchoredPosition = target.anchoredPosition + new Vector2(-band, band);
-            rect.sizeDelta = target.sizeDelta + new Vector2(band * 2f, band * 2f);
-
-            BorderFollower follower = layerObject.AddComponent<BorderFollower>();
-            follower.Target = target;
-            follower.Margin = band;
-
-            Image image = layerObject.GetComponent<Image>();
-            image.color = colour;
-            image.raycastTarget = false;
-            ApplyRounded(image, radius + band, true, band);
-
-            layerObject.transform.SetSiblingIndex(target.GetSiblingIndex());
-        }
-
-        /// <summary>描边的一层：一个比面板大这么多像素的圆角矩形。</summary>
-        private void AddBorderLayer(Image panel, float radius, Color colour, float margin)
-        {
-            RectTransform target = panel.rectTransform;
-            GameObject layerObject = new GameObject("Border", typeof(RectTransform), typeof(Image));
-            layerObject.transform.SetParent(target.parent, false);
-
-            RectTransform rect = layerObject.GetComponent<RectTransform>();
-            rect.anchorMin = target.anchorMin;
-            rect.anchorMax = target.anchorMax;
-            rect.pivot = target.pivot;
-            // 只增大 sizeDelta 只会把一个左上轴心的 rect 往右下方
-            // 扩——轴心钉在原地——于是多出来的边距出现在两条边上，
-            // 另外两条被塞进面板里面，读起来就是一条被裁掉的
-            // 描边。把位置按同样的边距回推，就能让放大后的 rect 以面板为中心，
-            // 四边的描边也就均匀了。
-            //
-            // 在左上轴心的坐标系里，anchoredPosition 是 (右, 下)：往左是
-            // 更小的 x，往上是更大的 y。
-            rect.anchoredPosition = target.anchoredPosition + new Vector2(-margin, margin);
-            rect.sizeDelta = target.sizeDelta + new Vector2(margin * 2f, margin * 2f);
-            // 而且要一直保持这样：稍后被改过尺寸的面板（拖动把手下的
-            // 时间轴、窗口缩放时的任何面板）否则会把它的圆环留在旧
-            // 尺寸上，表现成面板背后一块白板或者一条被裁掉的边。
-            BorderFollower follower = layerObject.AddComponent<BorderFollower>();
-            follower.Target = target;
-            follower.Margin = margin;
-
-            Image image = layerObject.GetComponent<Image>();
-            image.color = colour;
-            image.raycastTarget = false;
-            // 圆角跟着形状一起变大，这样描边绕过弯的时候宽度保持均匀，
-            // 而不是在角上被掐细。
-            ApplyRounded(image, radius + margin, false, 0f);
-
-            // 直接插在面板*之前*。Unity 按顺序画同级节点，所以索引
-            // 等于面板自己的话，这一层会排在它之后——盖在面板上而不是
-            // 垫在下面。插在面板自己的索引上会把面板往下推，这正是
-            // 想要的顺序：最宽的辉光、更紧的辉光、描边，最后面板在最上。
-            layerObject.transform.SetSiblingIndex(target.GetSiblingIndex());
+                {
+            // 纯平背景：预览面板同样不描边。
+            // 圆环只画边缘、不挡画面，所以它一直留着；这次按要求一并去掉，
+            // 四块面板与预览窗口都不再有边框。
         }
 
         /// <summary>
@@ -6461,7 +6932,8 @@ namespace ADOFAIEditorStudio
             rect.sizeDelta = new Vector2(0f, 1f);
 
             Image image = rect.gameObject.AddComponent<Image>();
-            image.color = PanelRule;
+            // 纯平背景：面板标题下的那条分隔线也不再画。
+            image.color = new Color(0f, 0f, 0f, 0f);
             image.raycastTarget = false;
             return image;
         }
@@ -6545,16 +7017,6 @@ namespace ADOFAIEditorStudio
         {
             Image image = CreateImage(name, parent, x, y, width, height, color);
             ApplyRounded(image, radius, false, 0f);
-            return image;
-        }
-
-        /// <summary>一个圆角轮廓，用于卡片或输入凹槽的边框。</summary>
-        private Image CreateRoundedFrame(
-            string name, RectTransform parent, float x, float y,
-            float width, float height, Color color, float radius, float frameWidth)
-        {
-            Image image = CreateImage(name, parent, x, y, width, height, color);
-            ApplyRounded(image, radius, true, frameWidth);
             return image;
         }
 
@@ -6686,22 +7148,6 @@ namespace ADOFAIEditorStudio
             return button;
         }
 
-        private Toggle CreateToggle(string name, RectTransform parent, float x, float y, float width, float height, string labelValue)
-        {
-            RectTransform rect = CreateTopLeftRect(name, parent, x, y, width, height);
-            Toggle toggle = rect.gameObject.AddComponent<Toggle>();
-            toggle.navigation = new Navigation { mode = Navigation.Mode.None };
-
-            Image box = CreateRoundedPanel("Box", rect, 0f, 4f, 22f, 22f, FieldWell, 5f);
-            box.raycastTarget = true;
-            Image check = CreateImage("Check", box.rectTransform, 5f, 5f, 12f, 12f, Accent);
-            toggle.targetGraphic = box;
-            toggle.graphic = check;
-
-            CreateText("Label", rect, 34f, 0f, width - 34f, height, labelValue, 13f, TextSecondary, TextAlignmentOptions.MidlineLeft, false);
-            return toggle;
-        }
-
         private void CreateMediaSearchControls(RectTransform parent, float viewWidth, float viewY)
         {
             const float searchHeight = 24f;
@@ -6728,12 +7174,10 @@ namespace ADOFAIEditorStudio
             background.color = FieldWell;
             background.raycastTarget = true;
 
-            // 一圈描边能让输入框在面板上读得清，也和参数栏
-            // 框住自己输入框的方式一致。
-            Outline rim = rect.gameObject.AddComponent<Outline>();
-            rim.effectColor = Border;
-            rim.effectDistance = new Vector2(1f, -1f);
-            rim.useGraphicAlpha = false;
+            // **输入框不要整圈边框**：无底色 + 底部一条 1px 细线，
+            // 和 ImGui 那版的输入框观感一致（整圈框在纯黑上像一块灰板）。
+            CreateImage("SearchRule", rect, 0f, searchHeight - 1f,
+                searchWidth, 1f, PanelRule).raycastTarget = false;
 
             // 先在对象非激活时接好线，最后再打开。TMP_InputField
             // 在 OnEnable 里创建光标，那时会去读 textComponent 和 textViewport；
@@ -6850,15 +7294,6 @@ namespace ADOFAIEditorStudio
             rect.sizeDelta = new Vector2(width, height);
         }
 
-        private static void SetStretch(RectTransform rect, float left, float bottom, float right, float top)
-        {
-            rect.anchorMin = Vector2.zero;
-            rect.anchorMax = Vector2.one;
-            rect.offsetMin = new Vector2(left, bottom);
-            rect.offsetMax = new Vector2(-right, -top);
-            rect.pivot = new Vector2(0.5f, 0.5f);
-        }
-
         private static void CreateAnchoredLine(string name, RectTransform parent, Vector2 anchorMin, Vector2 anchorMax, Vector2 sizeDelta, Color color)
         {
             GameObject gameObject = new GameObject(name, typeof(RectTransform), typeof(Image));
@@ -6893,38 +7328,6 @@ namespace ADOFAIEditorStudio
             }
         }
 
-        /// <summary>
-        /// 分段控件的分段外观：选中的那一段整块铺满实心强调色，文字反过来用深色。
-        ///
-        /// 和 <see cref="SetButtonPalette"/> 的 selected 分支不是一回事——那一支
-        /// 只叠一层两成多的淡色，在近黑底上几乎看不出来，选中和没选中长得一样。
-        /// 分段控件必须一眼看出当前在哪一段，所以这里用实心。
-        /// </summary>
-        private static void SetSegmentPalette(Button button, bool active, Color activeFill)
-        {
-            if (button == null)
-            {
-                return;
-            }
-
-            Color normal = active ? activeFill : ButtonNormal;
-            Color highlighted = active ? activeFill : ButtonHover;
-            ColorBlock colors = button.colors;
-            colors.normalColor = normal;
-            colors.highlightedColor = highlighted;
-            colors.pressedColor = active
-                ? new Color(activeFill.r * 0.88f, activeFill.g * 0.88f, activeFill.b * 0.88f, activeFill.a)
-                : ButtonHover;
-            colors.selectedColor = highlighted;
-            colors.disabledColor = new Color(normal.r, normal.g, normal.b, 0.45f);
-            colors.colorMultiplier = 1f;
-            colors.fadeDuration = 0.08f;
-            button.colors = colors;
-            if (button.targetGraphic != null)
-            {
-                button.targetGraphic.color = normal;
-            }
-        }
     }
 
     /// <summary>

@@ -47,8 +47,7 @@ namespace ADOFAIEditorStudio.Multiplayer
         /// 挂这一手而不是让外面每帧轮询 `IsShowing`：轮询会晚一帧，那一帧工作台
         /// 会从黑屏后面漏出来。
         /// </summary>
-        internal Action<bool> VisibilityChanged;
-
+    
         internal void Initialize(RectTransform host, TMP_FontAsset uiFont, Sprite rounded)
         {
             root = host;
@@ -112,8 +111,7 @@ namespace ADOFAIEditorStudio.Multiplayer
             {
                 root.gameObject.SetActive(true);
                 root.SetAsLastSibling();
-                NotifyVisibility(true);
-            }
+                }
 
             if (label != null)
             {
@@ -138,22 +136,12 @@ namespace ADOFAIEditorStudio.Multiplayer
             if (root != null && root.gameObject.activeSelf)
             {
                 root.gameObject.SetActive(false);
-                NotifyVisibility(false);
             }
         }
 
         internal bool IsShowing
         {
             get { return root != null && root.gameObject.activeSelf; }
-        }
-
-        private void NotifyVisibility(bool value)
-        {
-            Action<bool> handler = VisibilityChanged;
-            if (handler != null)
-            {
-                handler(value);
-            }
         }
 
         // ---------------------------------------------------------------- 布局与构造

@@ -132,8 +132,13 @@ namespace ADOFAIEditorStudio
         // 下拉行左侧那条缩略曲线占的宽度，以及它相对行左边缘的起点。
         // 勾画在 PopupCheckColumn 那一段里，曲线跟在它后面，
         // 标签再跟在曲线后面——三者错开。
-        internal const float OptionGraphX = 20f;
-        internal const float OptionGraphWidth = 44f;
+        //
+        // **宽度收到 22（原来 44）。** 用户对照原版后指出：高度对，但横向
+        // 拉得太长，整条曲线读起来是"扁的"，In / Out / InOut 的差别被摊平。
+        // 22×21 基本是方框，和原版那个小方图同比例；缩窄之后左边距也收一档，
+        // 不然曲线和右侧文字之间会空出一块。
+        internal const float OptionGraphX = 12f;
+        internal const float OptionGraphWidth = 22f;
 
         private static Color CurveLine { get { return WithAlpha(UiTheme.Current.TextPrimary, 0.90f); } }
 
@@ -272,7 +277,23 @@ namespace ADOFAIEditorStudio
             font = panelFont;
             owner = panelOwner;
             EnsureShell();
+            EnsureBackdrop();
             built = true;
+        }
+
+        /// <summary>
+        /// **只接数据与写入，不建任何 UI。**
+        ///
+        /// 新的 uGUI 参数栏（<see cref="UiInspectorPane"/>）自己画行，但写入必须
+        /// 走这一条路：只读拦截、批量合成一条撤销、装饰物活对象刷新、设置页
+        /// 副作用，全在 `Commit` 里。另写一条写路径迟早两边不一样。
+        ///
+        /// `built` 保持 false —— 这扇面板的 Update 轮询与行池就不会跑。
+        /// </summary>
+        internal void InitializeModel(EditorStudioOverlay panelOwner, TMP_FontAsset panelFont)
+        {
+            owner = panelOwner;
+            font = panelFont;
         }
 
         /// <summary>
@@ -346,7 +367,12 @@ namespace ADOFAIEditorStudio
             ApplyScrollLayout(panelRoot.rect.width, panelRoot.rect.height);
 
             Image background = scrollRect.gameObject.AddComponent<Image>();
-            background.color = WithAlpha(UiTheme.Current.SurfacePage, 0.35f);
+            // **直接用模块底色铺满滚动区，不再叠任何半透明层。**
+            //
+            // 之前的做法是「模块底 #0B0B0B + 一层 35% 黑」，实测出来是 5,5,5，
+            // 与顶栏的 11,11,11 对不上（用户看到的就是"参数栏比别处暗一档"）。
+            // 现在这一层本身就取模块色，叠多少层都还是同一个值。
+            background.color = Color.clear;
             background.raycastTarget = true;
 
             scroll = scrollRect.gameObject.AddComponent<ScrollRect>();
@@ -779,6 +805,44 @@ namespace ADOFAIEditorStudio
 
             float now = Time.unscaledTime;
 
+            // **面板尺寸变了就重排滚动区。**
+            //
+            // 拖时间轴高度会改参数栏的 rect，而滚动区的位置/高度只在建面板时
+            // 算过一次 —— 不跟着改，行就会跑到可视区外面（实测：反复拖高度
+            // 之后参数栏只剩半截内容，像"乱了"）。
+            if (panelRoot != null)
+            {
+                // **量外壳，不量内层。** 内层的 sizeDelta 是我们自己按外壳算的，
+                // 建面板那一刻外壳还没排版完（宽高是 0），内层就被定成了 0 ——
+                // 表现是「首次进来排版很小，拖一下高度又突然变大」。
+                Vector2 size = panelRect != null ? panelRect.rect.size : panelRoot.rect.size;
+                if (size.x > 1f && size.y > 1f)
+                {
+                    Vector2 wanted = new Vector2(size.x / PanelScale, size.y / PanelScale);
+                    if ((panelRoot.sizeDelta - wanted).sqrMagnitude > 0.5f)
+                    {
+                        panelRoot.sizeDelta = wanted;
+                    }
+                }
+                bool widthChanged = Mathf.Abs(size.x - lastPanelWidth) > 4f;
+                bool heightChanged = Mathf.Abs(size.y - lastPanelHeight) > 0.5f;
+                if (widthChanged || heightChanged)
+                {
+                    lastPanelWidth = size.x;
+                    lastPanelHeight = size.y;
+                    ApplyScrollLayout(size.x, size.y);
+                }
+                // **宽度变了要重排整行**，不只是滚动区。
+                //
+                // 每一行的「标签列 / 控件列」宽度是按面板宽度算死的：宽度变了
+                // 不重排，标签就会压到勾选框上（实测现象）。高度变化只影响
+                // 可视范围，滚动区重算就够。
+                if (widthChanged && !refreshQueued && currentEvent != null)
+                {
+                    refreshQueued = true;
+                }
+            }
+
             if (refreshQueued)
             {
                 refreshQueued = false;
@@ -998,6 +1062,41 @@ namespace ADOFAIEditorStudio
         /// 滚动区的位置。**预览块不显示时要把那 116px 还回去**，
         /// 不然面板顶部会留一条空白带。见 previewVisible。
         /// </summary>
+        /// <summary>
+        /// 面板自身的整块底色。
+        ///
+        /// **不能依赖外层 Inspector 面板的 Image**：那个面板的矩形和这里的
+        /// 缩放/内缩不是同一套坐标，一旦时间轴高度变了，就会出现「顶部一条
+        /// 没被覆盖的黑带」。这里铺一张跟着 panelRoot 走的整块底，
+        /// 颜色取模块色，和顶栏一致。
+        /// </summary>
+        private void EnsureBackdrop()
+        {
+            if (panelRoot == null || backdrop != null)
+            {
+                return;
+            }
+            GameObject layer = new GameObject("PaneFill", typeof(RectTransform));
+            layer.transform.SetParent(panelRoot, false);
+            RectTransform rect = layer.GetComponent<RectTransform>();
+            rect.anchorMin = Vector2.zero;
+            rect.anchorMax = Vector2.one;
+            rect.offsetMin = Vector2.zero;
+            rect.offsetMax = Vector2.zero;
+            Image image = layer.AddComponent<Image>();
+            // 总背景已经由工作台铺了，这里不再叠一层。
+            image.color = Color.clear;
+            image.raycastTarget = false;
+            backdrop = image;
+            // 排在最底层，免得盖住行。
+            layer.transform.SetAsFirstSibling();
+        }
+
+        private Image backdrop;
+
+        private float lastPanelWidth = -1f;
+        private float lastPanelHeight = -1f;
+
         private void ApplyScrollLayout(float width, float height)
         {
             if (scrollRectTransform == null)
@@ -1255,31 +1354,6 @@ namespace ADOFAIEditorStudio
             content.sizeDelta = new Vector2(
                 0f,
                 Mathf.Max(viewport == null ? 0f : viewport.rect.height, y));
-        }
-
-        /// <summary>
-        /// 显示**一页设置**（歌曲设置 / 轨道 / 背景 / 相机……）。
-        ///
-        /// 设置页在游戏里**本来就是 `LevelEvent`** —— `LevelData.songSettings`
-        /// 那些字段的类型就是它，`info` 取自 `GCS.settingsInfo`。所以行、控件、
-        /// 撤销这一整套一个字都不用改，只是喂给它的东西从「时间轴里的一个事件」
-        /// 换成「一页设置」。这也是为什么这里不需要另写一套设置控件。
-        ///
-        /// 写回时多两步副作用，见 <see cref="ApplySettingsSideEffects"/>。
-        /// </summary>
-        internal void ShowSettingsPage(LevelEvent page)
-        {
-            settingsPage = page;
-            followTimelineSelection = false;
-            Show(page);
-        }
-
-        /// <summary>退回跟时间轴选中的那一份。</summary>
-        internal void ClearSettingsPage()
-        {
-            settingsPage = null;
-            followTimelineSelection = true;
-            Show(null);
         }
 
         /// <summary>
@@ -1728,13 +1802,13 @@ namespace ADOFAIEditorStudio
             row.Rect = rect;
             row.Root = rect.gameObject;
 
-            // 一条淡条纹，而不是填充整行。旧值是近乎不透明的深色实心，
-            // 让每隔一行都变成一块板，与面板自身的底色打架；
-            // 改用低透明度白色来提亮交替行，不引入第二种底色。
+            // **行不铺任何底色。**
+            //
+            // 原来每隔一行加一条低透明度白色条纹（斑马纹），在纯平深色面板上
+            // 读起来是"相间的色块"，和整体三色规则冲突。行的高亮只保留
+            // 悬停反馈，由 Row 自身处理。
             Image background = rect.gameObject.AddComponent<Image>();
-            background.color = (index % 2 == 0)
-                ? RowStripe
-                : new Color(RowStripe.r, RowStripe.g, RowStripe.b, 0f);
+            background.color = new Color(0f, 0f, 0f, 0f);
             background.raycastTarget = false;
 
             row.Enable = CreateEnableToggle(rect);
@@ -1887,7 +1961,16 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private static bool StacksVertically(ADOFAI.PropertyInfo info, float controlWidth)
         {
-            if (info == null || info.type != PropertyType.Vector2)
+            if (info == null)
+            {
+                return false;
+            }
+            // Vector2Range 永远是两行（X 一行、Y 一行），行高固定翻倍。
+            if (info.type == PropertyType.Vector2Range)
+            {
+                return true;
+            }
+            if (info.type != PropertyType.Vector2)
             {
                 return false;
             }
@@ -2133,8 +2216,7 @@ namespace ADOFAIEditorStudio
         internal void SetDisabled(LevelEvent levelEvent, string key, bool disabled)
         {
             // **只读模式：什么都不写。** 同 `Commit` 那条 —— 这里也是改谱面
-            // （切某个属性的「启用 / 禁用」）。ImGui 版参数栏
-            // （`EditorImGuiInspector`）的那个勾选框也走这一条。
+            // （切某个属性的「启用 / 禁用」）。粒子浮窗里的那个勾选框也走这一条。
             if (owner != null && !owner.AllowEdit())
             {
                 return;
@@ -2157,10 +2239,17 @@ namespace ADOFAIEditorStudio
 
         private void SetDisabledOne(LevelEvent levelEvent, string key, bool disabled)
         {
-            if (levelEvent == null || !IsLive(levelEvent)
-                || levelEvent.disabled == null || !levelEvent.disabled.ContainsKey(key))
+            if (levelEvent == null || !IsLive(levelEvent))
             {
                 return;
+            }
+            // **不能要求键已经存在。** 事件的 `disabled` 字典只装「谱面里显式禁过」
+            // 的那几条，多数事件上根本没有这个键 —— 早先这里一判 `ContainsKey`
+            // 就直接返回，于是参数栏那个勾选框点了等于没点（写不进去，重建后又
+            // 回到勾选态）。缺键就现建一个，和原生面板一样。
+            if (levelEvent.disabled == null)
+            {
+                levelEvent.disabled = new Dictionary<string, bool>();
             }
             scnEditor editor = scnEditor.instance;
             if (editor != null)
@@ -2177,6 +2266,47 @@ namespace ADOFAIEditorStudio
                 Multiplayer.MultiplayerEditSink.Report(editor, levelEvent,
                     new[] { key }, new object[] { levelEvent[key] }, new[] { disabled });
             }
+
+            if (changed)
+            {
+                RefreshAfterDisabledChange(levelEvent, key, disabled);
+            }
+        }
+
+        /// <summary>
+        /// 勾掉 / 勾回一条属性之后，把改动推到画面上。两条路完全不一样：
+        ///
+        /// - **装饰物**：不去碰组件。预览求值器按作者数据算起点（见
+        ///   `DecorationCorePreviewDomain.AuthorPosition`），只要让它重新分析
+        ///   一次就够 —— 找组件这条路不可靠（检查器拿到的是 fake 事件，
+        ///   `UpdateDecorationObject` 遇到它直接 return，一次 Setup 都不跑）。
+        /// - **轨道 / 格子**：位移是在 `scnGame.ApplyEventsToFloors` 里烘进
+        ///   `floor.offsetPos` 的（那里认 `disabled`，第 514 行那个判断），所以
+        ///   重烘一次它自己就回到该在的位置；预览的基准值也是在 Analyze 时从
+        ///   `startPos + offsetPos` 抓的，得让它重新分析一次才吃到新值。
+        /// </summary>
+        private void RefreshAfterDisabledChange(LevelEvent levelEvent, string key, bool disabled)
+        {
+            scnEditor editor = scnEditor.instance;
+            if (editor == null)
+            {
+                return;
+            }
+            if (levelEvent != null && levelEvent.info != null && levelEvent.info.isDecoration)
+            {
+                // 求值器平时「时间没变就整帧早退」，置脏位才会拿新状态重算一次。
+                Preview.Domains.DecorationCorePreviewDomain.PositionSeedDirty = true;
+                return;
+            }
+            try
+            {
+                editor.ApplyEventsToFloors();
+            }
+            catch (Exception exception)
+            {
+                Main.Logger.Error("[PropertyPanel] rebake after disabled change failed: " + exception);
+            }
+            EditorPlaybackBridge.RequestEvaluatorRebuild("property-disabled");
         }
 
         /// <summary>
@@ -2293,6 +2423,21 @@ namespace ADOFAIEditorStudio
                     case PropertyType.Color:
                         BuildColor(row, levelEvent, info, x, width);
                         break;
+                    case PropertyType.Tile:
+                        BuildTile(row, levelEvent, info, x, width);
+                        break;
+                    case PropertyType.FloatPair:
+                        BuildFloatPair(row, levelEvent, info, x, width);
+                        break;
+                    case PropertyType.Vector2Range:
+                        BuildVector2Range(row, levelEvent, info, x, width);
+                        break;
+                    case PropertyType.MinMaxGradient:
+                        BuildMinMaxGradient(row, levelEvent, info, x, width);
+                        break;
+                    case PropertyType.ParticlePlayback:
+                        BuildParticlePlayback(row, levelEvent, info, x, width);
+                        break;
                     default:
                         BuildUnsupported(row, levelEvent, info, x, width);
                         break;
@@ -2302,6 +2447,404 @@ namespace ADOFAIEditorStudio
             {
                 Main.Logger.Error("[PropertyPanel] row " + info.name + " failed: " + exception);
                 BuildUnsupported(row, levelEvent, info, x, width);
+            }
+        }
+
+        /// <summary>
+        /// Tile 类型：一个整数字段 + 一个「本格 / 起点 / 终点」的模式按钮。
+        ///
+        /// ImGui 版早就是这个形态了，uGUI 这一份还停在「暂不支持 Tile」——
+        /// 那是 ImGui 改造前的旧实现。这里按 ImGui 版的语义补齐：
+        /// 数字与模式分开提交，提交时取另一半的**当前值**。
+        /// </summary>
+        private void BuildTile(Row row, LevelEvent levelEvent, ADOFAI.PropertyInfo info,
+            float x, float width)
+        {
+            float numberWidth = Mathf.Clamp(width * 0.42f, 48f, width);
+            const float gap = 6f;
+            float modeWidth = Mathf.Max(40f, width - numberWidth - gap);
+
+            Tuple<int, TileRelativeTo> stored = SafeGet<Tuple<int, TileRelativeTo>>(
+                levelEvent, info, null);
+            if (stored == null)
+            {
+                // 老谱面没写这一项：默认「本格 + 0」，与 ResolveTile 对 null 的处理一致。
+                stored = new Tuple<int, TileRelativeTo>(0, TileRelativeTo.ThisTile);
+            }
+
+            LevelEvent bound = levelEvent;
+            string key = info.name;
+            int offset = stored.Item1;
+            TileRelativeTo mode = stored.Item2;
+
+            TMP_InputField field = CreateInputField(row, "Tile", x, numberWidth,
+                "Standard", offset.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            row.Controls.Add(field.gameObject);
+            field.onEndEdit.AddListener(delegate(string text)
+            {
+                if (syncing || bound == null)
+                {
+                    return;
+                }
+                int parsed;
+                if (!int.TryParse(text, System.Globalization.NumberStyles.Integer,
+                    System.Globalization.CultureInfo.InvariantCulture, out parsed))
+                {
+                    return;
+                }
+                Commit(bound, key, new Tuple<int, TileRelativeTo>(parsed, mode));
+            });
+
+            // 模式：点击循环三档，不做下拉浮层（这一格只有三个取值，
+            // 弹层反而多一次点击、还要处理浮层层级）。
+            float modeX = x + numberWidth + gap;
+            RectTransform modeRect = NewChildRect("TileMode", row.ControlHost);
+            SetTopLeft(modeRect, modeX, (RowHeight - ControlHeight) * 0.5f,
+                modeWidth, ControlHeight);
+            BuildFieldChrome(modeRect, out Image modeBackground, out Image modeRim);
+            modeBackground.raycastTarget = true;
+            Button modeButton = modeRect.gameObject.AddComponent<Button>();
+            modeButton.targetGraphic = modeBackground;
+            modeButton.navigation = new Navigation { mode = Navigation.Mode.None };
+
+            TextMeshProUGUI modeLabel = CreateChildText("TileModeLabel", modeRect,
+                6f, 0f, modeWidth - 12f, ControlHeight, TileModeLabel(mode), 12f);
+            modeLabel.alignment = TextAlignmentOptions.MidlineLeft;
+            modeLabel.color = UiTheme.Current.TextPrimary;
+            row.Controls.Add(modeRect.gameObject);
+
+            TileRelativeTo capturedMode = mode;
+            modeButton.onClick.AddListener(delegate
+            {
+                if (bound == null)
+                {
+                    return;
+                }
+                TileRelativeTo next =
+                    capturedMode == TileRelativeTo.ThisTile ? TileRelativeTo.Start
+                    : capturedMode == TileRelativeTo.Start ? TileRelativeTo.End
+                    : TileRelativeTo.ThisTile;
+                capturedMode = next;
+                modeLabel.text = TileModeLabel(next);
+                Commit(bound, key, new Tuple<int, TileRelativeTo>(offset, next));
+            });
+        }
+
+        private static string TileModeLabel(TileRelativeTo mode)
+        {
+            switch (mode)
+            {
+                case TileRelativeTo.Start:
+                    return "起点";
+                case TileRelativeTo.End:
+                    return "终点";
+                default:
+                    return "本格";
+            }
+        }
+
+        /// <summary>一对浮点（`Tuple<float,float>`），最小 ~ 最大。</summary>
+        private void BuildFloatPair(Row row, LevelEvent levelEvent, ADOFAI.PropertyInfo info,
+            float x, float width)
+        {
+            Tuple<float, float> pair = SafeGet<Tuple<float, float>>(levelEvent, info, null);
+            if (pair == null)
+            {
+                pair = new Tuple<float, float>(0f, 0f);
+            }
+            float gap = 6f;
+            float suffixWidth = string.IsNullOrEmpty(info.unit) ? 0f : 22f;
+            float usable = Mathf.Max(40f, width - suffixWidth);
+            float half = Mathf.Max(1f, (usable - gap) * 0.5f);
+
+            LevelEvent bound = levelEvent;
+            string key = info.name;
+            float low = pair.Item1;
+            float high = pair.Item2;
+
+            TMP_InputField lowField = CreateInputField(row, "PairLow", x, half,
+                "0.###", FormatFloat(low));
+            TMP_InputField highField = CreateInputField(row, "PairHigh", x + half + gap, half,
+                "0.###", FormatFloat(high));
+            row.Controls.Add(lowField.gameObject);
+            row.Controls.Add(highField.gameObject);
+
+            lowField.onEndEdit.AddListener(delegate(string text)
+            {
+                if (syncing || bound == null)
+                {
+                    return;
+                }
+                float parsed;
+                if (float.TryParse(text, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out parsed))
+                {
+                    Commit(bound, key, new Tuple<float, float>(parsed, high));
+                }
+            });
+            highField.onEndEdit.AddListener(delegate(string text)
+            {
+                if (syncing || bound == null)
+                {
+                    return;
+                }
+                float parsed;
+                if (float.TryParse(text, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out parsed))
+                {
+                    Commit(bound, key, new Tuple<float, float>(low, parsed));
+                }
+            });
+        }
+
+        /// <summary>
+        /// 两对 Vector2（`Tuple<Vector2,Vector2>`）。排成两行：X 一行、Y 一行。
+        /// 行高已在 `StacksVertically` 里按双倍预留。
+        /// </summary>
+        private void BuildVector2Range(Row row, LevelEvent levelEvent, ADOFAI.PropertyInfo info,
+            float x, float width)
+        {
+            Tuple<Vector2, Vector2> range =
+                SafeGet<Tuple<Vector2, Vector2>>(levelEvent, info, null);
+            if (range == null)
+            {
+                range = new Tuple<Vector2, Vector2>(Vector2.zero, Vector2.zero);
+            }
+            Vector2 a = range.Item1;
+            Vector2 b = range.Item2;
+
+            const float axisWidth = 16f;
+            const float gap = 6f;
+            float suffixWidth = string.IsNullOrEmpty(info.unit) ? 0f : 22f;
+            float usable = Mathf.Max(60f, width - axisWidth - suffixWidth);
+            float fieldWidth = Mathf.Max(24f, (usable - gap) * 0.5f);
+
+            LevelEvent bound = levelEvent;
+            string key = info.name;
+
+            BuildRangeLine(row, bound, key, x, StackedFieldTop, axisWidth, fieldWidth, gap,
+                "X", a.x, b.x,
+                delegate(float low, float high)
+                {
+                    Commit(bound, key, new Tuple<Vector2, Vector2>(
+                        new Vector2(low, a.y), new Vector2(high, b.y)));
+                });
+            BuildRangeLine(row, bound, key, x,
+                StackedFieldTop + ControlHeight + StackedFieldGap,
+                axisWidth, fieldWidth, gap, "Y", a.y, b.y,
+                delegate(float low, float high)
+                {
+                    Commit(bound, key, new Tuple<Vector2, Vector2>(
+                        new Vector2(a.x, low), new Vector2(b.x, high)));
+                });
+        }
+
+        /// <summary>「X [最小] [最大]」这一行。</summary>
+        private void BuildRangeLine(Row row, LevelEvent bound, string key,
+            float x, float y, float axisWidth, float fieldWidth, float gap,
+            string axis, float low, float high, System.Action<float, float> apply)
+        {
+            CreateChildText("Axis" + axis, row.ControlHost, x, y, axisWidth,
+                ControlHeight, axis, 11f).color = UiTheme.Current.TextMuted;
+
+            TMP_InputField lowField = CreateInputFieldAt(row, "Min" + axis,
+                x + axisWidth, fieldWidth, y, "0.###", FormatFloat(low));
+            TMP_InputField highField = CreateInputFieldAt(row, "Max" + axis,
+                x + axisWidth + fieldWidth + gap, fieldWidth, y, "0.###", FormatFloat(high));
+            row.Controls.Add(lowField.gameObject);
+            row.Controls.Add(highField.gameObject);
+
+            float capturedHigh = high;
+            float capturedLow = low;
+            lowField.onEndEdit.AddListener(delegate(string text)
+            {
+                if (syncing || bound == null)
+                {
+                    return;
+                }
+                float parsed;
+                if (float.TryParse(text, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out parsed))
+                {
+                    apply(parsed, capturedHigh);
+                }
+            });
+            highField.onEndEdit.AddListener(delegate(string text)
+            {
+                if (syncing || bound == null)
+                {
+                    return;
+                }
+                float parsed;
+                if (float.TryParse(text, System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out parsed))
+                {
+                    apply(capturedLow, parsed);
+                }
+            });
+        }
+
+        /// <summary>
+        /// 双色渐变：两个 HEX 字段 + 两个色块（只读显示）。
+        /// 提交类型必须是 `SerializedMinMaxGradient`，游戏读的是它。
+        /// </summary>
+        private void BuildMinMaxGradient(Row row, LevelEvent levelEvent, ADOFAI.PropertyInfo info,
+            float x, float width)
+        {
+            Color low = Color.white;
+            Color high = Color.white;
+            try
+            {
+                ParticleSystem.MinMaxGradient gradient = levelEvent.GetMinMaxGradient(info.name);
+                bool twoColors = gradient.mode == ParticleSystemGradientMode.TwoColors;
+                low = twoColors ? gradient.colorMin : gradient.color;
+                high = twoColors ? gradient.colorMax : gradient.color;
+            }
+            catch (Exception)
+            {
+                // 读不到就用白色，用户改一次就覆盖了。
+            }
+
+            const float gap = 6f;
+            float half = Mathf.Max(60f, (width - gap) * 0.5f);
+
+            LevelEvent bound = levelEvent;
+            string key = info.name;
+            Color capturedLow = low;
+            Color capturedHigh = high;
+
+            BuildGradientHalf(row, x, 0f, half, "Low", low,
+                delegate(Color picked)
+                {
+                    capturedLow = picked;
+                    CommitGradient(bound, key, picked, capturedHigh);
+                });
+            BuildGradientHalf(row, x + half + gap, 0f, half, "High", high,
+                delegate(Color picked)
+                {
+                    capturedHigh = picked;
+                    CommitGradient(bound, key, capturedLow, picked);
+                });
+        }
+
+        private void BuildGradientHalf(Row row, float x, float y, float width, string caption,
+            Color color, System.Action<Color> apply)
+        {
+            const float swatch = 18f;
+            Image chip = CreateChildImage("Swatch" + caption, row.ControlHost, x,
+                y + (ControlHeight - swatch) * 0.5f, swatch, swatch);
+            chip.color = color;
+            chip.raycastTarget = false;
+            row.Controls.Add(chip.gameObject);
+
+            TMP_InputField field = CreateInputFieldAt(row, "Hex" + caption,
+                x + swatch + 4f, Mathf.Max(24f, width - swatch - 4f), y,
+                null, ColorToHex(color));
+            row.Controls.Add(field.gameObject);
+            field.onEndEdit.AddListener(delegate(string text)
+            {
+                if (syncing)
+                {
+                    return;
+                }
+                Color parsed;
+                if (TryParseHex(text, out parsed))
+                {
+                    chip.color = parsed;
+                    apply(parsed);
+                }
+            });
+        }
+
+        private void CommitGradient(LevelEvent bound, string key, Color low, Color high)
+        {
+            if (bound == null)
+            {
+                return;
+            }
+            Commit(bound, key, new ADOFAI.Editor.Models.SerializedMinMaxGradient
+            {
+                mode = ParticleSystemGradientMode.TwoColors,
+                color1 = ColorToHex(low),
+                color2 = ColorToHex(high),
+            });
+        }
+
+        /// <summary>
+        /// 粒子发射器：播放/暂停、停止、重置。原版还有「编辑」，
+        /// 那扇窗口目前仍是 ImGui 的，这里暂时不给入口。
+        /// </summary>
+        private void BuildParticlePlayback(Row row, LevelEvent levelEvent, ADOFAI.PropertyInfo info,
+            float x, float width)
+        {
+            scrParticleDecoration decoration = null;
+            try
+            {
+                if (levelEvent != null && scrDecorationManager.instance != null)
+                {
+                    decoration = scrDecorationManager.GetDecoration(levelEvent) as scrParticleDecoration;
+                }
+            }
+            catch (Exception)
+            {
+                decoration = null;
+            }
+
+            ParticleSystem system = decoration == null ? null : decoration.particleSystem;
+            if (system == null)
+            {
+                row.Controls.Add(CreateChildText("NoParticle", row.ControlHost, x, 0f,
+                    width, RowHeight, "（还没有对应的粒子对象）", 12f).gameObject);
+                return;
+            }
+
+            const float gap = 6f;
+            float buttonWidth = Mathf.Max(1f, (width - gap * 2f) / 3f);
+            string[] labels = { system.isPlaying ? "暂停" : "播放", "停止", "重置" };
+            for (int i = 0; i < labels.Length; i++)
+            {
+                int captured = i;
+                RectTransform buttonRect = NewChildRect("Particle" + i, row.ControlHost);
+                SetTopLeft(buttonRect, x + (buttonWidth + gap) * i,
+                    (RowHeight - ControlHeight) * 0.5f, buttonWidth, ControlHeight);
+                BuildFieldChrome(buttonRect, out Image buttonFace, out Image buttonRim);
+                buttonFace.raycastTarget = true;
+                Button button = buttonRect.gameObject.AddComponent<Button>();
+                button.targetGraphic = buttonFace;
+                button.navigation = new Navigation { mode = Navigation.Mode.None };
+                TextMeshProUGUI label = CreateChildText("Label", buttonRect,
+                    0f, 0f, buttonWidth, ControlHeight, labels[i], 12f);
+                label.alignment = TextAlignmentOptions.Center;
+                button.onClick.AddListener(delegate
+                {
+                    if (system == null)
+                    {
+                        return;
+                    }
+                    if (captured == 0)
+                    {
+                        ParticleSystem.MainModule main = system.main;
+                        main.useUnscaledTime = true;
+                        if (system.isPlaying)
+                        {
+                            system.Pause();
+                        }
+                        else
+                        {
+                            system.Play();
+                        }
+                    }
+                    else if (captured == 1)
+                    {
+                        system.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+                    }
+                    else
+                    {
+                        system.Clear();
+                    }
+                    label.text = system.isPlaying ? "暂停" : "播放";
+                });
+                row.Controls.Add(button.gameObject);
             }
         }
 
@@ -2418,13 +2961,13 @@ namespace ADOFAIEditorStudio
             RectTransform rect = NewChildRect("Enum", row.ControlHost);
             SetTopLeft(rect, x, (RowHeight - ControlHeight) * 0.5f, width - 4f, ControlHeight);
             Image background = rect.gameObject.AddComponent<Image>();
-            background.sprite = GetRoundedSprite(24, 5f, false);
+            background.sprite = GetRoundedSprite(24, 0f, false);
             background.type = Image.Type.Sliced;
             background.fillCenter = true;
-            background.color = FieldFill;
+            background.color = Color.black;
             background.raycastTarget = true;
             Image rim = CreateChildImage("Rim", rect, 0f, 0f, width - 4f, ControlHeight);
-            rim.sprite = GetRoundedSprite(24, 5f, true);
+            rim.sprite = GetRoundedSprite(24, 0f, true);
             rim.type = Image.Type.Sliced;
             rim.fillCenter = true;
             rim.color = FieldBorder;
@@ -2477,8 +3020,15 @@ namespace ADOFAIEditorStudio
             // 堆叠行要让两个字段之间留出明显空隙：2px 时它们读起来像
             // 一个被切开的控件，而不是两个独立的值。行高翻倍后是 76，
             // 两个 30px 控件，所以 3 + 30 + 10 + 30 + 3 刚好填满。
-            bool stacked = width < MinimumTwoAcrossWidth;
-            float half = stacked ? width : (width - gap) * 0.5f;
+            // **成对字段也要给单位留出同样的槽位。**
+            //
+            // 单值行会把右侧 22px 留给单位文字，成对行原来没有留 —— 于是
+            // 同一栏里「两个框并排」的那几行右边缘比别的行更靠右，
+            // 整列读起来间距不齐（用户指出的是这个）。
+            float suffixWidth = string.IsNullOrEmpty(info.unit) ? 0f : 22f;
+            float usable = Mathf.Max(40f, width - suffixWidth);
+            bool stacked = usable < MinimumTwoAcrossWidth;
+            float half = stacked ? usable : (usable - gap) * 0.5f;
             float firstY = stacked ? StackedFieldTop : (RowHeight - ControlHeight) * 0.5f;
             float secondY = stacked
                 ? StackedFieldTop + ControlHeight + StackedFieldGap
@@ -2655,14 +3205,15 @@ namespace ADOFAIEditorStudio
         private void BuildFieldChrome(RectTransform rect, out Image background, out Image rim)
         {
             background = rect.gameObject.AddComponent<Image>();
-            background.sprite = GetRoundedSprite(24, 5f, false);
+            // 直角 + 纯黑底：形状只靠外圈描边给出来，不用圆角也不用填色块。
+            background.sprite = GetRoundedSprite(24, 0f, false);
             background.type = Image.Type.Sliced;
             background.fillCenter = true;
-            background.color = FieldFill;
+            background.color = Color.black;
             background.raycastTarget = true;
 
             rim = CreateChildImage("Rim", rect, 0f, 0f, rect.sizeDelta.x, rect.sizeDelta.y);
-            rim.sprite = GetRoundedSprite(24, 5f, true);
+            rim.sprite = GetRoundedSprite(24, 0f, true);
             rim.type = Image.Type.Sliced;
             rim.fillCenter = true;
             rim.color = FieldBorder;
@@ -2780,12 +3331,22 @@ namespace ADOFAIEditorStudio
             RectTransform viewportRect = NewChildRect("Viewport", popup);
             SetTopLeft(viewportRect, 1f, 1f, popupWidth - 2f, listHeight);
             Image viewportBackground = viewportRect.gameObject.AddComponent<Image>();
-            viewportBackground.sprite = GetRoundedSprite(24, PopupRadius - 1f, false);
+            // **下拉列表：直角、纯黑底、只靠描边成形。**
+            viewportBackground.sprite = GetRoundedSprite(24, 0f, false);
             viewportBackground.type = Image.Type.Sliced;
             viewportBackground.fillCenter = true;
-            viewportBackground.color = PopupSurface;
+            viewportBackground.color = Color.black;
             viewportBackground.raycastTarget = true;
             viewportRect.gameObject.AddComponent<RectMask2D>();
+
+            // 描边单独一层，画在底之上；没有它这张浮层在深色面板上会"没有边界"。
+            Image popupRim = CreateChildImage("PopupRim", popup,
+                0f, 0f, popup.rect.width, popup.rect.height);
+            popupRim.sprite = GetRoundedSprite(24, 0f, true);
+            popupRim.type = Image.Type.Sliced;
+            popupRim.fillCenter = false;
+            popupRim.color = FieldBorder;
+            popupRim.raycastTarget = false;
 
             RectTransform contentRect = NewChildRect("Content", viewportRect);
             contentRect.anchorMin = new Vector2(0f, 1f);
@@ -3246,24 +3807,6 @@ namespace ADOFAIEditorStudio
         internal static bool IsEaseEnum(ADOFAI.PropertyInfo info)
         {
             return info != null && info.enumType == typeof(DG.Tweening.Ease);
-        }
-
-        private static bool TryReadEase(LevelEvent levelEvent, ADOFAI.PropertyInfo info,
-            out DG.Tweening.Ease ease)
-        {
-            ease = DG.Tweening.Ease.Linear;
-            if (levelEvent == null || info == null)
-            {
-                return false;
-            }
-            try
-            {
-                return TryParseEase(levelEvent[info.name] as string, out ease);
-            }
-            catch (Exception)
-            {
-                return false;
-            }
         }
 
         internal static bool TryParseEase(string name, out DG.Tweening.Ease ease)
