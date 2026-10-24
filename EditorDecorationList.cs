@@ -53,7 +53,7 @@ namespace ADOFAIEditorStudio
         private const float RowGap = 6f;
 
         /// <summary>行内容离面板左右边缘的距离。</summary>
-        private const float RowInset = 10f;
+        private const float RowInset = 6f;
         /// <summary>行内容的实际高度。</summary>
         private const float RowBodyHeight = RowHeight - RowGap;
         private const float PanePadding = 8f;
@@ -126,43 +126,6 @@ namespace ADOFAIEditorStudio
 
         private static readonly string[] DecoTypeNames = { "图片", "文本", "粒子", "对象" };
 
-        /// <summary>
-        /// 行首那条实心色标，按装饰物类型取色（下标和 <see cref="DecoTypes"/> 对齐）。
-        ///
-        /// 用四个色相而不是"统一的紫"：这个列表要回答的第一个问题就是
-        /// "哪些是图、哪些是文本"，颜色比图标快得多——图标要凑近才认得出。
-        ///
-        /// 四色都取满饱和度。色标只有一格宽，一压暗就成了灰线，等于没画。
-        /// 它们不会和紫/金打架：紫是"能点的"、金是"要读的"，这四个只是分类标签，
-        /// 面积也小到不参与整体色调。
-        /// </summary>
-        private static readonly Color[] TypeChipColors =
-        {
-            UiPrimitives.Hex("38bdf8"),
-            UiPrimitives.Hex("4ade80"),
-            UiPrimitives.Hex("fb7185"),
-            UiPrimitives.Hex("fbbf24")
-        };
-
-        // 色标的尺寸。**不能做成 3px 的细线**——3px 在 1080p 上就是一根
-        // 头发丝，读不出颜色，也就起不到"按类型分堆"的作用。做成一块
-        // 圆角色块，宽度按能看出色相来定。
-        private const float TypeChipWidth = 12f;
-        private const float TypeChipHeight = 18f;
-
-        private static Color TypeChipColor(LevelEventType type)
-        {
-            for (int i = 0; i < DecoTypes.Length; i++)
-            {
-                if (DecoTypes[i] == type)
-                {
-                    return TypeChipColors[i];
-                }
-            }
-
-            return TypeChipColors[TypeChipColors.Length - 1];
-        }
-
         // ---------------------------------------------------------------- 行数据
 
         /// <summary>
@@ -189,10 +152,7 @@ namespace ADOFAIEditorStudio
             internal GameObject GameObject;
             internal RectTransform Rect;
             internal Image Background;
-            /// <summary>行首那条实心色标。按类型取色，见 <see cref="TypeChipColors"/>。</summary>
-            internal Image TypeChip;
-            internal Image TypeIcon;
-            internal TextMeshProUGUI Name;
+                internal TextMeshProUGUI Name;
             internal TextMeshProUGUI Tag;
             internal Button Eye;
             internal Image EyeIcon;
@@ -223,6 +183,25 @@ namespace ADOFAIEditorStudio
             ApplyIconSprites();
             RefreshNow();
         }
+
+        /// <summary>
+        /// 只建数据、不建任何 UI —— 给新的 uGUI 左栏用（UI 在 <see cref="UiBrowserPane"/>）。
+        ///
+        /// 图标解析留着：它读的是游戏原版那几张精灵，行上那两个图标要跟着状态换，
+        /// 自己再写一遍取图逻辑迟早和这边走散。
+        /// </summary>
+        internal void InitializeModel()
+        {
+            BuildSprites();
+            RefreshNow();
+        }
+
+        // 行上那三个图标。**原版优先、自绘兜底**，和 ImGui 版同一套来源。
+        internal Sprite EyeOpenSprite { get { RetryIconsIfNeeded(); return eyeOpen; } }
+        internal Sprite EyeClosedSprite { get { RetryIconsIfNeeded(); return eyeClosed; } }
+        internal Sprite LockOpenSprite { get { RetryIconsIfNeeded(); return lockOpen; } }
+        internal Sprite LockClosedSprite { get { RetryIconsIfNeeded(); return lockClosed; } }
+        internal Sprite DeleteSprite { get { RetryIconsIfNeeded(); return deleteIcon; } }
 
         /// <summary>
         /// 面板尺寸的唯一入口。
@@ -707,8 +686,6 @@ namespace ADOFAIEditorStudio
         internal static int TypeCount { get { return DecoTypes.Length; } }
         internal static LevelEventType TypeAt(int index) { return DecoTypes[index]; }
         internal static string TypeNameAt(int index) { return DecoTypeNames[index]; }
-        internal static Color TypeColorAt(int index) { return TypeChipColors[index]; }
-        internal static int SlotOf(LevelEventType type) { return TypeSlotOf(type); }
         internal void SetSearchText(string text) { OnSearchChanged(text); }
         internal void ToggleBatchHiddenFromImGui() { ToggleBatchHidden(); }
         internal void ToggleBatchLockedFromImGui() { ToggleBatchLocked(); }
@@ -734,16 +711,6 @@ namespace ADOFAIEditorStudio
                 }
             }
             return null;
-        }
-
-        /// <summary>ImGui 接管左栏时隐藏原来的 uGUI 列表，切回时还原。</summary>
-        internal void SuppressForImGui(bool suppressed)
-        {
-            if (gameObject.activeSelf == !suppressed)
-            {
-                return;
-            }
-            gameObject.SetActive(!suppressed);
         }
 
         private void ApplyFilter()
@@ -972,11 +939,10 @@ namespace ADOFAIEditorStudio
                 GameObject = rowObject,
                 Rect = rect,
                 Background = background,
-                TypeChip = CreateImage("TypeChip", rect, RowInset,
-                    (RowBodyHeight - TypeChipHeight) * 0.5f,
-                    TypeChipWidth, TypeChipHeight, TypeChipColors[0]),
-                TypeIcon = CreateImage("TypeIcon", rect, 22f, (RowBodyHeight - 16f) * 0.5f, 16f, 16f, Color.white),
-                Name = CreateText("Name", rect, 42f, 0f, 100f, RowBodyHeight, string.Empty, UiType.Body,
+                // **行首不放任何装饰**：色标和类型图标都去掉了（用户要求）。
+                // 图标是一张纯白贴图，在深色行上就是一块白方块，反而抢眼。
+                Name = CreateText("Name", rect, RowInset + 4f, 0f, 100f, RowBodyHeight,
+                    string.Empty, UiType.Body,
                     UiTheme.Current.TextPrimary, TextAlignmentOptions.MidlineLeft, false),
                 Tag = CreateText("Tag", rect, 100f, 0f, 10f, RowBodyHeight, string.Empty, 11f,
                     Palette.TextMuted, TextAlignmentOptions.MidlineRight, false)
@@ -987,13 +953,6 @@ namespace ADOFAIEditorStudio
                 delegate { ToggleLockedEntry(EntryOf(row)); }, out row.LockIcon);
             row.Delete = CreateIconButton("Delete", rect, 0f, deleteIcon,
                 delegate { DeleteEntry(EntryOf(row)); }, out row.DeleteIcon);
-            row.TypeChip.raycastTarget = false;
-            // 圆角色块，不是方块：这块 12×18 的形状是行上唯一的纯装饰图形，
-            // 直角在深色底上显得硬，圆角才和标签药丸、面板圆角是同一套语言。
-            row.TypeChip.sprite = roundedSprite;
-            row.TypeChip.type = Image.Type.Sliced;
-            row.TypeIcon.raycastTarget = false;
-            row.TypeIcon.preserveAspect = true;
             row.Name.overflowMode = TextOverflowModes.Ellipsis;
             row.Tag.overflowMode = TextOverflowModes.Ellipsis;
 
@@ -1042,11 +1001,11 @@ namespace ADOFAIEditorStudio
 
         private void UpdateRows()
         {
-            if (rowScroll == null || rowContent == null)
-            {
-                return;
-            }
-
+            // **数据先刷，再管有没有 UI。**
+            //
+            // 新的 uGUI 左栏（UiBrowserPane）只用这里的数据快照、不建这套行，
+            // 所以 rowScroll 是 null。原来第一行就 return，导致 filtered 永远
+            // 是空的 —— 表现为「装饰物一栏什么都没有」。
             if (entriesDirty)
             {
                 RebuildEntries();
@@ -1065,6 +1024,11 @@ namespace ADOFAIEditorStudio
             }
 
             rowsDirty = false;
+
+            if (rowScroll == null || rowContent == null)
+            {
+                return;
+            }
 
             float viewportHeight = rowViewport == null ? RowHeight : rowViewport.rect.height;
             int visibleCount = Mathf.CeilToInt(viewportHeight / RowHeight) + 2;
@@ -1112,23 +1076,8 @@ namespace ADOFAIEditorStudio
             // 没有主体：名字、tag、三个按钮权重差不多，眼睛不知道该看哪。
             row.Name.color = UiTheme.Current.TextPrimary;
 
-            Sprite typeIcon = null;
-            if (GCS.levelEventIcons != null)
-            {
-                GCS.levelEventIcons.TryGetValue(entry.Type, out typeIcon);
-            }
-            row.TypeChip.color = TypeChipColor(entry.Type);
-            row.TypeIcon.sprite = typeIcon;
-            row.TypeIcon.enabled = typeIcon != null;
-
             row.Name.text = entry.DisplayName;
             row.Name.fontStyle = selected ? FontStyles.Bold : FontStyles.Normal;
-
-            // 色标、图标、名字依次排开，都从行左缘内缩 RowInset。
-            SetTopLeft(row.TypeChip.rectTransform, RowInset,
-                (RowBodyHeight - TypeChipHeight) * 0.5f, TypeChipWidth, TypeChipHeight);
-            SetTopLeft(row.TypeIcon.rectTransform, RowInset + 20f,
-                (RowBodyHeight - 16f) * 0.5f, 16f, 16f);
 
             // 名字和 tag 抢同一段横向空间。名字给大头（它才是用来分辨
             // 两个装饰物的），tag 只在确实有内容时才占一截。
@@ -1137,7 +1086,8 @@ namespace ADOFAIEditorStudio
             // （vni、s1 这种），多数只有几个字符；而名字是文件名，
             // 长得多。按比例分会让 tag 白占掉一截该给名字的地方。
             float buttonsWidth = EyeWidth + LockWidth + DeleteWidth;
-            float textLeft = RowInset + 42f;
+            // 行首不再有色标 / 图标，名字直接从行左缘内缩一点点开始。
+            float textLeft = RowInset + 4f;
             float textRight = width - RowInset - buttonsWidth - 8f;
             float textHeight = RowBodyHeight;
             if (string.IsNullOrEmpty(entry.Tag))
@@ -1503,6 +1453,9 @@ namespace ADOFAIEditorStudio
                 int playheadFloor = timeline.PlayheadFloorIndex();
                 if (playheadFloor >= 0 && playheadFloor < editor.floors.Count)
                 {
+                    // 同上：只是把选中挪到播放头，不该带动画面。
+                    EditorPlaybackBridge.MarkNextFloorSelect(
+                        EditorPlaybackBridge.FloorSelectPlayheadSync);
                     editor.SelectFloor(editor.floors[playheadFloor], cameraJump: false);
                 }
             }
@@ -1702,11 +1655,8 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>
-        /// 手绘位图 → 贴图。
-        ///
-        /// **单独拆出来是给 ImGui 那版用的**（EditorImGuiIcons.TryGetDrawn）——
-        /// 两个界面画的是同一份像素图，但一边要 Sprite、一边要贴图，所以把
-        /// "位图变贴图"这一步提出来共用，免得两边各写一遍迟早走样。
+        /// 手绘位图 → 贴图。`BuildGlyph` 包成 Sprite 用，这里单独留着，
+        /// 方便别处直接拿贴图（渲染路径换成 uGUI 之前 ImGui 那版就是这么用的）。
         /// </summary>
         internal static Texture2D BuildGlyphTexture(string name, bool[] pixels)
         {
@@ -1846,14 +1796,26 @@ namespace ADOFAIEditorStudio
             // 于是光标根本不会建，字段再点也不会闪。
             rect.gameObject.SetActive(false);
 
+            // **不要输入框外壳，只要一条下划线。**
+            //
+            // 原来是一整块灰底 + 一圈描边（FieldWell + Outline），在这个纯黑
+            // 面板上像贴了一块灰色板子。改成"只有底线"：底色透明、无描边、
+            // 底部一条 1px 细线，占位符与文字照旧。
             Image background = rect.gameObject.AddComponent<Image>();
-            background.color = Palette.FieldWell;
+            background.color = Color.clear;
             background.raycastTarget = true;
 
-            Outline rim = rect.gameObject.AddComponent<Outline>();
-            rim.effectColor = new Color(1f, 1f, 1f, 0.10f);
-            rim.effectDistance = new Vector2(1f, -1f);
-            rim.useGraphicAlpha = false;
+            RectTransform underlineRect = CreateRect("Underline", rect, 0f, 0f, 0f, 1f);
+            // 横向按父节点拉伸：搜索框会随面板宽度变宽，写死宽度的话
+            // 底线永远停在最初那一截（实测现象）。
+            underlineRect.anchorMin = new Vector2(0f, 0f);
+            underlineRect.anchorMax = new Vector2(1f, 0f);
+            underlineRect.pivot = new Vector2(0.5f, 0f);
+            underlineRect.offsetMin = new Vector2(0f, 0f);
+            underlineRect.offsetMax = new Vector2(0f, 1f);
+            Image underline = underlineRect.gameObject.AddComponent<Image>();
+            underline.color = new Color(1f, 1f, 1f, 0.18f);
+            underline.raycastTarget = false;
 
             // 文本与占位符都铺满输入框（拉伸锚点），而不是左上锚点定尺寸。
             // TMP_InputField 会写 textComponent 的 anchoredPosition 去跟光标，

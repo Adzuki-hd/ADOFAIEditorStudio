@@ -538,23 +538,47 @@ namespace ADOFAIEditorStudio
         private static System.Reflection.PropertyInfo _unsavedProperty;
         private static bool _unsavedProbeDone;
 
-        // ------------------------------------------------------- 时间轴块移动
+        // ------------------------------------------------------- 时间轴行号（纵向）
 
         /// <summary>
-        /// 时间轴上把块往上/往下挪一行（纵向）。**整批一起**。
+        /// 记一次"把一批事件块上下挪行"。**整批一条**，不是每块一条 ——
+        /// 多选整批拖一次，撤销就该一次退回。
         ///
-        /// **只管行号，不管横向。** 横向的还原另有其人 —— 被拖的那个由
-        /// `CommitBlockDrag` 记、每个跟随者由 `CommitFollowerDrag` 各记一条
-        /// （都是谱面 `floor`/`angleOffset` 的改动）。
-        ///
-        /// 纵向是**纯画布布局**、没有别人管它，所以整批都得记进来：
-        /// 只记被拖的那一个的话，框选一堆拖完按 Ctrl+Z 只退回一个，
-        /// 其余的留在原地 —— 和"能整批横向拖、纵向只有它自己动"是同一个缺口。
-        ///
-        /// 时间轴那边**一次拖动只在松手时记一条**，不是每帧一条：
-        /// 每帧记的话拖一次鼠标就是上百条，按一次 Ctrl+Z 只退一行。
+        /// 行号只活在工作台会话里（不写 `.aes`、不写回 `.adofai`），但它是
+        /// **执行优先级**：拖乱了再撤销，横向回去了、纵向没回去，看起来就是
+        /// "撤销把块拆散架了"。所以这一条也要进历史。
         /// </summary>
-        private sealed class MoveTimelineBlockRowsCommand : ICommand
+        internal static void RecordBlockRows(EditorTimelineView view,
+            LevelEvent[] targets, int[] fromRows, int[] toRows)
+        {
+            if (view == null || targets == null || fromRows == null || toRows == null
+                || targets.Length == 0)
+            {
+                return;
+            }
+            bool changed = false;
+            for (int i = 0; i < targets.Length; i++)
+            {
+                if (fromRows[i] != toRows[i])
+                {
+                    changed = true;
+                    break;
+                }
+            }
+            if (!changed)
+            {
+                return;
+            }
+            Record(new BlockRowsCommand
+            {
+                View = view,
+                Targets = targets,
+                FromRows = fromRows,
+                ToRows = toRows
+            });
+        }
+
+        private sealed class BlockRowsCommand : ICommand
         {
             internal EditorTimelineView View;
             internal LevelEvent[] Targets;
@@ -563,7 +587,7 @@ namespace ADOFAIEditorStudio
 
             public string Description
             {
-                get { return "移动事件块"; }
+                get { return "移动事件块行"; }
             }
 
             public bool Undo()
@@ -582,33 +606,9 @@ namespace ADOFAIEditorStudio
                 {
                     return false;
                 }
-                for (int i = 0; i < Targets.Length && i < rows.Length; i++)
-                {
-                    View.MoveBlockRowByEvent(Targets[i], rows[i]);
-                }
+                View.ApplyBlockRows(Targets, rows);
                 return true;
             }
-        }
-
-        /// <summary>
-        /// 记一次整批纵向移动。**一个都没动就什么都不记** ——
-        /// 点一下没拖动也会走到这里。
-        /// </summary>
-        internal static void RecordTimelineBlockRows(EditorTimelineView view,
-            LevelEvent[] targets, int[] fromRows, int[] toRows)
-        {
-            if (view == null || targets == null || targets.Length == 0
-                || fromRows == null || toRows == null)
-            {
-                return;
-            }
-            Record(new MoveTimelineBlockRowsCommand
-            {
-                View = view,
-                Targets = targets,
-                FromRows = fromRows,
-                ToRows = toRows
-            });
         }
 
         /// <summary>
@@ -908,16 +908,6 @@ namespace ADOFAIEditorStudio
             {
                 return RemoveEventNow(Editor, Event);
             }
-        }
-
-        internal static void RecordEventCreate(scnEditor editor, LevelEvent levelEvent, int index)
-        {
-            Record(new CreateEventCommand
-            {
-                Editor = editor,
-                Event = levelEvent,
-                Index = index
-            });
         }
 
         /// <summary>

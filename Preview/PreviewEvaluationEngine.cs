@@ -66,40 +66,6 @@ namespace ADOFAIEditorStudio.Preview
         // 帧开销剖析，仅在 VerboseDiagnostics 打开时填充。
         private static readonly float[] lastDomainMs = new float[32];
         private static float lastSyncMs;
-        private static int lastProfileFrame = -1000;
-
-        /// <summary>
-        /// 单独测量引擎自身的工作（校验、帧构建、域
-        /// 派发、同步），与各域分开，这样帧开销的差距可以
-        /// 被归因，而不是靠猜。
-        /// </summary>
-        private static void LogProfile()
-        {
-            if (Time.frameCount - lastProfileFrame < 60)
-            {
-                return;
-            }
-            lastProfileFrame = Time.frameCount;
-
-            System.Text.StringBuilder builder = new System.Text.StringBuilder("[PreviewCost] ");
-            float total = lastSyncMs;
-            for (int i = 0; i < Domains.Count && i < lastDomainMs.Length; i++)
-            {
-                if (lastDomainMs[i] < 0.05f)
-                {
-                    continue;
-                }
-                total += lastDomainMs[i];
-                builder.Append(Domains[i].Name).Append('=')
-                    .Append(lastDomainMs[i].ToString("0.00")).Append("ms ");
-            }
-            builder.Append("sync=").Append(lastSyncMs.ToString("0.00"))
-                .Append("ms domains=").Append(total.ToString("0.00"))
-                .Append("ms engine=").Append(lastEngineMs.ToString("0.00"))
-                .Append("ms validate=").Append(lastValidateMs.ToString("0.00"))
-                .Append("ms.");
-            Main.Logger.Log(builder.ToString());
-        }
 
         private static float lastEngineMs;
         private static float lastValidateMs;        private static bool active;
@@ -210,7 +176,6 @@ namespace ADOFAIEditorStudio.Preview
                 }
             }
         }
-
 
         /// <summary>
         /// 由 EditorStudioOverlay.LateUpdate 每帧调用。
@@ -502,6 +467,7 @@ namespace ADOFAIEditorStudio.Preview
                         lastDomainMs[i] = (float)(
                             (System.Diagnostics.Stopwatch.GetTimestamp() - domainStart)
                             * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+                        PreviewDiagnostics.RecordDomain(Domains[i].Name, lastDomainMs[i]);
                     }
                 }
 
@@ -524,7 +490,7 @@ namespace ADOFAIEditorStudio.Preview
                     lastSyncMs = (float)(
                         (System.Diagnostics.Stopwatch.GetTimestamp() - syncStart)
                         * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
-                    LogProfile();
+
                 }
                 return true;
             }

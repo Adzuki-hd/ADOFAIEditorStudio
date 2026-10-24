@@ -42,24 +42,3 @@ desktop.ini
 # 工具的输出图（布局预览、图标自检），是产物不是源码
 tools/layout-preview/*.png
 tools/icons/selftest.png
-
-# ---------------------------------------------------------------------------
-# 2026-10-21：公开仓库只保留源码。
-# 下面这些只在本机保留，不再进仓库，也不在历史里（历史已重写）。
-# ---------------------------------------------------------------------------
-/CLAUDE.md
-/.claude/
-/开发计划.md
-/测试清单.md
-/交接回执-*.md
-/交接-*.md
-/tools/
-/FrameCacheSpike/
-/restart-and-install.ps1
-/pack-release.ps1
-/install-after-game-exit.ps1
-/rollback-to-baseline.ps1
-/queue-install-after-game-exit.cmd
-/Logo.png
-/Logo.rgba
-/Preview/PREVIEW_COVERAGE.md

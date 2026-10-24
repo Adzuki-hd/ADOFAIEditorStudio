@@ -29,6 +29,15 @@ namespace ADOFAIEditorStudio.Ui
         /// 面板标题条的实心底衬。比面板亮一档，四条横带才立得起来。
         /// </summary>
         internal Color SurfaceBand;
+        /// <summary>
+        /// 顶栏带（标题 / 菜单 / 标签条那三行）的底色。
+        ///
+        /// 全局背景已改纯黑，顶栏再纯黑就和内容糊成一片，所以这里单独留一档
+        /// 极浅的灰（原来的 #0B0B0B）。**无边框、无圆角**，只是一块满宽矩形。
+        /// </summary>
+        internal Color SurfaceTopBand;
+
+
 
         // ── 文字 ──────────────────────────────────────────────────────────
         // 三级足够：正文 / 次要 / 弱化。等级再多就分不出主次了。
@@ -96,60 +105,84 @@ namespace ADOFAIEditorStudio.Ui
         ///   border.strong  #64748B → 约 4.2:1，满足控件边框的 3:1
         /// 注意 border.hairline 是纯装饰（白 8%），不用于需要辨识的控件轮廓。
         /// </summary>
+        /// <summary>完全透明。用于「这一层不再自己画底色」的表面。</summary>
+        private static readonly Color Transparent = new Color(0f, 0f, 0f, 0f);
+
         internal static readonly UiTheme Slate = new UiTheme
         {
             Id = "slate",
             DisplayName = "雾蓝",
 
+            // 全灰阶配色（2026-10-22）：只用黑/灰/白，不带任何色相。
+            // 明度阶梯仍然拉开，保证文字与控件的可读性；原来那套雾蓝/天蓝
+            // 语义色全部收敛成中性灰阶。
             // 明度阶梯。相邻两档的差距要够大，否则面板和背景糊成一片，
-            // 界面会显得「平」——层次是靠明度差读出来的，不是靠描边。
             // 实测梯度：page 最暗 → panel 约两倍 → raised 再上一档 → thumb 最亮。
-            SurfacePage = UiPrimitives.Hex("0A0C0F"),
-            SurfacePanel = UiPrimitives.Hex("1A1F27"),
-            SurfaceRaised = UiPrimitives.Hex("242A33"),
-            SurfaceRaisedHover = UiPrimitives.Hex("2A313B"),
-            SurfaceOverlay = UiPrimitives.Hex("2A313B"),
-            SurfaceWell = UiPrimitives.Hex("07080B"),
-            SurfaceThumb = UiPrimitives.Hex("2E353F"),
+            // 纯黑底：原来 #0B0B0B 在暗处仍能看出一点点灰，观感“不是纯黑”。
+            SurfacePage = UiPrimitives.Hex("000000"),
+            // ── 纯平背景（2026-10-21）──────────────────────────────────────
+            // 只保留**一层**总背景：SurfacePage。其余所有"面上再叠面"的填充
+            // 一律透明 —— 面板底、标题条、输入凹槽、缩略图底都不再自己画底色，
+            // 露出来的就是那一层背景。
+            //
+            // 控件本身不在此列：SurfaceRaised / RaisedHover 仍然有填充，
+            // 否则按钮、卡片会和背景糊在一起。这一版只清背景，不动控件。
+            // **uGUI 迁移后必须把面画回来。**
+            //
+            // 「纯平背景」那一版的前提是：所有面板底色都由 ImGui 的
+            // DrawModuleBlocks 统一铺。面板改回 uGUI 之后没有那一层了，
+            // 于是整块工作台只剩文字浮在游戏画面上 —— 表现就是
+            // 「界面像是空的 / 下拉菜单点了没反应」（其实浮层在，只是全透明）。
+            // 与 ImGui 那套一致：面板/顶栏就是模块底色 #0B0B0B，
+            // 页面纯黑，浮层只比面板亮一档。uGUI 要还原的是**同一套灰阶**，
+            // 不是另起一套蓝灰。
+            SurfacePanel = UiPrimitives.Hex("0B0B0B"),
+            // 控件也去底：按钮、开关、图标一律"纯图标"，不再带圆角底色。
+            // 唯一保留的是**悬停/按下**的一层极淡白（8% / 14%），否则鼠标移上去
+            // 完全没有反馈，看不出哪里能点。
+            SurfaceRaised = Transparent,
+            SurfaceRaisedHover = new Color(1f, 1f, 1f, 0.08f),
+            SurfaceOverlay = UiPrimitives.Hex("131313"),
+            SurfaceWell = Transparent,
+            SurfaceThumb = Transparent,
             // 对 SurfacePanel(#1A1F27) 的明度比约 1.26:1。
             // 标题条只有 28px 高、又贴着面板边缘，再低就看不出是条横带了。
-            SurfaceBand = UiPrimitives.Hex("2A313B"),
+            SurfaceBand = Transparent,
+            SurfaceTopBand = UiPrimitives.Hex("0B0B0B"),
 
-            TextPrimary = UiPrimitives.Slate.C200,
-            TextSecondary = UiPrimitives.Slate.C400,
-            TextMuted = UiPrimitives.Slate.C500,
-            TextDisabled = UiPrimitives.Slate.C600,
+            TextPrimary = UiPrimitives.Hex("F2F2F2"),
+            TextSecondary = UiPrimitives.Hex("B8B8B8"),
+            TextMuted = UiPrimitives.Hex("8A8A8A"),
+            TextDisabled = UiPrimitives.Hex("5C5C5C"),
             // 强调文字：天蓝的中间那一档（#0EA5E9）。
             // 对 panel #1A1F27 的对比度约 6.0:1，是**还过得了正文 4.5:1 的、最不刺眼
             // 的一档** —— 再暗一档（C600）只有约 4.1:1，达不到正文要求；
             // 再用主色那一档（C400）就比按钮还亮了，撒在正文里太吵。
-            TextEmphasis = UiPrimitives.Sky.C500,
-            TextOnAccent = UiPrimitives.Hex("0F1115"),
+            TextEmphasis = UiPrimitives.Hex("FFFFFF"),
+            TextOnAccent = UiPrimitives.Hex("0B0B0B"),
 
             BorderHairline = new Color(1f, 1f, 1f, 0.08f),
-            BorderStrong = UiPrimitives.Slate.C500,
-            BorderFocus = UiPrimitives.Sky.C400,
+            BorderStrong = UiPrimitives.Hex("8A8A8A"),
+            BorderFocus = UiPrimitives.Hex("FFFFFF"),
 
-            ActionPrimary = UiPrimitives.Sky.C400,
-            ActionPrimaryHover = UiPrimitives.Sky.C300,
-            ActionPrimaryPressed = UiPrimitives.Sky.C500,
+            ActionPrimary = UiPrimitives.Hex("E8E8E8"),
+            ActionPrimaryHover = UiPrimitives.Hex("FFFFFF"),
+            ActionPrimaryPressed = UiPrimitives.Hex("C4C4C4"),
 
-            AccentSecondary = UiPrimitives.Sky.C400,
+            AccentSecondary = UiPrimitives.Hex("E8E8E8"),
 
             // 选中态用主色的半透明叠加，而不是另配一个颜色——
             // 这样换主题时选中态自动跟着主色走，不会漏改。
-            SelectedFill = new Color(
-                UiPrimitives.Sky.C400.r, UiPrimitives.Sky.C400.g,
-                UiPrimitives.Sky.C400.b, 0.15f),
-            SelectedHoverFill = new Color(
-                UiPrimitives.Sky.C400.r, UiPrimitives.Sky.C400.g,
-                UiPrimitives.Sky.C400.b, 0.22f),
+            // 选中态：中性白叠加，不再带色相。
+            SelectedFill = new Color(1f, 1f, 1f, 0.14f),
+            SelectedHoverFill = new Color(1f, 1f, 1f, 0.22f),
 
-            FeedbackDanger = UiPrimitives.Rose.C400,
-            FeedbackWarning = UiPrimitives.Amber.C400,
-            FeedbackSuccess = UiPrimitives.Emerald.C400,
+            FeedbackDanger = UiPrimitives.Hex("E8E8E8"),
+            FeedbackWarning = UiPrimitives.Hex("C4C4C4"),
+            FeedbackSuccess = UiPrimitives.Hex("FFFFFF"),
 
-            Shadow = new Color(0f, 0f, 0f, 0.45f)
+            // 纯平背景：不留投影（面板本身也透明了，阴影只会变成一块孤立深色）。
+            Shadow = Transparent
         };
 
         private static UiTheme current;

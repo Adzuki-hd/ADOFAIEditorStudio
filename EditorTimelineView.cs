@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using ADOFAI;
@@ -80,6 +80,8 @@ namespace ADOFAIEditorStudio
             internal RectTransform Rect;
             internal Image Background;
             internal EaseCurveImage Curve;
+            /// <summary>上一次绑的曲线数组。同一个数组不重复 SetCurve。</summary>
+            internal float[] CurveValues;
             internal Image Icon;
             internal TextMeshProUGUI Label;
             // 精确选中时点亮的白色描边。常驻对象，只切换显隐，
@@ -89,6 +91,8 @@ namespace ADOFAIEditorStudio
             // 拖动交互。挂在块上，随池复用，所以创建一次就够。
             internal TimelineBlockDrag Drag;
             internal TimelineItem Item;
+            /// <summary>当前绑定的块 ID（-1 = 没绑）。回收时用它摘掉旧映射。</summary>
+            internal int BoundBlockId = -1;
         }
 
         private struct RowInterval
@@ -242,6 +246,15 @@ namespace ADOFAIEditorStudio
                     return;
                 }
 
+                // **只读：块不能拖。** 拖动改的是事件的时间和时长，都是写谱面。
+                // 拦在这里而不是 Drag 里：一旦进入拖动状态，光标、预览位置、
+                // 松手提交都要走完整条链，中途拦反而容易留下半截状态。
+                // `AllowEdit` 会顺手弹一句"只读模式不能修改谱面"。
+                if (!view.CanEditChart())
+                {
+                    return;
+                }
+
                 // 用 pressPosition 判边缘，不用 position：OnPointerMove 不保证
                 // 在 OnBeginDrag 之前跑过，而 pressPosition 一定是按下的那一点。
                 bool onLeftEdge;
@@ -338,8 +351,9 @@ namespace ADOFAIEditorStudio
                 {
                     case Mode.Move:
                     {
-                        // 拖块身：起点吸附到格边界，时长不变。
-                        float start = view.SnapBlockTime(originalStartTime + deltaTime);
+                        // 拖块身：按整拍移动、保住格内偏移，时长不变。
+                        float start = view.SnapBlockTimeKeepingPhase(
+                            originalStartTime + deltaTime, originalStartTime);
                         view.PreviewBlockDrag(marker, start, originalDuration);
                         break;
                     }
@@ -517,7 +531,15 @@ namespace ADOFAIEditorStudio
         }
 
         internal const int LaneCount = 7;
-        private const int MarkerPoolSize = 320;
+        /// <summary>
+        /// 块对象池上限。
+        ///
+        /// **必须远大于"一屏最多能同时显示的块数"。** 之前是 320：密集谱上
+        /// 一屏能过几百个块，池子一满循环就 `break`，后面的块拿不到标记 ——
+        /// 表现是"块看不见、也点不中"，但拖别的块过去照样会判重叠变红
+        /// （重叠判定看的是数据，不是标记）。
+        /// </summary>
+        private const int MarkerPoolSize = 1600;
         private const int MajorTickPoolSize = 32;
         private const int FloorLinePoolSize = 160;
         private const int RowBackgroundPoolSize = 32;
@@ -531,17 +553,8 @@ namespace ADOFAIEditorStudio
         // 工具栏占两行，给后续要加的小按钮留位置。
         // 第一行放时间轴自己的控件（筛选、缩放、播放模式…），
         // 第二行预留给后续功能。主体从两行之下开始。
-        /// <summary>
-        /// 标题行的高度（最上面那一条）。
-        ///
-        /// 事件面板从 `PaletteRowY = 42 + 2` 起，紧贴它下面 —— 所以这一条是
-        /// **能单独接管**的：ImGui 画它、把这一排 uGUI 藏掉，下面照旧。
-        /// </summary>
-        internal const float TitleRowHeight = 42f;
-
         private const float ToolRowHeight = 34f;
         private const float ToolRowGap = 2f;
-        private static readonly float ToolRow2Y = ToolRowHeight + ToolRowGap;
         // 工具区高度不是常量：放置事件面板的按钮放不下时会多占一行，
         // 这里跟着变高，时间轴可视区相应变矮。见 RefreshEventPalette。
         private float headerHeight = 42f + ToolRowHeight + ToolRowGap;
@@ -607,7 +620,6 @@ namespace ADOFAIEditorStudio
         // 下面还有更多，不用去读「+N」。
         private const float SectionVisibleRows = 4f;
         private const float SectionSliverRows = 0.5f;
-        private static readonly float SectionWindowRows = SectionVisibleRows + SectionSliverRows;
         private const float BadgeWidth = 68f;
         private const float BadgeHeight = 7f;
         // 默认缩放下可见跨度是十二秒，让分类框打开时显示的是一段
@@ -661,10 +673,17 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>缩放上限：让「每拍像素」固定，所以快谱的上限更大。</summary>
-        private static float MaximumPixelsPerSecond
+        /// <summary>
+        /// 缩放上限：视口里最少显示 `MinVisibleSeconds` 秒。
+        /// 用"看到多少秒"定，而不是拿 BPM 推像素 —— 换谱面/BPM 变化时范围不会飘。
+        /// </summary>
+        private const float MinVisibleSeconds = 1.2f;
+
+private static float MaximumPixelsPerSecond
         {
             get { return MaxPixelsPerBeat * ChartBpm / 60f; }
         }
+
 
         /// <summary>
         /// 缩放下限，取上限的一个固定比例。
@@ -673,10 +692,23 @@ namespace ADOFAIEditorStudio
         /// 而是「整条轴别挤成一片」—— 再小下去块虽然不会窄过 64 像素，
         /// 但彼此贴到一起，名字和缓速曲线都读不出来。
         /// </summary>
-        private static float MinimumPixelsPerSecond
+        /// <summary>
+        /// 缩放下限：视口里最多显示 `MaxVisibleSeconds` 秒。
+        /// 再缩下去一块就要占好几秒，同行必然叠住。
+        /// </summary>
+        private const float MaxVisibleSeconds = 45f;
+
+private static float MinimumPixelsPerSecond
         {
             get { return MaximumPixelsPerSecond * MinZoomRatio; }
         }
+
+        /// <summary>视口宽度（布局未就绪时退回设计宽度，避免除零）。</summary>
+        private float EffectiveBodyWidth()
+        {
+            return bodyWidth > 1f ? bodyWidth : 1890f;
+        }
+
         private const float DataRefreshInterval = 0.5f;
         private const float SelectionRefreshInterval = 0.12f;
         private const float EventGap = 3f;
@@ -699,10 +731,20 @@ namespace ADOFAIEditorStudio
         // 独立表面而不是一个洞，又足够柔和，不会和面板抢眼。
         // 0.196 是第一次尝试，结果读成白色；现在行条纹近乎透明，
         // 所以这个值就是卡片的最终观感，而不是被覆盖层盖住后露出的底色。
-        private static Color TimelineCard { get { return WithAlpha(UiTheme.Current.SurfaceRaised, 0.90f); } }
+        // 纯平背景：时间轴视口不再铺一层 90% 的凸起面，
+        // 露出的就是工作台那一层底色（与「参数」栏一致）。
+        private static Color TimelineCard { get { return new Color(0f, 0f, 0f, 0f); } }
         // 标尺条铺在卡片上，颜色刻意更深，好让时间标签
         // 有自己的底带。
-        private static Color RulerStrip { get { return WithAlpha(UiTheme.Current.SurfaceRaised, 0.95f); } }
+        // 标尺条同样不再铺底色，只保留刻度线与数字。
+        /// <summary>
+        /// 标尺那一条的底色。**必须不透明。**
+        ///
+        /// 之前给的是全透明（后来改成 3% 白），依赖模块底色透上来；但标尺
+        /// 这一段实际没有东西垫底，结果是游戏画面直接透过来 —— 齿标在、
+        /// 背后是空的。这里直接铺模块那一档 #0B0B0B。
+        /// </summary>
+        private static Color RulerStrip { get { return new Color(0.043f, 0.043f, 0.043f, 1f); } }
         // 分类框窗口的填充色：不透明，且与卡片同值，让各窗口读成
         // 一整块表面，而不是一排瓷砖。
         private static Color WindowFill { get { return UiTheme.Current.SurfacePanel; } }
@@ -724,7 +766,10 @@ namespace ADOFAIEditorStudio
         // 0.45 落在「不深不浅」那一段：对分类框底色约 7:1，六个家族彼此
         // 又在同一条亮度线上，所以谁也不会比谁更抢眼，但每个色相都还
         // 认得出来。低了整片读成灰，高了就刺眼。
-        private const float BlockBrightness = 0.45f;
+        // 0.45 → 0.32：整片事件块原来偏亮，长时间看刺眼。
+        // 压暗后色相仍分得开（六个家族还在同一条亮度线上），
+        // 但要跟时间轴底色拉开层次就靠块上文字与曲线，不再靠块本身的亮度。
+        private const float BlockBrightness = 0.32f;
         // 块上文字（以及缓速曲线、选中描边）的亮度。压到接近黑，
         // 对块本身约 7:1，小块上的小字也清楚。
         private const float LabelBrightness = 0.020f;
@@ -742,6 +787,26 @@ namespace ADOFAIEditorStudio
         private readonly List<TimelineItem> layoutItems = new List<TimelineItem>();
         private readonly List<List<RowInterval>> layoutRows = new List<List<RowInterval>>();
         private readonly List<TimelineMarker> markerPool = new List<TimelineMarker>();
+        /// <summary>
+        /// 块稳定 ID → 画它的那个对象。
+        ///
+        /// **不能按遍历顺序轮流绑池子。** `BlockViews` 的顺序不是稳定的，
+        /// 每帧同一个池位可能换成另一块，曲线就会来回跳变（用户看到的
+        /// 「缓速反复镜像」其实就是这个）。按 ID 绑，对象就认死一块。
+        /// </summary>
+        /// <summary>事件块那一层（在标尺下、播放头上）。</summary>
+        private RectTransform blockLayer;
+        /// <summary>格线层（在块下面）。</summary>
+        private RectTransform gridLayer;
+        private EditorStudioOverlay owner;
+        private RectTransform root;
+        private RectTransform viewport;
+
+        /// <summary>下一次重建时要不要重排（载入 / 换谱 / 固定排版）。</summary>
+        private bool repackOnNextRebuild = true;
+        /// <summary>防抖：到这个时刻执行一次重排（0 = 不排）。</summary>
+        private float repackDueTime;
+        private readonly HashSet<int> activeBlockIds = new HashSet<int>();
         private readonly List<TimelineSection> layoutSections = new List<TimelineSection>();
         private readonly List<int> layoutRowSection = new List<int>();
         private readonly List<float> layoutRowY = new List<float>();
@@ -752,28 +817,20 @@ namespace ADOFAIEditorStudio
         private readonly List<string> majorTickLabelText = new List<string>();
         private readonly List<Image> floorLines = new List<Image>();
         private readonly List<RectTransform> rowBackgrounds = new List<RectTransform>();
-
-        private EditorStudioOverlay owner;
-        private RectTransform root;
-        private RectTransform viewport;
-        /// <summary>
-        /// 一个分类框的窗口：不透明的盒子，裁掉自己溢出的行。
-        ///
-        /// 盒子让分类框可滚动而不是无限铺开。一个分类框持有的行
-        /// 远多于窗口显示的行数，不裁剪的话多出来的行会直接画到
-        /// 下面的分类框上。遮罩负责裁剪，背景让盒子实心，这样两个
-        /// 叠在一起的分类框不会互相透出来。
-        /// </summary>
-        private sealed class SectionWindow
-        {
-            internal RectTransform Rect;
             internal RectTransform Content;
-            internal Image Background;
-        }
 
-        private const int SectionWindowPoolSize = 32;
-        private readonly List<SectionWindow> sectionWindowPool = new List<SectionWindow>();
-        private int sectionWindowIndex;
+        private readonly Dictionary<int, TimelineMarker> markerByBlockId
+            = new Dictionary<int, TimelineMarker>();
+        /// <summary>
+        /// 上一帧收起来的块对象，下一帧优先复用。
+        ///
+        /// **没有这张表就只能一直新建**：滚一下视口，进来的块都要新对象，
+        /// 撞到池上限后循环 `break`，后面的块全没有实体（数据还在，拖过去
+        /// 照样判重叠变红）—— 用户看到的"稍微一动就消失一大片"就是这个。
+        /// </summary>
+        private readonly List<TimelineMarker> freeMarkers = new List<TimelineMarker>();
+
+
 
         private RectTransform markerLayer;
         private RectTransform sectionHeaderLayer;
@@ -799,11 +856,112 @@ namespace ADOFAIEditorStudio
         private Sprite outlineSprite;
         private Texture2D outlineTexture;
         private Button viewLockButton;
-        private Button layoutModeButton;
+        /// <summary>「点轨道跟随」与「定位到播放头」两颗按钮（图标自绘）。</summary>
+        private Button locateButton;
+        private Button locatePlayheadButton;
+        /// <summary>标题行里的车道筛选按钮与图标（原来在预览工具栏上）。</summary>
+        /// <summary>
+        /// 播放时视图怎么跟随。
+        /// </summary>
+        private enum TimelineFollowMode
+        {
+            /// <summary>播放头自由走，视图归用户手动滚。</summary>
+            FreePlayhead,
+            /// <summary>播放头钉在时间轴正中，内容从它下面滑过。</summary>
+            CenteredPlayhead
+        }
+
+        private TimelineFollowMode followMode = TimelineFollowMode.FreePlayhead;
+
+        internal bool IsCenteredPlayhead
+        {
+            get { return followMode == TimelineFollowMode.CenteredPlayhead; }
+        }
+
+
+        // 固定播放头下中键横拖 = 扫时间：记开始时间与累计量。
+        private float centerBrowseStartTime;
+        private float centerBrowseAccum;
+        private bool centerBrowseScrubbing;
+
+        /// <summary>
+        /// 固定播放头下视图滑向"播放头在正中"的速度（每秒指数逼近比例）。
+        ///
+        /// **缓动而不是每帧硬摆**：硬摆时一停播放、一切模式就"啪"地跳一下；
+        /// 缓动之后这些时刻都是滑过去的，停止播放也是平滑收尾。
+        /// </summary>
+        private const float CenterLerpSpeed = 10f;
+
+        /// <summary>手动横滚之后暂停回位的时长（秒），避免边滚边被拽。</summary>
+        private float centeredHoldUntil;
+
+        /// <summary>
+        /// 固定播放头下 Shift+滚轮 = 扫时间。
+        ///
+        /// 和自由模式的滚动用**同一套"欠账 + 指数逼近"**（`ScrollSmoothSpeed`），
+        /// 所以手感、滑停时长完全一致 —— 之前这里固定按 5 秒/秒 追，明显比
+        /// 自由模式慢一大截。
+        /// </summary>
+        private float centeredScrubPending;
+        private bool centeredScrubActive;
+
+        /// <summary>「定位到播放头」的滑动目标与开关（滑过去而不是瞬移）。</summary>
+        private float viewGlideTarget;
+        private bool viewGliding;
+
+        /// <summary>
+        /// 滚轮平滑：**只追赶，不留惯性**。
+        ///
+        /// 滚轮把"还没走完的距离"记进 `*ScrollPending`，每帧按指数逼近把它花掉
+        /// （`1 - e^(-22·dt)`），花完就停。
+        ///
+        /// 早先那套是"给一个初速度再衰减"，在触控板上会出事：系统自己会连发
+        /// 一串动量事件，每个都再加一次速度，叠起来松手后能滑好几秒。
+        /// 改成"欠账式"之后，输入停 → 欠账有限 → 0.2 秒内停稳，不会有残余。
+        /// </summary>
+        private const float ScrollSmoothSpeed = 22f;
+        private float verticalScrollPending;
+        private float horizontalScrollPending;
+
+        /// <summary>切换「自由 / 固定播放头」。</summary>
+        internal void ToggleFollowMode()
+        {
+            followMode = followMode == TimelineFollowMode.FreePlayhead
+                ? TimelineFollowMode.CenteredPlayhead
+                : TimelineFollowMode.FreePlayhead;
+            // 切模式时把可能还开着的"扫时间"会话收掉，否则 scrub 状态挂住。
+            if (centeredScrubActive)
+            {
+                centeredScrubActive = false;
+                SubmitPendingScrub(true);
+                EditorPlaybackBridge.EndTimelineScrub();
+                ParticleWatch.ResumeAll();
+            }
+            visualsDirty = true;
+            if (Main.Overlay != null)
+            {
+                Main.Overlay.SetTransientStatus(followMode == TimelineFollowMode.CenteredPlayhead
+                    ? "固定播放头：开（内容从中间滑过）"
+                    : "固定播放头：关（视图归你手动滚）");
+            }
+        }
+
+        /// <summary>居中模式下视图该在的位置（让播放头落在视口正中）。</summary>
+        private float CenteredViewTarget()
+        {
+            float visible = Mathf.Max(1f, bodyWidth) / Mathf.Max(1f, pixelsPerSecond);
+            return PlayheadSeconds - visible * 0.5f;
+        }
+
+        private readonly List<Button> laneButtons = new List<Button>();
+        private readonly List<Image> laneIcons = new List<Image>();
+        private Image locateIcon;
+        private Image locatePlayheadIcon;
+        private Sprite locateSprite;
+        private Sprite locatePlayheadSprite;
         private Button followModeButton;
         private Button selectionFollowButton;
         private Button snapDragButton;
-        private Sprite layoutModeSprite;
         private Sprite followModeSprite;
         private Sprite selectionFollowSprite;
         private Sprite snapDragSprite;
@@ -823,17 +981,6 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>
-        /// 播放时视图怎么跟随。
-        /// </summary>
-        private enum TimelineFollowMode
-        {
-            /// <summary>播放头自由走，视图只在它快出界时才推一格。</summary>
-            FreePlayhead,
-            /// <summary>播放头钉在时间轴正中，内容从右往左滚。</summary>
-            CenteredPlayhead
-        }
-
-        /// <summary>
         /// 排布方式。**分类卷帘那一档已经删掉了** —— 按分类各自开一个固定高度的
         /// 滚动窗口、能折叠、折叠了还要画徽标，那一整套在一个"看谱面"的工具里
         /// 是鸡肋：真要找某个分类，直接滚过去就行。
@@ -843,7 +990,6 @@ namespace ADOFAIEditorStudio
         /// 车道区重写一起做，免得现在两头改。
         /// </summary>
         private TimelineLayoutMode layoutMode = TimelineLayoutMode.LayerStack;
-        private TimelineFollowMode followMode = TimelineFollowMode.FreePlayhead;
 
         internal bool IsSectionRollLayout
         {
@@ -861,40 +1007,6 @@ namespace ADOFAIEditorStudio
             get { return layoutMode == TimelineLayoutMode.SectionRoll ? SectionHeaderHeight : 0f; }
         }
 
-        internal bool IsCenteredPlayhead
-        {
-            get { return followMode == TimelineFollowMode.CenteredPlayhead; }
-        }
-
-        /// <summary>切换排列方式。布局立刻重算。</summary>
-        internal void ToggleLayoutMode()
-        {
-            layoutMode = layoutMode == TimelineLayoutMode.SectionRoll
-                ? TimelineLayoutMode.LayerStack
-                : TimelineLayoutMode.SectionRoll;
-            verticalScrollOffset = 0f;
-            layoutDirty = true;
-            rowTableDirty = true;
-            visualsDirty = true;
-        }
-
-        /// <summary>切换播放时的跟随方式。</summary>
-        internal void ToggleFollowMode()
-        {
-            followMode = followMode == TimelineFollowMode.FreePlayhead
-                ? TimelineFollowMode.CenteredPlayhead
-                : TimelineFollowMode.FreePlayhead;
-            // 切到居中时立刻把画面挪过去，否则要等下一帧播放才动。
-            centerViewOnNextFollow = true;
-            manualNavigationUntil = 0f;
-            visualsDirty = true;
-        }
-
-        /// <summary>居中播放模式下，内容相对播放头的偏移。</summary>
-        private const float CenteredPlayheadFraction = 0.5f;
-
-        /// <summary>切到居中的那一帧要把视图挪过去，之后靠 FollowPlayback 维持。</summary>
-        private bool centerViewOnNextFollow;
         private readonly List<Button> laneFilterButtons = new List<Button>();
         private readonly List<Image> laneFilterIcons = new List<Image>();
         private bool laneFilterStateInitialized;
@@ -912,8 +1024,6 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private bool pendingZoomToMaximum;
         private float viewStartTime;
-        /// <summary>自动翻页探针已输出几次（上限 5，避免拖动时刷屏）。</summary>
-        private int pageLogCount;
         private float totalDuration;
         private float navigationDuration;
         private float nextDataRefresh;
@@ -928,23 +1038,15 @@ namespace ADOFAIEditorStudio
         private float rowHeight;
         private int dataFingerprint;
         private int selectionFingerprint;
-        private int displayRowCount;
-        private float layoutContentHeight;
-        private float layoutTotalHeight;
         private bool dataFingerprintValid;
         private bool viewInitialized;
         private bool visualsDirty = true;
         private bool layoutDirty = true;
+
+
         // 只滚动分类框时用它，避免为一格滚动重建整个布局。
         // 布局本身没变，变的只是各行在窗口里的纵向偏移。
-        private bool rowTableDirty;
         private bool middleDragging;
-        // 居中浏览：中键横拖时，记录拖动开始时播放头所在的时间。
-        // 拖动量按时间累加到它上面，于是「线不动、时间在扫」。
-        private float centerBrowseStartTime;
-        private float centerBrowseAccum;
-        // 居中浏览自己开了一次 scrub，结束时由它负责关掉。
-        private bool centerBrowseScrubbing;
         private bool scrubbing;
         // 拖动时指针相对视口的横向位置，用来判断要不要边缘自动滚动。
         private float scrubPointerX;
@@ -1837,10 +1939,29 @@ namespace ADOFAIEditorStudio
             }
 
             float now = Time.unscaledTime;
+            // 供预览层判断"现在是拖动定位"：那期间不写粒子装饰物的位置，
+            // 否则原生 SetPosition 每帧清一次粒子，看着就是冻住。
+            ParticleWatch.ScrubbingActive = scrubbing || centerBrowseScrubbing
+                || centeredScrubActive;
             RelayoutIfResized();
             DiagCheckStuckBlockDrag();
             HandleKeyboardShortcuts();
+            RefreshFeatureButtons();
+            RefreshLaneButtons();
+            // **块数据每帧重建。**
+            CollectBlocks();
+            UpdateBlocks();
+            UpdateRuler();
+
+            // 拖播放头期间每帧把粒子放起来：定位会重建装饰物，
+            // 只靠"提交后放一次"仍有空档（用户反馈会卡住）。
+            if (scrubbing)
+            {
+                ParticleWatch.ResumeAll();
+            }
             TickEdgeAutoScroll();
+            // 拖块贴住视口上下边缘时自动纵向滚动（横向那套在 TickEdgeAutoScroll）。
+            TickDragVerticalAutoScroll();
             if (scrubPending && now >= nextScrubSubmitTime)
             {
                 SubmitPendingScrub(false);
@@ -1878,68 +1999,97 @@ namespace ADOFAIEditorStudio
                 navigationDuration = Mathf.Max(navigationDuration, snapshot.CurrentTime + visibleDuration);
             }
 
-            // 切到「固定中间」的那一帧要立刻居中，即使当前没在播放——
-            // 否则用户点了按钮画面纹丝不动，看不出这个模式有什么不同。
-            // **这一帧必须用 SyncCenteredView**：FollowPlayback 只在指针贴近
-            // 边缘时才动，指针本来就在中间附近的话它什么也不做。
-            // 所有"视图自己跟着播放头跑"的行为都归这一个开关管：
-            //   · 播放中的跟随（FollowPlayback）
-            //   · 手动把播放头拖到尽头时的翻页（PageViewAtPlayhead，见下面那个分支）
-            // 以前前者是无条件的，于是"关掉开关"在播放时看起来毫无区别 ——
-            // 用户报的"关的时候也能翻页"就是它。
-            bool autoPage = Main.Settings != null && Main.Settings.AutoPageTimeline;
+            // 固定播放头下的 Shift+滚轮：**和自由模式同一套欠账式平滑**
+            // （同样的 `ScrollSmoothSpeed`），所以速度和滑停时长一致。
+            if (centeredScrubActive)
+            {
+                if (Mathf.Abs(centeredScrubPending) > 0.0002f)
+                {
+                    float k = 1f - Mathf.Exp(-Time.unscaledDeltaTime * ScrollSmoothSpeed);
+                    float move = centeredScrubPending * k;
+                    float scrubNow = snapshot.CurrentTime;
+                    float scrubNext = Mathf.Clamp(scrubNow + move, 0f,
+                        Mathf.Max(0f, navigationDuration));
+                    if (Mathf.Abs(scrubNext - (scrubNow + move)) > 0.00001f)
+                    {
+                        // 撞到谱面头/尾：欠账作废，别继续"想"走。
+                        centeredScrubPending = 0f;
+                    }
+                    else
+                    {
+                        centeredScrubPending -= move;
+                        if (Mathf.Abs(centeredScrubPending) < 0.0002f)
+                        {
+                            centeredScrubPending = 0f;
+                        }
+                    }
+                    pendingScrubTime = scrubNext;
+                    scrubPending = true;
+                    nextScrubSubmitTime = 0f;
+                }
+                else
+                {
+                    centeredScrubActive = false;
+                    SubmitPendingScrub(true);
+                    EditorPlaybackBridge.EndTimelineScrub();
+                    ParticleWatch.ResumeAll();
+                }
+            }
 
-            if (centerViewOnNextFollow)
+            // 固定播放头：**播放中每帧精确摆正，其它时候缓动滑回。**
+            //
+            // 为什么分两种：一直用缓动的话，播放时视图会恒定落后一点点
+            // （实测 533px/s 下落后约 53px，看起来就是"没固定在中间"）；
+            // 一直硬摆的话，切换模式 / 手动横滚回位会"啪"地跳。
+            if (followMode == TimelineFollowMode.CenteredPlayhead)
             {
-                centerViewOnNextFollow = false;
-                if (followMode == TimelineFollowMode.CenteredPlayhead)
+                float centeredTarget = CenteredViewTarget();
+                // 三种情况必须**精确摆正**（不能缓动）：
+                //   · 正在播放；
+                //   · Shift+滚轮扫时间；
+                //   · 中键横拖扫时间（`centerBrowseScrubbing`）。
+                // 后两者播放头是每帧被推着走的，缓动跟不上 —— 表现出来就是
+                // "播放头先左右飘、松手后再慢慢回到中间"。
+                bool playing = snapshot.State == EditorPlaybackState.Playing
+                    || centeredScrubActive
+                    || centerBrowseScrubbing;
+                if (playing)
                 {
-                    SyncCenteredView(snapshot.CurrentTime);
+                    if (Mathf.Abs(viewStartTime - centeredTarget) > 0.0001f)
+                    {
+                        viewStartTime = centeredTarget;
+                        ClampCenteredViewStart();
+                        visualsDirty = true;
+                    }
                 }
-                else if (autoPage)
+                else if (Time.unscaledTime >= centeredHoldUntil
+                    && Mathf.Abs(viewStartTime - centeredTarget) > 0.0005f)
                 {
-                    FollowPlayback(snapshot.CurrentTime);
+                    float k = 1f - Mathf.Exp(-Time.unscaledDeltaTime * CenterLerpSpeed);
+                    viewStartTime = Mathf.Lerp(viewStartTime, centeredTarget, k);
+                    ClampCenteredViewStart();
+                    visualsDirty = true;
+                }
+                // 固定播放头自己不产生横向欠账：位置由上面每帧算死。
+                horizontalScrollPending = 0f;
+            }
+
+            // 「定位到播放头」的滑动（自由模式用；固定模式由上面的缓动代劳）。
+            if (viewGliding)
+            {
+                float k = 1f - Mathf.Exp(-Time.unscaledDeltaTime * CenterLerpSpeed);
+                viewStartTime = Mathf.Lerp(viewStartTime, viewGlideTarget, k);
+                ClampViewStart();
+                visualsDirty = true;
+                if (Mathf.Abs(viewStartTime - viewGlideTarget) < 0.002f)
+                {
+                    viewStartTime = viewGlideTarget;
+                    ClampViewStart();
+                    viewGliding = false;
                 }
             }
-            else if (snapshot.State == EditorPlaybackState.Playing
-                && now >= manualNavigationUntil
-                && autoPage)
-            {
-                FollowPlayback(snapshot.CurrentTime);
-            }
-            // 居中模式：**每帧**把视图摆回中点，不设例外。
-            //
-            // 这是「固定中间」的字面含义 —— 那根竖线永远在正中，是内容在它
-            // 下面滑过去。所以这里不能放行任何「把视图挪走」的路径。
-            //
-            // 那拖动怎么办？**拖动改的不是视图，是时间**（见 PanBy 的居中分支）。
-            // 一开始我在 PanBy 里直接挪 viewStartTime，每一帧又被这里改回去，
-            // 表现出来就是「固定中间模式下时间轴拖不动」—— 病根在 PanBy 那边，
-            // 不是这一句。
-            //
-            // 纵向滚动不受影响：那是看更多行，与水平居中无关。
-            //
-            // **开关关掉时居中也不生效**：这个开关的语义是"时间轴要不要自动滚"，
-            // 居中是其中最激进的一种（每帧都摆），留着它就等于开关关不掉。
-            if (followMode == TimelineFollowMode.CenteredPlayhead && autoPage)
-            {
-                SyncCenteredView(snapshot.CurrentTime);
-            }
-            // 自动翻页（开关在标题行，快捷键 Ctrl+K）。
-            //
-            // 和「固定中间」互斥——那个模式每帧自己把视图摆回中点，
-            // 再翻页会两边打架。开关关掉时这里也不动（和上面播放中的跟随
-            // 用的是同一个 autoPage）。
-            // **只在播放头真的被驱动时翻页：播放中，或者正在拖播放头。**
-            //
-            // 之前这里是每帧无条件跑。开关默认又是开的，于是用户手动横向滚
-            // 去看别处时，播放头一离开视口就会被拽回来 —— 等于"开了自动翻页
-            // 就没法自己滚"。静止时视口归用户，翻页只服务于播放和拖播放头。
-            else if (autoPage
-                && (scrubbing || snapshot.State == EditorPlaybackState.Playing))
-            {
-                PageViewAtPlayhead(snapshot.CurrentTime);
-            }
+
+            ApplyScrollSmoothing();
 
             if (visualsDirty)
             {
@@ -1947,31 +2097,6 @@ namespace ADOFAIEditorStudio
             }
 
             UpdatePlayhead(snapshot);
-        }
-
-        /// <summary>
-        /// 指针落在哪个分类框的盒子上，没有则返回 null。用盒子当前的屏幕
-        /// rect 判断，而不是去查行表，因为用户指的正是那个盒子
-        /// 本身。
-        /// </summary>
-        private bool FindSectionWindowAt(Vector2 screenPosition, out TimelineSection section)
-        {
-            section = null;
-            for (int i = 0; i < sectionWindowIndex && i < sectionWindowPool.Count; i++)
-            {
-                SectionWindow window = sectionWindowPool[i];
-                if (window.Rect == null || !window.Rect.gameObject.activeInHierarchy)
-                {
-                    continue;
-                }
-                if (RectTransformUtility.RectangleContainsScreenPoint(window.Rect, screenPosition, null)
-                    && i < layoutSections.Count)
-                {
-                    section = layoutSections[i];
-                    return true;
-                }
-            }
-            return false;
         }
 
         public void OnScroll(PointerEventData eventData)
@@ -2013,6 +2138,12 @@ namespace ADOFAIEditorStudio
         /// 不该顺手把谱面的时间也改了。
         /// </summary>
         /// <summary>uGUI 那条路正在拖块吗（探针用）。</summary>
+        /// <summary>当前能不能改谱面（只读模式返回 false，并弹统一提示）。</summary>
+        internal bool CanEditChart()
+        {
+            return owner == null || owner.AllowEdit();
+        }
+
         internal bool BlockDragActive
         {
             get { return blockDragActive; }
@@ -2077,17 +2208,6 @@ namespace ADOFAIEditorStudio
             }
         }
 
-        internal void AutoScrollHorizontally(float dxPixels)
-        {
-            if (Mathf.Approximately(dxPixels, 0f))
-            {
-                return;
-            }
-            viewStartTime += dxPixels / Mathf.Max(1f, pixelsPerSecond);
-            ClampViewStart();
-            visualsDirty = true;
-        }
-
         internal void ScrollBy(float wheelDelta, bool control, bool alt, bool shift)
         {
             if (Mathf.Approximately(wheelDelta, 0f))
@@ -2108,9 +2228,7 @@ namespace ADOFAIEditorStudio
                 {
                     return;
                 }
-                verticalScrollOffset -= wheelDelta * rowHeight * 1.7f;
-                ClampVerticalScroll();
-                visualsDirty = true;
+                AddVerticalScrollDelta(-wheelDelta * rowHeight * 1.7f);
                 return;
             }
 
@@ -2122,19 +2240,124 @@ namespace ADOFAIEditorStudio
             {
                 AdjustRowHeight(wheelDelta > 0f ? 1f : -1f);
             }
-            else if (shift || GetMaximumVerticalScroll() <= 0.01f)
+            else if (shift)
             {
-                viewStartTime -= wheelDelta * 150f / Mathf.Max(1f, pixelsPerSecond);
-                ClampViewStart();
-                MarkManualNavigation();
+                // 只有按住 Shift 才横滚。固定播放头下也滚 —— 先把手动位置
+                // 交给用户，停手一会儿再缓动滑回中间（不让每帧的缓动抢手）。
+                float pixels = wheelDelta * 150f;
+                if (followMode == TimelineFollowMode.CenteredPlayhead)
+                {
+                    // **固定播放头下横滚 = 挪时间**，视图不挪 —— 播放头始终钉在正中。
+                    // 只把"还要走多少秒"记进欠账，推进交给 Update 里的指数逼近，
+                    // 参数和自由模式的滚动同一个 `ScrollSmoothSpeed`。
+                    if (!centeredScrubActive)
+                    {
+                        centeredScrubPending = 0f;
+                        centeredScrubActive = true;
+                        string scrubStatus;
+                        EditorPlaybackBridge.TryBeginTimelineScrub(out scrubStatus);
+                    }
+                    centeredScrubPending -= pixels / Mathf.Max(1f, pixelsPerSecond);
+                    MarkManualNavigation();
+                }
+                else
+                {
+                    AddHorizontalScrollDelta(-pixels);
+                }
             }
             else
             {
-                verticalScrollOffset -= wheelDelta * rowHeight * 1.7f;
-                ClampVerticalScroll();
+                // **普通滚轮一律纵向滚动。**
+                //
+                // 原来这里多了一条 `|| GetMaximumVerticalScroll() <= 0.01f`：
+                // 纵向没有可滚空间时改滚横向。但主体改 uGUI 之后，纵向可滚
+                // 高度一度算成 0，于是普通滚轮全被当成横滚 —— 表现就是
+                // 「往上滚，画面往左跑」。纵向没得滚时就应该什么都不动。
+                AddVerticalScrollDelta(-wheelDelta * rowHeight * 1.7f);
             }
 
             visualsDirty = true;
+        }
+
+        /// <summary>
+        /// 纵向滚轮：**只记欠账，不产生惯性**。
+        ///
+        /// 滚一格记一笔"还要走多少像素"，由 `ApplyScrollSmoothing` 按指数逼近
+        /// 花掉；花完即停。这样既不顿（不是一格一跳），也不会像惯性那样松手
+        /// 之后还滑几秒（触控板会连发动量事件，速度叠起来停不下来）。
+        /// </summary>
+        private void AddVerticalScrollDelta(float pixels)
+        {
+            verticalScrollPending += pixels;
+            visualsDirty = true;
+        }
+
+        /// <summary>横向滚轮：同上，单位是像素，落到 `viewStartTime` 时再换成秒。</summary>
+        private void AddHorizontalScrollDelta(float pixels)
+        {
+            viewGliding = false;
+            horizontalScrollPending += pixels;
+            MarkManualNavigation();
+            visualsDirty = true;
+        }
+
+        /// <summary>
+        /// 每帧把"欠账"按指数逼近花掉：`move = pending · (1 − e^(−22·dt))`。
+        ///
+        /// 到点即停（剩余不足 0.01 直接抹零），所以**松手就是停**，
+        /// 不会像惯性那样还往前滑。撞到边界也立刻清零，免得贴着边抖。
+        /// </summary>
+        private void ApplyScrollSmoothing()
+        {
+            float delta = Time.unscaledDeltaTime;
+            if (delta <= 0f)
+            {
+                return;
+            }
+            float k = 1f - Mathf.Exp(-delta * ScrollSmoothSpeed);
+            bool dirty = false;
+
+            if (Mathf.Abs(verticalScrollPending) > 0.01f)
+            {
+                float move = verticalScrollPending * k;
+                float before = verticalScrollOffset;
+                verticalScrollOffset += move;
+                ClampVerticalScroll();
+                verticalScrollPending -= move;
+                if (Mathf.Abs(before - verticalScrollOffset) < 0.001f)
+                {
+                    // 顶到边界：欠账作废，别让它一直"想"滚。
+                    verticalScrollPending = 0f;
+                }
+                if (Mathf.Abs(verticalScrollPending) < 0.01f)
+                {
+                    verticalScrollPending = 0f;
+                }
+                dirty = true;
+            }
+
+            if (Mathf.Abs(horizontalScrollPending) > 0.01f)
+            {
+                float move = horizontalScrollPending * k;
+                float before = viewStartTime;
+                viewStartTime += move / Mathf.Max(1f, pixelsPerSecond);
+                ClampViewStart();
+                horizontalScrollPending -= move;
+                if (Mathf.Abs(before - viewStartTime) < 0.000001f)
+                {
+                    horizontalScrollPending = 0f;
+                }
+                if (Mathf.Abs(horizontalScrollPending) < 0.01f)
+                {
+                    horizontalScrollPending = 0f;
+                }
+                dirty = true;
+            }
+
+            if (dirty)
+            {
+                visualsDirty = true;
+            }
         }
 
         public void OnPointerDown(PointerEventData eventData)
@@ -2260,13 +2483,15 @@ namespace ADOFAIEditorStudio
                 eventData.Use();
                 return;
             }
-            if (followMode == TimelineFollowMode.CenteredPlayhead)
+            middleDragging = eventData.button == PointerEventData.InputButton.Middle && ContainsScreenPoint(eventData.position);
+
+            // **固定播放头下中键横拖 = 扫时间**，不是平移视图。
+            // 线钉在屏幕上、内容从它下面过，所以"抓住内容往右拖"等价于
+            // "把播放头挪到更早的时间"——和剪辑软件拖时间轴同一种手感。
+            // 必须真的进一次 scrub 状态：`TryScrubTimelineToTime` 开头就检查
+            // `timelineScrubActive`，不进状态的话每次提交都被静默拒绝（拖不动）。
+            if (middleDragging && followMode == TimelineFollowMode.CenteredPlayhead)
             {
-                // 居中浏览：先把当前播放头时间记下来，之后按拖动量累加。
-                //
-                // 必须真的进一次 scrub 状态：TryScrubTimelineToTime 开头就是
-                // `if (!timelineScrubActive) return false;`，不进状态的话每次
-                // 提交都会被静默拒绝，表现就是「拖不动」。
                 string browseStatus;
                 if (EditorPlaybackBridge.TryBeginTimelineScrub(out browseStatus))
                 {
@@ -2276,7 +2501,6 @@ namespace ADOFAIEditorStudio
                 }
             }
 
-            middleDragging = eventData.button == PointerEventData.InputButton.Middle && ContainsScreenPoint(eventData.position);
             if (Main.Settings != null && Main.Settings.VerboseDiagnostics)
             {
                 anyPointerCapture = true;
@@ -2318,17 +2542,9 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
-            // ── 临时诊断：中键拖动到底有没有真的平移 ──
-
-            if (followMode == TimelineFollowMode.CenteredPlayhead)
+            if (centerBrowseScrubbing)
             {
-                // 居中浏览：线钉在屏幕上，拖动改变的是它指向的时间。
-                // 往右拖 = 内容右移 = 中线指向更早的时间，也就是「抓住内容拖」
-                // 的手感，跟剪辑软件里拖时间轴一致。
-                //
-                // 这里复用 scrubbing 的提交路径而不是直接改 viewStartTime：
-                // 画面要跟着线走，必须走求值器的定位，否则只有时间轴在动、
-                // 预览纹丝不动。
+                // 固定播放头：横拖改时间（走 scrub 提交，预览画面才跟着走）
                 centerBrowseAccum -= eventData.delta.x / Mathf.Max(1f, pixelsPerSecond);
                 float browseTime = Mathf.Clamp(
                     centerBrowseStartTime + centerBrowseAccum,
@@ -2336,11 +2552,11 @@ namespace ADOFAIEditorStudio
                     Mathf.Max(0f, navigationDuration));
                 pendingScrubTime = browseTime;
                 scrubPending = true;
-                manualNavigationUntil = 0f;
                 nextScrubSubmitTime = 0f;
             }
             else
             {
+                viewGliding = false;
                 viewStartTime -= eventData.delta.x / Mathf.Max(1f, pixelsPerSecond);
                 ClampViewStart();
             }
@@ -2358,6 +2574,7 @@ namespace ADOFAIEditorStudio
                 blockingPointerDrag = false;
                 scrubPointerValid = false;
                 FinishScrub();
+                ParticleWatch.ResumeAll();
                 anyPointerCapture = middleDragging;
                 eventData.Use();
                 return;
@@ -2368,13 +2585,14 @@ namespace ADOFAIEditorStudio
             }
             if (centerBrowseScrubbing)
             {
-                // 居中的 scrub 由这里收尾：提交最后一次定位并退出状态，
-                // 否则 timelineScrubActive 会一直挂着，后续定位全被拒。
+                // 固定播放头下中键扫时间：这里收尾，提交最后一次定位并退出
+                // scrub 状态 —— 否则 `timelineScrubActive` 一直挂着，
+                // 后续所有定位提交都会被静默拒绝。
                 centerBrowseScrubbing = false;
                 SubmitPendingScrub(true);
                 EditorPlaybackBridge.EndTimelineScrub();
+                ParticleWatch.ResumeAll();
             }
-
             middleDragging = false;
             blockingPointerDrag = false;
             anyPointerCapture = false;
@@ -2396,14 +2614,11 @@ namespace ADOFAIEditorStudio
             bool zero = Input.GetKeyDown(KeyCode.Alpha0) || Input.GetKeyDown(KeyCode.Keypad0);
             bool saveKey = Input.GetKeyDown(KeyCode.S);
 
-            // **开发期的工程保存入口：Ctrl+Alt+S。**
+            // **单独的排版保存：Ctrl+Alt+S**（Ctrl+S 已经同时存谱面 + 排版了，
+            // 这里留一个只写 `.aesprj` 的入口，方便单独验证排版）。
             //
-            // 原来挂的是 `Ctrl+Shift+S`，但**那个被游戏原生占了** ——
-            // 反编译 `scnEditor` 里注册的是 `Ctrl+Shift+S → SaveLevelAs`
-            // （另存谱面），按下去会同时触发"另存谱面"和"存工程"两件事。
-            // `Ctrl+Alt+S` 原生没占。
-            //
-            // 发布前会并进 `Ctrl+S`（那时一下存两样：谱面转发游戏原生、工程写 aesprj）。
+            // 挂 `Ctrl+Shift+S` 是不行的：反编译 `scnEditor` 里注册的是
+            // `Ctrl+Shift+S → SaveLevelAs`（另存谱面），按下去会同时触发两件事。
             if (control && alt && saveKey)
             {
                 SaveProjectInteractive();
@@ -2465,6 +2680,8 @@ namespace ADOFAIEditorStudio
                 // 让光标下始终是谱面的同一处，而不是保持同一个
                 // 行号——行号已经不再对应固定位置了。
                 verticalScrollOffset = scrollRatio * BlockContentHeight;
+            // 改行高时位置是重算出来的，把滚轮的欠账清掉，否则两边抢。
+            verticalScrollPending = 0f;
                 if (Main.Settings != null)
                 {
                     Main.Settings.TimelineRowHeight = rowHeight;
@@ -2520,13 +2737,13 @@ namespace ADOFAIEditorStudio
         /// 速度按指针进入边缘区的深度平方递增：刚进去是微调，顶到边上才最快。
         /// 否则一碰边就全速，很难停在想要的位置。
         ///
-        /// 只在「自由播放头」模式下生效。居中模式下视图是播放头的从属量，
-        /// 再叠一层自动滚动会互相打架。
+        /// 只在「自由播放头」+ 拖播放头时生效：固定播放头模式下视图是
+        /// 播放头的从属量，再叠一层自动滚动会互相打架。
         /// </summary>
         private void TickEdgeAutoScroll()
         {
             if (!scrubbing || !scrubPointerValid
-                || followMode != TimelineFollowMode.FreePlayhead)
+                || followMode == TimelineFollowMode.CenteredPlayhead)
             {
                 return;
             }
@@ -2595,6 +2812,9 @@ namespace ADOFAIEditorStudio
                 // 每个渲染帧的 Update 只提交一次。播放桥会做一次
                 // 只含视觉的精确采样，所以指针慢速移动也能保持顺滑。
                 nextScrubSubmitTime = Time.unscaledTime;
+                // 每次定位后立刻把粒子放起来：拖动过程中也会被清掉，
+                // 只在松手时恢复的话，看起来就是「拖着的时候粒子停了」。
+                ParticleWatch.ResumeAll();
             }
             scrubPending = false;
         }
@@ -2608,129 +2828,6 @@ namespace ADOFAIEditorStudio
             anyPointerCapture = middleDragging;
             manualNavigationUntil = Time.unscaledTime + 2.4f;
             EditorPlaybackBridge.EndTimelineScrub();
-        }
-
-        // ------------------------------------------------ ImGui 版标题行的口子
-        //
-        // 标题行是时间轴面板最上面那 42 像素（事件面板从 y=44 起，紧贴它下面），
-        // 所以它是一个**能独立接管**的切片：ImGui 画这一条、把下面那排 uGUI
-        // 整排藏掉，事件面板和车道区照旧。
-
-        /// <summary>标题行那几个物件。接管时整排藏掉（见 SuppressTitleRow）。</summary>
-        private readonly List<GameObject> titleRowObjects = new List<GameObject>();
-
-        /// <summary>
-        /// 标题行上那几件的名字，**和 BuildUi 里创建时用的名字一一对应**。
-        ///
-        /// 按名字找而不是把每个创建调用都包一层：那串调用有十几处、大半是
-        /// 多行的，一个个包起来既容易漏，也把本来就密的那段糊得更难读。
-        /// 代价是**名字改了这里要跟着改** —— 找不到就只是没登记上，
-        /// 表现是"接管之后那一件还留在下面"，看得见，不会静默出错。
-        /// </summary>
-        private static readonly string[] TitleRowNames =
-        {
-            "HeadingBand", "HeadingBar", "Heading",
-            "FollowMode", "SelectionFollow", "SnapDrag", "ViewLock",
-            "Zoom", "ZoomOut", "ZoomIn", "GoToStart",
-            "Time", "Summary"
-        };
-
-        private void TrackTitleRow()
-        {
-            titleRowObjects.Clear();
-            if (root == null)
-            {
-                return;
-            }
-            for (int i = 0; i < TitleRowNames.Length; i++)
-            {
-                Transform found = root.Find(TitleRowNames[i]);
-                if (found != null)
-                {
-                    titleRowObjects.Add(found.gameObject);
-                }
-            }
-        }
-
-        internal void SuppressTitleRow(bool suppressed)
-        {
-            bool active = !suppressed;
-            for (int i = 0; i < titleRowObjects.Count; i++)
-            {
-                GameObject target = titleRowObjects[i];
-                if (target != null && target.activeSelf != active)
-                {
-                    target.SetActive(active);
-                }
-            }
-        }
-
-        /// <summary>
-        /// 标题行那排模式开关，**一次全取走**。
-        ///
-        /// 不收成十五个 internal 成员（五个 × 状态/图标/点击）：五个开关的结构
-        /// 完全一样，拆开口子两边迟早走散。图标本来就是 `ApplyXxxIcon` 造出来的
-        /// Sprite，ImGui 直接拿来画，不用重画像素图。
-        ///
-        /// **点击动作要连带调 `ApplyXxxIcon()`** —— 那一步既切状态又重造图标，
-        /// uGUI 那排按钮被藏了之后，不带着调图标就再也不会更新。
-        /// </summary>
-        internal struct HeaderToggle
-        {
-            internal string Name;
-            internal string Hint;
-            internal bool On;
-            internal Sprite Icon;
-            internal Color Tint;
-            internal System.Action Flip;
-        }
-
-        private readonly List<HeaderToggle> headerToggles = new List<HeaderToggle>();
-
-        internal List<HeaderToggle> CollectHeaderToggles()
-        {
-            headerToggles.Clear();
-            headerToggles.Add(new HeaderToggle
-            {
-                Name = "跟随",
-                Hint = IsCenteredPlayhead ? "光标居中（点一下改成自由）" : "自由光标（点一下改成居中）",
-                On = IsCenteredPlayhead,
-                Icon = followModeSprite,
-                Tint = TextPrimary,
-                Flip = delegate { ToggleFollowMode(); ApplyFollowModeIcon(); }
-            });
-            headerToggles.Add(new HeaderToggle
-            {
-                Name = "选中跟随",
-                Hint = "点事件块时画面跟不跟着跳",
-                On = Main.Settings != null && Main.Settings.FollowSelectionOnClick,
-                Icon = selectionFollowSprite,
-                Tint = TextPrimary,
-                Flip = delegate { ToggleSelectionFollow(); ApplySelectionFollowIcon(); }
-            });
-            bool snap = Main.Settings == null || Main.Settings.SnapTimelineDrag;
-            headerToggles.Add(new HeaderToggle
-            {
-                Name = "拖动吸附",
-                Hint = "拖动事件块时吸附到格边界",
-                On = snap,
-                Icon = snapDragSprite,
-                // 只有这一个的底色跟着状态变（和 ApplySnapDragIcon 一致）；
-                // 另外四个的开/关差别画在图标本身里。
-                Tint = snap ? Palette.Accent : TextMuted,
-                Flip = delegate { ToggleSnapDrag(); }
-            });
-            bool locked = Main.Settings != null && Main.Settings.LockPreviewPosition;
-            headerToggles.Add(new HeaderToggle
-            {
-                Name = "视图锁",
-                Hint = "锁住预览的相机位置和缩放",
-                On = locked,
-                Icon = viewLockSprite,
-                Tint = TextPrimary,
-                Flip = delegate { ToggleViewLock(); ApplyViewLockIcon(); }
-            });
-            return headerToggles;
         }
 
         /// <summary>标题行的时间读数（"00:00.000 / 00:00.000"）。</summary>
@@ -2749,11 +2846,6 @@ namespace ADOFAIEditorStudio
         {
             get { return zoomText == null ? null : zoomText.text; }
         }
-
-        /// <summary>标题行上那几颗"按一下"的按钮，转发给 uGUI 那套现成的实现。</summary>
-        internal void ZoomOutStep() { ZoomAt(0.8f, bodyWidth * 0.5f); }
-
-        internal void ZoomInStep() { ZoomAt(1.25f, bodyWidth * 0.5f); }
 
         internal void GoToStart() { ReturnToStart(); }
 
@@ -2776,21 +2868,8 @@ namespace ADOFAIEditorStudio
         internal float RowHeightPixels { get { return rowHeight; } }
 
         internal float SectionHeaderPixels { get { return SectionHeaderHeight; } }
-        /// <summary>
-        /// 内容区（那条卡片）**相对时间轴面板**的矩形。
-        ///
-        /// 面板自己的屏幕位置由外面算（overlay 知道它在设计空间的哪儿），
-        /// 这里只给相对量 —— 免得两个地方各算一遍"面板在哪"而对不上。
-        /// </summary>
-        internal void GetViewportLocalRect(out float x, out float y, out float width, out float height)
-        {
-            x = GutterWidth + ContentShift;
-            y = headerHeight;
-            width = bodyWidth;
-            height = bodyHeight;
-        }
 
-        // -------------------------------------------- ImGui 版自由画布的口子
+        // -------------------------------------------- 自由画布的口子
         //
         // **这是一套新模型，和上面的排版模型（layoutRows / layoutRowY）不是一回事。**
         // 那一套是"按格分组 + 自动打包成行"，是旧时间轴的骨架，ImGui 这边不读它。
@@ -2996,12 +3075,6 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private float autoArrangedBpm;
 
-        /// <summary>把布局标脏。拖块换行、重置排版这些会调。</summary>
-        internal void MarkProjectDirty()
-        {
-            projectDirty = true;
-        }
-
         /// <summary>自动排列跑过几次。用来抓"每帧重排把拖动冲掉"那类问题。</summary>
         private int placementArranges;
 
@@ -3056,6 +3129,23 @@ namespace ADOFAIEditorStudio
         internal string SaveProjectRows(string projectPath, string chartName)
         {
             EnsureBlockPlacements();
+
+            // **存之前把身份键重算一遍。**
+            //
+            // 键里带着"起点时间"和"参数哈希"，而拖动改的正是这两样。用的是
+            // 上一次 `RefreshData` 留下的旧键就会把行号存到旧身份下 —— 重开谱面
+            // 时键对不上，位置就"自己没了"。
+            List<TimelineItem> items = new List<TimelineItem>(blockPlacements.Count);
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                BlockPlacement placement = blockPlacements[i];
+                if (placement != null && placement.Item != null)
+                {
+                    items.Add(placement.Item);
+                }
+            }
+            EnsureEventKeys(items);
+
             var project = new EditorProjectFile.Project { Chart = chartName };
             for (int i = 0; i < blockPlacements.Count; i++)
             {
@@ -3309,6 +3399,7 @@ namespace ADOFAIEditorStudio
             // 强制重排是一次性的：这次用掉就清掉，别让它一直生效
             // （那样每帧都会重排，玩家拖好的位置会被反复冲掉）。
             forcePlacementRebuild = false;
+            repackOnNextRebuild = true;
 
             placementsChart = chart;
             blockPlacements.Clear();
@@ -3614,6 +3705,20 @@ namespace ADOFAIEditorStudio
                 blockPlacements.Add(new BlockPlacement { Item = item, Row = row, Time = time });
             }
 
+            // **只在载入 / 换谱时排一次。**
+            //
+            // 原来这里还带着「固定排版模式下每次改动都重排」，而重排是
+            // O(块数 × 行数) 的全量装箱（这张谱 3400+ 块、上百行），
+            // 一次就要几百毫秒 —— 拖动/缩放时每次重建都跑，直接把主线程卡死。
+            // 等块表真的有内容再排：第一次重建常常发生在事件清单还没刷进来时，
+            // 那一次重排是空跑，标记却被清掉 —— 首次进谱面就用了老规则。
+            if (repackOnNextRebuild && BlockTableLooksComplete())
+            {
+                repackOnNextRebuild = false;
+                RepackRowsByTypePriority();
+            }
+
+
             // **这一轮没被任何块领走的旧行号 = 刚刚消失的事件。**
             //
             // 记起来给撤销用。上限只是防长期不关工作台时无限攒 ——
@@ -3766,7 +3871,10 @@ namespace ADOFAIEditorStudio
             // 而它在一帧里不会变 —— 4237 个块就是白查 4237 次。`imBlockDrag` 同理
             // （循环里没有改它的地方）。
             scnEditor chartEditor = scnEditor.instance;
-            bool liveTimeBase = !imBlockDrag && chartEditor != null
+            // 两条拖动路径都要算「正在拖」：`imBlockDrag` 是 ImGui 时代那条，
+            // `blockDragActive` 是现在 uGUI 标记块走的这条。少判一个，拖动期间
+            // 位置表就会被谱面（还没提交的旧值）覆盖回去，块不跟手。
+            bool liveTimeBase = !imBlockDrag && !blockDragActive && chartEditor != null
                 && chartEditor.floors != null && chartEditor.floors.Count > 0;
             for (int i = 0; i < blockPlacements.Count; i++)
             {
@@ -3832,6 +3940,35 @@ namespace ADOFAIEditorStudio
                 });
             }
             BlockRowCount = rows;
+
+
+
+
+
+            // **可用横向范围必须覆盖到最靠后的块。**
+            //
+            // `navigationDuration` 原来只取谱面时长 / 播放位置，遇到"块的时间
+            // 超出谱面时长"（长事件、末尾的装饰物事件等）就会被算小 —— 于是
+            // 横向滚动在某个位置被卡住，后面的块**永远滚不到**，看起来就是
+            // "第 N 格之后的事件块全消失了"。
+            float latestBlockTime = 0f;
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                BlockPlacement placement = blockPlacements[i];
+                if (placement == null)
+                {
+                    continue;
+                }
+                float end = placement.Time + Mathf.Max(0f, placement.Item.Duration);
+                if (end > latestBlockTime)
+                {
+                    latestBlockTime = end;
+                }
+            }
+            if (latestBlockTime > 0f)
+            {
+                navigationDuration = Mathf.Max(navigationDuration, latestBlockTime + 2f);
+            }
             // **这里原来要把 blockViews 按（行号, Id）排一遍，去掉了。**
             //
             // 排序唯一的用途，是让绘制那边能「画到屏幕底下就 break」提前收工。
@@ -4095,73 +4232,6 @@ namespace ADOFAIEditorStudio
             imBlockDragOrigins.Clear();
         }
 
-        /// <summary>
-        /// 纵向拖动：**整批按同一个行位移走**。
-        ///
-        /// 横向交给 `DragBlockTo`（它自己管吸附和跟随者）。纵向原来只挪被拖的
-        /// 那一个，所以"框选一堆能整批横向拖，纵向只有它自己动" —— 这条就是那个
-        /// 缺的那一半。
-        ///
-        /// 位移**先夹住再整批套用**：逐个 clamp 到 0 会把整队压扁
-        /// （横向那次踩的是同一个坑）。所以按"整批里最靠上的那一块"算下界。
-        /// </summary>
-        internal void DragBlockRowBy(int deltaRows)
-        {
-            if (!imBlockDrag)
-            {
-                return;
-            }
-
-            // 只读模式：布局也不动 ——「只读」是什么都不改，不只是不改谱面。
-            if (owner != null && !owner.AllowEdit())
-            {
-                return;
-            }
-
-            // 拖块换行 = 布局变了，关工作台时要提示保存。
-            projectDirty = true;
-
-            // **只有"整体移动"才动纵向。**
-            //
-            // 拉两端是在改时长 —— 纵向跟着鼠标跑的话，手稍微一斜就顺手把行号
-            // 也改了。用户看到的是"我只是想拉长一点，它却上下跳了一行"。
-            if (imBlockDragMode != BlockDragMode.Move)
-            {
-                return;
-            }
-
-            int highest = int.MaxValue;
-            for (int i = 0; i < imBlockDragOrigins.Count; i++)
-            {
-                if (imBlockDragOrigins[i].Item != null)
-                {
-                    highest = Mathf.Min(highest, imBlockDragOrigins[i].Row);
-                }
-            }
-            if (highest == int.MaxValue)
-            {
-                return;
-            }
-            if (deltaRows < -highest)
-            {
-                deltaRows = -highest;
-            }
-
-            for (int i = 0; i < imBlockDragOrigins.Count; i++)
-            {
-                DragOrigin origin = imBlockDragOrigins[i];
-                if (origin.Item == null || origin.Item.Event == null)
-                {
-                    continue;
-                }
-                BlockPlacement placement = FindPlacementForEvent(origin.Item.Event);
-                if (placement != null)
-                {
-                    placement.Row = Mathf.Max(0, origin.Row + deltaRows);
-                }
-            }
-        }
-
         private BlockPlacement FindPlacementForEvent(LevelEvent target)
         {
             if (target == null)
@@ -4177,179 +4247,6 @@ namespace ADOFAIEditorStudio
                 }
             }
             return null;
-        }
-
-        /// <summary>
-        /// 拖完如果还跟别的块叠着，就**整批退回起点行**。
-        ///
-        /// 返回 true 表示作废了。**必须在 `RecordDragRowMove` 之前调** ——
-        /// 退回之后每块的行号都等于起点行，那一步自然会认为"一个都没动"、
-        /// 不记撤销，也就不会出现"撤销之后位置不对"。
-        ///
-        /// 为什么要作废而不是放任：块的**最小宽度**（`BlockMinWidth`）让两个
-        /// 时间上并不重叠的事件画出来也会叠；叠在一起之后，用户既看不出谁压着谁，
-        /// 撤销也会看着像"跳错地方"。
-        /// </summary>
-        internal bool RevertDragIfOverlapping()
-        {
-            bool overlapping = false;
-            for (int i = 0; i < imBlockDragOrigins.Count; i++)
-            {
-                DragOrigin origin = imBlockDragOrigins[i];
-                if (origin.Item == null || origin.Item.Event == null)
-                {
-                    continue;
-                }
-                if (BlockOverlapsOthers(origin.Item.Event))
-                {
-                    overlapping = true;
-                    break;
-                }
-            }
-            if (!overlapping)
-            {
-                return false;
-            }
-
-            for (int i = 0; i < imBlockDragOrigins.Count; i++)
-            {
-                DragOrigin origin = imBlockDragOrigins[i];
-                if (origin.Item == null || origin.Item.Event == null)
-                {
-                    continue;
-                }
-                BlockPlacement placement = FindPlacementForEvent(origin.Item.Event);
-                if (placement != null)
-                {
-                    placement.Row = origin.Row;
-                    // **横向要退在 `placement.Time` 上，不是 `item.StartTime`。**
-                    //
-                    // 拖动中的横纵预览都写在位置表里（见 `DragBlockTo` 收尾那句
-                    // "预览直接写在位置表上"），画布每帧取的就是它；`item.StartTime`
-                    // 是"不在拖动时"才被现算覆盖的缓存。退错了字段等于没退 ——
-                    // 纵向退了、横向纹丝不动，看起来就是"作废没生效"。
-                    // 而且 `EndBlockDrag` 也读这个值去提交，不退就会把横向写进谱面。
-                    placement.Time = origin.Start;
-                    placement.PreviewDuration = float.NaN;   // 清掉拖动时的临时时长
-                }
-                origin.Item.StartTime = origin.Start;
-                origin.Item.Duration = origin.StartDuration;
-            }
-
-            // 起点表清掉：横纵都不再提交（`EndBlockDrag` 的跟随者循环也一并跳过）。
-            imBlockDragOrigins.Clear();
-
-            visualsDirty = true;
-            return true;
-        }
-
-        /// <summary>
-        /// 这个块按它**当前的行号和时间**，会不会跟别的块撞上。
-        ///
-        /// 判据和画的时候一致：**同一行 + 画出来的像素区间相交**。
-        /// 不能拿"名义时长"比 —— 块有最小宽度（`BlockMinWidth`），
-        /// 两个点事件时间上不重叠、画出来却是叠着的。
-        ///
-        /// 拖动中拿它做「这一下能不能放下」的判据，也用来决定要不要描红。
-        /// 只查这一块（不两两比），所以代价是 O(块数)，拖动时每帧调得起。
-        /// </summary>
-        internal bool BlockOverlapsOthers(LevelEvent target)
-        {
-            BlockPlacement self = FindPlacementForEvent(target);
-            if (self == null || self.Item == null)
-            {
-                return false;
-            }
-            float speed = Mathf.Max(1f, pixelsPerSecond);
-            float selfLeft = self.Time * speed;
-            float selfWidth = Mathf.Max(BlockMinWidth,
-                self.Item.Duration * speed - BlockGap);
-            float selfRight = selfLeft + selfWidth;
-
-            for (int i = 0; i < blockPlacements.Count; i++)
-            {
-                BlockPlacement other = blockPlacements[i];
-                if (other == self || other.Item == null || other.Row != self.Row)
-                {
-                    continue;
-                }
-                float otherLeft = other.Time * speed;
-                float otherWidth = Mathf.Max(BlockMinWidth,
-                    other.Item.Duration * speed - BlockGap);
-                // 区间相交：左端在对方右端之前，且右端在对方左端之后。
-                if (selfLeft < otherLeft + otherWidth && otherLeft < selfRight)
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        /// <summary>
-        /// 按事件找块，**只把行号摆回去**。撤销/重做走这个。
-        ///
-        /// 对着的是那个事件而不是下标 —— 谱面重载过也对得上。找不到就什么都不做。
-        /// 横向不在这里：位置表里那份时间每帧都从谱面现算（见 `CollectBlocks`），
-        /// 硬写一份进去只会被下一帧冲掉。
-        /// </summary>
-        internal bool MoveBlockRowByEvent(LevelEvent target, int row)
-        {
-            if (target == null)
-            {
-                return false;
-            }
-            BlockPlacement placement = FindPlacementForEvent(target);
-            if (placement == null)
-            {
-                return false;
-            }
-            placement.Row = Mathf.Max(0, row);
-            return true;
-        }
-
-        /// <summary>
-        /// 把这一轮拖动的纵向位移记成一条撤销：**整批的"起行 → 落行"**。
-        ///
-        /// **必须在 `EndBlockDrag` 之前叫** —— 那一步的结尾会把
-        /// `imBlockDragOrigins` 清空，之后就问不到起点了。
-        /// 行号在拖动过程中就已经定下来（见 `DragBlockRowBy`），
-        /// 所以松手前读到的落点就是最终落点。
-        ///
-        /// 横向不记 —— 它由各事件自己的谱面命令负责还原。
-        /// </summary>
-        internal void RecordDragRowMove()
-        {
-            if (imBlockDragOrigins.Count == 0)
-            {
-                return;
-            }
-
-            List<LevelEvent> targets = new List<LevelEvent>();
-            List<int> fromRows = new List<int>();
-            List<int> toRows = new List<int>();
-            for (int i = 0; i < imBlockDragOrigins.Count; i++)
-            {
-                DragOrigin origin = imBlockDragOrigins[i];
-                if (origin.Item == null || origin.Item.Event == null)
-                {
-                    continue;
-                }
-                BlockPlacement placement = FindPlacementForEvent(origin.Item.Event);
-                if (placement == null || placement.Row == origin.Row)
-                {
-                    continue;
-                }
-                targets.Add(origin.Item.Event);
-                fromRows.Add(origin.Row);
-                toRows.Add(placement.Row);
-            }
-
-            if (targets.Count == 0)
-            {
-                return;
-            }
-            EditorCommandHistory.RecordTimelineBlockRows(this,
-                targets.ToArray(), fromRows.ToArray(), toRows.ToArray());
         }
 
         /// <summary>
@@ -4370,108 +4267,6 @@ namespace ADOFAIEditorStudio
             visualsDirty = true;
         }
 
-        /// <summary>
-        /// 居中模式下的「拖动时间轴」—— 开始。
-        ///
-        /// 那个模式里播放头钉在屏幕上，**拖动改的是它指向的时间，不是视图起点**：
-        /// 直接挪 viewStartTime 会被 SyncCenteredView 每帧摆回去，看起来就是拖不动。
-        ///
-        /// **这一步不能省。** TryScrubTimelineToTime 开头就检查 timelineScrubActive，
-        /// 没进状态的话每次提交都被静默拒绝 —— 表现同样是「拖不动」。
-        /// 返回 false 表示这会儿进不去（播放中之类），那就别往下走。
-        /// </summary>
-        internal bool BeginCenteredBrowse()
-        {
-            if (!IsCenteredPlayhead)
-            {
-                return false;
-            }
-            string status;
-            if (!EditorPlaybackBridge.TryBeginTimelineScrub(out status))
-            {
-                return false;
-            }
-            centerBrowseScrubbing = true;
-            centerBrowseStartTime = EditorPlaybackBridge.ReadSnapshot().CurrentTime;
-            centerBrowseAccum = 0f;
-            return true;
-        }
-
-        /// <summary>居中浏览是否在进行中（ImGui 那边靠它决定要不要收尾）。</summary>
-        internal bool CenteredBrowsing
-        {
-            get { return centerBrowseScrubbing; }
-        }
-
-        /// <summary>
-        /// 居中浏览推进一段像素。**往右拖 = 时间倒退** —— 那是「抓住内容拖」的手感
-        /// （跟 uGUI 那条路、跟剪辑软件里拖时间轴一致）。
-        ///
-        /// 累积量是从 Begin 时记下的时间往上加的，**不在拖动中读当前时间**：
-        /// 提交有节流，读回来可能还是旧值，那样每帧都会把上一步的增量丢掉。
-        /// </summary>
-        internal void BrowseCenteredBy(float deltaXPixels)
-        {
-            if (!centerBrowseScrubbing)
-            {
-                return;
-            }
-            centerBrowseAccum -= deltaXPixels / Mathf.Max(1f, pixelsPerSecond);
-            pendingScrubTime = Mathf.Clamp(
-                centerBrowseStartTime + centerBrowseAccum,
-                0f,
-                Mathf.Max(0f, navigationDuration));
-            scrubPending = true;
-            // 清冷却并要求立刻提交：拖动要跟手，不能等节流窗口。
-            manualNavigationUntil = 0f;
-            nextScrubSubmitTime = 0f;
-            visualsDirty = true;
-        }
-
-        /// <summary>
-        /// 居中浏览收尾：提交最后一次定位并退出状态。
-        /// 不退的话 timelineScrubActive 会一直挂着，之后所有定位都被拒。
-        /// </summary>
-        internal void EndCenteredBrowse()
-        {
-            if (!centerBrowseScrubbing)
-            {
-                return;
-            }
-            centerBrowseScrubbing = false;
-            SubmitPendingScrub(true);
-            EditorPlaybackBridge.EndTimelineScrub();
-        }
-
-        /// <summary>纵向平移（中键上下拖用的）。规则同 PanBy。</summary>
-        internal void PanVerticalBy(float dyPixels)
-        {
-            if (Mathf.Approximately(dyPixels, 0f))
-            {
-                return;
-            }
-            verticalScrollOffset += dyPixels;
-            ClampVerticalScroll();
-            visualsDirty = true;
-        }
-
-        /// <summary>
-        /// 清掉画布上的全部选中（点空白处用的）。
-        ///
-        /// 有这一条之前，选了一堆之后想全清掉，只能去点另一个块（那是"替换选择"、
-        /// 还留着那一个），或者去别处找。点在空处取消是最基本的习惯。
-        /// </summary>
-        internal void ClearBlockSelection()
-        {
-            if (selectedEvent == null && multiSelection.Count == 0)
-            {
-                return;
-            }
-            selectedEvent = null;
-            multiSelection.Clear();
-            visualsDirty = true;
-        }
-
         /// <summary>画布上选中的块数（排查框选用）。</summary>
         internal int SelectedBlockCount { get { return multiSelection.Count; } }
 
@@ -4479,45 +4274,6 @@ namespace ADOFAIEditorStudio
         internal float PlayheadSeconds
         {
             get { return Mathf.Max(0f, EditorPlaybackBridge.ReadSnapshot().CurrentTime); }
-        }
-
-        /// <summary>
-        /// 开始拖播放头。返回 false 表示这会儿不能拖（播放中之类）。
-        ///
-        /// **和 uGUI 那条路是同一套**（TryBeginTimelineScrub / QueueScrubAtX /
-        /// SubmitPendingScrub / EndTimelineScrub）—— 少了哪一步，拖动要么不生效，
-        /// 要么松手之后求值器那头还停在"正在拖"的状态上。
-        /// </summary>
-        internal bool BeginScrub()
-        {
-            string status;
-            if (!EditorPlaybackBridge.TryBeginTimelineScrub(out status))
-            {
-                return false;
-            }
-            scrubbing = true;
-            lastSubmittedScrubTime = float.NaN;
-            scrubPointerValid = true;
-            return true;
-        }
-
-        /// <summary>拖到视口内 x 像素处。</summary>
-        internal void ScrubToX(float x)
-        {
-            scrubPointerX = x;
-            QueueScrubAtX(x);
-        }
-
-        internal void EndScrub()
-        {
-            if (!scrubbing)
-            {
-                return;
-            }
-            scrubbing = false;
-            scrubPointerValid = false;
-            SubmitPendingScrub(true);
-            EditorPlaybackBridge.EndTimelineScrub();
         }
 
         /// <summary>
@@ -4645,8 +4401,6 @@ namespace ADOFAIEditorStudio
             return IsTimelineItemSelected(item);
         }
 
-
-
         /// <summary>标尺上的一条刻度（格号）。</summary>
         internal struct RulerTick
         {
@@ -4661,10 +4415,10 @@ namespace ADOFAIEditorStudio
             internal float X;
         }
 
-        private readonly List<RulerTick> rulerTicks = new List<RulerTick>();
+        private readonly List<RulerTick> rulerTickMarks = new List<RulerTick>();
         private readonly List<RulerLine> rulerLines = new List<RulerLine>();
 
-        internal List<RulerTick> RulerTicks { get { return rulerTicks; } }
+        internal List<RulerTick> RulerTicks { get { return rulerTickMarks; } }
         internal List<RulerLine> RulerLines { get { return rulerLines; } }
 
         /// <summary>标尺那一屏的左右边界（时间轴单位：秒）。</summary>
@@ -4676,49 +4430,6 @@ namespace ADOFAIEditorStudio
 
         internal float BodyHeightPixels { get { return bodyHeight; } }
 
-        /// <summary>ImGui 版接管标尺时置位：uGUI 那两排刻度/格线不再摆。</summary>
-        private bool rulerTakenOver;
-
-        /// <summary>
-        /// ImGui 版接管事件块时置位：uGUI 那批块和它们的分类框都不再摆。
-        ///
-        /// **分类框也要一起收** —— 层堆叠下它没有底衬，但它是块的父节点，
-        /// 留着的话那批块还会跟着它一起显示出来。
-        /// </summary>
-        private bool blocksTakenOver;
-
-        internal void SuppressBlocks(bool suppressed)
-        {
-            blocksTakenOver = suppressed;
-            if (suppressed && markerLayer != null)
-            {
-                HideAllMarkers();
-            }
-        }
-
-        private void HideAllMarkers()
-        {
-            for (int i = 0; i < markerPool.Count; i++)
-            {
-                if (markerPool[i].GameObject != null)
-                {
-                    markerPool[i].GameObject.SetActive(false);
-                }
-            }
-            for (int i = 0; i < sectionWindowPool.Count; i++)
-            {
-                if (sectionWindowPool[i].Rect != null)
-                {
-                    sectionWindowPool[i].Rect.gameObject.SetActive(false);
-                }
-            }
-        }
-
-        internal void SuppressRuler(bool suppressed)
-        {
-            rulerTakenOver = suppressed;
-        }
-
         /// <summary>
         /// 摊平这一屏的标尺：刻度（格号）和格线。
         ///
@@ -4727,9 +4438,34 @@ namespace ADOFAIEditorStudio
         /// 格线）；格宽用「可视区里的格数」均摊而不是全谱总格数（全谱平均在放大
         /// 之后会严重低估格宽，刻度糊成一片）。这两条都是踩出来的，别再推一遍。
         /// </summary>
+        // 标尺缓存：视口（起点 / 宽 / 缩放 / 总格数）没变就不重算。
+        private double rulerCacheViewStart = double.NaN;
+        private float rulerCacheBodyWidth = -1f;
+        private float rulerCachePixelsPerSecond = -1f;
+        private int rulerCacheFloorCount = -1;
+
         internal void CollectRuler()
         {
-            rulerTicks.Clear();
+            // **每帧重算标尺是白花的。**
+            // 它按可视格数循环两遍并给每个刻度 `seqID.ToString()`，
+            // 一屏两三百格就是几百次分配 —— 实测标尺占 3ms/帧。
+            // 视口没动时直接用上一次的结果。
+            scnEditor rulerEditor = scnEditor.instance;
+            int rulerFloorCount = (rulerEditor != null && rulerEditor.floors != null)
+                ? rulerEditor.floors.Count : 0;
+            if (rulerCacheViewStart == viewStartTime
+                && rulerCacheBodyWidth == bodyWidth
+                && rulerCachePixelsPerSecond == pixelsPerSecond
+                && rulerCacheFloorCount == rulerFloorCount)
+            {
+                return;
+            }
+            rulerCacheViewStart = viewStartTime;
+            rulerCacheBodyWidth = bodyWidth;
+            rulerCachePixelsPerSecond = pixelsPerSecond;
+            rulerCacheFloorCount = rulerFloorCount;
+
+            rulerTickMarks.Clear();
             rulerLines.Clear();
 
             scnEditor editor = scnEditor.instance;
@@ -4758,7 +4494,7 @@ namespace ADOFAIEditorStudio
                 {
                     continue;
                 }
-                rulerTicks.Add(new RulerTick
+                rulerTickMarks.Add(new RulerTick
                 {
                     X = (floorTime - viewStartTime) * pixelsPerSecond,
                     Label = floor.seqID.ToString()
@@ -4828,21 +4564,115 @@ namespace ADOFAIEditorStudio
                 delegate { ToggleSelectionFollow(); ApplySelectionFollowIcon(); });
             ApplySelectionFollowIcon();
 
-            // 拖动事件块时是否吸附到格边界。放在一排开关的最后，
-            // 和上面三个一样是"模式开关"的性质。
+            // 拖动事件块时是否吸附到格边界。
             snapDragButton = CreateButton(
                 "SnapDrag", root, 208f + ContentShift, 7f, 32f, 29f, string.Empty,
                 delegate { ToggleSnapDrag(); });
             ApplySnapDragIcon();
 
+            // 图标按钮没有文字，靠悬停提示说明自己是谁。
+            UiHoverTip.Attach(followModeButton,
+                "固定播放头：开 = 播放头钉在正中、内容从中间滑过；关 = 视图归你手动滚");
+            // 和旁边那颗「点轨道跟随」（准星）区分开：这一颗画的是
+            // 「指针指着一个事件块」，一眼能看出触发对象是**事件块**。
+            UiHoverTip.Attach(selectionFollowButton,
+                "点事件跟随：在时间轴上点事件块，画面 1 秒内加速走过去");
+            UiHoverTip.Attach(snapDragButton, "拖动吸附：拖块时吸附到格边界");
+
+            // **「定位」「翻页」两颗模式按钮。**
+            //
+            // ImGui 那版把它们画在四个图标开关后面（也是 32×29 的方钮，只是
+            // 里面写字）。迁回 uGUI 时漏了这两颗，现在补回来。
+            locateButton = CreateButton(
+                "LocateOnClick", root, 248f + ContentShift, 7f, 32f, 29f, string.Empty,
+                delegate { ToggleLocateOnTrackClick(); RefreshFeatureButtons(); });
+            HideButtonLabel(locateButton);
+            locateIcon = CreateImage("LocateIcon", locateButton.GetComponent<RectTransform>(),
+                5f, 6f, 18f, 16f, TextMuted);
+            locateIcon.raycastTarget = false;
+
+            // 「定位到播放头」：把视图横向滚到播放头位置（一次性的动作）。
+            // 原来这颗是「自动翻页」开关，功能已取消 —— 视图不再自己跟着播放头跑。
+            locatePlayheadButton = CreateButton(
+                "LocatePlayhead", root, 284f + ContentShift, 7f, 32f, 29f, string.Empty,
+                delegate { LocateToPlayhead(); RefreshFeatureButtons(); });
+            HideButtonLabel(locatePlayheadButton);
+            locatePlayheadIcon = CreateImage("PlayheadIcon",
+                locatePlayheadButton.GetComponent<RectTransform>(),
+                5f, 6f, 18f, 16f, TextPrimary);
+            locatePlayheadIcon.raycastTarget = false;
+
+            // **排版模式**：固定（按类型优先级自动排）/ 自由（自己拖）。
+            // 放在最后：它是"整体行为"的开关，不参与上面那排"跟随/吸附"的心智。
+            layoutModeButton = CreateButton(
+                "LayoutMode", root, 320f + ContentShift, 7f, 32f, 29f, string.Empty,
+                delegate { ToggleFixedTimelineLayout(); });
+            HideButtonLabel(layoutModeButton);
+            ApplyLayoutModeIcon();
+            UiHoverTip.Attach(layoutModeButton,
+                "排版：固定 = 按事件类型自动分层（每次改动自动重排）；自由 = 行号完全由你拖（Ctrl+L）");
+
+            RefreshFeatureButtons();
+            UiHoverTip.Attach(locateButton,
+                "点轨道跟随：在预览里点轨道，画面 1 秒内加速走过去（Ctrl+J）");
+            UiHoverTip.Attach(locatePlayheadButton,
+                "定位到播放头：把时间轴横向滚到播放头位置（Ctrl+K）");
+
             BuildEventPalette(root);
 
-            float controlsX = rootWidth - 76f;
-            zoomText = CreateText("Zoom", root, controlsX - 58f, 8f, 52f, 28f, "100%", 11f, TextMuted, TextAlignmentOptions.Center, false);
-            CreateButton("ZoomOut", root, controlsX, 7f, 28f, 29f, "-", delegate { ZoomAt(0.8f, bodyWidth * 0.5f); });
-            CreateButton("ZoomIn", root, controlsX + 32f, 7f, 28f, 29f, "+", delegate { ZoomAt(1.25f, bodyWidth * 0.5f); });
-            Button rewindButton = CreateButton("GoToStart", root, controlsX - 96f, 7f, 32f, 29f, "|<", ReturnToStart);
-            ApplyNativeRewindIcon(rewindButton);
+            // **右侧那一串从右往左排**：缩放 +/− → 回到开头 → 缩放读数 →
+            // 车道筛选。各自按右边距硬算会互相压（ImGui 那边也踩过）。
+            const float stepSize = 28f;
+            const float laneSize = 26f;
+            const float laneGap = 4f;
+            int laneCount = LaneCount;
+            float lanesWidth = laneCount * laneSize + (laneCount - 1) * laneGap;
+
+            float zoomInX = rootWidth - 16f - stepSize;
+            float zoomOutX = zoomInX - 4f - stepSize;
+            float rewindX = zoomOutX - 16f - 32f;
+            float zoomTextX = rewindX - 12f - 52f;
+            float lanesX = zoomTextX - 20f - lanesWidth;
+
+            zoomText = CreateText("Zoom", root, zoomTextX, 8f, 52f, 28f, "100%", 11f, TextMuted, TextAlignmentOptions.Center, false);
+
+            Button rewindButton = CreateIconButton("GoToStart", root, rewindX, 32f,
+                CreateRewindSprite(), TextSecondary, ReturnToStart, "回到开头");
+            rewindButton.name = "GoToStart";
+
+            CreateIconButton("ZoomOut", root, zoomOutX, stepSize,
+                CreateMinusSprite(), TextSecondary,
+                delegate { ZoomAt(0.8f, bodyWidth * 0.5f); }, "缩小");
+            CreateIconButton("ZoomIn", root, zoomInX, stepSize,
+                CreatePlusSprite(), TextSecondary,
+                delegate { ZoomAt(1.25f, bodyWidth * 0.5f); }, "放大");
+
+            // 车道筛选：从预览工具栏搬回时间轴第一行（ImGui 版就在这里）。
+            laneButtons.Clear();
+            laneIcons.Clear();
+            for (int lane = 0; lane < laneCount; lane++)
+            {
+                int index = lane;
+                RectTransform host = CreateRect("LaneFilter" + lane, root,
+                    lanesX + lane * (laneSize + laneGap), 7f, laneSize, 29f);
+                Image hit = host.gameObject.AddComponent<Image>();
+                hit.color = Color.clear;
+                hit.raycastTarget = true;
+                Button laneButton = host.gameObject.AddComponent<Button>();
+                laneButton.targetGraphic = hit;
+                laneButton.transition = Selectable.Transition.None;
+                laneButton.onClick.AddListener(delegate { ToggleLane(index); });
+                UiHoverTip.Attach(laneButton, "筛选：显示 / 隐藏这一类");
+
+                Sprite icon = GetLaneIcon(lane);
+                Image iconImage = CreateImage("Icon", host, 4f, 6f, 18f, 16f,
+                    IsLaneVisible(lane) ? TextPrimary : TextMuted);
+                iconImage.sprite = icon;
+                iconImage.preserveAspect = true;
+                iconImage.raycastTarget = false;
+                laneButtons.Add(laneButton);
+                laneIcons.Add(iconImage);
+            }
 
             // 视图锁：一个按钮同时管相机位置和缩放。
             //
@@ -4850,10 +4680,11 @@ namespace ADOFAIEditorStudio
             // 右端已经排满了——时间读数右对齐，
             // 最后几位数字一直顶到播放控件——所以早先尝试把锁放在
             // 那里，结果被「00:00.000」盖住了。
+            // 和前面几颗模式开关排在一起（原来钉在 550，孤零零挂在中间）。
             viewLockButton = CreateButton(
                 "ViewLock",
                 root,
-                550f + ContentShift,
+                322f + ContentShift,
                 7f,
                 32f,
                 29f,
@@ -4861,6 +4692,7 @@ namespace ADOFAIEditorStudio
                 delegate { ToggleViewLock(); }
             );
             ApplyViewLockIcon();
+            UiHoverTip.Attach(viewLockButton, "视图锁：锁住预览的相机位置和缩放");
 
             // 这个设置会持久化，所以启动时必须告知求值器——
             // 否则会出现一开始实际未锁、按钮却已显示为锁定状态的情况。
@@ -4869,18 +4701,21 @@ namespace ADOFAIEditorStudio
                 EditorPlaybackBridge.ApplyPreviewPositionLock(Main.Settings.LockPreviewPosition);
             }
 
-            timeText = CreateText("Time", root, rootWidth - 420f, 8f, 240f, 28f, "00:00.000 / 00:00.000", 13f, Palette.AccentSecondary, TextAlignmentOptions.MidlineRight, false);
-            // 宽度按「从起点到时间读数左缘」算，不能写死。
-            // 时间读数右对齐占 rootWidth-420 起的一段，摘要右移之后
-            // 如果还按老的定宽铺开，会直接压在读数上。
-            float summaryLeft = 590f + ContentShift;
-            summaryText = CreateText("Summary", root, summaryLeft, 8f,
-                Mathf.Max(100f, rootWidth - 420f - summaryLeft - 12f), 28f, string.Empty, 11f,
-                TextMuted, TextAlignmentOptions.MidlineLeft, false);
-            summaryText.overflowMode = TextOverflowModes.Ellipsis;
+            // 时间读数摆在**整条时间轴的正中**（用户要求）。原来贴右缘，
+            // 和缩放/筛选挤成一串；居中之后它是这一行的视觉锚点。
+            const float timeWidth = 240f;
+            float timeX = Mathf.Max(200f, (rootWidth - timeWidth) * 0.5f);
+            timeText = CreateText("Time", root, timeX, 8f, timeWidth, 28f,
+                "00:00.000 / 00:00.000", 13f, Palette.AccentSecondary,
+                TextAlignmentOptions.Center, false);
 
-            // 标题行建完了，把这几件登记下来 —— ImGui 版接管时整排藏掉。
-            TrackTitleRow();
+            // 摘要放到读数左边那段空档里，右对齐贴住读数。
+            // 起点让开视图锁（322 + 32）那一格。
+            float summaryLeft = 364f + ContentShift;
+            summaryText = CreateText("Summary", root, summaryLeft, 8f,
+                Mathf.Max(60f, timeX - 12f - summaryLeft), 28f, string.Empty, 11f,
+                TextMuted, TextAlignmentOptions.MidlineRight, false);
+            summaryText.overflowMode = TextOverflowModes.Ellipsis;
 
             // 时间轴主体是浮在面板上的一张卡片，不是面板上的凹槽。它曾经用 PanelAlt
             // ——比面板暗——那会把它压到表面之下；而设计稿要求
@@ -4899,6 +4734,14 @@ namespace ADOFAIEditorStudio
             }
             viewport = viewportImage.rectTransform;
             viewport.gameObject.AddComponent<RectMask2D>();
+            // 格线要压在块**下面**，所以单独一层、先建。
+            gridLayer = CreateRect("GridLayer", viewport, 0f, 0f, bodyWidth, bodyHeight);
+            // 事件块层：夹在标尺上沿与视口之间，播放头在它上面。
+            //
+            // **不要再给它加 RectMask2D。** 视口自己已经有遮罩了；这一层
+            // 建的时候按当时的 bodyHeight 定尺寸，面板拉高之后它不跟着变 ——
+            // 多出来那一段就被它自己裁掉（用户看到「下面又被剪了」）。
+            blockLayer = CreateRect("BlockLayer", viewport, 0f, 0f, bodyWidth, bodyHeight);
             markerLayer = CreateRect("MarkerLayer", viewport, 0f, 0f, bodyWidth, bodyHeight);
             // 这些层必须在填充各自的池之前就存在，否则
             // 表头会被挂到场景根节点而不是画布下，导致
@@ -5006,21 +4849,7 @@ namespace ADOFAIEditorStudio
 
         /// <summary>竖条的最小高度。再矮就没法放搜索框和一行列表了。</summary>
         private const float RowPaneMinimumHeight = 140f;
-        /// <summary>
-        /// 把分类框打开或合上。折叠集合单独保存，因为
-        /// 分类在每趟布局都会重建。
-        /// </summary>
-        private void ToggleSection(TimelineSection section)
-        {
-            if (section == null)
-            {
-                return;
-            }
 
-            section.Collapsed = !section.Collapsed;
-            layoutDirty = true;
-            visualsDirty = true;
-        }
         private void RefreshData(bool force)
         {
             // 拖动期间绝不能重建 TimelineItem。
@@ -5057,7 +4886,6 @@ namespace ADOFAIEditorStudio
                 laneItems[i].Clear();
             }
             layoutItems.Clear();
-            displayRowCount = 0;
             verticalScrollOffset = 0f;
 
             totalDuration = 0f;
@@ -5124,7 +4952,6 @@ namespace ADOFAIEditorStudio
 
         // ==== 以下方法从备份原样拼回（英文注释）====
 
-
         private void AddTimelineItem(scnEditor editor, LevelEvent levelEvent, bool isDecoration, int order)
         {
             if (levelEvent == null)
@@ -5174,7 +5001,6 @@ namespace ADOFAIEditorStudio
             Dictionary<string, ADOFAI.PropertyInfo> properties = levelEvent.info.propertiesInfo;
             return properties != null && properties.ContainsKey("duration");
         }
-
 
         /// <summary>
         /// 给每个事件补算身份（`Key`）：**类型 + 格 + 同类型同格里的序号**。
@@ -5273,7 +5099,6 @@ namespace ADOFAIEditorStudio
             return string.Join("|", parts);
         }
 
-
         private void RebuildDynamicRows()
         {
             layoutItems.Clear();
@@ -5294,7 +5119,6 @@ namespace ADOFAIEditorStudio
             Dictionary<int, float> scrollByType = SnapshotRowScroll();
             layoutSections.Clear();
             layoutRows.Clear();
-            displayRowCount = 0;
             float minimumDuration = (MinimumPointEventWidth + EventGap)
                 / Mathf.Max(1f, pixelsPerSecond);
             // 图层模式的排法是「所有事件按时间重叠全局装箱」，不按类型分组：
@@ -5415,34 +5239,6 @@ namespace ADOFAIEditorStudio
             UpdateSummary();
         }
 
-        /// <summary>
-        /// Distinct event types in first-appearance order. The key is an int rather
-        /// than LevelEventType so decoration events, which carry the decoration type
-        /// instead of an event type, are grouped by what they actually are.
-        /// </summary>
-
-
-        /// <summary>
-        /// Distinct event types in first-appearance order. The key is an int rather
-        /// than LevelEventType so decoration events, which carry the decoration type
-        /// instead of an event type, are grouped by what they actually are.
-        /// </summary>
-        private List<int> CollectOrderedEventTypes()
-        {
-            var seen = new HashSet<int>();
-            var ordered = new List<int>();
-            for (int i = 0; i < layoutItems.Count; i++)
-            {
-                int key = GetLayoutTypeKey(layoutItems[i]);
-                if (seen.Add(key))
-                {
-                    ordered.Add(key);
-                }
-            }
-            return ordered;
-        }
-
-
         private static int GetLayoutTypeKey(TimelineItem item)
         {
             return (int)item.Event.eventType;
@@ -5461,7 +5257,6 @@ namespace ADOFAIEditorStudio
         /// the moment anything marks the layout dirty -- which is exactly what scrolling does,
         /// so the band snapped back to its first row on the next frame.
         /// </summary>
-
 
         /// <summary>
         /// Captures which bands were collapsed before the rows are recomputed. The
@@ -5490,7 +5285,6 @@ namespace ADOFAIEditorStudio
             return scroll;
         }
 
-
         private Dictionary<int, TimelineSection> SnapshotCollapsedSections()
         {
             var collapsed = new Dictionary<int, TimelineSection>();
@@ -5508,7 +5302,6 @@ namespace ADOFAIEditorStudio
         /// The editor icon for an event type, straight from the sprite table the game
         /// fills when the editor opens. Also used for the band header.
         /// </summary>
-
 
         /// <summary>
         /// The editor icon for an event type, straight from the sprite table the game
@@ -5530,62 +5323,6 @@ namespace ADOFAIEditorStudio
         /// meaningful for rows that belong to a band; a row a collapsed band hides
         /// still resolves, which keeps a stale DisplayRow harmless.
         /// </summary>
-
-
-        /// <summary>
-        /// The band a row belongs to, by the full row table (headers included). Only
-        /// meaningful for rows that belong to a band; a row a collapsed band hides
-        /// still resolves, which keeps a stale DisplayRow harmless.
-        /// </summary>
-        private TimelineSection GetSectionForRow(int row)
-        {
-            if (row < 0 || row >= layoutRowSection.Count)
-            {
-                return null;
-            }
-
-            int index = layoutRowSection[row];
-            return index >= 0 && index < layoutSections.Count ? layoutSections[index] : null;
-        }
-
-
-        private int GetRowIndexAtY(float contentY)
-        {
-            int low = 0;
-            int high = layoutRowY.Count - 1;
-            int found = -1;
-            while (low <= high)
-            {
-                int middle = (low + high) / 2;
-                if (layoutRowY[middle] <= contentY)
-                {
-                    found = middle;
-                    low = middle + 1;
-                }
-                else
-                {
-                    high = middle - 1;
-                }
-            }
-            return found;
-        }
-
-
-        private float GetRowTop(int row)
-        {
-            if (row <= 0)
-            {
-                return 0f;
-            }
-            return row < layoutRowY.Count ? layoutRowY[row] : layoutTotalHeight;
-        }
-
-
-        private float GetRowBottom(int row)
-        {
-            return row < layoutRowY.Count ? layoutRowY[row] + rowHeight : layoutTotalHeight;
-        }
-
 
         private static bool TryFindRowInsertion(
             List<RowInterval> intervals,
@@ -5614,7 +5351,6 @@ namespace ADOFAIEditorStudio
             return !overlapsPrevious && !overlapsNext;
         }
 
-
         private void RefreshGeometry()
         {
             visualsDirty = false;
@@ -5641,67 +5377,16 @@ namespace ADOFAIEditorStudio
         /// Content-space Y of the last row a band shows, in the band's current state.
         /// </summary>
 
-
-        /// <summary>
-        /// Content-space Y of the last row a band shows, in the band's current state.
-        /// </summary>
-        private float GetBandBottom(TimelineSection section)
-        {
-            if (section.ShownRows <= 0)
-            {
-                return GetRowTop(section.HeaderRow) + HeaderRowHeight;
-            }
-
-            int lastRow = section.EventRowStart + section.ShownRows - 1;
-            return GetRowTop(lastRow) + rowHeight;
-        }
-
         /// <summary>
         /// How many of a band's visible rows start below the viewport. Counted from the
         /// far end so a band with thousands of rows does not walk all of them.
         /// </summary>
-
-
-        /// <summary>
-        /// How many of a band's visible rows start below the viewport. Counted from the
-        /// far end so a band with thousands of rows does not walk all of them.
-        /// </summary>
-        private int CountRowsBelowViewport(TimelineSection section, float viewBottom)
-        {
-            int below = 0;
-            for (int bandRow = section.ShownRows - 1; bandRow >= 0; bandRow--)
-            {
-                if (GetRowTop(section.EventRowStart + bandRow) <= viewBottom)
-                {
-                    break;
-                }
-                below++;
-            }
-            return below;
-        }
-        private int collapsedBadgeIndex;
-        private static string SectionTitle(TimelineSection section)
-        {
-            // Plain triangles rather than the small variants: these are in the CJK
-            // font's glyph set, the small ones usually are not and would render as
-            // missing-glyph boxes.
-            return (section.Collapsed ? "▶ " : "▼ ")
-                + section.Title
-                + "  (" + section.EventRowCount + ")";
-        }
-
-
-        internal static float GetMarkerIconSize(float height)
-        {
-            return Mathf.Clamp(height - 8f, 9f, 16f);
-        }
 
         /// <summary>
         /// The editor icon the game uses for an event type. The table is filled by
         /// scnEditor when the editor opens, so it is normally present; a missing entry
         /// just means the block is laid out without an icon.
         /// </summary>
-
 
         /// <summary>
         /// The editor icon the game uses for an event type. The table is filled by
@@ -5718,14 +5403,12 @@ namespace ADOFAIEditorStudio
             Sprite icon;
             return GCS.levelEventIcons.TryGetValue(levelEvent.eventType, out icon) ? icon : null;
         }
-        private int easedLogged;
 
         /// <summary>
         /// Reads the ease a timeline item animates with. Returns Linear when the
         /// property is absent or disabled, matching how the evaluator treats an
         /// unspecified ease.
         /// </summary>
-
 
         /// <summary>
         /// Reads the ease a timeline item animates with. Returns Linear when the
@@ -5784,7 +5467,11 @@ namespace ADOFAIEditorStudio
         // without the inset the stroke merges into the block border.
         // Feathering spreads the stroke's apparent weight, so the solid core is set a
         // little wider than a plain hairline to end up reading as the same thickness.
-        internal const float EaseCurveThickness = 1.4f;
+        // 1.4 → 2.4：块变小/变暗之后 1.4 的线几乎看不见。
+        /// <summary>块高低于这个值就不画缓速曲线（扁到没有可读形状）。</summary>
+        private const float EaseCurveHideBelowHeight = 26f;
+
+        internal const float EaseCurveThickness = 2.4f;
         internal const float EaseCurveMarginX = 3f;
         internal const float EaseCurveMarginY = 2f;
 
@@ -5799,9 +5486,9 @@ namespace ADOFAIEditorStudio
         // rim. The dot needs its own, thinner feather: the stroke's is proportionally
         // large enough that reusing it would leave a core barely wider than the stroke
         // itself, and the dot would read as a blunt line end rather than a marker.
-        internal const float EaseCurveDotRadius = 2.2f;
+        // 2.2 → 3.4：端点圆点原来和线同宽，视觉上读不出"这里有端点"。
+        internal const float EaseCurveDotRadius = 3.4f;
         private const float EaseCurveDotFeather = 0.6f;
-
 
         /// <summary>
         /// 把所有缓速类型的采样点先算出来。
@@ -5871,11 +5558,15 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private sealed class EaseCurveImage : Image
         {
+            /// <summary>当前块高对应的缩放系数（OnPopulateMesh 里算，画端点球用）。</summary>
+            private float _dotScale = 1f;
             private float[] _values;
 
             internal void SetCurve(float[] values)
             {
                 _values = values;
+                // 换了数据必须标脏，否则网格还是上一条曲线的样子。
+                SetVerticesDirty();
             }
 
             protected override void OnPopulateMesh(VertexHelper vh)
@@ -5893,9 +5584,22 @@ namespace ADOFAIEditorStudio
                 // thickness, and a feathered band around it that fades to transparent.
                 // The end dots reach further out than the stroke, so the whole mesh is
                 // inset by their radius as well and they still sit inside the block.
-                float inner = EaseCurveThickness * 0.5f;
-                float outer = inner + EaseCurveFeather;
-                float inset = outer + EaseCurveDotRadius;
+                // **粗细/留白跟着块高自适应。**
+                //
+                // 原来线宽 2.4、羽化 0.75、端点半径 3.4 都是写死的，
+                // 三者加起来 inset≈5.35；行高被 ALT+滚轮压到最扁时曲线框只剩
+                // 十几像素，上下各让掉 5 像素之后有效高度接近 0 ——
+                // 表现就是「所有曲线都拉成一条直线」。
+                // 现在按短边等比缩放，并把 inset 压到短边的 28% 以内。
+                float shortSide = Mathf.Min(rect.width, rect.height);
+                float scale = Mathf.Clamp(shortSide / 42f, 0.45f, 1f);
+                _dotScale = scale;
+                // **线宽给下限**：最扁一档按比例只剩不到 1px，看起来像断线。
+                float thickness = Mathf.Max(1.2f, EaseCurveThickness * scale);
+                float inner = thickness * 0.5f;
+                float outer = inner + Mathf.Max(0.4f, EaseCurveFeather * scale);
+                float inset = Mathf.Min(outer + EaseCurveDotRadius * scale,
+                    shortSide * 0.28f);
                 float left = rect.xMin + inset;
                 float right = rect.xMax - inset;
                 float width = right - left;
@@ -5990,7 +5694,10 @@ namespace ADOFAIEditorStudio
                 vertex.position = new Vector3(centreX, centreY, 0f);
                 vh.AddVert(vertex);
 
-                float inner = EaseCurveDotRadius - EaseCurveDotFeather;
+                // **端点球也跟着块高缩。** 下限 1.6px，最扁时仍看得见一个点。
+                float radius = Mathf.Max(1.6f, EaseCurveDotRadius * _dotScale);
+                float feather = Mathf.Max(0.35f, EaseCurveDotFeather * _dotScale);
+                float inner = Mathf.Max(0.6f, radius - feather);
                 Color fade = new Color(color.r, color.g, color.b, 0f);
                 for (int i = 0; i < wedges; i++)
                 {
@@ -6005,8 +5712,8 @@ namespace ADOFAIEditorStudio
 
                     vertex.color = fade;
                     vertex.position = new Vector3(
-                        centreX + cos * EaseCurveDotRadius,
-                        centreY + sin * EaseCurveDotRadius,
+                        centreX + cos * radius,
+                        centreY + sin * radius,
                         0f);
                     vh.AddVert(vertex);
                 }
@@ -6050,36 +5757,6 @@ namespace ADOFAIEditorStudio
         private int diagClampLogged;
 
         /// <summary>诊断用：拖动中的 marker 被回收循环拦下过几次（限流）。</summary>
-        private int diagReclaimLogged;
-
-        /// <summary>诊断用：上一次记录的"抓取漂移"。</summary>
-        private float diagLastGrabDrift = float.NaN;
-
-        /// <summary>
-        /// 诊断：块和鼠标之间的**实际距离**相对按下时漂了多少。
-        ///
-        /// 这才是眼前能看见的那个量：抓取时块左边缘离光标 `dragGrabOffset.x`，
-        /// 拖动中这个距离如果保持 = 抓取偏移，块就是跟手的；如果它一路变大，
-        /// 就是块在从鼠标底下溜走。只记变化超过 10px 的，避免刷屏。
-        /// </summary>
-        private void DiagGrabDrift(float blockLeftX)
-        {
-            if (Main.Settings == null || !Main.Settings.VerboseDiagnostics)
-            {
-                return;
-            }
-            float drift = (dragPointerLocal.x - blockLeftX) - dragGrabOffset.x;
-            if (!float.IsNaN(diagLastGrabDrift)
-                && Mathf.Abs(drift - diagLastGrabDrift) < 10f)
-            {
-                return;
-            }
-            diagLastGrabDrift = drift;
-            Main.Logger.Log("[TimelineDrag] 抓取漂移=" + drift.ToString("0.0")
-                + "px 鼠标x=" + dragPointerLocal.x.ToString("0.0")
-                + " 块左=" + blockLeftX.ToString("0.0")
-                + " 抓取偏移=" + dragGrabOffset.x.ToString("0.0"));
-        }
 
         /// <summary>
         /// 诊断：抓「块拖动收尾没走到」。
@@ -6258,6 +5935,654 @@ namespace ADOFAIEditorStudio
 
             dragPointerLocal = ToMarkerLayerTopLeft(screenPoint);
             dragPointerValid = true;
+
+            // **纵向也跟手。**
+            //
+            // 纵轴不是"改数据"而是"改行号"：这里的行号就是执行优先级
+            // （ADOFAI 从上往下执行事件），所以拖动时直接把人挪到目标行、
+            // 其余块顺势上下让位 —— 松手不需要再补一次提交。
+            //
+            // 拉长/缩短不动行：那是改时长，纵向跟着跑会顺手把行号也改了。
+            if (blockDragResizing || blockDragItem == null)
+            {
+                return;
+            }
+
+            ApplyBlockDragRowFromPointer();
+        }
+
+        /// <summary>
+        /// 按当前指针位置算目标行并整批挪过去。
+        ///
+        /// 单独拆出来是因为**贴边自动滚动**时指针没动、但内容在滚 —— 那种情况
+        /// 不会触发 `OnDrag`，得每帧自己再算一次，否则块停在原地、视口越滚越远。
+        /// </summary>
+        private void ApplyBlockDragRowFromPointer()
+        {
+            if (!blockDragActive || blockDragResizing || blockDragItem == null
+                || !dragPointerValid)
+            {
+                return;
+            }
+            float stride = Mathf.Max(1f, BlockStridePixels);
+            float desiredTop = dragPointerLocal.y - dragGrabOffset.y;
+            int row = Mathf.Max(0, Mathf.RoundToInt((desiredTop - ContentTop()) / stride));
+            if (blockDragRow >= 0 && row == blockDragRow)
+            {
+                return;
+            }
+            blockDragRow = row;
+
+            // **整批一起挪。** 位移以被拖那个为基准（和横向组拖同一套心智）：
+            // 抓手落到第几行，其余按各自原来的行号加上同一个位移。
+            int deltaRows = dragOrigins.Count > 0 ? row - dragOrigins[0].Row : 0;
+            MoveDragGroupRows(deltaRows);
+        }
+
+        /// <summary>
+        /// 拖块时贴到视口上/下边缘 → 自动纵向滚动。
+        ///
+        /// 和横向贴边滚动同一套手感：越往边上顶越快（深度平方），松手即停。
+        /// 滚完立刻按指针重算目标行，块才跟着一起往下走。
+        /// </summary>
+        private void TickDragVerticalAutoScroll()
+        {
+            if (!blockDragActive || blockDragResizing || !dragPointerValid)
+            {
+                return;
+            }
+            float zone = EdgeScrollZone;
+            float height = Mathf.Max(1f, bodyHeight);
+            float y = dragPointerLocal.y;
+            float direction = 0f;
+            if (y < zone)
+            {
+                direction = -(1f - Mathf.Clamp01(y / zone));
+            }
+            else if (y > height - zone)
+            {
+                direction = 1f - Mathf.Clamp01((height - y) / zone);
+            }
+            if (Mathf.Abs(direction) < 0.02f)
+            {
+                return;
+            }
+            float depth = Mathf.Abs(direction);
+            verticalScrollOffset += direction * 900f * depth * depth * Time.unscaledDeltaTime;
+            ClampVerticalScroll();
+            visualsDirty = true;
+            ApplyBlockDragRowFromPointer();
+        }
+
+        /// <summary>切换「固定排版 / 自由排版」，固定时立刻重排一次。</summary>
+        internal void ToggleFixedTimelineLayout()
+        {
+            if (Main.Settings == null)
+            {
+                return;
+            }
+            Main.Settings.FixedTimelineLayout = !Main.Settings.FixedTimelineLayout;
+            Main.SaveSettings();
+            if (Main.Settings.FixedTimelineLayout)
+            {
+                RepackRowsByTypePriority();
+                visualsDirty = true;
+            }
+            ApplyLayoutModeIcon();
+            if (Main.Overlay != null)
+            {
+                Main.Overlay.SetTransientStatus(Main.Settings.FixedTimelineLayout
+                    ? "排版：固定（按类型自动分层，Ctrl+L）"
+                    : "排版：自由（行号归你，Ctrl+L）");
+            }
+        }
+
+        private Button layoutModeButton;
+        private Sprite layoutModeSprite;
+
+        /// <summary>
+        /// 排版模式图标：三条横线。
+        /// 固定 = 三条**错落**（上长下短，表示按类型分层）+ 强调色；
+        /// 自由 = 三条等长 + 弱化色。
+        /// </summary>
+        private void ApplyLayoutModeIcon()
+        {
+            if (layoutModeButton == null)
+            {
+                return;
+            }
+            bool fixedLayout = FixedTimelineLayout;
+            Transform existing = layoutModeButton.transform.Find("LayoutIcon");
+            if (existing != null)
+            {
+                UnityEngine.Object.Destroy(existing.gameObject);
+            }
+            if (layoutModeSprite != null)
+            {
+                UnityEngine.Object.Destroy(layoutModeSprite);
+            }
+            const int w = 32;
+            const int h = 28;
+            Texture2D texture = new Texture2D(w, h, TextureFormat.RGBA32, false, true);
+            Color32[] pixels = new Color32[w * h];
+            void Fill(int x0, int y0, int x1, int y1)
+            {
+                for (int y = y0; y <= y1; y++)
+                {
+                    for (int x = x0; x <= x1; x++)
+                    {
+                        if (x >= 0 && y >= 0 && x < w && y < h)
+                        {
+                            pixels[y * w + x] = new Color32(255, 255, 255, 255);
+                        }
+                    }
+                }
+            }
+            if (fixedLayout)
+            {
+                Fill(6, 7, 25, 9);
+                Fill(6, 13, 21, 15);
+                Fill(6, 19, 17, 21);
+            }
+            else
+            {
+                Fill(6, 7, 25, 9);
+                Fill(6, 13, 25, 15);
+                Fill(6, 19, 25, 21);
+            }
+            texture.SetPixels32(pixels);
+            texture.Apply(false, true);
+            layoutModeSprite = Sprite.Create(texture, new Rect(0f, 0f, w, h),
+                new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect);
+            layoutModeSprite.hideFlags = HideFlags.HideAndDontSave;
+            Image icon = CreateImage("LayoutIcon",
+                layoutModeButton.GetComponent<RectTransform>(), 5f, 6f, 18f, 16f,
+                fixedLayout ? Palette.Accent : TextMuted);
+            icon.sprite = layoutModeSprite;
+            icon.preserveAspect = true;
+            icon.raycastTarget = false;
+        }
+
+        /// <summary>当前是不是「固定排版」（类型优先级自动排）。</summary>
+        private static bool FixedTimelineLayout
+        {
+            get { return Main.Settings != null && Main.Settings.FixedTimelineLayout; }
+        }
+
+        /// <summary>
+        /// 事件类型的排版优先级（越小越靠上）。
+        ///
+        /// 用**名字**而不是枚举成员：这样写错一个名字只是排到最后，
+        /// 不会编译不过；以后游戏加新事件类型也自动落到"其它"里。
+        /// </summary>
+        private static readonly string[] LayoutPriorityNames =
+        {
+            "MoveDecorations",
+            "MoveCamera",
+            "SetFilter",
+            "SetFilterAdvanced",
+            "MoveTrack",
+            "SetSpeed",
+            "Twirl",
+            "SetHitsound",
+            "Pause",
+            "RecolorTrack",
+            "AnimateTrack",
+            "Bloom",
+            "ScreenTile",
+            "RepeatEvents",
+            "Flash",
+            "SetConditionalEvents",
+        };
+
+        private static int LayoutPriorityOf(LevelEvent levelEvent)
+        {
+            if (levelEvent == null)
+            {
+                return LayoutPriorityNames.Length;
+            }
+            string name = levelEvent.eventType.ToString();
+            for (int i = 0; i < LayoutPriorityNames.Length; i++)
+            {
+                if (string.Equals(LayoutPriorityNames[i], name, StringComparison.Ordinal))
+                {
+                    return i;
+                }
+            }
+            return LayoutPriorityNames.Length;
+        }
+
+        /// <summary>
+        /// 块表是否已经把这一轮事件全建好了。
+        ///
+        /// 首次打开时 `EnsureBlockPlacements` 会先被调一次（事件清单还没刷完），
+        /// 那时块表只有一部分；如果这时就重排，排的是残缺数据，之后再进就
+        /// 走老规则 —— 表现就是"首次排版和手动重置的结果不一样"。
+        /// </summary>
+        private bool BlockTableLooksComplete()
+        {
+            if (blockPlacements.Count == 0)
+            {
+                return false;
+            }
+            scnEditor editor = scnEditor.instance;
+            if (editor == null)
+            {
+                return true;
+            }
+            int expected = 0;
+            if (editor.events != null)
+            {
+                expected += editor.events.Count;
+            }
+            if (editor.decorations != null)
+            {
+                expected += editor.decorations.Count;
+            }
+            // 一块对应一个事件；留一点余量（有些事件不上时间轴）。
+            return expected == 0 || blockPlacements.Count >= expected - 1;
+        }
+
+
+        /// <summary>
+        /// 按类型优先级重排行号（固定排版）。
+        ///
+        /// 和旧模型一样**允许同排共用**：同类型里时间不重叠的块会挤进同一行，
+        /// 所以 1400+ 个块仍然只占几十行。差别只在"谁先挑行"——
+        /// 优先级高的类型先挑，于是自然形成自上而下的分带。
+        /// </summary>
+        /// <summary>
+        /// 按事件类型优先级重排行号（保留给「固定排版」开关用）。
+        ///
+        /// 每类从上往下分带，同类内按时间先后贪心装箱：能塞进第一排就塞，
+        /// 塞不下才新开一排。
+        /// </summary>
+        internal void RepackRowsByTypePriority()
+        {
+            if (blockPlacements.Count == 0)
+            {
+                return;
+            }
+            List<BlockPlacement> ordered = new List<BlockPlacement>(blockPlacements.Count);
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                BlockPlacement placement = blockPlacements[i];
+                if (placement != null && placement.Item != null)
+                {
+                    ordered.Add(placement);
+                }
+            }
+            ordered.Sort(delegate (BlockPlacement a, BlockPlacement b)
+            {
+                int priorityA = LayoutPriorityOf(a.Item.Event);
+                int priorityB = LayoutPriorityOf(b.Item.Event);
+                if (priorityA != priorityB)
+                {
+                    return priorityA.CompareTo(priorityB);
+                }
+                int byTime = a.Time.CompareTo(b.Time);
+                return byTime != 0 ? byTime : a.Item.FloorId.CompareTo(b.Item.FloorId);
+            });
+
+            // **全局首次适配 + 行内二分。**
+            //
+            // 每一行维护"按起点排好的区间表"，插入时二分找位置，只比较相邻两段
+            // —— 原来每块都线性扫整行，3400 块 × 上百行要几百毫秒，只能挂在载入
+            // 时；现在单次约几毫秒，可以跟着缩放做（防抖后重排）。
+            List<List<float>> rowStarts = new List<List<float>>();
+            List<List<float>> rowEnds = new List<List<float>>();
+            // 占位要把**块间距**也算进去：绘制时块宽是
+            // `max(BlockMinWidth, 时长×pps − BlockGap)`，两块贴边时若只按
+            // 最小块宽占位，视觉上还会蹭在一起（最小缩放档最明显）。
+            float perSecond = Mathf.Max(1f, pixelsPerSecond);
+            float minSpan = (BlockMinWidth + BlockGap) / perSecond;
+
+            for (int i = 0; i < ordered.Count; i++)
+            {
+                BlockPlacement placement = ordered[i];
+                float blockStart = placement.Time;
+                float blockEnd = blockStart + Mathf.Max(minSpan,
+                    placement.Item.Duration + BlockGap / perSecond);
+
+                int row = -1;
+                for (int r = 0; r < rowStarts.Count; r++)
+                {
+                    List<float> starts = rowStarts[r];
+                    List<float> ends = rowEnds[r];
+                    int at = LowerBound(starts, blockStart);
+                    bool clash = (at > 0 && ends[at - 1] > blockStart)
+                        || (at < starts.Count && starts[at] < blockEnd);
+                    if (!clash)
+                    {
+                        starts.Insert(at, blockStart);
+                        ends.Insert(at, blockEnd);
+                        row = r;
+                        break;
+                    }
+                }
+                if (row < 0)
+                {
+                    rowStarts.Add(new List<float> { blockStart });
+                    rowEnds.Add(new List<float> { blockEnd });
+                    row = rowStarts.Count - 1;
+                }
+                placement.Row = row;
+            }
+            visualsDirty = true;
+        }
+
+        /// <summary>`list` 里第一个 >= value 的下标（二分）。</summary>
+        private static int LowerBound(List<float> list, float value)
+        {
+            int low = 0;
+            int high = list.Count;
+            while (low < high)
+            {
+                int mid = (low + high) / 2;
+                if (list[mid] < value)
+                {
+                    low = mid + 1;
+                }
+                else
+                {
+                    high = mid;
+                }
+            }
+            return low;
+        }
+
+        private const int BlocksPerRowTarget = 26;
+
+        /// <summary>单个类型最多分几行 —— 再密也不至于把整条时间轴摊成几十行。</summary>
+        private const int MaxRowsPerType = 8;
+
+        private static bool RowFits(List<Vector2> intervals, float start, float end)
+        {
+            for (int i = 0; i < intervals.Count; i++)
+            {
+                Vector2 interval = intervals[i];
+                if (start < interval.y && interval.x < end)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 把整批选中的块按同一行位移挪过去。
+        ///
+        /// **行是共享的** —— 1468 个块只占 0~73 行（时间不重叠的块同排一行），
+        /// 所以这里只改这一组的行号，**绝不动别人的**。
+        /// （早先按"一块一行"整体重排过一次，把 1468 个块摊成 1468 行，
+        ///   全滚到视口外，看起来就是"块全没了"。）
+        ///
+        /// 上下界：不小于 0，不越过现有最后一行 —— 拖出很远的话块会掉到视口外，
+        /// 用户既看不见也拖不回来。
+        /// </summary>
+        private void MoveDragGroupRows(int deltaRows)
+        {
+            if (dragOrigins.Count == 0)
+            {
+                return;
+            }
+            int maxRow = 0;
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                if (blockPlacements[i] != null)
+                {
+                    maxRow = Mathf.Max(maxRow, blockPlacements[i].Row);
+                }
+            }
+            for (int i = 0; i < dragOrigins.Count; i++)
+            {
+                DragOrigin origin = dragOrigins[i];
+                if (origin.Item == null)
+                {
+                    continue;
+                }
+                BlockPlacement placement = FindPlacementForEvent(origin.Item.Event);
+                if (placement == null)
+                {
+                    continue;
+                }
+                // **下界 0，上界放宽到「最后一行 + 末尾预留行」。**
+                //
+                // 原来夹在 `maxRow`（当前最靠下的那块），于是只有两行时往第三行
+                // 拖不动 —— 手感上就是"最多拖到现有层数"。末尾本来就预留了
+                // `ExtraRowsBelow` 行空白（内容高度也按它算），块落进去既看得见
+                // 也滚得回来。
+                int upperRow = maxRow + ExtraRowsBelow;
+                int row = Mathf.Clamp(origin.Row + deltaRows, 0, upperRow);
+                if (placement.Row != row)
+                {
+                    placement.Row = row;
+                    visualsDirty = true;
+                    // **行号是工程数据。** 不置这个位，Ctrl+S 不会写、关工作台
+                    // 也不会提示保存 —— 重开谱面时位置就"自己没了"。
+                    projectDirty = true;
+                }
+            }
+        }
+
+
+        /// <summary>
+        /// 这个块按它**当前的行号和时间**，会不会跟别的块撞上。
+        ///
+        /// 判据和画的时候一致：**同一行 + 画出来的像素区间相交**。不能拿"名义
+        /// 时长"比 —— 块有最小宽度（`BlockMinWidth`），两个点事件时间上并不重叠、
+        /// 画出来却是叠着的。
+        ///
+        /// 拖动中拿它做「这一下能不能放下」的判据，也用来决定要不要描红。
+        /// 只查这一块（不两两比），代价 O(块数)。
+        /// </summary>
+        internal bool BlockOverlapsOthers(LevelEvent target)
+        {
+            BlockPlacement self = FindPlacementForEvent(target);
+            if (self == null || self.Item == null)
+            {
+                return false;
+            }
+            float speed = Mathf.Max(1f, pixelsPerSecond);
+            float selfLeft = self.Time * speed;
+            float selfWidth = Mathf.Max(BlockMinWidth, self.Item.Duration * speed - BlockGap);
+            float selfRight = selfLeft + selfWidth;
+
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                BlockPlacement other = blockPlacements[i];
+                if (other == self || other == null || other.Item == null
+                    || other.Row != self.Row)
+                {
+                    continue;
+                }
+                float otherLeft = other.Time * speed;
+                float otherWidth = Mathf.Max(BlockMinWidth,
+                    other.Item.Duration * speed - BlockGap);
+                if (selfLeft < otherLeft + otherWidth && otherLeft < selfRight)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 松手前检查：这批块里只要有一块和别的块叠着，就整批**作废**并返回 true。
+        ///
+        /// 为什么要作废而不是放任：块的**最小宽度**让两个时间上并不重叠的事件
+        /// 画出来也会叠；叠在一起之后用户既看不出谁压着谁，撤销也会像"跳错地方"。
+        ///
+        /// **必须在记录行号撤销之前调** —— 退回之后每块的行号都等于起点行，
+        /// 那一步自然会认为"一个都没动"、不记撤销。
+        /// </summary>
+        internal bool RevertDragIfOverlapping()
+        {
+            bool overlapping = false;
+            for (int i = 0; i < dragOrigins.Count; i++)
+            {
+                DragOrigin origin = dragOrigins[i];
+                if (origin.Item == null || origin.Item.Event == null)
+                {
+                    continue;
+                }
+                if (BlockOverlapsOthers(origin.Item.Event))
+                {
+                    overlapping = true;
+                    break;
+                }
+            }
+            if (!overlapping)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < dragOrigins.Count; i++)
+            {
+                DragOrigin origin = dragOrigins[i];
+                if (origin.Item == null || origin.Item.Event == null)
+                {
+                    continue;
+                }
+                BlockPlacement placement = FindPlacementForEvent(origin.Item.Event);
+                if (placement != null)
+                {
+                    placement.Row = origin.Row;
+                    // 横向要退在 `placement.Time` 上：拖动中的预览就写在那儿，
+                    // 而 `EndBlockDrag` 也是读它去提交的 —— 退错字段等于没退。
+                    placement.Time = origin.Start;
+                    placement.PreviewDuration = float.NaN;
+                }
+                origin.Item.StartTime = origin.Start;
+                origin.Item.Duration = origin.StartDuration;
+            }
+
+            // 起点表清掉：横纵都不再提交。
+            dragOrigins.Clear();
+            visualsDirty = true;
+            return true;
+        }
+
+        /// <summary>
+        /// 收掉「固定播放头下滚轮扫时间」留下的 scrub 会话。
+        ///
+        /// 滚动时我们开了一次 scrub 来挪播放头；会话没关之前求值器仍处于
+        /// "拖动定位"，空格播放起不来。按空格前先调这里。
+        /// </summary>
+        internal void CancelScrollScrub()
+        {
+            if (!centeredScrubActive)
+            {
+                return;
+            }
+            centeredScrubActive = false;
+            centeredScrubPending = 0f;
+            SubmitPendingScrub(true);
+            EditorPlaybackBridge.EndTimelineScrub();
+            ParticleWatch.ResumeAll();
+        }
+
+        /// <summary>某个事件当前在第几行；找不到这个块返回 -1。</summary>
+        internal int BlockRowOf(LevelEvent target)
+        {
+            BlockPlacement placement = FindPlacementForEvent(target);
+            return placement == null ? -1 : placement.Row;
+        }
+
+        /// <summary>
+        /// 直接把一批块放回指定行（撤销 / 重做用）。
+        ///
+        /// **不做让位。** 撤销要复原的是"当时那一份布局"，逐块做插入让位
+        /// 会把其它块再推一遍，结果和撤销前的样子对不上。
+        /// </summary>
+        internal void ApplyBlockRows(LevelEvent[] targets, int[] rows)
+        {
+            if (targets == null || rows == null)
+            {
+                return;
+            }
+            for (int i = 0; i < targets.Length && i < rows.Length; i++)
+            {
+                BlockPlacement placement = FindPlacementForEvent(targets[i]);
+                if (placement != null)
+                {
+                    int row = Mathf.Max(0, rows[i]);
+                    if (placement.Row != row)
+                    {
+                        placement.Row = row;
+                        projectDirty = true;
+                    }
+                }
+            }
+            visualsDirty = true;
+        }
+
+        /// <summary>
+        /// 拖动结束时把"行号怎么变的"记进撤销栈。
+        ///
+        /// **记的是整张行表**（拖动开始时的快照 vs 现在的值），不是只记本组：
+        /// 整组插入会让其它块顺势上/下移一行，只把自己的行号记回去的话，
+        /// 撤销后那些被让位的块会留下空档，布局和拖动前对不上。
+        ///
+        /// 只有真的变了才记 —— 纯横向拖动不该多出一条撤销记录。
+        /// </summary>
+        private void RecordRowMoveIfChanged()
+        {
+            if (dragOrigins.Count == 0)
+            {
+                return;
+            }
+            // **按事件记，不按下标记。** 拖动期间位置表可能被重绑（`RefreshData`），
+            // 下标和快照对不上就会把行号记到别的块头上 —— 撤销之后位置自然不对。
+            // 只记本组：现在纵向移动只改这一组的行号，别人的一行都没动。
+            List<LevelEvent> targets = new List<LevelEvent>(dragOrigins.Count);
+            List<int> fromRows = new List<int>(dragOrigins.Count);
+            List<int> toRows = new List<int>(dragOrigins.Count);
+            for (int i = 0; i < dragOrigins.Count; i++)
+            {
+                TimelineItem item = dragOrigins[i].Item;
+                if (item == null || item.Event == null)
+                {
+                    continue;
+                }
+                int now = BlockRowOf(item.Event);
+                if (now < 0 || now == dragOrigins[i].Row)
+                {
+                    continue;
+                }
+                targets.Add(item.Event);
+                fromRows.Add(dragOrigins[i].Row);
+                toRows.Add(now);
+            }
+            if (targets.Count == 0)
+            {
+                return;
+            }
+            EditorCommandHistory.RecordBlockRows(this,
+                targets.ToArray(), fromRows.ToArray(), toRows.ToArray());
+        }
+
+        /// <summary>把整张行表恢复到快照（取消拖动时用）。</summary>
+        private void RestoreRowSnapshot()
+        {
+            if (dragRowSnapshot == null || dragRowSnapshot.Length != blockPlacements.Count)
+            {
+                return;
+            }
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                if (blockPlacements[i] != null)
+                {
+                    blockPlacements[i].Row = Mathf.Max(0, dragRowSnapshot[i]);
+                }
+            }
+            visualsDirty = true;
+        }
+
+        /// <summary>内容区（标尺以下）在标记层坐标系里的顶端。</summary>
+        private float ContentTop()
+        {
+            return RulerHeight - verticalScrollOffset;
         }
 
         private DragOrigin CaptureDragOrigin(TimelineItem item)
@@ -6291,32 +6616,6 @@ namespace ADOFAIEditorStudio
             };
         }
 
-        /// <summary>
-        /// 按事件反查它的 item（多选一起拖时要把一批事件映射回 item）。
-        ///
-        /// 从 layoutRows 扫，而不是从 marker 池 —— 池里只有**当前可见**的那些，
-        /// 选中的块滚出视野后也要能跟着一起动。
-        /// </summary>
-        /// <summary>这个 item 是不是这次拖动的成员（被拖的那个，或某个跟随者）。</summary>
-        private bool IsBlockDragMember(TimelineItem item)
-        {
-            if (item == null)
-            {
-                return false;
-            }
-
-            for (int i = 0; i < dragOrigins.Count; i++)
-            {
-                if (ReferenceEquals(dragOrigins[i].Item, item))
-                {
-                    return true;
-                }
-            }
-
-            // 名单还没填上（拖动的第一帧）时，至少别把被拖的那个漏掉。
-            return ReferenceEquals(item, blockDragItem);
-        }
-
         private TimelineItem FindItemForEvent(LevelEvent target)
         {
             if (target == null)
@@ -6338,6 +6637,33 @@ namespace ADOFAIEditorStudio
             }
             return null;
         }
+
+        /// <summary>拖动中的块描红：和别人的像素区间叠上了，松手会作废。</summary>
+        private static readonly Color DragOverlapColor = new Color(0.92f, 0.26f, 0.28f, 1f);
+
+        /// <summary>这次拖动涉及的块（描边和重叠判定要按它认人）。</summary>
+        private readonly HashSet<LevelEvent> dragMembers = new HashSet<LevelEvent>();
+
+        /// <summary>这次拖动是不是在拉边缘（拉边缘不挪行）。</summary>
+        private bool blockDragResizing;
+        /// <summary>拖动中当前落到的行号；-1 = 还没算过。</summary>
+        private int blockDragRow = -1;
+
+        /// <summary>
+        /// 拖动时钉在「原位置」的那条竖线。
+        ///
+        /// 横向是按格吸附的，拖动时块和鼠标会一段一段错开，光看块本身分不清
+        /// 离原处多远了；这条线就是那个原点，拖回它附近会吸回去。松手即隐藏。
+        /// </summary>
+        private RectTransform dragOriginGuide;
+
+        /// <summary>原位竖线的颜色（浅蓝，半透明，不抢事件块的眼）。</summary>
+        private static readonly Color DragOriginGuideColor = new Color(0.62f, 0.78f, 0.95f, 0.55f);
+        /// <summary>
+        /// 拖动开始时的**整张行表**（按 `blockPlacements` 下标）。撤销和取消都靠它
+        /// 精确复原：整组插入会让其它块跟着上下移，只记本组不够。
+        /// </summary>
+        private int[] dragRowSnapshot;
 
         // 拖动开始时的原始值，松手时用来做「有没有真的改动」的判断
         // 和撤销的 old 值。
@@ -6374,6 +6700,15 @@ namespace ADOFAIEditorStudio
             blockDragActive = true;
             blockDragItem = item;
             blockDragMarker = marker;
+            // 拉长/缩短不参与纵向挪行（见 UpdateBlockDragPointer）。
+            blockDragResizing = resizing;
+            blockDragRow = -1;
+            EnsureBlockPlacements();
+            dragRowSnapshot = new int[blockPlacements.Count];
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                dragRowSnapshot[i] = blockPlacements[i] == null ? 0 : blockPlacements[i].Row;
+            }
             blockDragOriginalFloor = item.FloorId;
             blockDragOriginalAngleOffset = GetEnabledFloat(item.Event, "angleOffset");
             blockDragOriginalDuration = GetEnabledFloat(item.Event, "duration");
@@ -6385,8 +6720,6 @@ namespace ADOFAIEditorStudio
             // 时长一起改掉不会有人想要。而且被拖的那个必须**在选中里**
             // 才组队 —— 否则拖一个没被选中的块会把旁边选中的一批也带走。
             diagClampLogged = 0;
-            diagReclaimLogged = 0;
-            diagLastGrabDrift = float.NaN;
             dragOrigins.Clear();
             dragOrigins.Add(CaptureDragOrigin(item));
             if (!resizing && multiSelection.Count > 1 && multiSelection.Contains(item.Event))
@@ -6403,6 +6736,17 @@ namespace ADOFAIEditorStudio
                     {
                         dragOrigins.Add(CaptureDragOrigin(other));
                     }
+                }
+            }
+
+            // 描边和重叠判定按这份名单认人。
+            dragMembers.Clear();
+            for (int i = 0; i < dragOrigins.Count; i++)
+            {
+                TimelineItem member = dragOrigins[i].Item;
+                if (member != null && member.Event != null)
+                {
+                    dragMembers.Add(member.Event);
                 }
             }
 
@@ -6434,6 +6778,19 @@ namespace ADOFAIEditorStudio
 
             item.StartTime = newStart;
             item.Duration = newDuration;
+
+            // **同时写进位置表。**
+            //
+            // 画布摆块读的是 `placement.Time`，不是 `item.StartTime`；而拖动期间
+            // `RefreshGeometry` 又会让位置表“听位置表自己的”（见 `liveTimeBase`）。
+            // 只改 item 的话，位置表里还是拖动前那一份 —— 表现就是**块不跟手，
+            // 松手提交之后才落到新位置**。
+            BlockPlacement preview = FindPlacementForEvent(item.Event);
+            if (preview != null)
+            {
+                preview.Time = newStart;
+                preview.PreviewDuration = newDuration;
+            }
 
             // **整批跟着走**，位移以被拖的那个（dragOrigins[0]）为准。
             //
@@ -6500,6 +6857,12 @@ namespace ADOFAIEditorStudio
                     }
 
                     origin.Item.StartTime = Mathf.Max(0f, wanted);
+                    // 跟随者也一样：位置表不跟着改，整组就只有被拖那个在动。
+                    BlockPlacement followerPlacement = FindPlacementForEvent(origin.Item.Event);
+                    if (followerPlacement != null)
+                    {
+                        followerPlacement.Time = origin.Item.StartTime;
+                    }
                 }
             }
 
@@ -6527,6 +6890,17 @@ namespace ADOFAIEditorStudio
             blockDragItem = null;
             blockDragMarker = null;
             dragPointerValid = false;
+            blockDragResizing = false;
+            blockDragRow = -1;
+
+            // **叠上了就整批作废**（描红已经提示过）。放在记录行号撤销之前 ——
+            // 退回之后行号等于起点行，那一步自然会认为"一个都没动"。
+            if (RevertDragIfOverlapping())
+            {
+                dragRowSnapshot = null;
+                dragMembers.Clear();
+                return;
+            }
 
             TimelineItem item = marker == null ? null : marker.Item;
             scnEditor editor = scnEditor.instance;
@@ -6595,11 +6969,42 @@ namespace ADOFAIEditorStudio
                         blockDragOriginalFloor, blockDragOriginalAngleOffset,
                         blockDragOriginalDuration, blockDragHadDuration);
                 }
+
+                // **行号也记进同一批。** 放在 try 里才和上面的时间改动合成一条
+                // 撤销记录 —— 一次 Ctrl+Z 把横向和纵向一起退回，块不会只回一半。
+                RecordRowMoveIfChanged();
             }
             finally
             {
                 EditorCommandHistory.EndBatch();
+                // 松手之后位置表的预览时长作废：下一帧按谱面重新算
+                // （提交时可能被钳过，留着预览值会让块比数据长一截）。
+                ClearDragPreview(dragOrigins);
+                dragRowSnapshot = null;
+                dragMembers.Clear();
                 dragOrigins.Clear();
+            }
+        }
+
+        /// <summary>把这一批块的拖动预览清掉（只清时长，时间下一帧会重算）。</summary>
+        private void ClearDragPreview(List<DragOrigin> origins)
+        {
+            if (origins == null)
+            {
+                return;
+            }
+            for (int i = 0; i < origins.Count; i++)
+            {
+                TimelineItem target = origins[i].Item;
+                if (target == null)
+                {
+                    continue;
+                }
+                BlockPlacement placement = FindPlacementForEvent(target.Event);
+                if (placement != null)
+                {
+                    placement.PreviewDuration = float.NaN;
+                }
             }
         }
 
@@ -6615,6 +7020,15 @@ namespace ADOFAIEditorStudio
             blockDragItem = null;
             blockDragMarker = null;
             dragPointerValid = false;
+            blockDragResizing = false;
+            blockDragRow = -1;
+            // 取消也要把预览清掉，否则位置表会一直停在半路那个位置。
+            ClearDragPreview(dragOrigins);
+            // 纵向是拖动中实时改的，取消得把整张行表退回快照。
+            RestoreRowSnapshot();
+            dragRowSnapshot = null;
+            dragMembers.Clear();
+            dragOrigins.Clear();
             visualsDirty = true;
         }
 
@@ -6935,6 +7349,68 @@ namespace ADOFAIEditorStudio
             return (time - before) <= (after - time) ? before : after;
         }
 
+        /// <summary>
+        /// 带格内偏移的块怎么吸。
+        ///
+        /// 普通块吸到格边界就对了；但块的起点未必压在格上（`angleOffset` 写的，
+        /// 或者变速把它推偏了）。这类块如果也吸到格边界，**偏移会被抹平** ——
+        /// 手指还没动，块就先横跳半拍。
+        ///
+        /// 所以按「整拍移动、保住格内相位」来：先把时间减掉相位、吸附到格边界，
+        /// 再把相位加回去。于是块只在整拍之间跳，作者写的偏移一个字不动。
+        /// </summary>
+        internal float SnapBlockTimeKeepingPhase(float time, float referenceStart)
+        {
+            if (!SnapDragEnabled)
+            {
+                return Mathf.Max(0f, time);
+            }
+            float perSecond = Mathf.Max(1f, pixelsPerSecond);
+
+            // **1) 原位优先。** 拖回出发的地方要能精确吸住 —— 屏幕上那条竖线
+            // 标的就是它，看得见就该吸得上。
+            if (Mathf.Abs(time - referenceStart) <= OriginSnapPixels / perSecond)
+            {
+                return referenceStart;
+            }
+
+            float baseTime = FloorTimeAtOrBefore(referenceStart);
+            float phase = Mathf.Max(0f, referenceStart - baseTime);
+            float plain = SnapBlockTime(time);
+            if (phase <= 0.001f)
+            {
+                // 没偏移的块：只有格边界这一条线。
+                return plain;
+            }
+
+            // **2) 两条线都算一遍，取更近的那条：**
+            //    · 格边界（整拍）
+            //    · 格边界 + 这块自己的格内偏移（保住作者的偏移）
+            float phased = Mathf.Max(0f, SnapBlockTime(Mathf.Max(0f, time - phase)) + phase);
+            return Mathf.Abs(time - phased) < Mathf.Abs(time - plain) ? phased : plain;
+        }
+
+        /// <summary>`time` 之前（含）最近那一格的 entryTime；没有则 0。</summary>
+        private float FloorTimeAtOrBefore(float time)
+        {
+            scnEditor editor = scnEditor.instance;
+            if (editor == null || editor.floors == null || editor.floors.Count == 0)
+            {
+                return 0f;
+            }
+            List<scrFloor> floors = editor.floors;
+            int index = LowerBoundFloors(floors, time);
+            if (index <= 0)
+            {
+                return 0f;
+            }
+            if (index > floors.Count)
+            {
+                index = floors.Count;
+            }
+            return Convert.ToSingle(floors[index - 1].entryTime);
+        }
+
         /// <summary>吸附开关：设置项，拖的时候按住 Alt 临时反转。</summary>
         private bool SnapDragEnabled
         {
@@ -6963,12 +7439,6 @@ namespace ADOFAIEditorStudio
         internal static bool IsAltHeld()
         {
             return Input.GetKey(KeyCode.LeftAlt) || Input.GetKey(KeyCode.RightAlt);
-        }
-
-        /// <summary>Shift 按住没有。理由同 <see cref="IsAltHeld"/>。</summary>
-        internal static bool IsShiftHeld()
-        {
-            return Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift);
         }
 
         // ---------------------------------------------------------- 拖动指针
@@ -7117,15 +7587,6 @@ namespace ADOFAIEditorStudio
             return false;
         }
 
-        private float GetItemPixelWidth(TimelineItem item)
-        {
-            float durationWidth = item.Duration > 0.001f
-                ? item.Duration * pixelsPerSecond - EventGap
-                : 0f;
-            return Mathf.Max(MinimumPointEventWidth, durationWidth);
-        }
-
-
         /// <summary>
         /// 只有「这一个事件本身」被选中才算。
         ///
@@ -7214,16 +7675,6 @@ namespace ADOFAIEditorStudio
             timeText.text = FormatTime(current) + " / "
                 + FormatTime(Mathf.Max(totalDuration, snapshot.Duration, current));
 
-            // ImGui 版接管了就整个不摆 —— 不藏的话会和它画的那条**重叠成两条**。
-            if (blocksTakenOver)
-            {
-                if (playhead != null)
-                {
-                    playhead.gameObject.SetActive(false);
-                }
-                return;
-            }
-
             float x = (current - viewStartTime) * pixelsPerSecond;
             bool inside = viewInitialized && x >= 0f && x <= bodyWidth;
             playhead.gameObject.SetActive(inside);
@@ -7233,124 +7684,6 @@ namespace ADOFAIEditorStudio
                 SyncPlayheadHeight();
             }
         }
-
-
-        /// <summary>
-        /// Places the view so the playhead sits at the centre.
-        ///
-        /// In centred mode viewStartTime is derived entirely from currentTime --
-        /// it is not a value anything else may set. So every path that moves the
-        /// view (middle-drag panning, a zoom anchor) has to have this run again
-        /// in the same frame, or the playhead drifts off centre and the mode
-        /// looks broken.
-        ///
-        /// ClampViewStart is deliberately not called: it clamps the view to
-        /// [0, duration - visible span], but centred mode needs padding at both
-        /// ends of the chart or the playhead can never reach the centre.
-        /// </summary>
-        private void SyncCenteredView(float currentTime)
-        {
-            float wanted = currentTime
-                - bodyWidth * CenteredPlayheadFraction / Mathf.Max(1f, pixelsPerSecond);
-            if (!Mathf.Approximately(viewStartTime, wanted))
-            {
-                viewStartTime = wanted;
-                visualsDirty = true;
-            }
-        }
-
-        /// <summary>
-        /// 播放头**整根跑出视口**时把视图翻一页（瞬间完成，没有动画）。
-        ///
-        /// 与 <see cref="FollowPlayback"/> 的区别：那个是"接近边缘就开始挪"，
-        /// 只在播放时用；这个是"已经出去了才翻"，给手动拖播放头用。判据用
-        /// 出界而不是接近，是为了不跟用户的横向滚动抢视野 —— 播放头还在视口里
-        /// 就一帧都不动。
-        /// </summary>
-        private void PageViewAtPlayhead(float currentTime)
-        {
-            if (!viewInitialized || pixelsPerSecond <= 0f)
-            {
-                return;
-            }
-
-            float x = (currentTime - viewStartTime) * pixelsPerSecond;
-            float margin = Mathf.Max(24f, bodyWidth * 0.04f);
-            // 拖播放头时 `QueueScrubAtX` 会把 x 钳在 [0, bodyWidth]，
-            // 所以**播放头永远越不过右边缘**——原来判据写的是 `x > bodyWidth`，
-            // 这一支在实际拖动里一次都不会成立，功能等于没接上（用户报的
-            // 「自动翻页开关失效」就是它）。改成「碰到边缘」：留 1.5 像素容差，
-            // 让"拖到尽头"也能翻页。
-            const float edgeTolerance = 1.5f;
-            float targetStart = viewStartTime;
-            if (x >= bodyWidth - edgeTolerance)
-            {
-                // 翻过去之后播放头落在左侧留白处，和拖动时的落点手感一致。
-                targetStart = currentTime - margin / pixelsPerSecond;
-            }
-            // 反向只在"确实离开了开头"时才翻：t≈0 时 x 天然是 0，
-            // 不加这个条件会每帧做一次空翻（夹回 0，什么也不变，但会白跑）。
-            else if (x <= edgeTolerance && currentTime > 0.001f)
-            {
-                targetStart = currentTime - (bodyWidth - margin) / pixelsPerSecond;
-            }
-
-            if (Mathf.Approximately(targetStart, viewStartTime))
-            {
-                return;
-            }
-
-            float before = viewStartTime;
-            viewStartTime = targetStart;
-            ClampViewStart();
-            if (Mathf.Approximately(before, viewStartTime))
-            {
-                // 夹完没动（比如已经在最左端）—— 不算一次翻页，不置脏、不记日志。
-                return;
-            }
-            visualsDirty = true;
-
-            // 探针：只记前几次，用来确认这个开关到底有没有真的翻过页
-            // （上一版判据写成了永远不成立的条件，功能是死的）。
-            if (pageLogCount < 5 && Main.VerboseLog)
-            {
-                pageLogCount++;
-                Main.Logger.Log("[翻页] t=" + currentTime.ToString("0.000")
-                    + " 视口起点=" + viewStartTime.ToString("0.000")
-                    + " x=" + x.ToString("0.0") + "/" + bodyWidth.ToString("0.0") + ".");
-            }
-        }
-
-        /// <summary>
-        /// 把视图挪到播放头附近。只在播放头接近视口边缘时才动，
-        /// 这样正常播放时画面是「一页一页」翻，而不是每帧都在挪。
-        /// </summary>
-        private void FollowPlayback(float currentTime)
-        {
-            if (!viewInitialized || pixelsPerSecond <= 0f)
-            {
-                return;
-            }
-
-            float x = (currentTime - viewStartTime) * pixelsPerSecond;
-            float targetStart = viewStartTime;
-            if (x > bodyWidth * 0.88f)
-            {
-                targetStart = currentTime - bodyWidth * 0.18f / pixelsPerSecond;
-            }
-            else if (x < bodyWidth * 0.08f)
-            {
-                targetStart = currentTime - bodyWidth * 0.12f / pixelsPerSecond;
-            }
-            if (!Mathf.Approximately(targetStart, viewStartTime))
-            {
-                viewStartTime = targetStart;
-                ClampViewStart();
-                visualsDirty = true;
-            }
-        }
-
-
 
         /// <summary>
         /// Toggle one lane's visibility. Called by the icon buttons on the
@@ -7482,7 +7815,6 @@ namespace ADOFAIEditorStudio
                 + "  ·  " + layoutSections.Count + " 类";
         }
 
-
         private void ActivateMarker(TimelineMarker marker)
         {
             TimelineItem item = marker == null ? null : marker.Item;
@@ -7558,10 +7890,13 @@ namespace ADOFAIEditorStudio
                 // 不清的话，参数栏会一直显示上一次选中的那个装饰物
                 // （`PanelSelection` 现在会去看 `selectedDecorations`）。
                 editor.DeselectAllDecorations();
+                // 标来源：这是"点事件块"引起的选中同步，只听「选中跟随」，
+                // 不要被「定位」当成点轨道去做 1 秒加速走位。
+                EditorPlaybackBridge.MarkNextFloorSelect(
+                    EditorPlaybackBridge.FloorSelectTimelineEvent);
                 editor.SelectFloor(editor.floors[floorId], cameraJump: false);
             }
         }
-
 
         private void ReturnToStart()
         {
@@ -7578,44 +7913,6 @@ namespace ADOFAIEditorStudio
             }
         }
 
-
-        private void ApplyNativeRewindIcon(Button button)
-        {
-            if (button == null)
-            {
-                return;
-            }
-
-            scnEditor editor = scnEditor.instance;
-            Sprite sprite = editor == null || editor.rewind == null || editor.rewind.image == null
-                ? null
-                : editor.rewind.image.sprite;
-            if (sprite == null)
-            {
-                return;
-            }
-
-            TextMeshProUGUI label = button.GetComponentInChildren<TextMeshProUGUI>();
-            if (label != null)
-            {
-                label.text = string.Empty;
-            }
-            Image icon = CreateImage(
-                "NativeRewindIcon",
-                button.GetComponent<RectTransform>(),
-                7f,
-                5f,
-                18f,
-                18f,
-                Color.white
-            );
-            icon.sprite = sprite;
-            icon.type = Image.Type.Simple;
-            icon.preserveAspect = true;
-            icon.raycastTarget = false;
-        }
-
-
         private void ResetHorizontalView()
         {
             pixelsPerSecond = DefaultPixelsPerSecond;
@@ -7627,7 +7924,6 @@ namespace ADOFAIEditorStudio
             UpdateZoomText();
             visualsDirty = true;
         }
-
 
         private void ZoomAt(float factor, float anchorX)
         {
@@ -7646,16 +7942,36 @@ namespace ADOFAIEditorStudio
             {
                 return;
             }
-            float anchorTime = viewStartTime + anchorX / oldPixels;
-            pixelsPerSecond = requestedPixels;
-            viewStartTime = anchorTime - anchorX / pixelsPerSecond;
-            ClampViewStart();
+            if (followMode == TimelineFollowMode.CenteredPlayhead)
+            {
+                // 固定播放头下锚点就是播放头：改完比例后**当场**把视图摆回居中。
+                //
+                // 只改比例、等下一帧居中接手会晚一帧 —— 连续滚轮缩小时每帧都落后
+                // 一帧的量，看起来就是"边缩边漂"（放大时恰好因对称而不明显）。
+                pixelsPerSecond = requestedPixels;
+                viewStartTime = CenteredViewTarget();
+                ClampCenteredViewStart();
+            }
+            else
+            {
+                float anchorTime = viewStartTime + anchorX / oldPixels;
+                pixelsPerSecond = requestedPixels;
+                viewStartTime = anchorTime - anchorX / pixelsPerSecond;
+                ClampViewStart();
+            }
+            // **缩放后要重排行号。**
+            //
+            // 块有最小像素宽度，缩小时"名义不重叠"的两个块在屏幕上照样会叠在
+            // 一起。固定排版下重排一次，让间距按新的像素尺度重新分配。
+            if (FixedTimelineLayout)
+            {
+                RepackRowsByTypePriority();
+            }
             layoutDirty = true;
             MarkManualNavigation();
             UpdateZoomText();
             visualsDirty = true;
         }
-
 
         private void UpdateZoomText()
         {
@@ -7665,13 +7981,32 @@ namespace ADOFAIEditorStudio
             }
         }
 
-
         private void ClampViewStart()
         {
+            // 固定播放头的范围不一样（允许负起点），统一走它自己那套 ——
+            // 否则缩放/拖动里调一次这个、每帧居中又调一次那个，两套边界
+            // 互相打架，0 秒附近就会来回跳。
+            if (followMode == TimelineFollowMode.CenteredPlayhead)
+            {
+                ClampCenteredViewStart();
+                return;
+            }
             float maximumStart = Mathf.Max(0f, navigationDuration - bodyWidth / Mathf.Max(1f, pixelsPerSecond));
             viewStartTime = Mathf.Clamp(viewStartTime, 0f, maximumStart);
         }
 
+        /// <summary>
+        /// 固定播放头专用的夹取：**允许起点为负**。
+        ///
+        /// 播放头在 0 秒时，要让它落在正中，视图起点必须是 `-可见时长 × 0.5`
+        /// （谱面左边留白）。普通夹取会把起点按住 0，于是 0 秒时播放头顶在左边缘。
+        /// </summary>
+        private void ClampCenteredViewStart()
+        {
+            float visible = bodyWidth / Mathf.Max(1f, pixelsPerSecond);
+            float maximumStart = Mathf.Max(0f, navigationDuration - visible);
+            viewStartTime = Mathf.Clamp(viewStartTime, -visible * 0.5f, maximumStart);
+        }
 
         private float GetMaximumVerticalScroll()
         {
@@ -7679,28 +8014,28 @@ namespace ADOFAIEditorStudio
             // **接管之后按新画布的内容高算。** 旧模型是按格分组打包的几行，
             // 新画布是一块一行、高得多 —— 还用旧的算就会"滚不到底"，
             // 后面那些块永远出不来。
-            float contentHeight = blocksTakenOver ? BlockContentHeight : layoutTotalHeight;
+            // **块画布现在**永远是 uGUI 那套「一块一行」的模型（ImGui 主体已经
+            // 不再绘制），所以内容高一律取 `BlockContentHeight`。
+            // 还在按旧的 `layoutTotalHeight` 算的话，纵向可滚高度会算成 0 ——
+            // 表现就是「普通滚轮完全不响应」（或者被当成横滚）。
+            float contentHeight = BlockContentHeight;
             return Mathf.Max(0f, contentHeight - visibleHeight);
         }
-
 
         private void ClampVerticalScroll()
         {
             verticalScrollOffset = Mathf.Clamp(verticalScrollOffset, 0f, GetMaximumVerticalScroll());
         }
 
-
         private void MarkManualNavigation()
         {
             manualNavigationUntil = Time.unscaledTime + 1.6f;
         }
 
-
         private bool LaneIsVisible(TimelineLane lane)
         {
             return laneVisible[(int)lane];
         }
-
 
         private int GetFilteredItemCount()
         {
@@ -7715,7 +8050,6 @@ namespace ADOFAIEditorStudio
             return total;
         }
 
-
         private bool IsDecorationSelected(TimelineItem item)
         {
             scnEditor editor = scnEditor.instance;
@@ -7724,7 +8058,6 @@ namespace ADOFAIEditorStudio
                 && editor.selectedDecorations != null
                 && editor.selectedDecorations.Contains(item.Event);
         }
-
 
         private int ComputeSelectionFingerprint()
         {
@@ -7754,7 +8087,6 @@ namespace ADOFAIEditorStudio
             }
         }
 
-
         private static int ComputeDataFingerprint(scnEditor editor)
         {
             if (editor == null)
@@ -7778,7 +8110,6 @@ namespace ADOFAIEditorStudio
                 return hash;
             }
         }
-
 
         private static int HashCollection(int hash, IEnumerable<LevelEvent> events)
         {
@@ -7813,7 +8144,6 @@ namespace ADOFAIEditorStudio
             }
         }
 
-
         private bool ContainsEventReference(LevelEvent target)
         {
             for (int lane = 0; lane < LaneCount; lane++)
@@ -7828,7 +8158,6 @@ namespace ADOFAIEditorStudio
             }
             return false;
         }
-
 
         private float FindEventTime(LevelEvent target)
         {
@@ -7845,7 +8174,6 @@ namespace ADOFAIEditorStudio
             return 0f;
         }
 
-
         private static int CompareTimelineItems(TimelineItem left, TimelineItem right)
         {
             int result = left.StartTime.CompareTo(right.StartTime);
@@ -7857,7 +8185,6 @@ namespace ADOFAIEditorStudio
             return result != 0 ? result : left.SourceOrder.CompareTo(right.SourceOrder);
         }
 
-
         private static int CompareTimelineItemsForLayout(TimelineItem left, TimelineItem right)
         {
             int result = right.Duration.CompareTo(left.Duration);
@@ -7868,27 +8195,6 @@ namespace ADOFAIEditorStudio
             result = left.StartTime.CompareTo(right.StartTime);
             return result != 0 ? result : left.SourceOrder.CompareTo(right.SourceOrder);
         }
-
-
-        private static int LowerBoundRowEnd(List<RowInterval> intervals, float time)
-        {
-            int low = 0;
-            int high = intervals.Count;
-            while (low < high)
-            {
-                int middle = low + (high - low) / 2;
-                if (intervals[middle].EndTime < time)
-                {
-                    low = middle + 1;
-                }
-                else
-                {
-                    high = middle;
-                }
-            }
-            return low;
-        }
-
 
         private static int LowerBoundFloors(List<scrFloor> floors, float time)
         {
@@ -7909,7 +8215,6 @@ namespace ADOFAIEditorStudio
             return low;
         }
 
-
         private static float GetEventStartTime(scnEditor editor, LevelEvent levelEvent)
         {
             int floorId = Mathf.Clamp(levelEvent.floor, 0, editor.floors.Count - 1);
@@ -7918,7 +8223,6 @@ namespace ADOFAIEditorStudio
             float angleOffset = GetEnabledFloat(levelEvent, "angleOffset");
             return Mathf.Max(0f, Convert.ToSingle(floor.entryTime) + angleOffset / 180f * 60f / bpm);
         }
-
 
         private static float GetEventDuration(scnEditor editor, LevelEvent levelEvent)
         {
@@ -7933,7 +8237,6 @@ namespace ADOFAIEditorStudio
             return duration * 60f / bpm;
         }
 
-
         private static float GetEnabledFloat(LevelEvent levelEvent, string key)
         {
             bool disabled;
@@ -7947,7 +8250,6 @@ namespace ADOFAIEditorStudio
             return levelEvent.TryGet<float>(key, out value) ? value : 0f;
         }
 
-
         private static string GetTimelineItemName(LevelEvent levelEvent, TimelineLane lane)
         {
             if (lane == TimelineLane.Decoration)
@@ -7959,9 +8261,49 @@ namespace ADOFAIEditorStudio
                 }
             }
 
+            // **滤镜块用滤镜名当名字，而且必须是原生那套中文名。**
+            //
+            // 全叫「滤镜」的话，一排滤镜块长得一模一样，只能靠点开参数栏才知道
+            // 哪个是哪个 —— 而这恰恰是排布时最需要一眼看出来的信息。
+            //
+            // 名字走 `EditorPropertyPanel.DisplayEnumName`：它内部是
+            // `RDString.GetEnumValue(...)`，和参数栏下拉框、原生属性面板同一条
+            // 本地化路径，所以中文名一定和原版一模一样（不会出现我们自造的译名）。
+            if (levelEvent.eventType == LevelEventType.SetFilter)
+            {
+                ADOFAI.PropertyInfo filterInfo;
+                if (levelEvent.info != null && levelEvent.info.propertiesInfo != null
+                    && levelEvent.info.propertiesInfo.TryGetValue("filter", out filterInfo))
+                {
+                    string raw = EditorPropertyPanel.ReadEnumName(levelEvent, filterInfo);
+                    string localized = EditorPropertyPanel.DisplayEnumName(
+                        levelEvent, filterInfo, raw);
+                    if (!string.IsNullOrWhiteSpace(localized))
+                    {
+                        return NormalizeTimelineLabel(localized);
+                    }
+                }
+            }
+
+            // **高级滤镜的值是类名字符串**，走不了枚举那条路 ——
+            // 用参数栏下拉的同一套映射（去前缀 → RDString → 拆驼峰兜底），
+            // 保证块名、下拉、原生面板三处显示的是同一个中文名。
+            if (levelEvent.eventType == LevelEventType.SetFilterAdvanced)
+            {
+                string rawFilter;
+                if (levelEvent.TryGet<string>("filter", out rawFilter)
+                    && !string.IsNullOrWhiteSpace(rawFilter))
+                {
+                    string localized = UiInspectorPane.FilterDisplayFor(rawFilter);
+                    if (!string.IsNullOrWhiteSpace(localized))
+                    {
+                        return NormalizeTimelineLabel(localized);
+                    }
+                }
+            }
+
             return GetEventName(levelEvent.eventType);
         }
-
 
         private static string NormalizeTimelineLabel(string value)
         {
@@ -7986,6 +8328,9 @@ namespace ADOFAIEditorStudio
         private static Color GetEventTypeColor(LevelEventType eventType, TimelineLane lane)
         {
             float hue = GetEventHue(eventType, lane);
+            // **事件块保留彩色**：块的色相是用户区分事件类型的唯一可靠线索，
+            // 全灰阶会让 MoveTrack / MoveDecorations 这类近邻类型混成一片。
+            // 界面（面板、文字、控件）仍是黑灰白，只有时间轴事件块例外。
             float saturation = BlockTintMaxSaturation;
             if (Luminance(Color.HSVToRGB(hue, saturation, 1f)) < BlockBrightness)
             {
@@ -8011,6 +8356,7 @@ namespace ADOFAIEditorStudio
         private static Color GetEventLabelColor(LevelEventType eventType, TimelineLane lane)
         {
             float hue = GetEventHue(eventType, lane);
+            // 块上文字跟着块的色相走（同色相的深色），否则文字与块脱节。
             Color color = Color.HSVToRGB(
                 hue,
                 LabelReferenceSaturation,
@@ -8103,7 +8449,6 @@ namespace ADOFAIEditorStudio
                 : Mathf.Pow((channel + 0.055f) / 1.055f, 2.4f);
         }
 
-
         private static bool TryClassify(LevelEventType eventType, bool isDecoration, out TimelineLane lane)
         {
             lane = TimelineLane.Other;
@@ -8193,7 +8538,6 @@ namespace ADOFAIEditorStudio
             }
         }
 
-
         private static string GetEventName(LevelEventType eventType)
         {
             string key = "editor." + eventType;
@@ -8212,17 +8556,6 @@ namespace ADOFAIEditorStudio
             return eventType.ToString();
         }
 
-
-        private static float NiceInterval(float raw)
-        {
-            raw = Mathf.Max(0.001f, raw);
-            float exponent = Mathf.Pow(10f, Mathf.Floor(Mathf.Log10(raw)));
-            float fraction = raw / exponent;
-            float nice = fraction <= 1f ? 1f : fraction <= 2f ? 2f : fraction <= 5f ? 5f : 10f;
-            return nice * exponent;
-        }
-
-
         private static string FormatTime(float seconds)
         {
             seconds = Mathf.Max(0f, seconds);
@@ -8231,34 +8564,9 @@ namespace ADOFAIEditorStudio
             return minutes.ToString("00") + ":" + remainder.ToString("00.000");
         }
 
-
         private static readonly System.Text.StringBuilder RulerTimeBuilder =
             new System.Text.StringBuilder(8);
 
-        /// <summary>
-        /// The ruler tick text, e.g. 1:05.
-        ///
-        /// Built into a reused StringBuilder rather than concatenated: during a
-        /// horizontal drag this runs thirty-odd times a frame and was a steady
-        /// source of garbage. The ticks themselves still go through the text
-        /// cache, so repeated frames do not actually write to TMP.
-        /// </summary>
-        private static string FormatRulerTime(float seconds)
-        {
-            seconds = Mathf.Max(0f, seconds);
-            int minutes = Mathf.FloorToInt(seconds / 60f);
-            int wholeSeconds = Mathf.FloorToInt(seconds - minutes * 60f);
-
-            RulerTimeBuilder.Length = 0;
-            RulerTimeBuilder.Append(minutes);
-            RulerTimeBuilder.Append(':');
-            if (wholeSeconds < 10)
-            {
-                RulerTimeBuilder.Append('0');
-            }
-            RulerTimeBuilder.Append(wholeSeconds);
-            return RulerTimeBuilder.ToString();
-        }
         private Image CreateImage(string name, RectTransform parent, float x, float y, float width, float height, Color color)
         {
             RectTransform rect = CreateRect(name, parent, x, y, width, height);
@@ -8266,7 +8574,6 @@ namespace ADOFAIEditorStudio
             image.color = color;
             return image;
         }
-
 
         private Image CreateRoundedImage(string name, RectTransform parent, float x, float y, float width, float height, Color color)
         {
@@ -8288,7 +8595,6 @@ namespace ADOFAIEditorStudio
         /// stroke thin out at high zoom and fatten at low zoom, because the sprite is stretched
         /// across a fixed-time hint rather than a fixed-width one.
         /// </summary>
-
 
         /// <summary>
         /// A downward chevron drawn into a texture: two strokes meeting at the bottom centre.
@@ -8354,7 +8660,6 @@ namespace ADOFAIEditorStudio
             return sprite;
         }
 
-
         private static float DistanceToSegment(float px, float py, float ax, float ay, float bx, float by)
         {
             float vx = bx - ax;
@@ -8367,7 +8672,6 @@ namespace ADOFAIEditorStudio
             float dy = wy - vy * t;
             return Mathf.Sqrt(dx * dx + dy * dy);
         }
-
 
         private Sprite CreateRoundedSprite()
         {
@@ -8477,7 +8781,6 @@ namespace ADOFAIEditorStudio
         /// an ambiguous middle state that only produced confusion.
         /// </summary>
 
-
         /// <summary>
         /// Toggles both view locks together.
         ///
@@ -8527,29 +8830,37 @@ namespace ADOFAIEditorStudio
         }
 
         /// <summary>
-        /// 自动翻页：播放头跑出时间轴右边缘时，把视图整页翻过去（瞬间）。
+        /// 把视图横向滚到播放头位置（一次性动作，取代原来的「自动翻页」开关）。
+        ///
+        /// 落点放在视口左侧 1/3 处 —— 这样"跳过去"之后，播放头右侧还留着
+        /// 大部分可看的空间。
         /// </summary>
-        internal void ToggleAutoPageTimeline()
+        internal void LocateToPlayhead()
         {
-            if (Main.Settings == null)
+            if (!viewInitialized || pixelsPerSecond <= 0f)
             {
                 return;
             }
-
-            Main.Settings.AutoPageTimeline = !Main.Settings.AutoPageTimeline;
-            Main.SaveSettings();
-            // 探针：开关切换留痕。前一版"开关失效"其实是这一项被关掉了，
-            // 没有这条日志就只能靠猜。
-            if (Main.VerboseLog)
+            float current = PlayheadSeconds;
+            if (followMode == TimelineFollowMode.CenteredPlayhead)
             {
-                Main.Logger.Log("[翻页] 切换 → " + (Main.Settings.AutoPageTimeline ? "开" : "关")
-                    + "（已写盘）");
+                // 固定播放头下本来就一直在摆正，按一下只要放开"手动让位"即可。
+                centeredHoldUntil = 0f;
+                visualsDirty = true;
+            }
+            else
+            {
+                // **滑过去，不是瞬移** —— 瞬移在长谱面上很容易丢失方位感。
+                viewGlideTarget = current - bodyWidth * 0.34f
+                    / Mathf.Max(1f, pixelsPerSecond);
+                viewGliding = true;
+                MarkManualNavigation();
+                visualsDirty = true;
             }
             if (Main.Overlay != null)
             {
-                Main.Overlay.SetTransientStatus(Main.Settings.AutoPageTimeline
-                    ? "自动翻页：开（播放头出界就翻页，Ctrl+K）"
-                    : "自动翻页：关（Ctrl+K）");
+                Main.Overlay.SetTransientStatus(
+                    "已定位到播放头 " + current.ToString("0.000") + "s");
             }
         }
 
@@ -8699,6 +9010,456 @@ namespace ADOFAIEditorStudio
             }
         }
 
+        /// <summary>图标按钮：清掉文字、塞一张自绘图标，并挂上悬停提示。</summary>
+        private Button CreateIconButton(string name, RectTransform parent, float x,
+            float width, Sprite sprite, Color tint, System.Action action, string tip)
+        {
+            Button button = CreateButton(name, parent, x, 7f, width, 29f,
+                string.Empty, delegate { action(); });
+            HideButtonLabel(button);
+            Image icon = CreateImage("Icon", button.GetComponent<RectTransform>(),
+                4f, 6f, width - 8f, 16f, tint);
+            icon.sprite = sprite;
+            icon.preserveAspect = true;
+            icon.raycastTarget = false;
+            UiHoverTip.Attach(button, tip);
+            return button;
+        }
+
+        /// <summary>车道筛选按钮的图标/颜色每帧对齐一次（切车道、数据刷新都会变）。</summary>
+        private void RefreshLaneButtons()
+        {
+            for (int i = 0; i < laneButtons.Count && i < laneIcons.Count; i++)
+            {
+                Image icon = laneIcons[i];
+                if (icon == null)
+                {
+                    continue;
+                }
+                Color wanted = IsLaneVisible(i) ? TextPrimary : TextMuted;
+                if (icon.color != wanted)
+                {
+                    icon.color = wanted;
+                }
+                Sprite sprite = GetLaneIcon(i);
+                if (sprite != null && icon.sprite != sprite)
+                {
+                    icon.sprite = sprite;
+                }
+            }
+        }
+
+        /// <summary>回到开头：一条竖线 + 向左的三角。</summary>
+        private static Sprite CreateRewindSprite()
+        {
+            const int w = 24;
+            const int h = 22;
+            Texture2D tex = new Texture2D(w, h, TextureFormat.RGBA32, false, true);
+            Color32[] px = new Color32[w * h];
+            Color32 on = new Color32(255, 255, 255, 255);
+            Color32 off = new Color32(0, 0, 0, 0);
+            for (int i = 0; i < px.Length; i++)
+            {
+                px[i] = off;
+            }
+
+            int midY = h / 2;
+            for (int y = 4; y < h - 4; y++)
+            {
+                for (int x = 4; x <= 5; x++)
+                {
+                    px[y * w + x] = on;
+                }
+            }
+            for (int i = 0; i <= 7; i++)
+            {
+                for (int t = -i; t <= i; t++)
+                {
+                    int x = 16 - i;
+                    int y = midY + t;
+                    if (x >= 0 && x < w && y >= 0 && y < h)
+                    {
+                        px[y * w + x] = on;
+                    }
+                }
+            }
+
+            tex.SetPixels32(px);
+            tex.Apply();
+            tex.filterMode = FilterMode.Bilinear;
+            return Sprite.Create(tex, new Rect(0f, 0f, w, h), new Vector2(0.5f, 0.5f), 100f);
+        }
+
+        /// <summary>缩小：一条横杠。</summary>
+        private static Sprite CreateMinusSprite()
+        {
+            const int w = 24;
+            const int h = 22;
+            Texture2D tex = new Texture2D(w, h, TextureFormat.RGBA32, false, true);
+            Color32[] px = new Color32[w * h];
+            Color32 on = new Color32(255, 255, 255, 255);
+            for (int i = 0; i < px.Length; i++)
+            {
+                px[i] = new Color32(0, 0, 0, 0);
+            }
+            int midY = h / 2;
+            for (int x = 5; x <= 18; x++)
+            {
+                px[(midY - 1) * w + x] = on;
+                px[midY * w + x] = on;
+            }
+            tex.SetPixels32(px);
+            tex.Apply();
+            tex.filterMode = FilterMode.Bilinear;
+            return Sprite.Create(tex, new Rect(0f, 0f, w, h), new Vector2(0.5f, 0.5f), 100f);
+        }
+
+        /// <summary>放大：一个加号。</summary>
+        private static Sprite CreatePlusSprite()
+        {
+            const int w = 24;
+            const int h = 22;
+            Texture2D tex = new Texture2D(w, h, TextureFormat.RGBA32, false, true);
+            Color32[] px = new Color32[w * h];
+            Color32 on = new Color32(255, 255, 255, 255);
+            for (int i = 0; i < px.Length; i++)
+            {
+                px[i] = new Color32(0, 0, 0, 0);
+            }
+            int midY = h / 2;
+            int midX = w / 2;
+            for (int x = 5; x <= 18; x++)
+            {
+                px[(midY - 1) * w + x] = on;
+                px[midY * w + x] = on;
+            }
+            for (int y = 4; y <= h - 5; y++)
+            {
+                px[y * w + (midX - 1)] = on;
+                px[y * w + midX] = on;
+            }
+            tex.SetPixels32(px);
+            tex.Apply();
+            tex.filterMode = FilterMode.Bilinear;
+            return Sprite.Create(tex, new Rect(0f, 0f, w, h), new Vector2(0.5f, 0.5f), 100f);
+        }
+
+        /// <summary>
+        /// 刷新那两颗按钮的图标：左边那颗是开关（开 = 强调色、关 = 弱化色），
+        /// 右边那颗是「定位到播放头」的一次性动作（恒为主文字色）。
+        /// 键盘（Ctrl+J / Ctrl+K）也能触发，所以放在 Update 里跑。
+        /// </summary>
+        private void RefreshFeatureButtons()
+        {
+            bool locate = Main.Settings != null && Main.Settings.LocateOnTrackClick;
+
+            if (locateIcon != null)
+            {
+                if (locateSprite == null)
+                {
+                    locateSprite = CreateLocateSprite();
+                }
+                if (locateIcon.sprite != locateSprite)
+                {
+                    locateIcon.sprite = locateSprite;
+                }
+                Color wanted = locate ? Palette.Accent : Palette.TextMuted;
+                if (locateIcon.color != wanted)
+                {
+                    locateIcon.color = wanted;
+                }
+            }
+
+            if (locatePlayheadIcon != null)
+            {
+                if (locatePlayheadSprite == null)
+                {
+                    locatePlayheadSprite = CreatePageSprite();
+                }
+                if (locatePlayheadIcon.sprite != locatePlayheadSprite)
+                {
+                    locatePlayheadIcon.sprite = locatePlayheadSprite;
+                }
+                // 一次性动作，没有开/关状态 —— 恒为主文字色。
+                if (locatePlayheadIcon.color != TextPrimary)
+                {
+                    locatePlayheadIcon.color = TextPrimary;
+                }
+            }
+        }
+
+        private static void HideButtonLabel(Button button)
+        {
+            if (button == null)
+            {
+                return;
+            }
+            TextMeshProUGUI label = button.GetComponentInChildren<TextMeshProUGUI>();
+            if (label != null)
+            {
+                label.text = string.Empty;
+            }
+        }
+
+        /// <summary>定位图标：一个靶环 + 中心点 + 四个刻度。</summary>
+        private static Sprite CreateLocateSprite()
+        {
+            const int w = 24;
+            const int h = 22;
+            Texture2D tex = new Texture2D(w, h, TextureFormat.RGBA32, false, true);
+            Color32[] px = new Color32[w * h];
+            Color32 on = new Color32(255, 255, 255, 255);
+            Color32 off = new Color32(0, 0, 0, 0);
+            for (int i = 0; i < px.Length; i++)
+            {
+                px[i] = off;
+            }
+
+            float cx = (w - 1) * 0.5f;
+            float cy = (h - 1) * 0.5f;
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    float dx = x - cx;
+                    float dy = y - cy;
+                    float dist = Mathf.Sqrt(dx * dx + dy * dy);
+                    // 环：7±1
+                    if (Mathf.Abs(dist - 7f) <= 1f)
+                    {
+                        px[y * w + x] = on;
+                    }
+                    // 中心点
+                    if (dist <= 1.6f)
+                    {
+                        px[y * w + x] = on;
+                    }
+                    // 四个刻度
+                    if ((Mathf.Abs(dx) <= 0.6f && Mathf.Abs(dy) >= 9f)
+                        || (Mathf.Abs(dy) <= 0.6f && Mathf.Abs(dx) >= 9f))
+                    {
+                        px[y * w + x] = on;
+                    }
+                }
+            }
+
+            tex.SetPixels32(px);
+            tex.Apply();
+            tex.filterMode = FilterMode.Bilinear;
+            return Sprite.Create(tex, new Rect(0f, 0f, w, h), new Vector2(0.5f, 0.5f), 100f);
+        }
+
+        /// <summary>
+        /// 「点事件跟随」的图标：**一个事件块（横条）+ 指着它的指针**。
+        ///
+        /// 原来的图标是"准星 + 四角括弧"，和旁边那颗「点轨道跟随」（真准星）
+        /// 几乎一样，两颗按钮并排时根本分不出谁是谁。现在画的是触发对象本身：
+        /// 指针尖头**贴着**横条 = 开，**留一道缝** = 关。
+        /// </summary>
+        private static Sprite CreateEventFollowSprite(bool follow)
+        {
+            const int w = 32;
+            const int h = 28;
+            Texture2D tex = new Texture2D(w, h, TextureFormat.RGBA32, false, true);
+            Color32[] px = new Color32[w * h];
+
+            void Plot(int x, int y, float alpha)
+            {
+                if (x < 0 || y < 0 || x >= w || y >= h || alpha <= 0f)
+                {
+                    return;
+                }
+                int index = y * w + x;
+                byte value = (byte)Mathf.RoundToInt(Mathf.Clamp01(alpha) * 255f);
+                if (value > px[index].a)
+                {
+                    px[index] = new Color32(255, 255, 255, value);
+                }
+            }
+
+            // 事件块：一条圆角横条
+            const float left = 5f;
+            const float right = 27f;
+            const float top = 4f;
+            const float bottom = 12f;
+            const float corner = 2.5f;
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    float cx = x + 0.5f;
+                    float cy = y + 0.5f;
+                    if (cx < left || cx > right || cy < top || cy > bottom)
+                    {
+                        // 圆角外侧：按到圆心的距离给抗锯齿
+                        float dx = Mathf.Max(0f, Mathf.Max(left + corner - cx, cx - (right - corner)));
+                        float dy = Mathf.Max(0f, Mathf.Max(top + corner - cy, cy - (bottom - corner)));
+                        float outside = Mathf.Sqrt(dx * dx + dy * dy);
+                        Plot(x, y, Mathf.Clamp01(corner - outside + 0.5f));
+                    }
+                    else
+                    {
+                        Plot(x, y, 1f);
+                    }
+                }
+            }
+
+            // 指针：向下的实心箭头。开着的时候尖头贴住横条，关着留 3.5px 缝。
+            float gap = follow ? 0f : 3.5f;
+            float tipY = bottom + 1.5f + gap;
+            float baseY = tipY + 7f;
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    float cx = x + 0.5f;
+                    float cy = y + 0.5f;
+                    if (cy < tipY - 0.5f || cy > baseY + 0.5f)
+                    {
+                        continue;
+                    }
+                    float t = Mathf.InverseLerp(tipY, baseY, cy);
+                    float half = Mathf.Lerp(0.7f, 4.4f, t);
+                    Plot(x, y, Mathf.Clamp01(half - Mathf.Abs(cx - 16f) + 0.5f));
+                }
+            }
+
+            tex.SetPixels32(px);
+            tex.Apply(false, true);
+            Sprite sprite = Sprite.Create(tex, new Rect(0f, 0f, w, h),
+                new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect);
+            sprite.hideFlags = HideFlags.HideAndDontSave;
+            return sprite;
+        }
+
+        /// <summary>「定位到播放头」的图标：一条竖线（播放头）+ 指向它的箭头。</summary>
+        private static Sprite CreatePageSprite()
+        {
+            const int w = 24;
+            const int h = 22;
+            Texture2D tex = new Texture2D(w, h, TextureFormat.RGBA32, false, true);
+            Color32[] px = new Color32[w * h];
+            Color32 on = new Color32(255, 255, 255, 255);
+            Color32 off = new Color32(0, 0, 0, 0);
+            for (int i = 0; i < px.Length; i++)
+            {
+                px[i] = off;
+            }
+
+            int midY = h / 2;
+            for (int y = 4; y < h - 4; y++)
+            {
+                for (int x = 19; x <= 21; x++)
+                {
+                    px[y * w + x] = on;
+                }
+            }
+            // 箭杆
+            for (int x = 4; x <= 13; x++)
+            {
+                px[(midY - 1) * w + x] = on;
+                px[midY * w + x] = on;
+                px[(midY + 1) * w + x] = on;
+            }
+            // 箭头（朝右）
+            for (int i = 0; i <= 5; i++)
+            {
+                for (int t = -i; t <= i; t++)
+                {
+                    int x = 13 + i;
+                    int y = midY + t;
+                    if (x < w && y >= 0 && y < h)
+                    {
+                        px[y * w + x] = on;
+                    }
+                }
+            }
+
+            tex.SetPixels32(px);
+            tex.Apply();
+            tex.filterMode = FilterMode.Bilinear;
+            return Sprite.Create(tex, new Rect(0f, 0f, w, h), new Vector2(0.5f, 0.5f), 100f);
+        }
+
+        /// <summary>刷新「固定播放头」那颗按钮的图标：开 = 强调色，关 = 弱化色。</summary>
+        private void ApplyFollowModeIcon()
+        {
+            if (followModeButton == null)
+            {
+                return;
+            }
+            HideButtonLabel(followModeButton);
+            Transform existing = followModeButton.transform.Find("FollowIcon");
+            if (existing != null)
+            {
+                UnityEngine.Object.Destroy(existing.gameObject);
+            }
+            if (followModeSprite != null)
+            {
+                UnityEngine.Object.Destroy(followModeSprite);
+            }
+            bool centered = followMode == TimelineFollowMode.CenteredPlayhead;
+            followModeSprite = CreateFollowModeSprite(centered);
+            Image icon = CreateImage("FollowIcon", followModeButton.GetComponent<RectTransform>(),
+                5f, 6f, 18f, 16f, centered ? Palette.Accent : TextMuted);
+            icon.sprite = followModeSprite;
+            icon.preserveAspect = true;
+            icon.raycastTarget = false;
+        }
+
+        /// <summary>
+        /// 图标：一条竖线（播放头）+ 两侧内容条。
+        /// 关 = 内容条靠右（自由滚动）；开 = 内容条在竖线两侧（居中）。
+        /// </summary>
+        private static Sprite CreateFollowModeSprite(bool centered)
+        {
+            const int w = 32;
+            const int h = 28;
+            Texture2D tex = new Texture2D(w, h, TextureFormat.RGBA32, false, true);
+            Color32[] px = new Color32[w * h];
+
+            void Fill(int x0, int y0, int x1, int y1)
+            {
+                for (int y = y0; y <= y1; y++)
+                {
+                    for (int x = x0; x <= x1; x++)
+                    {
+                        if (x < 0 || y < 0 || x >= w || y >= h)
+                        {
+                            continue;
+                        }
+                        px[y * w + x] = new Color32(255, 255, 255, 255);
+                    }
+                }
+            }
+
+            // 播放头竖线
+            Fill(15, 4, 16, 23);
+            // 内容条：开 → 左右各一条；关 → 只在右侧
+            Fill(6, 9, 13, 11);
+            Fill(6, 16, 13, 18);
+            Fill(18, 9, 25, 11);
+            Fill(18, 16, 25, 18);
+            if (!centered)
+            {
+                // 关：把左边两条擦掉，只留右边
+                for (int y = 9; y <= 18; y++)
+                {
+                    for (int x = 6; x <= 13; x++)
+                    {
+                        px[y * w + x] = new Color32(0, 0, 0, 0);
+                    }
+                }
+            }
+
+            tex.SetPixels32(px);
+            tex.Apply(false, true);
+            Sprite sprite = Sprite.Create(tex, new Rect(0f, 0f, w, h),
+                new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect);
+            sprite.hideFlags = HideFlags.HideAndDontSave;
+            return sprite;
+        }
+
         private void ApplySelectionFollowIcon()
         {
             if (selectionFollowButton == null)
@@ -8720,7 +9481,7 @@ namespace ADOFAIEditorStudio
                 UnityEngine.Object.Destroy(selectionFollowSprite);
             }
             bool on = Main.Settings != null && Main.Settings.FollowSelectionOnClick;
-            selectionFollowSprite = CreateSelectionFollowSprite(on);
+            selectionFollowSprite = CreateEventFollowSprite(on);
             Image icon = CreateImage("SelectionFollowIcon", selectionFollowButton.GetComponent<RectTransform>(),
                 5f, 6f, 18f, 16f, TextPrimary);
             icon.sprite = selectionFollowSprite;
@@ -8774,35 +9535,6 @@ namespace ADOFAIEditorStudio
         private readonly List<LevelEventType> paletteTypes = new List<LevelEventType>();
         private bool paletteBuilt;
 
-        // ------------------------------------------------- ImGui 版那排按钮要用的快照
-        //
-        // **几何和行为的唯一来源仍是上面那套 uGUI 布局**（`LayoutPaletteRows` 摆到
-        // 哪儿、`ActivatePaletteEvent` 点了干什么），ImGui 只按这份快照画和转发。
-        // 各算一份的话，换行规则一改两边就会错位 —— 今天已经栽过一次
-        // （时间读数和筛选按钮各自硬算位置、互相压）。
-        //
-        // 位置是**相对面板原点**的，和 `SetTopLeft` 用的是同一套坐标；ImGui 那边
-        // 把窗口放在面板原点 + `PaletteRowY` 处，所以本地 y 要再减掉 `PaletteRowY`。
-        private readonly List<Vector2> paletteSlotPositions = new List<Vector2>();
-        private int paletteRowCount;
-        private bool paletteSuppressed;
-
-        /// <summary>事件面板那一行的顶端相对面板顶端的偏移（ImGui 版要照这个放窗口）。</summary>
-        internal const float PaletteRowYOffset = PaletteRowY;
-
-        /// <summary>槽位数（没建、或者谱面没加载时是 0）。</summary>
-        internal int PaletteSlotCount
-        {
-            get { return paletteBuilt ? paletteEntries.Count : 0; }
-        }
-
-        internal Vector2 PaletteSlotPosition(int index)
-        {
-            return index >= 0 && index < paletteSlotPositions.Count
-                ? paletteSlotPositions[index]
-                : new Vector2(PaletteMargin, PaletteRowY);
-        }
-
         internal LevelEventType PaletteSlotType(int index)
         {
             return index >= 0 && index < paletteEntries.Count
@@ -8810,65 +9542,11 @@ namespace ADOFAIEditorStudio
                 : LevelEventType.None;
         }
 
-        internal float PaletteSlotSize { get { return PaletteMaxButtonSize; } }
-
-        /// <summary>时间轴当前的位置表条数（探针和"新建之后进没进"比对用）。</summary>
-        internal int PlacementCount
-        {
-            get { return blockPlacements.Count; }
-        }
-
-        /// <summary>槽位对应的中文事件名（ImGui 版拿它做悬停提示）。</summary>
+        /// <summary>槽位对应的中文事件名（做悬停提示）。</summary>
         internal string PaletteSlotName(int index)
         {
             LevelEventType type = PaletteSlotType(index);
             return type == LevelEventType.None ? null : GetEventName(type);
-        }
-
-        /// <summary>那排按钮一共占多高（ImGui 版窗口的高度）。</summary>
-        internal float PaletteBandHeight
-        {
-            get
-            {
-                int rows = paletteRowCount > 0 ? paletteRowCount : 1;
-                return rows * (PaletteMaxButtonSize + PaletteGap) + 6f;
-            }
-        }
-
-        /// <summary>某个事件类型的原版图标（图谱面加载后才有）。</summary>
-        internal Sprite GetPaletteIcon(LevelEventType type)
-        {
-            Sprite sprite = null;
-            if (GCS.levelEventIcons != null)
-            {
-                GCS.levelEventIcons.TryGetValue(type, out sprite);
-            }
-            return sprite;
-        }
-
-        /// <summary>点第几个按钮 —— 和 uGUI 那边**同一个入口**（含只读判断）。</summary>
-        internal void ActivatePaletteSlot(int index)
-        {
-            ActivatePaletteEvent(index);
-        }
-
-        /// <summary>
-        /// 把 uGUI 那排按钮藏起来（ImGui 版接管时）。
-        ///
-        /// **只藏不拆** —— 布局、图标、点击都还是它们算的，拆了就得把那一整套
-        /// 搬进 ImGui 重写一遍，那正是这次要避免的。
-        /// </summary>
-        internal void SuppressPalette(bool suppressed)
-        {
-            paletteSuppressed = suppressed;
-            for (int i = 0; i < paletteButtons.Count; i++)
-            {
-                if (paletteButtons[i] != null
-                    && paletteButtons[i].gameObject.activeSelf == suppressed)
-                {
-                    paletteButtons[i].gameObject.SetActive(!suppressed);
-                }
-            }
         }
 
         /// <summary>
@@ -8910,7 +9588,6 @@ namespace ADOFAIEditorStudio
 
         private readonly List<LevelEventType> paletteEntries = new List<LevelEventType>();
         private readonly List<bool> paletteGroupStart = new List<bool>();
-
 
         /// <summary>
         /// 当前应该显示的事件，按分类分组、组内保持枚举顺序。
@@ -8983,6 +9660,13 @@ namespace ADOFAIEditorStudio
             float available = Mathf.Max(80f, root.rect.width - ContentShift - PaletteMargin * 2f);
             int layoutRows = LayoutPaletteRows(available);
 
+            // 每个事件按钮挂上「悬停显示事件名」——和标题行那排图标按钮一致。
+            for (int i = 0; i < paletteButtons.Count; i++)
+            {
+                string name = i < paletteEntries.Count ? PaletteSlotName(i) : null;
+                UiHoverTip.Attach(paletteButtons[i], name);
+            }
+
         }
 
         /// <summary>
@@ -9000,9 +9684,6 @@ namespace ADOFAIEditorStudio
             float x = PaletteMargin + ContentShift;
             float y = PaletteRowY;
             int rows = 1;
-
-            // 这一趟同时把每个槽位的位置记下来给 ImGui 版用（见上面那段说明）。
-            paletteSlotPositions.Clear();
 
             for (int i = 0; i < paletteEntries.Count; i++)
             {
@@ -9027,11 +9708,8 @@ namespace ADOFAIEditorStudio
                 Button button = paletteButtons[i];
                 LevelEventType type = paletteEntries[i];
                 paletteTypes[i] = type;
-                // 被 ImGui 版接管时这里也别点亮 —— 否则每次刷新又会把那排 uGUI
-                // 按钮显出来，和 ImGui 画的重叠成两排。
-                button.gameObject.SetActive(!paletteSuppressed);
+                button.gameObject.SetActive(true);
                 SetTopLeft(button.GetComponent<RectTransform>(), x, y, size, size);
-                paletteSlotPositions.Add(new Vector2(x, y));
 
                 Image icon = paletteIcons[i];
                 if (icon != null)
@@ -9072,7 +9750,6 @@ namespace ADOFAIEditorStudio
                     SetTopLeft(viewport, GutterWidth + ContentShift, headerHeight, bodyWidth, bodyHeight);
                 }
             }
-            paletteRowCount = rows;
             return rows;
         }
 
@@ -9099,6 +9776,422 @@ namespace ADOFAIEditorStudio
                 paletteButtons.Add(button);
                 paletteIcons.Add(icon);
                 paletteTypes.Add(LevelEventType.None);
+            }
+        }
+
+        // 齿标：一条竖线 + 一个时间文字。池子按屏宽最多 32 组。
+        private readonly List<Image> tickLinePool = new List<Image>();
+        private readonly List<TextMeshProUGUI> tickLabelPool = new List<TextMeshProUGUI>();
+
+        private readonly List<Image> gridLinePool = new List<Image>();
+
+        /// <summary>
+        /// 画标尺：**刻度写的是格子编号**（`floor.seqID`），不是秒。
+        ///
+        /// 数据来自 `CollectRuler()` —— 它按可视格数均摊格宽、按 seqID 出标签，
+        /// 这套数学是从原生 `RefreshGrid` 搬来的（变速谱里格子时长不等，
+        /// 按时间均分会对不上格线）。原来它只被 ImGui 的 `DrawRuler` 调，
+        /// 主体停掉后标尺就空了。
+        /// </summary>
+        private void UpdateRuler()
+        {
+            if (rulerBackdrop == null || viewport == null)
+            {
+                return;
+            }
+            CollectRuler();
+
+            List<RulerTick> ticks = RulerTicks;
+            int used = 0;
+            for (int i = 0; i < ticks.Count && used < 64; i++)
+            {
+                RulerTick tick = ticks[i];
+                if (tick.X < -40f || tick.X > viewport.rect.width + 40f)
+                {
+                    continue;
+                }
+                EnsureRulerSlot(used + 1);
+
+                Image line = tickLinePool[used];
+                if (!line.gameObject.activeSelf)
+                {
+                    line.gameObject.SetActive(true);
+                }
+                SetTopLeft(line.rectTransform, tick.X, RulerHeight - 9f, 1f, 8f);
+
+                TextMeshProUGUI label = tickLabelPool[used];
+                if (!label.gameObject.activeSelf)
+                {
+                    label.gameObject.SetActive(true);
+                }
+                label.text = tick.Label;
+                SetTopLeft(label.rectTransform, tick.X + 3f, 1f, 56f, 16f);
+                used++;
+            }
+
+            for (int i = used; i < tickLinePool.Count; i++)
+            {
+                if (tickLinePool[i].gameObject.activeSelf)
+                {
+                    tickLinePool[i].gameObject.SetActive(false);
+                }
+                if (tickLabelPool[i].gameObject.activeSelf)
+                {
+                    tickLabelPool[i].gameObject.SetActive(false);
+                }
+            }
+
+            // 格线：比刻度密，铺满从标尺下沿到视口底。
+            List<RulerLine> lines = RulerLines;
+            int gridUsed = 0;
+            for (int i = 0; i < lines.Count && gridUsed < 220; i++)
+            {
+                float x = lines[i].X;
+                if (x < 0f || x > viewport.rect.width)
+                {
+                    continue;
+                }
+                EnsureGridSlot(gridUsed + 1);
+                Image grid = gridLinePool[gridUsed];
+                if (!grid.gameObject.activeSelf)
+                {
+                    grid.gameObject.SetActive(true);
+                }
+                SetTopLeft(grid.rectTransform, x, RulerHeight, 1f,
+                    Mathf.Max(0f, viewport.rect.height - RulerHeight));
+                gridUsed++;
+            }
+            for (int i = gridUsed; i < gridLinePool.Count; i++)
+            {
+                if (gridLinePool[i].gameObject.activeSelf)
+                {
+                    gridLinePool[i].gameObject.SetActive(false);
+                }
+            }
+        }
+
+        private void EnsureGridSlot(int count)
+        {
+            while (gridLinePool.Count < count)
+            {
+                Image grid = CreateImage("GridLine" + gridLinePool.Count,
+                    gridLayer != null ? gridLayer : blockLayer,
+                    0f, 0f, 1f, 10f, new Color(1f, 1f, 1f, 0.06f));
+                grid.raycastTarget = false;
+                gridLinePool.Add(grid);
+            }
+        }
+
+        private void EnsureRulerSlot(int count)
+        {
+            while (tickLinePool.Count < count)
+            {
+                // **齿标要够亮。** 标尺底色是全透明的（靠模块底色透上来），
+                // 1px / 22% 白 + 弱化文字叠在 #0B0B0B 上几乎看不见 ——
+                // 用户反馈「齿标变透明了」就是这个。线和字都提一档。
+                Image line = CreateImage("Tick" + tickLinePool.Count, viewport,
+                    0f, 0f, 1f, 8f, new Color(1f, 1f, 1f, 0.55f));
+                line.raycastTarget = false;
+                tickLinePool.Add(line);
+
+                TextMeshProUGUI label = CreateText("TickLabel" + tickLabelPool.Count,
+                    viewport, 0f, 0f, 56f, 16f, string.Empty, 10f,
+                    Palette.TextPrimary, TextAlignmentOptions.MidlineLeft, false);
+                label.raycastTarget = false;
+                tickLabelPool.Add(label);
+            }
+        }
+
+        /// <summary>按需把块对象建到池子里（上限 `MarkerPoolSize`）。</summary>
+        private TimelineMarker CreateMarker()
+        {
+            {
+                int index = markerPool.Count;
+                RectTransform rect = CreateRect("Block" + index, blockLayer,
+                    0f, 0f, 100f, DefaultRowHeight);
+                Image background = rect.gameObject.AddComponent<Image>();
+                background.raycastTarget = true;
+                // 块允许圆角：用和面板同一个九宫格圆角图，拉伸时四角不糊。
+                if (roundedSprite != null)
+                {
+                    background.sprite = roundedSprite;
+                    background.type = Image.Type.Sliced;
+                }
+
+                TimelineMarker marker = new TimelineMarker();
+                marker.GameObject = rect.gameObject;
+                marker.Rect = rect;
+                marker.Background = background;
+
+                // 选中用**白色描边**表示，不再提亮底色。
+                if (outlineSprite != null)
+                {
+                    Image outline = CreateImage("Outline", rect, 0f, 0f, 100f,
+                        DefaultRowHeight, Color.white);
+                    outline.sprite = outlineSprite;
+                    outline.type = Image.Type.Sliced;
+                    outline.raycastTarget = false;
+                    marker.Outline = outline;
+                    outline.gameObject.SetActive(false);
+                }
+
+                Button button = rect.gameObject.AddComponent<Button>();
+                button.targetGraphic = background;
+                button.transition = Selectable.Transition.None;
+                // **交给 ActivateMarker**：它区分「Ctrl 切换多选」和
+                // 「普通点击替换选择」。原来这里直接调 ToggleSelectionOf，
+                // 于是不按 Ctrl 连点几个块会变成多选（用户报的问题）。
+                button.onClick.AddListener(delegate { ActivateMarker(marker); });
+
+                TimelineBlockDrag drag = rect.gameObject.AddComponent<TimelineBlockDrag>();
+                drag.Initialize(this, marker);
+                marker.Drag = drag;
+
+                marker.Label = CreateText("Label", rect, 22f, 0f, 80f, DefaultRowHeight,
+                    string.Empty, 11f, Color.white, TextAlignmentOptions.MidlineLeft, false);
+                marker.Label.overflowMode = TextOverflowModes.Ellipsis;
+                marker.Label.raycastTarget = false;
+                // **去掉阴影/描边**：块上的文字要干净，阴影会让黑字糊成一团。
+                marker.Label.fontStyle = FontStyles.Normal;
+                marker.Label.outlineWidth = 0f;
+                Shadow labelShadow = marker.Label.GetComponent<Shadow>();
+                if (labelShadow != null)
+                {
+                    Destroy(labelShadow);
+                }
+                Outline labelOutline = marker.Label.GetComponent<Outline>();
+                if (labelOutline != null)
+                {
+                    Destroy(labelOutline);
+                }
+                // **关掉字体材质里的下投影（underlay）。** TMP 的阴影不是
+                // `Shadow` 组件，而是材质上的 UNDERLAY 关键字 —— 只删组件
+                // 是删不掉的（用户反馈「文字阴影还是没去掉」）。
+                Material labelMaterial = marker.Label.fontMaterial;
+                if (labelMaterial != null)
+                {
+                    labelMaterial.DisableKeyword("UNDERLAY_ON");
+                    labelMaterial.DisableKeyword("UNDERLAY_INNER");
+                }
+
+                marker.Icon = CreateImage("Icon", rect, 4f, 5f, 16f, 16f, Color.white);
+                marker.Icon.preserveAspect = true;
+                marker.Icon.raycastTarget = false;
+
+                RectTransform curveRect = CreateRect("Curve", rect, 4f, 4f, 40f, 10f);
+                EaseCurveImage curve = curveRect.gameObject.AddComponent<EaseCurveImage>();
+                curve.raycastTarget = false;
+                marker.Curve = curve;
+
+                markerPool.Add(marker);
+                return marker;
+            }
+        }
+
+        /// <summary>拖动时那条「原位置」竖线：每帧跟着视图换算，松手就藏。</summary>
+        private void UpdateDragOriginGuide(float viewStart, float pixelsPerSecond,
+            float viewHeight)
+        {
+            bool show = blockDragActive && !blockDragResizing
+                && dragOrigins.Count > 0 && dragOrigins[0].Item != null;
+            if (!show)
+            {
+                if (dragOriginGuide != null && dragOriginGuide.gameObject.activeSelf)
+                {
+                    dragOriginGuide.gameObject.SetActive(false);
+                }
+                return;
+            }
+            if (dragOriginGuide == null)
+            {
+                if (blockLayer == null)
+                {
+                    return;
+                }
+                Image guide = CreateImage("DragOriginGuide", blockLayer,
+                    0f, RulerHeight, 1.5f, Mathf.Max(1f, viewHeight - RulerHeight),
+                    DragOriginGuideColor);
+                guide.raycastTarget = false;
+                dragOriginGuide = guide.rectTransform;
+            }
+            if (!dragOriginGuide.gameObject.activeSelf)
+            {
+                dragOriginGuide.gameObject.SetActive(true);
+            }
+            float x = (dragOrigins[0].Start - viewStart) * pixelsPerSecond;
+            SetTopLeft(dragOriginGuide, x, RulerHeight, 1.5f,
+                Mathf.Max(1f, viewHeight - RulerHeight));
+        }
+
+        /// <summary>
+        /// 把这一帧可见的块绑到池子里。几何直接照 ImGui 主体那套公式：
+        /// 横轴按 `PixelsPerSecond`，纵轴按行号 × 行距，标尺高度以上被裁掉。
+        /// </summary>
+        private void UpdateBlocks()
+        {
+            if (blockLayer == null || viewport == null)
+            {
+                return;
+            }
+
+            float pixelsPerSecond = Mathf.Max(1f, PixelsPerSecond);
+            float viewStart = ViewStartSeconds;
+            float contentTop = RulerHeight - verticalScrollOffset;
+            float stride = BlockStridePixels;
+            float blockHeight = BlockHeightPixels;
+            float viewWidth = viewport.rect.width;
+            float viewHeight = viewport.rect.height;
+
+            UpdateDragOriginGuide(viewStart, pixelsPerSecond, viewHeight);
+
+            // **不要在这里清空 `freeMarkers`** —— 里面的对象是上一帧帧尾收进来的，
+            // 正是这一帧绑定阶段要复用的。清在这一步的话，绑定阶段永远拿不到
+            // 空闲对象，只能一路新建到池上限再 break（拖一下还是会丢一大片）。
+            activeBlockIds.Clear();
+            for (int i = 0; i < blockViews.Count; i++)
+            {
+                BlockView block = blockViews[i];
+                float left = (block.Time - viewStart) * pixelsPerSecond;
+                float width = Mathf.Max(BlockMinWidth,
+                    block.Duration * pixelsPerSecond - BlockGap);
+                float top = contentTop + block.Row * stride;
+
+                if (left + width <= 0f || left >= viewWidth
+                    || top + blockHeight <= RulerHeight || top >= viewHeight)
+                {
+                    continue;
+                }
+                TimelineMarker marker;
+                if (!markerByBlockId.TryGetValue(block.Id, out marker))
+                {
+                    // **池满时回收"上一帧收起"的对象，而不是 break。**
+                    //
+                    // 原来撞到上限就跳出循环：滚一下视口，新进来的块都要新建
+                    // 对象，一旦满了，后面所有块都没有实体 —— 表现就是
+                    // "稍微动一下就消失一大片"（数据还在，拖过去照样判重叠变红）。
+                    if (freeMarkers.Count > 0)
+                    {
+                        marker = freeMarkers[freeMarkers.Count - 1];
+                        freeMarkers.RemoveAt(freeMarkers.Count - 1);
+                        if (marker.BoundBlockId >= 0)
+                        {
+                            markerByBlockId.Remove(marker.BoundBlockId);
+                        }
+                    }
+                    else if (markerPool.Count < MarkerPoolSize)
+                    {
+                        marker = CreateMarker();
+                    }
+                    else
+                    {
+                        break;
+                    }
+                    marker.BoundBlockId = block.Id;
+                    markerByBlockId[block.Id] = marker;
+                }
+                activeBlockIds.Add(block.Id);
+                marker.Item = FindItemForEvent(block.Event);
+                if (!marker.GameObject.activeSelf)
+                {
+                    marker.GameObject.SetActive(true);
+                }
+                SetTopLeft(marker.Rect, left, top, width, blockHeight);
+
+                // 选中不再改底色 —— 用描边表达（见下）。
+                Color fill = block.BlockColor;
+                fill.a = block.Active ? 1f : 0.46f;
+                marker.Background.color = fill;
+
+                if (marker.Outline != null)
+                {
+                    // **拖动中、而且还跟别人叠着 → 描红边**，松手时这一下会作废。
+                    //
+                    // 长事件往右铺得很远，拖动时只看这一块根本看不出后面撞没撞
+                    // —— 这个红边就是那个提示（没有它，用户只能靠"撤回之后位置
+                    // 怎么不对"来反推）。只查被拖着的那几块，每帧 O(块数)。
+                    bool dragMember = blockDragActive && block.Event != null
+                        && dragMembers.Contains(block.Event);
+                    bool showOutline = block.Selected || dragMember;
+                    if (marker.Outline.gameObject.activeSelf != showOutline)
+                    {
+                        marker.Outline.gameObject.SetActive(showOutline);
+                    }
+                    if (showOutline)
+                    {
+                        marker.Outline.color = dragMember && BlockOverlapsOthers(block.Event)
+                            ? DragOverlapColor
+                            : Color.white;
+                        SetTopLeft(marker.Outline.rectTransform, -1f, -1f,
+                            width + 2f, blockHeight + 2f);
+                    }
+                }
+
+                marker.Label.text = block.Name ?? string.Empty;
+                // 块上的文字/图标统一**纯黑**，在彩色底上对比最强。
+                marker.Label.color = Color.black;
+                SetTopLeft(marker.Label.rectTransform, block.Icon != null ? 22f : 8f, 0f,
+                    Mathf.Max(10f, width - 28f), blockHeight);
+
+                bool hasIcon = block.Icon != null;
+                if (marker.Icon.gameObject.activeSelf != hasIcon)
+                {
+                    marker.Icon.gameObject.SetActive(hasIcon);
+                }
+                if (hasIcon)
+                {
+                    marker.Icon.sprite = block.Icon;
+                    marker.Icon.color = Color.black;
+                }
+
+                // **行高压到一定程度就不画曲线了。** 再扁下去它只剩一条几乎
+                // 贴着中线的细线，既读不出缓动形状、又和块名抢像素 ——
+                // 不如干脆空出来。阈值取 26：最扁档（24）隐藏，默认档（30）正常画。
+                bool hasCurve = block.Curve != null && block.Curve.Length >= 2
+                    && width >= 44f && blockHeight >= EaseCurveHideBelowHeight;
+                if (marker.Curve.gameObject.activeSelf != hasCurve)
+                {
+                    marker.Curve.gameObject.SetActive(hasCurve);
+                }
+                if (hasCurve)
+                {
+                    // **同一个数组不重复塞。** 每帧重设会让曲线跟着池子换绑抖动
+                    // （用户看到「拖动时缓速一直在变」）。
+                    if (!ReferenceEquals(marker.CurveValues, block.Curve))
+                    {
+                        marker.CurveValues = block.Curve;
+                        marker.Curve.SetCurve(block.Curve);
+                    }
+                    // 缓速曲线**不用纯黑**：比文字浅一档，免得和名字糊在一起。
+                    marker.Curve.color = new Color(0.12f, 0.12f, 0.12f, 0.95f);
+
+                    // **轴心必须是左下角。** `EaseCurveImage` 的顶点是按
+                    // 「(0,0) 在左下」写的（和 UILineRenderer 同一套约定）；
+                    // 用左上角轴心就会上下镜像 —— 用户看到的就是
+                    // 「拖动时曲线像 Y 轴反复翻转」。
+                    RectTransform curveRect = marker.Curve.rectTransform;
+                    curveRect.anchorMin = new Vector2(0f, 1f);
+                    curveRect.anchorMax = new Vector2(0f, 1f);
+                    curveRect.pivot = new Vector2(0f, 0f);
+                    curveRect.anchoredPosition = new Vector2(4f, -(blockHeight - 4f));
+                    curveRect.sizeDelta = new Vector2(width - 8f, blockHeight - 8f);
+                }
+            }
+
+            // 这一帧没出现的块：把它的对象收进空闲表，留给下一帧的新块复用。
+            // 先清空再重建，避免跨帧累积重复项（本帧复用过的不在此列，
+            // 它们已经在 `activeBlockIds` 里）。
+            freeMarkers.Clear();
+            foreach (KeyValuePair<int, TimelineMarker> pair in markerByBlockId)
+            {
+                if (activeBlockIds.Contains(pair.Key))
+                {
+                    continue;
+                }
+                if (pair.Value.GameObject.activeSelf)
+                {
+                    pair.Value.GameObject.SetActive(false);
+                }
+                freeMarkers.Add(pair.Value);
             }
         }
 
@@ -9140,6 +10233,9 @@ namespace ADOFAIEditorStudio
             int playheadFloor = PlayheadFloorIndex();
             if (playheadFloor >= 0)
             {
+                // 纯粹是"把选中挪到播放头"，不该带动画面（否则定位开着会回环）。
+                EditorPlaybackBridge.MarkNextFloorSelect(
+                    EditorPlaybackBridge.FloorSelectPlayheadSync);
                 editor.SelectFloor(editor.floors[playheadFloor], cameraJump: false);
             }
 
@@ -9247,7 +10343,6 @@ namespace ADOFAIEditorStudio
             return Mathf.Clamp(index - 1, 0, editor.floors.Count - 1);
         }
 
-
         private Sprite playheadGlowSprite;
 
         /// <summary>
@@ -9293,293 +10388,6 @@ namespace ADOFAIEditorStudio
                 new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect);
             playheadGlowSprite.hideFlags = HideFlags.HideAndDontSave;
             return playheadGlowSprite;
-        }
-
-        private void ApplyLayoutModeIcon()
-        {
-            if (layoutModeButton == null)
-            {
-                return;
-            }
-            TextMeshProUGUI label = layoutModeButton.GetComponentInChildren<TextMeshProUGUI>();
-            if (label != null)
-            {
-                label.text = string.Empty;
-            }
-            Transform existing = layoutModeButton.transform.Find("LayoutIcon");
-            if (existing != null)
-            {
-                UnityEngine.Object.Destroy(existing.gameObject);
-            }
-            if (layoutModeSprite != null)
-            {
-                UnityEngine.Object.Destroy(layoutModeSprite);
-            }
-            layoutModeSprite = CreateLayoutModeSprite(layoutMode == TimelineLayoutMode.LayerStack);
-            Image icon = CreateImage("LayoutIcon", layoutModeButton.GetComponent<RectTransform>(),
-                5f, 6f, 18f, 16f, TextPrimary);
-            icon.sprite = layoutModeSprite;
-            icon.raycastTarget = false;
-        }
-
-        private void ApplyFollowModeIcon()
-        {
-            if (followModeButton == null)
-            {
-                return;
-            }
-            TextMeshProUGUI label = followModeButton.GetComponentInChildren<TextMeshProUGUI>();
-            if (label != null)
-            {
-                label.text = string.Empty;
-            }
-            Transform existing = followModeButton.transform.Find("FollowIcon");
-            if (existing != null)
-            {
-                UnityEngine.Object.Destroy(existing.gameObject);
-            }
-            if (followModeSprite != null)
-            {
-                UnityEngine.Object.Destroy(followModeSprite);
-            }
-            followModeSprite = CreateFollowModeSprite(followMode == TimelineFollowMode.CenteredPlayhead);
-            Image icon = CreateImage("FollowIcon", followModeButton.GetComponent<RectTransform>(),
-                5f, 6f, 18f, 16f, TextPrimary);
-            icon.sprite = followModeSprite;
-            icon.raycastTarget = false;
-        }
-
-        /// <summary>
-        /// 排列方式图标：三条圆角横条。
-        ///
-        /// 卷帘模式三条之间留出明显的缝——缝就是「每个类型是一个独立盒子」
-        /// 这件事本身；图层模式三条贴得更近、更薄，读作一整叠连续图层。
-        ///
-        /// 圆角用距离场画（到圆角矩形边界的距离），直边保持精确、转角圆滑，
-        /// 而不是靠削角凑近似。文字字形不可靠，所以一律自绘。
-        /// </summary>
-        private static Sprite CreateLayoutModeSprite(bool layerStack)
-        {
-            const int w = 32;
-            const int h = 28;
-            var tex = new Texture2D(w, h, TextureFormat.RGBA32, false, true);
-            var px = new Color32[w * h];
-
-            // 图层模式：条更薄、更密；卷帘模式：条略厚、缝更大。
-            float barH = layerStack ? 5.2f : 4.6f;
-            float gap = layerStack ? 2.2f : 5.4f;
-            float radius = barH * 0.5f;
-
-            for (int b = 0; b < 3; b++)
-            {
-                float top = h - (5f + b * (barH + gap));
-                float left = 7f;
-                float right = w - 7f;
-                for (int y = 0; y < h; y++)
-                {
-                    for (int x = 0; x < w; x++)
-                    {
-                        float cx = Mathf.Clamp(x + 0.5f, left + radius, right - radius);
-                        float cy = Mathf.Clamp(y + 0.5f, top + radius, top + barH - radius);
-                        float dx = x + 0.5f - cx;
-                        float dy = y + 0.5f - cy;
-                        float d = Mathf.Sqrt(dx * dx + dy * dy);
-                        float a = Mathf.Clamp01(radius + 0.5f - d);
-                        if (a > 0f)
-                        {
-                            px[y * w + x] = new Color32(255, 255, 255, (byte)Mathf.RoundToInt(a * 255f));
-                        }
-                    }
-                }
-            }
-            tex.SetPixels32(px);
-            tex.Apply(false, true);
-            Sprite sp = Sprite.Create(tex, new Rect(0, 0, w, h), new Vector2(0.5f, 0.5f), 100f, 0,
-                SpriteMeshType.FullRect);
-            sp.hideFlags = HideFlags.HideAndDontSave;
-            return sp;
-        }
-
-        /// <summary>
-        /// 播放方式图标：一个圆点代表播放头，外加两条向它收拢的圆头短线。
-        ///
-        /// 圆点落在左侧＝播放头自由；落在正中且两侧短线对称＝内容朝中点汇聚。
-        /// 用几何位置表达状态，比画箭头更省笔画，缩到 24px 也读得清。
-        /// </summary>
-        private static Sprite CreateFollowModeSprite(bool centered)
-        {
-            const int w = 32;
-            const int h = 28;
-            var tex = new Texture2D(w, h, TextureFormat.RGBA32, false, true);
-            var px = new Color32[w * h];
-
-            float dotX = centered ? w * 0.5f : w * 0.32f;
-            float dotY = h * 0.5f;
-            const float dotR = 3.4f;
-
-            // 圆点
-            for (int y = 0; y < h; y++)
-            {
-                for (int x = 0; x < w; x++)
-                {
-                    float dx = x + 0.5f - dotX;
-                    float dy = y + 0.5f - dotY;
-                    float d = Mathf.Sqrt(dx * dx + dy * dy);
-                    float a = Mathf.Clamp01(dotR + 0.5f - d);
-                    if (a > 0f)
-                    {
-                        px[y * w + x] = new Color32(255, 255, 255, (byte)Mathf.RoundToInt(a * 255f));
-                    }
-                }
-            }
-
-            // 两侧的圆头短线：居中时左右对称，自由时只画右侧一段表示余量。
-            const float segR = 1.5f;
-            int segCount = centered ? 2 : 1;
-            for (int s = 0; s < segCount; s++)
-            {
-                float inward = centered ? (s == 0 ? 1f : -1f) : 1f;
-                float x0 = dotX + inward * (dotR + 3.5f);
-                float x1 = dotX + inward * (dotR + 9.5f);
-                for (int y = 0; y < h; y++)
-                {
-                    for (int x = 0; x < w; x++)
-                    {
-                        float px0 = Mathf.Min(x0, x1);
-                        float px1 = Mathf.Max(x0, x1);
-                        float sx = Mathf.Clamp(x + 0.5f, px0, px1);
-                        float dx = x + 0.5f - sx;
-                        float dy = y + 0.5f - dotY;
-                        float d = Mathf.Sqrt(dx * dx + dy * dy);
-                        float a = Mathf.Clamp01(segR + 0.5f - d) * 0.85f;
-                        if (a > 0f)
-                        {
-                            int o = y * w + x;
-                            byte v = (byte)Mathf.RoundToInt(a * 255f);
-                            if (v > px[o].a) px[o] = new Color32(255, 255, 255, v);
-                        }
-                    }
-                }
-            }
-
-            tex.SetPixels32(px);
-            tex.Apply(false, true);
-            Sprite sp = Sprite.Create(tex, new Rect(0, 0, w, h), new Vector2(0.5f, 0.5f), 100f, 0,
-                SpriteMeshType.FullRect);
-            sp.hideFlags = HideFlags.HideAndDontSave;
-            return sp;
-        }
-
-        /// <summary>
-        /// 跟随选中图标：右边一个方块（被选中的事件），左边一个箭头。
-        ///
-        /// 开启时箭头指向方块（点哪跳哪），关闭时箭头朝外背离方块
-        /// （不跟过去）。两个状态一眼能分开，不用看文字。
-        /// </summary>
-        /// <summary>
-        /// 跟随选中图标：一个取景框加十字准星。
-        ///
-        /// 两态的差别刻意做大，因为按钮只有 18×16 像素，细微区别看不见：
-        ///   跟随 —— 四条手臂一直伸到中心附近，并有一个实心中心点
-        ///   关闭 —— 手臂收得很短、离中心留一大段空，且没有中心点
-        /// 这样缩到 18px 宽也一眼能分开，不用去猜箭头朝哪边。
-        /// </summary>
-        private static Sprite CreateSelectionFollowSprite(bool follow)
-        {
-            const int w = 32;
-            const int h = 28;
-            var tex = new Texture2D(w, h, TextureFormat.RGBA32, false, true);
-            var px = new Color32[w * h];
-
-            const float cx = 16f;
-            const float cy = 14f;
-            const float box = 11f;      // 取景框半边长
-            const float armThick = 2f;
-
-            // 手臂内端离中心多远。跟随贴到 2.5，关闭退到 10——
-            // 中心留下的空档差四倍，这是两态最主要的差别。
-            float armInner = follow ? 2.5f : 10f;
-
-            void Stroke(float x0, float y0, float x1, float y1, float r)
-            {
-                float lox = Mathf.Min(x0, x1);
-                float hix = Mathf.Max(x0, x1);
-                float loy = Mathf.Min(y0, y1);
-                float hiy = Mathf.Max(y0, y1);
-                for (int y = 0; y < h; y++)
-                {
-                    for (int x = 0; x < w; x++)
-                    {
-                        float sx = Mathf.Clamp(x + 0.5f, lox, hix);
-                        float sy = Mathf.Clamp(y + 0.5f, loy, hiy);
-                        float dx = x + 0.5f - sx;
-                        float dy = y + 0.5f - sy;
-                        float a = Mathf.Clamp01(r + 0.5f - Mathf.Sqrt(dx * dx + dy * dy));
-                        if (a <= 0f)
-                        {
-                            continue;
-                        }
-                        int o = y * w + x;
-                        byte v = (byte)Mathf.RoundToInt(a * 255f);
-                        if (v > px[o].a)
-                        {
-                            px[o] = new Color32(255, 255, 255, v);
-                        }
-                    }
-                }
-            }
-
-            // 十字的四条手臂，从取景框边界指向中心。
-            Stroke(cx, cy - box, cx, cy - armInner, armThick);
-            Stroke(cx, cy + armInner, cx, cy + box, armThick);
-            Stroke(cx - box, cy, cx - armInner, cy, armThick);
-            Stroke(cx + armInner, cy, cx + box, cy, armThick);
-
-            // 四角括弧。两态都画——它是「取景/定位」的通用记号，
-            // 也让手臂收短的那一态不至于散成四个孤立短线。
-            const float tick = 4.5f;
-            const float tickR = 1.4f;
-            Stroke(cx - box, cy - box, cx - box + tick, cy - box, tickR);
-            Stroke(cx - box, cy - box, cx - box, cy - box + tick, tickR);
-            Stroke(cx + box - tick, cy - box, cx + box, cy - box, tickR);
-            Stroke(cx + box, cy - box, cx + box, cy - box + tick, tickR);
-            Stroke(cx - box, cy + box - tick, cx - box, cy + box, tickR);
-            Stroke(cx - box, cy + box, cx - box + tick, cy + box, tickR);
-            Stroke(cx + box, cy + box - tick, cx + box, cy + box, tickR);
-            Stroke(cx + box - tick, cy + box, cx + box, cy + box, tickR);
-
-            // 中心实心点。只有跟随态有——第二个一眼可辨的差别，
-            // 和手臂长度互相印证。
-            if (follow)
-            {
-                const float dotR = 2.8f;
-                for (int y = 0; y < h; y++)
-                {
-                    for (int x = 0; x < w; x++)
-                    {
-                        float dx = x + 0.5f - cx;
-                        float dy = y + 0.5f - cy;
-                        float a = Mathf.Clamp01(dotR + 0.5f - Mathf.Sqrt(dx * dx + dy * dy));
-                        if (a <= 0f)
-                        {
-                            continue;
-                        }
-                        int o = y * w + x;
-                        byte v = (byte)Mathf.RoundToInt(a * 255f);
-                        if (v > px[o].a)
-                        {
-                            px[o] = new Color32(255, 255, 255, v);
-                        }
-                    }
-                }
-            }
-
-            tex.SetPixels32(px);
-            tex.Apply(false, true);
-            Sprite sp = Sprite.Create(tex, new Rect(0, 0, w, h), new Vector2(0.5f, 0.5f), 100f, 0,
-                SpriteMeshType.FullRect);
-            sp.hideFlags = HideFlags.HideAndDontSave;
-            return sp;
         }
 
         private void ApplyViewLockIcon()

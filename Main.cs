@@ -86,13 +86,9 @@ namespace ADOFAIEditorStudio
                     UnityEngine.Object.DontDestroyOnLoad(host);
                     Overlay = host.AddComponent<EditorStudioOverlay>();
 
-                    // ImGui 桥接。
-                    //
-                    // 这一步只画一个测试窗口，目的是验证「ImGui 产出顶点 → Unity 的
-                    // CanvasRenderer 画出来」这条路通不通。**现有 uGUI 界面完全不动**
-                    // ——这是共存渐进的第一步，不是替换；两条路会并行一段时间，
-                    // 面板一个一个搬过去。
-                    host.AddComponent<EditorImGuiBridge>();
+                    // 编辑器左下角那颗「打开工作台」的按钮：自己一块画布，
+                    // 位置和配色都照原生底栏那一排小按钮。
+                    AesOpenButton.Install(host.transform);
                 }
 
                 Overlay.Configure(Settings);
@@ -178,6 +174,30 @@ namespace ADOFAIEditorStudio
         // 很吵，只在排查特定播放问题时才需要。
         public bool VerboseDiagnostics = false;
 
+        // 预览时**完全不应用装饰物遮罩**。默认关：遮罩已改为只对屏幕内的
+        // 装饰物生效，常态下开销可接受。只有当某张谱遮罩极多、帧率仍不够时，
+        // 才需要打开它彻底关掉遮罩。
+        //
+        // 遮罩一旦生效，原生会对每件带遮罩的装饰物逐帧重合成一张 RT
+        // （`ApplyAlphaMaskToRT`）。杪夏这类谱在上百件遮罩同时可见时，
+        // 单帧要 200ms 以上，帧率掉到 4 帧。关掉后这些装饰物按普通贴图画，
+        // 代价是「该被遮住的部分会露出来」。
+        public bool SimplifyDecorationMasks = false;
+
+        // ── uGUI 迁移：已经全部完成 ─────────────────────────────────────
+        //
+        // 原来的规则是「迁完一块就删掉对应的 ImGui 实现与开关，最终成品里不再有
+        // ImGui」。2026-10-24 收尾：最后四扇窗（说明 / 版本说明 / 创建工程 /
+        // 悬浮球）都换成了 uGUI，`EditorImGuiBridge`、`EditorImGuiDraw` 与
+        // ImGui.NET 依赖已整体删除。
+
+        // 预览时用**老的 SpriteMask 管线**（`disableV15Features = true`）。
+        //
+        // 原生两套遮罩实现：V15 那套对每件可见遮罩件逐帧重合成 RT（贵到 4 帧），
+        // 老那套只是切 `spriteRenderer.enabled` / `spriteMask.enabled`（几乎免费）。
+        // 老管线的代价是不支持「自定义遮罩深度」，但预览里那点差异基本看不出。
+        public bool UseLegacySpriteMask = true;
+
         // 上一次「看过更新内容」的版本号。
         //
         // 更新窗口只在**换了版本之后第一次**打开工作台时弹一次，判据就是这个
@@ -203,14 +223,20 @@ namespace ADOFAIEditorStudio
         // 「选中事件时跟随」是两件事：那个管时间轴上的事件块，这个管画面里的轨道。
         // 快捷键 Ctrl+J。
         public bool LocateOnTrackClick = false;
-        // 时间轴的自动翻页总开关：
-        //   · 开：播放时视图跟着播放头走；手动把播放头拖到尽头时整页翻过去。
-        //   · 关：**完全不自动滚** —— 播放时也不跟，拖到尽头也不翻，全靠自己滚。
-        //
-        // 默认开：以前"播放时跟随"是无条件的行为，默认关会让所有人一进游戏
-        // 就发现时间轴不跟了。开关的作用是"能关掉"，不是"默认关着"。
-        // 快捷键 Ctrl+K。
-        public bool AutoPageTimeline = true;
+        /// <summary>
+        /// 时间轴排版模式。
+        ///
+        /// · **固定排版（true）**：事件块的行号由类型优先级自动决定 ——
+        ///   移动装饰物 → 移动摄像头 → 滤镜 → 高级滤镜 → 其余，同类型内按时间先后
+        ///   自上而下紧凑排布；每次改完事件自动重排一次，手动拖出来的行号会被覆盖。
+        /// · **自由排版（false）**：行号完全归用户（拖动 / 撤销），保持现状。
+        ///
+        /// 标题行最右那颗「排版」按钮切换，快捷键 Ctrl+L。
+        /// </summary>
+        public bool FixedTimelineLayout = true;
+
+        // 时间轴的自动翻页已取消（0.34.0）：视图不再自己跟着播放头跑。
+        // 想回到播放头，用标题行那颗「定位到播放头」按钮（Ctrl+K）。
         // 参数栏的显示缩放。参数栏是按 1920x1080 的设计尺寸排的，
         // 在 1440p / 4K 上会显得比工作台其它面板小一号。
         // 1.0 = 原始大小；面板不变大，里面的字和控件等比放大。
