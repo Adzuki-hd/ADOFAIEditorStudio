@@ -35,11 +35,22 @@ namespace ADOFAIEditorStudio.Preview.Domains
             internal FilterPlane Plane;
             internal Type FilterType;
             internal FieldInfo[] Fields;
-            internal MonoBehaviour Component;
-            internal bool AddedComponent;
+            /// <summary>
+            /// 背景平面的滤镜要同时挂到两台背景相机上。
+            ///
+            /// 原版只挂 `BGcam`（移动背景那台），但编辑器场景里静态背景
+            /// 由 `Bgcamstatic` 画 —— 只挂一台的话，画面上看到的背景
+            /// 不会被染色（本谱 2019 的 YUV 就是“原版蓝、预览紫”）。
+            /// 两台各画各的层，不会重复染色。
+            /// </summary>
+            internal readonly List<MonoBehaviour> Components = new List<MonoBehaviour>();
+            internal readonly List<bool> ComponentAdded = new List<bool>();
             internal bool OriginalEnabled;
             internal readonly Dictionary<string, object> OriginalValues =
                 new Dictionary<string, object>();
+            internal readonly List<Dictionary<string, object>> ComponentOriginals =
+                new List<Dictionary<string, object>>();
+            internal readonly List<bool> ComponentOriginalEnabled = new List<bool>();
             internal readonly List<AdvancedEvent> Events = new List<AdvancedEvent>();
         }
 
@@ -126,7 +137,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
         {
             foreach (FilterTrack track in tracks.Values)
             {
-                if (track.Component == null)
+                if (track.Components.Count == 0)
                 {
                     continue;
                 }
@@ -138,7 +149,13 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     enabled = false;
                 }
 
-                track.Component.enabled = enabled;
+                for (int c = 0; c < track.Components.Count; c++)
+                {
+                    if (track.Components[c] != null)
+                    {
+                        track.Components[c].enabled = enabled;
+                    }
+                }
                 if (track.Fields == null)
                 {
                     continue;
@@ -155,6 +172,26 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
                     ApplyField(track, field, frame.Time);
                 }
+
+                // 每约一秒打一次 YUV 的实际字段值：证明滤镜有没有被真正启用、
+                    // 以及 100/-100 有没有被正确换算成 1/-1。
+                if (track.Name == "CameraFilterPack_Color_YUV"
+                    && Main.Settings != null && Main.Settings.DecorationProbe
+                    && track.Components.Count > 0
+                    && Time.frameCount % 60 == 0)
+                {
+                    FieldInfo u = FindField(track.Fields, "_U");
+                    FieldInfo v = FindField(track.Fields, "_V");
+                    FieldInfo y = FindField(track.Fields, "_Y");
+                    MonoBehaviour probe = track.Components[0];
+                    Main.Logger.Log("[FilterProbe] YUV t=" + frame.Time.ToString("F2")
+                        + " enabled=" + probe.enabled
+                        + " active=" + probe.gameObject.activeInHierarchy
+                        + " cameras=" + track.Components.Count
+                        + " U=" + (u == null ? "无" : u.GetValue(probe).ToString())
+                        + " V=" + (v == null ? "无" : v.GetValue(probe).ToString())
+                        + " Y=" + (y == null ? "无" : y.GetValue(probe).ToString()));
+                }
             }
         }
 
@@ -162,45 +199,55 @@ namespace ADOFAIEditorStudio.Preview.Domains
         {
             foreach (FilterTrack track in tracks.Values)
             {
-                if (track.Component == null)
+                for (int c = 0; c < track.Components.Count; c++)
                 {
-                    continue;
-                }
-
-                foreach (KeyValuePair<string, object> pair in track.OriginalValues)
-                {
-                    FieldInfo field = FindField(track.Fields, pair.Key);
-                    if (field == null)
+                    MonoBehaviour component = track.Components[c];
+                    if (component == null)
                     {
                         continue;
                     }
 
-                    try
+                    Dictionary<string, object> originals = c < track.ComponentOriginals.Count
+                        ? track.ComponentOriginals[c]
+                        : track.OriginalValues;
+                    foreach (KeyValuePair<string, object> pair in originals)
                     {
-                        field.SetValue(track.Component, pair.Value);
-                    }
-                    catch (Exception exception)
-                    {
-                        Main.Logger.Error("[StaticPreview/FilterAdvanced] failed to restore "
-                            + track.Name + "." + pair.Key + ": " + exception.Message);
-                    }
-                }
+                        FieldInfo field = FindField(track.Fields, pair.Key);
+                        if (field == null)
+                        {
+                            continue;
+                        }
 
-                if (track.AddedComponent)
-                {
-                    try
-                    {
-                        UnityEngine.Object.DestroyImmediate(track.Component);
+                        try
+                        {
+                            field.SetValue(component, pair.Value);
+                        }
+                        catch (Exception exception)
+                        {
+                            Main.Logger.Error("[StaticPreview/FilterAdvanced] failed to restore "
+                                + track.Name + "." + pair.Key + ": " + exception.Message);
+                        }
                     }
-                    catch (Exception exception)
+
+                    bool added = c < track.ComponentAdded.Count && track.ComponentAdded[c];
+                    if (added)
                     {
-                        Main.Logger.Error("[StaticPreview/FilterAdvanced] failed to destroy "
-                            + track.Name + ": " + exception.Message);
+                        try
+                        {
+                            UnityEngine.Object.DestroyImmediate(component);
+                        }
+                        catch (Exception exception)
+                        {
+                            Main.Logger.Error("[StaticPreview/FilterAdvanced] failed to destroy "
+                                + track.Name + ": " + exception.Message);
+                        }
                     }
-                }
-                else
-                {
-                    track.Component.enabled = track.OriginalEnabled;
+                    else
+                    {
+                        component.enabled = c < track.ComponentOriginalEnabled.Count
+                            ? track.ComponentOriginalEnabled[c]
+                            : track.OriginalEnabled;
+                    }
                 }
             }
 
@@ -230,61 +277,102 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 return null;
             }
 
-            Camera camera = GetPlaneCamera(plane);
-            if (camera == null)
+            FilterTrack track = new FilterTrack
+            {
+                Name = filterName,
+                Plane = plane,
+                FilterType = filterType,
+                Fields = filterType.GetFields(BindingFlags.Instance | BindingFlags.Public)
+            };
+
+            // 前景只挂主相机；背景两台都要挂（BGcam 画移动背景，
+            // Bgcamstatic 画静态背景，编辑器里看到的那层是哪台不确定）。
+            List<Camera> cameras = new List<Camera>();
+            Camera mainCamera = GetPlaneCamera(FilterPlane.Foreground);
+            if (plane == FilterPlane.Foreground)
+            {
+                if (mainCamera != null)
+                {
+                    cameras.Add(mainCamera);
+                }
+            }
+            else
+            {
+                // **背景滤镜只能挂背景相机。**
+                //
+                // 试过挂主相机（camobj）：整谱画面会被重复/错误染色 ——
+                // 编辑器里主相机也参与合成，背景滤镜上去就是全屏乱套。
+                // 原版同样只挂 BGcam；Bgcamstatic 是补静态背景那层。
+                scrCamera scr = scrCamera.instance;
+                if (scr != null)
+                {
+                    if (scr.BGcam != null)
+                    {
+                        cameras.Add(scr.BGcam);
+                    }
+                    if (scr.Bgcamstatic != null && scr.Bgcamstatic != scr.BGcam)
+                    {
+                        cameras.Add(scr.Bgcamstatic);
+                    }
+                }
+            }
+
+            if (cameras.Count == 0)
             {
                 Main.Logger.Log("[StaticPreview/FilterAdvanced] camera not found for plane "
                     + plane + ": " + filterName);
                 return null;
             }
 
-            Component component = camera.gameObject.GetComponent(filterType);
-            bool added = false;
-            if (component == null)
+            for (int c = 0; c < cameras.Count; c++)
             {
-                try
-                {
-                    component = camera.gameObject.AddComponent(filterType);
-                    added = component != null;
-                }
-                catch (Exception exception)
-                {
-                    Main.Logger.Error("[StaticPreview/FilterAdvanced] AddComponent failed for "
-                        + filterName + ": " + exception.Message);
-                    return null;
-                }
-            }
-
-            MonoBehaviour behaviour = component as MonoBehaviour;
-            if (behaviour == null)
-            {
-                return null;
-            }
-
-            FilterTrack track = new FilterTrack
-            {
-                Name = filterName,
-                Plane = plane,
-                FilterType = filterType,
-                Fields = filterType.GetFields(BindingFlags.Instance | BindingFlags.Public),
-                Component = behaviour,
-                AddedComponent = added,
-                OriginalEnabled = behaviour.enabled
-            };
-
-            if (added)
-            {
-                behaviour.enabled = false;
-            }
-
-            for (int i = 0; i < track.Fields.Length; i++)
-            {
-                FieldInfo field = track.Fields[i];
-                if (IsSupportedField(field.FieldType))
+                Camera camera = cameras[c];
+                Component component = camera.gameObject.GetComponent(filterType);
+                bool added = false;
+                if (component == null)
                 {
                     try
                     {
-                        track.OriginalValues[field.Name] = field.GetValue(component);
+                        component = camera.gameObject.AddComponent(filterType);
+                        added = component != null;
+                    }
+                    catch (Exception exception)
+                    {
+                        Main.Logger.Error("[StaticPreview/FilterAdvanced] AddComponent failed for "
+                            + filterName + " on " + camera.name + ": " + exception.Message);
+                        continue;
+                    }
+                }
+
+                MonoBehaviour behaviour = component as MonoBehaviour;
+                if (behaviour == null)
+                {
+                    continue;
+                }
+
+                track.Components.Add(behaviour);
+                track.ComponentAdded.Add(added);
+                track.ComponentOriginalEnabled.Add(behaviour.enabled);
+                if (added)
+                {
+                    behaviour.enabled = false;
+                }
+
+                Dictionary<string, object> originals = new Dictionary<string, object>();
+                for (int i = 0; i < track.Fields.Length; i++)
+                {
+                    FieldInfo field = track.Fields[i];
+                    if (!IsSupportedField(field.FieldType))
+                    {
+                        continue;
+                    }
+                    try
+                    {
+                        originals[field.Name] = field.GetValue(component);
+                        if (c == 0)
+                        {
+                            track.OriginalValues[field.Name] = originals[field.Name];
+                        }
                     }
                     catch (Exception exception)
                     {
@@ -292,7 +380,22 @@ namespace ADOFAIEditorStudio.Preview.Domains
                             + filterName + "." + field.Name + ": " + exception.Message);
                     }
                 }
+                track.ComponentOriginals.Add(originals);
+
+                Main.Logger.Log("[StaticPreview/FilterAdvanced] track " + filterName
+                    + " plane=" + plane
+                    + " camera=" + camera.name
+                    + " active=" + camera.gameObject.activeInHierarchy
+                    + " enabled=" + camera.enabled
+                    + " added=" + added);
             }
+
+            if (track.Components.Count == 0)
+            {
+                return null;
+            }
+
+            track.OriginalEnabled = track.ComponentOriginalEnabled[0];
 
             tracks.Add(key, track);
             return track;
@@ -354,7 +457,13 @@ namespace ADOFAIEditorStudio.Preview.Domains
             object value = Interpolate(fromValue, toValue, field.FieldType, eased);
             try
             {
-                field.SetValue(track.Component, value);
+                for (int c = 0; c < track.Components.Count; c++)
+                {
+                    if (track.Components[c] != null)
+                    {
+                        field.SetValue(track.Components[c], value);
+                    }
+                }
             }
             catch (Exception exception)
             {

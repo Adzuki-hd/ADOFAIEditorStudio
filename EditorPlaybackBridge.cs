@@ -1050,6 +1050,18 @@ namespace ADOFAIEditorStudio
                     harmony.Patch(scrubToFloor, new HarmonyMethod(scrubPrefix));
                 }
 
+                // 透明度探针：只在「轨道探针」打开时记录谁把格子淡成 0。
+                // 和上面几条一样是诊断用的单点补丁，不扩大共享补丁集。
+                MethodInfo tweenOpacity = typeof(scrFloor).GetMethod("TweenOpacity",
+                    InstanceFlags, null,
+                    new[] { typeof(float), typeof(float), typeof(DG.Tweening.Ease) }, null);
+                MethodInfo opacityPrefix = typeof(FloorOpacityProbe).GetMethod(
+                    "Prefix", StaticFlags);
+                if (tweenOpacity != null && opacityPrefix != null)
+                {
+                    harmony.Patch(tweenOpacity, new HarmonyMethod(opacityPrefix));
+                }
+
                 // 退出追踪器：每一个都只是针对一个方法的诊断，所以用
                 // 反射打补丁，而不是扩大基于特性的补丁集。
                 PatchTracer(harmony, typeof(scrController), "QuitToMainMenu",

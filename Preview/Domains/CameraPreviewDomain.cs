@@ -616,6 +616,9 @@ namespace ADOFAIEditorStudio.Preview.Domains
             ApplyCamera(camera, context, resolved, rotation, zoom);
             LogChannelJump(frame.Time, resolved, rotation, zoom);
             LogCameraCompare(frame.Time, floorIndex, resolved, rotation, zoom);
+            // 轨道探针（设置 → 开发者里手动开）：相机应用之后再采样，
+            // 这样屏幕坐标和视锥结果都是这一帧的真实值。
+            TrackProbe.Tick(frame, camera);
         }
 
         /// <summary>

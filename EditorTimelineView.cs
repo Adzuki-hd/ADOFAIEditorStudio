@@ -841,6 +841,7 @@ private static float MinimumPixelsPerSecond
         private TextMeshProUGUI summaryText;
         private TextMeshProUGUI timeText;
         private TextMeshProUGUI zoomText;
+        private TMP_InputField jumpField;
         private TMP_FontAsset font;
         private Sprite roundedSprite;
         private EditorDecorationList decoPane;
@@ -960,6 +961,8 @@ private static float MinimumPixelsPerSecond
         private Sprite selectionFollowSprite;
         private Sprite snapDragSprite;
         private Sprite viewLockSprite;
+        /// <summary>跳转按钮那张「文档 + 放大镜」图标，只生成一次。</summary>
+        private static Sprite jumpIconSprite;
         // 筛选改成多选：每个车道一个可见标志，而不是一个单选值。
         // 按钮挂在预览面板的工具栏上（见 EditorStudioOverlay.BuildPreview），
         // 由它调用 ToggleLane / SetAllLanes，状态仍然由时间轴持有。
@@ -4596,15 +4599,10 @@ private static float MinimumPixelsPerSecond
                 5f, 6f, 18f, 16f, TextPrimary);
             locatePlayheadIcon.raycastTarget = false;
 
-            // **排版模式**：固定（按类型优先级自动排）/ 自由（自己拖）。
-            // 放在最后：它是"整体行为"的开关，不参与上面那排"跟随/吸附"的心智。
-            layoutModeButton = CreateButton(
-                "LayoutMode", root, 320f + ContentShift, 7f, 32f, 29f, string.Empty,
-                delegate { ToggleFixedTimelineLayout(); });
-            HideButtonLabel(layoutModeButton);
-            ApplyLayoutModeIcon();
-            UiHoverTip.Attach(layoutModeButton,
-                "排版：固定 = 按事件类型自动分层（每次改动自动重排）；自由 = 行号完全由你拖（Ctrl+L）");
+            // **排版模式那颗按钮已搬进「设置窗口 → 常规设置」。**
+            //
+            // 时间轴标题行只留「跟随 / 吸附 / 定位」这类操作，模式开关归到设置里。
+            // 快捷键 Ctrl+L 仍然保留（见 EditorPlaybackBridge），不占按钮位置。
 
             RefreshFeatureButtons();
             UiHoverTip.Attach(locateButton,
@@ -4711,6 +4709,21 @@ private static float MinimumPixelsPerSecond
                 TextMuted, TextAlignmentOptions.MidlineRight, false);
             summaryText.overflowMode = TextOverflowModes.Ellipsis;
 
+            // **跳转栏：输入格号 + 点击跳过去。**
+            //
+            // 放在时间读数右边那段空档里（左侧 1/3 落点、滑过去），不挤占
+            // 摘要和右侧的缩放/车道筛选。窄窗口里塞不下就整条不建 ——
+            // 让它压住时间读数或车道筛选比没有更糟。
+            const float jumpWidth = 128f;
+            float jumpRoom = lanesX - 12f - (timeX + timeWidth + 16f);
+            if (jumpRoom >= jumpWidth)
+            {
+                float jumpX = Mathf.Min(
+                    timeX + timeWidth + 24f,
+                    lanesX - 12f - jumpWidth);
+                BuildJumpBar(root, jumpX);
+            }
+
             // 时间轴主体是浮在面板上的一张卡片，不是面板上的凹槽。它曾经用 PanelAlt
             // ——比面板暗——那会把它压到表面之下；而设计稿要求
             // 模块的内容区读成一张浮起的卡片，所以改用较亮的取值和
@@ -4816,6 +4829,388 @@ private static float MinimumPixelsPerSecond
             resizeHandleImage.transform.SetAsLastSibling();
 
             UpdateFilterVisuals();
+        }
+
+        /// <summary>
+        /// 标题行右侧的跳转栏：输入格号 + 一颗「跳过去」按钮。
+        ///
+        /// 长谱面里想精确回到某一格，拖动播放头是在几千格、几千像素里找一个
+        /// 点；输入格号再点一下才是稳的。回车和按钮走同一条路。
+        /// </summary>
+        private void BuildJumpBar(RectTransform root, float x)
+        {
+            const float fieldWidth = 92f;
+            const float fieldHeight = 29f;
+            const float gap = 4f;
+            const float buttonWidth = 32f;
+
+            RectTransform host = CreateRect("JumpField", root, x, 7f, fieldWidth, fieldHeight);
+            Image background = host.gameObject.AddComponent<Image>();
+            background.color = Palette.FieldWell;
+            // 输入框自己要能接住点击 —— 标题条那块底衬铺满整行，
+            // 不显式要射线的话，点下去只会落到后面那层底衬上。
+            background.raycastTarget = true;
+
+            TextMeshProUGUI text = CreateStretchedInputText("Text", host, 8f,
+                string.Empty, 12.5f, Palette.TextPrimary);
+            TextMeshProUGUI placeholder = CreateStretchedInputText("Placeholder", host, 8f,
+                "格号", 12.5f, Palette.TextMuted);
+
+            TMP_InputField field = host.gameObject.AddComponent<TMP_InputField>();
+            field.targetGraphic = background;
+            field.lineType = TMP_InputField.LineType.SingleLine;
+            field.contentType = TMP_InputField.ContentType.IntegerNumber;
+            field.characterLimit = 5;
+            field.navigation = new Navigation { mode = Navigation.Mode.None };
+            field.richText = false;
+            field.customCaretColor = true;
+            field.caretColor = new Color(0.96f, 0.96f, 0.96f, 1f);
+            field.caretWidth = 2;
+            field.caretBlinkRate = 0.85f;
+            field.textViewport = host;
+            field.textComponent = text;
+            field.placeholder = placeholder;
+            // 打错字按回车只是回退到原值，不要把框清空。
+            field.restoreOriginalTextOnEscape = true;
+            field.onSubmit.AddListener(delegate { JumpToFloorFromInput(); });
+            jumpField = field;
+
+            // 图标按钮和别的工具按钮同一规格（32 宽、29 高、图标内缩 4/6），
+            // 这样这一排读起来是一条线，而不是中间突然插了个陌生的控件。
+            CreateIconButton(
+                "JumpToFloor",
+                root,
+                x + fieldWidth + gap,
+                buttonWidth,
+                GetJumpIconSprite(),
+                Palette.TextSecondary,
+                JumpToFloorFromInput,
+                "跳转到指定格（输入后按回车也行）");
+        }
+
+        /// <summary>
+        /// 输入框里的文字：横向铺满父级、上下留 1 像素，左边留出内边距。
+        ///
+        /// TMP_InputField 会按自己的 caret 位置去摆 textComponent，所以这层
+        /// 必须是「拉伸锚点」而不是固定尺寸 —— 否则光标和文字会各走各的。
+        /// </summary>
+        private TextMeshProUGUI CreateStretchedInputText(string name, RectTransform parent,
+            float padding, string value, float size, Color color)
+        {
+            RectTransform rect = CreateRect(name, parent, 0f, 0f, 0f, 0f);
+            rect.anchorMin = Vector2.zero;
+            rect.anchorMax = Vector2.one;
+            rect.pivot = new Vector2(0.5f, 0.5f);
+            rect.offsetMin = new Vector2(padding, 1f);
+            rect.offsetMax = new Vector2(-padding, -1f);
+
+            TextMeshProUGUI text = rect.gameObject.AddComponent<TextMeshProUGUI>();
+            text.font = font;
+            text.text = value;
+            text.fontSize = size;
+            text.color = color;
+            text.alignment = TextAlignmentOptions.MidlineLeft;
+            text.textWrappingMode = TextWrappingModes.NoWrap;
+            text.raycastTarget = false;
+            EditorStudioOverlay.ApplyTextShadow(text);
+            return text;
+        }
+
+        /// <summary>
+        /// 从输入框读格号并跳过去。空着或者不是数字就只提示，不乱跳。
+        /// </summary>
+        internal void JumpToFloorFromInput()
+        {
+            scnEditor editor = scnEditor.instance;
+            if (editor == null || editor.floors == null || editor.floors.Count == 0)
+            {
+                return;
+            }
+
+            string raw = jumpField == null || jumpField.text == null
+                ? string.Empty
+                : jumpField.text.Trim();
+            int wanted;
+            if (!int.TryParse(raw, out wanted))
+            {
+                if (Main.Overlay != null)
+                {
+                    Main.Overlay.SetTransientStatus("请输入要跳转的格号");
+                }
+                if (jumpField != null)
+                {
+                    // 回到输入状态，省得用户再点一次。
+                    jumpField.ActivateInputField();
+                    jumpField.Select();
+                }
+                return;
+            }
+
+            JumpToFloor(wanted);
+        }
+
+        /// <summary>
+        /// 跳到指定格：选中它、让预览播放头走过去、再把时间轴滑到那一格。
+        ///
+        /// 三件事得一起做 —— 只滑时间轴不动播放头，画面还停在原处；
+        /// 只动播放头不滑时间轴，落点在视口外，等于没看见。
+        /// </summary>
+        internal void JumpToFloor(int floorId)
+        {
+            scnEditor editor = scnEditor.instance;
+            if (editor == null || editor.floors == null || editor.floors.Count == 0)
+            {
+                return;
+            }
+
+            // 超出范围就夹到两端：用户输入 99999 时应该落在最后一格，
+            // 而不是什么都不发生。
+            int clamped = Mathf.Clamp(floorId, 0, editor.floors.Count - 1);
+            scrFloor target = editor.floors[clamped];
+            if (target == null)
+            {
+                return;
+            }
+
+            // 和「从面板加事件」同一条路：只把选中挪过去，别让原版
+            // SelectFloor 的跟随逻辑再动一次镜头（cameraJump:false）。
+            EditorPlaybackBridge.MarkNextFloorSelect(
+                EditorPlaybackBridge.FloorSelectPlayheadSync);
+            editor.SelectFloor(target, cameraJump: false);
+
+            // 播放头加速走过去。预览会话没起来时它返回 false ——
+            // 那种情况下时间轴照样滑，至少能让用户看到那一格。
+            EditorPlaybackBridge.JumpPreviewToFloor(target);
+
+            if (viewInitialized && pixelsPerSecond > 0f)
+            {
+                if (followMode == TimelineFollowMode.CenteredPlayhead)
+                {
+                    // 固定播放头下不需要滑动，放开手动让位即可。
+                    centeredHoldUntil = 0f;
+                }
+                else
+                {
+                    // 和「定位到播放头」用同一个落点：视口左侧 1/3，
+                    // 跳过去之后右边还留着大部分可看的空间。
+                    float targetTime = (float)target.entryTime;
+                    viewGlideTarget = targetTime - bodyWidth * 0.34f
+                        / Mathf.Max(1f, pixelsPerSecond);
+                    viewGliding = true;
+                }
+                MarkManualNavigation();
+                visualsDirty = true;
+            }
+
+            if (jumpField != null)
+            {
+                // 夹过之后就写回夹过的值，用户一眼能看出实际跳到了哪。
+                jumpField.SetTextWithoutNotify(clamped.ToString());
+            }
+            if (Main.Overlay != null)
+            {
+                Main.Overlay.SetTransientStatus("已跳转到第 " + clamped + " 格");
+            }
+        }
+
+        /// <summary>跳转按钮的图标，只生成一次。</summary>
+        private static Sprite GetJumpIconSprite()
+        {
+            if (jumpIconSprite != null)
+            {
+                return jumpIconSprite;
+            }
+            jumpIconSprite = CreatePinIconSprite(false);
+            return jumpIconSprite;
+        }
+
+        /// <summary>
+        /// 「定位到播放头」的图标：同一枚定位针，但针尖下面多一条短横线
+        /// （落点/基线）。整根针相应缩到 88%，给那条线腾出位置 ——
+        /// 两个按钮挨着，靠“有没有基线”一眼区分，比换色更稳。
+        /// </summary>
+        private static Sprite CreateLocatePlayheadIconSprite()
+        {
+            return CreatePinIconSprite(true);
+        }
+
+        /// <summary>
+        /// 定位针图标：**map pin**（中间一个圆环）。
+        ///
+        /// 直接按用户给的 SVG 描：1024×1024 坐标系里四个子路径 ——
+        /// 定位针外沿、内沿、圆环外圈、圆环内圈 —— 采样成多边形后用
+        /// 奇偶规则填充，等价于 SVG 的填充结果。外框和圆环都是实心带，
+        /// 不是描边，所以水滴的尖端是尖的、圆环宽度处处一致。
+        ///
+        /// `withBaseline` 为真时再加一条针尖下方的横线（定位到播放头用）。
+        /// </summary>
+        private static Sprite CreatePinIconSprite(bool withBaseline)
+        {
+            const int size = 24;
+            const int samples = 4;
+            const int big = size * samples;
+
+            // 三次贝塞尔采样。步数按 96×96 的采样网格定：24 步在
+            // 最大的一圈上每步约 7 个采样像素，肉眼已经看不出多边形。
+            void AddCubic(List<Vector2> points, Vector2 start, Vector2 control1,
+                Vector2 control2, Vector2 end)
+            {
+                const int steps = 24;
+                for (int i = 1; i <= steps; i++)
+                {
+                    float t = i / (float)steps;
+                    float u = 1f - t;
+                    points.Add(u * u * u * start
+                        + 3f * u * u * t * control1
+                        + 3f * u * t * t * control2
+                        + t * t * t * end);
+                }
+            }
+
+            void AddCircle(List<Vector2> points, float centerX, float centerY, float radius)
+            {
+                const int steps = 64;
+                for (int i = 0; i < steps; i++)
+                {
+                    float angle = i * Mathf.PI * 2f / steps;
+                    points.Add(new Vector2(centerX + Mathf.Cos(angle) * radius,
+                        centerY + Mathf.Sin(angle) * radius));
+                }
+            }
+
+            // ---- 子路径 1：定位针外沿（尖端朝下）----
+            var pinOuter = new List<Vector2>(96);
+            pinOuter.Add(new Vector2(512f, 0f));
+            AddCubic(pinOuter, new Vector2(512f, 0f),
+                new Vector2(744.374857f, 0f), new Vector2(928.914286f, 195.072f),
+                new Vector2(928.914286f, 427.008f));
+            AddCubic(pinOuter, new Vector2(928.914286f, 427.008f),
+                new Vector2(928.914286f, 656.530286f), new Vector2(761.417143f, 883.2f),
+                new Vector2(537.526857f, 1009.6f));
+            pinOuter.Add(new Vector2(512f, 1024f)); // 针尖
+            pinOuter.Add(new Vector2(486.473143f, 1009.6f));
+            AddCubic(pinOuter, new Vector2(486.473143f, 1009.6f),
+                new Vector2(262.582857f, 883.2f), new Vector2(95.085714f, 656.530286f),
+                new Vector2(95.085714f, 427.008f));
+            AddCubic(pinOuter, new Vector2(95.085714f, 427.008f),
+                new Vector2(95.085714f, 195.072f), new Vector2(279.625143f, 0f),
+                new Vector2(512f, 0f));
+
+            // ---- 子路径 2：定位针内沿（外沿内缩约 101.7）----
+            var pinInner = new List<Vector2>(96);
+            var innerStart = new Vector2(512f, 101.668571f);
+            pinInner.Add(innerStart);
+            AddCubic(pinInner, innerStart,
+                new Vector2(340.699429f, 101.668571f), new Vector2(198f, 246.930285f),
+                new Vector2(198f, 427.008f));
+            AddCubic(pinInner, new Vector2(198f, 427.008f),
+                new Vector2(198f, 601.673143f), new Vector2(323.659429f, 790.235429f),
+                new Vector2(512f, 906.313143f));
+            AddCubic(pinInner, new Vector2(512f, 906.313143f),
+                new Vector2(700.342857f, 790.235429f), new Vector2(826f, 601.673143f),
+                new Vector2(826f, 427.008f));
+            AddCubic(pinInner, new Vector2(826f, 427.008f),
+                new Vector2(826f, 246.857143f), new Vector2(683.300571f, 101.668571f),
+                new Vector2(512f, 101.668571f));
+
+            // ---- 子路径 3 / 4：中间圆环的外圈与内圈 ----
+            // 圆心在定位针头部中心，半径 177.81 / 76.215。
+            var ringOuter = new List<Vector2>(64);
+            var ringInner = new List<Vector2>(64);
+            AddCircle(ringOuter, 512f, 420.425f, 177.81f);
+            AddCircle(ringInner, 512f, 420.425f, 76.215f);
+
+            List<Vector2>[] contours = { pinOuter, pinInner, ringOuter, ringInner };
+
+            // 「定位到播放头」那版：整根针缩到 88%、往下挪一点，
+            // 针尖停在横线上方而不是压住它。这里只算缩放参数 ——
+            // 采样时做逆变换，省得把两百多个顶点再复制一遍。
+            float pinScale = withBaseline ? 0.88f : 1f;
+            float pinTop = withBaseline ? 12.8f : 0f;
+
+            // 奇偶规则：落在这几个子路径里的次数是奇数就填。
+            // 针身带 = 外沿里 + 内沿外（1 次）；圆环带 = 外沿 + 内沿 +
+            // 圆环外圈（3 次）；圆环的孔 = 4 次，不填。
+            bool Inside(List<Vector2> polygon, float x, float y)
+            {
+                bool inside = false;
+                for (int i = 0, j = polygon.Count - 1; i < polygon.Count; j = i++)
+                {
+                    Vector2 a = polygon[i];
+                    Vector2 b = polygon[j];
+                    if ((a.y > y) != (b.y > y))
+                    {
+                        float t = (y - a.y) / (b.y - a.y);
+                        if (x < a.x + t * (b.x - a.x))
+                        {
+                            inside = !inside;
+                        }
+                    }
+                }
+                return inside;
+            }
+
+            bool[] on = new bool[big * big];
+            const float scale = 1024f / big;
+            for (int y = 0; y < big; y++)
+            {
+                // 纹理第 0 行是底边，而 SVG 的 y 轴朝下 —— 采样时翻一下，
+                // 针尖才会落在图标底部。
+                float sy = 1024f - (y + 0.5f) * scale;
+                for (int x = 0; x < big; x++)
+                {
+                    float sx = (x + 0.5f) * scale;
+                    // 逆变换回“未缩放的 1024 空间”再测子路径。
+                    float px = 512f + (sx - 512f) / pinScale;
+                    float py = (sy - pinTop) / pinScale;
+                    bool filled = false;
+                    for (int c = 0; c < contours.Length; c++)
+                    {
+                        if (Inside(contours[c], px, py))
+                        {
+                            filled = !filled;
+                        }
+                    }
+                    // 横线不参与缩放，直接在真实坐标里测；它和针身
+                    // 不重叠，所以异或不会抵消。
+                    if (withBaseline && sx >= 280f && sx <= 744f
+                        && sy >= 954f && sy <= 998f)
+                    {
+                        filled = !filled;
+                    }
+                    on[y * big + x] = filled;
+                }
+            }
+
+            Texture2D texture = new Texture2D(size, size, TextureFormat.RGBA32, false, true);
+            Color32[] pixels = new Color32[size * size];
+            const int perPixel = samples * samples;
+            for (int y = 0; y < size; y++)
+            {
+                for (int x = 0; x < size; x++)
+                {
+                    int hits = 0;
+                    for (int sy = 0; sy < samples; sy++)
+                    {
+                        int row = (y * samples + sy) * big + x * samples;
+                        for (int sx = 0; sx < samples; sx++)
+                        {
+                            if (on[row + sx])
+                            {
+                                hits++;
+                            }
+                        }
+                    }
+                    byte alpha = (byte)Mathf.RoundToInt(255f * hits / perPixel);
+                    pixels[y * size + x] = new Color32(255, 255, 255, alpha);
+                }
+            }
+
+            texture.SetPixels32(pixels);
+            texture.Apply();
+            texture.filterMode = FilterMode.Bilinear;
+            return Sprite.Create(texture, new Rect(0f, 0f, size, size),
+                new Vector2(0.5f, 0.5f), 100f);
         }
 
         /// <summary>
@@ -6008,93 +6403,41 @@ private static float MinimumPixelsPerSecond
             ApplyBlockDragRowFromPointer();
         }
 
-        /// <summary>切换「固定排版 / 自由排版」，固定时立刻重排一次。</summary>
+        /// <summary>
+        /// 把排版模式拨到指定值；固定时立刻重排一次。
+        ///
+        /// 设置窗口的两个分段按钮要能**直接指定**（而不是只能翻转），
+        /// 所以真正的活在这里，`ToggleFixedTimelineLayout` 只是包一层。
+        /// </summary>
+        internal void SetFixedTimelineLayout(bool fixedLayout)
+        {
+            if (Main.Settings == null || Main.Settings.FixedTimelineLayout == fixedLayout)
+            {
+                return;
+            }
+            Main.Settings.FixedTimelineLayout = fixedLayout;
+            Main.SaveSettings();
+            if (fixedLayout)
+            {
+                RepackRowsByTypePriority();
+                visualsDirty = true;
+            }
+            if (Main.Overlay != null)
+            {
+                Main.Overlay.SetTransientStatus(fixedLayout
+                    ? "排版：固定（按类型自动分层，Ctrl+L）"
+                    : "排版：自由（行号归你，Ctrl+L）");
+            }
+        }
+
+        /// <summary>切换「固定排版 / 自由排版」（Ctrl+L 走这里）。</summary>
         internal void ToggleFixedTimelineLayout()
         {
             if (Main.Settings == null)
             {
                 return;
             }
-            Main.Settings.FixedTimelineLayout = !Main.Settings.FixedTimelineLayout;
-            Main.SaveSettings();
-            if (Main.Settings.FixedTimelineLayout)
-            {
-                RepackRowsByTypePriority();
-                visualsDirty = true;
-            }
-            ApplyLayoutModeIcon();
-            if (Main.Overlay != null)
-            {
-                Main.Overlay.SetTransientStatus(Main.Settings.FixedTimelineLayout
-                    ? "排版：固定（按类型自动分层，Ctrl+L）"
-                    : "排版：自由（行号归你，Ctrl+L）");
-            }
-        }
-
-        private Button layoutModeButton;
-        private Sprite layoutModeSprite;
-
-        /// <summary>
-        /// 排版模式图标：三条横线。
-        /// 固定 = 三条**错落**（上长下短，表示按类型分层）+ 强调色；
-        /// 自由 = 三条等长 + 弱化色。
-        /// </summary>
-        private void ApplyLayoutModeIcon()
-        {
-            if (layoutModeButton == null)
-            {
-                return;
-            }
-            bool fixedLayout = FixedTimelineLayout;
-            Transform existing = layoutModeButton.transform.Find("LayoutIcon");
-            if (existing != null)
-            {
-                UnityEngine.Object.Destroy(existing.gameObject);
-            }
-            if (layoutModeSprite != null)
-            {
-                UnityEngine.Object.Destroy(layoutModeSprite);
-            }
-            const int w = 32;
-            const int h = 28;
-            Texture2D texture = new Texture2D(w, h, TextureFormat.RGBA32, false, true);
-            Color32[] pixels = new Color32[w * h];
-            void Fill(int x0, int y0, int x1, int y1)
-            {
-                for (int y = y0; y <= y1; y++)
-                {
-                    for (int x = x0; x <= x1; x++)
-                    {
-                        if (x >= 0 && y >= 0 && x < w && y < h)
-                        {
-                            pixels[y * w + x] = new Color32(255, 255, 255, 255);
-                        }
-                    }
-                }
-            }
-            if (fixedLayout)
-            {
-                Fill(6, 7, 25, 9);
-                Fill(6, 13, 21, 15);
-                Fill(6, 19, 17, 21);
-            }
-            else
-            {
-                Fill(6, 7, 25, 9);
-                Fill(6, 13, 25, 15);
-                Fill(6, 19, 25, 21);
-            }
-            texture.SetPixels32(pixels);
-            texture.Apply(false, true);
-            layoutModeSprite = Sprite.Create(texture, new Rect(0f, 0f, w, h),
-                new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect);
-            layoutModeSprite.hideFlags = HideFlags.HideAndDontSave;
-            Image icon = CreateImage("LayoutIcon",
-                layoutModeButton.GetComponent<RectTransform>(), 5f, 6f, 18f, 16f,
-                fixedLayout ? Palette.Accent : TextMuted);
-            icon.sprite = layoutModeSprite;
-            icon.preserveAspect = true;
-            icon.raycastTarget = false;
+            SetFixedTimelineLayout(!Main.Settings.FixedTimelineLayout);
         }
 
         /// <summary>当前是不是「固定排版」（类型优先级自动排）。</summary>
@@ -9168,7 +9511,9 @@ private static float MinimumPixelsPerSecond
             {
                 if (locatePlayheadSprite == null)
                 {
-                    locatePlayheadSprite = CreatePageSprite();
+                    // 同一枚定位针 + 针尖下一条横线：和跳转按钮成对，
+                    // 但一眼能看出这颗是“定位到播放头”。
+                    locatePlayheadSprite = CreateLocatePlayheadIconSprite();
                 }
                 if (locatePlayheadIcon.sprite != locatePlayheadSprite)
                 {
@@ -9324,55 +9669,6 @@ private static float MinimumPixelsPerSecond
                 new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect);
             sprite.hideFlags = HideFlags.HideAndDontSave;
             return sprite;
-        }
-
-        /// <summary>「定位到播放头」的图标：一条竖线（播放头）+ 指向它的箭头。</summary>
-        private static Sprite CreatePageSprite()
-        {
-            const int w = 24;
-            const int h = 22;
-            Texture2D tex = new Texture2D(w, h, TextureFormat.RGBA32, false, true);
-            Color32[] px = new Color32[w * h];
-            Color32 on = new Color32(255, 255, 255, 255);
-            Color32 off = new Color32(0, 0, 0, 0);
-            for (int i = 0; i < px.Length; i++)
-            {
-                px[i] = off;
-            }
-
-            int midY = h / 2;
-            for (int y = 4; y < h - 4; y++)
-            {
-                for (int x = 19; x <= 21; x++)
-                {
-                    px[y * w + x] = on;
-                }
-            }
-            // 箭杆
-            for (int x = 4; x <= 13; x++)
-            {
-                px[(midY - 1) * w + x] = on;
-                px[midY * w + x] = on;
-                px[(midY + 1) * w + x] = on;
-            }
-            // 箭头（朝右）
-            for (int i = 0; i <= 5; i++)
-            {
-                for (int t = -i; t <= i; t++)
-                {
-                    int x = 13 + i;
-                    int y = midY + t;
-                    if (x < w && y >= 0 && y < h)
-                    {
-                        px[y * w + x] = on;
-                    }
-                }
-            }
-
-            tex.SetPixels32(px);
-            tex.Apply();
-            tex.filterMode = FilterMode.Bilinear;
-            return Sprite.Create(tex, new Rect(0f, 0f, w, h), new Vector2(0.5f, 0.5f), 100f);
         }
 
         /// <summary>刷新「固定播放头」那颗按钮的图标：开 = 强调色，关 = 弱化色。</summary>

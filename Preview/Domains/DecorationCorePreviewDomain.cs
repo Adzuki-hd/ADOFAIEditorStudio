@@ -134,6 +134,11 @@ namespace ADOFAIEditorStudio.Preview.Domains
             internal MaskingType FrameMasking;
             internal bool FrameVisible;
             internal float FrameOpacity;
+            /// <summary>
+            /// 本帧算出来的视差（百分比）。种子可能是 0，事件才算数，
+            /// 所以每帧都要把本帧值存下来给视差重算和探针用。
+            /// </summary>
+            internal Vector2 FrameParallax;
 
 
             /// <summary>上次驱动 AO 遮罩合成刷新的帧号。</summary>
@@ -174,6 +179,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
             /// 每帧都有一个事件。
             /// </summary>
             internal string AppliedImage;
+            /// <summary>上次记「换图失败」的时间（探针用，避免每帧刷屏）。</summary>
+            internal float LastImageLogTime = -1000f;
 
             /// <summary>
             /// 装饰物创作时用的那张图，在有图片事件另行指定之前，
@@ -214,6 +221,105 @@ namespace ADOFAIEditorStudio.Preview.Domains
         private readonly System.Collections.Generic.List<int> maskCandidates
             = new System.Collections.Generic.List<int>(64);
 
+        // ── 装饰物探针 ────────────────────────────────────────────────────
+        //
+        // 只回答一个问题：**求值说该显示的装饰物，组件到底画没画？**
+        //
+        // 「不见了」有两种完全不同的原因：
+        //   1. 求值把它判成隐藏（事件链 / 遮罩算错）；
+        //   2. 求值要它显示，但 sprite 被清空、renderer 被关、mesh 路径没开。
+        // 画面上看起来一模一样，日志里必须分开。所以这里只在「模型可见 + 实际没画」
+        // 时记一行，恢复时再记一行，其余一概不写（否则 500 多件每帧都刷屏）。
+        private sealed class ProbeEntry
+        {
+            internal bool Missing;
+            internal float LastLogTime;
+        }
+
+        private readonly System.Collections.Generic.Dictionary<int, ProbeEntry> probeEntries
+            = new System.Collections.Generic.Dictionary<int, ProbeEntry>();
+        private float probeSummaryTime = -1000f;
+        private bool lastLegacyMaskSetting = true;
+        private bool simplifyMaskApplied;
+
+        /// <summary>当前活着的预览实例。设置窗口那颗「导出装饰物状态」按钮要用。</summary>
+        private static DecorationCorePreviewDomain activeInstance;
+
+        /// <summary>
+        /// 把当前这一帧所有装饰物的「模型状态 + 组件状态」整份写进日志。
+        ///
+        /// 探针只报异常，导出是给"某一段整片不见了"用的：拖到出问题的那一格，
+        /// 点一次按钮，日志里就有 500 多行完整对照 —— 哪些是模型判了隐藏
+        /// （opacity/scale/visible 是 0），哪些是模型要它显示但 sprite 已经是 null，
+        /// 一眼能分开。
+        /// </summary>
+        internal static void DumpAll()
+        {
+            if (activeInstance == null)
+            {
+                Main.Logger.Log("[DecoProbe] 预览没在跑，无法导出装饰物状态。");
+                return;
+            }
+            activeInstance.DumpStates();
+        }
+
+        private void DumpStates()
+        {
+            Main.Logger.Log("[DecoProbe] 导出：共 " + states.Count + " 件（模型 + 组件）");
+            for (int i = 0; i < states.Count; i++)
+            {
+                DecorationState state = states[i];
+                scrDecoration decoration = state == null ? null : state.Decoration;
+                if (decoration == null)
+                {
+                    continue;
+                }
+                scrVisualDecoration visual = decoration as scrVisualDecoration;
+                SpriteRenderer renderer = visual == null ? null : visual.spriteRenderer;
+                SpriteAlphaMask mask = visual == null ? null : visual.spriteAlphaMask;
+                string tag = decoration.sourceLevelEvent == null
+                    ? "?"
+                    : AuthorString(decoration.sourceLevelEvent, "tag", "?");
+                // 排序层 + 屏幕矩形：判断「谁压在轨道上」靠这两项，
+                // 只看模型值分不出遮挡。
+                string sorting = renderer == null
+                    ? "-"
+                    : renderer.sortingLayerName + ":" + renderer.sortingOrder;
+                string screenRect = "-";
+                Camera camera = scrCamera.instance == null ? null : scrCamera.instance.camobj;
+                if (renderer != null && camera != null)
+                {
+                    Bounds worldBounds = renderer.bounds;
+                    Vector3 minimum = camera.WorldToScreenPoint(worldBounds.min);
+                    Vector3 maximum = camera.WorldToScreenPoint(worldBounds.max);
+                    screenRect = minimum.x.ToString("0") + "," + minimum.y.ToString("0")
+                        + "~" + maximum.x.ToString("0") + "," + maximum.y.ToString("0");
+                }
+                Main.Logger.Log("[DecoProbe] #" + i
+                    + " tag=" + tag
+                    + " image=" + (state.AppliedImage ?? "")
+                    + " floor=" + state.CreationFloor
+                    + " 模型(visible=" + state.FrameVisible
+                    + " opacity=" + state.FrameOpacity.ToString("F2")
+                    + " scale=" + state.AppliedScale.x.ToString("F2") + "x"
+                    + state.AppliedScale.y.ToString("F2")
+                    + " depth=" + state.AppliedDepth
+                    + " masking=" + state.FrameMasking
+                    + " placement=" + state.AppliedPlacement + ")"
+                    + " 组件(active=" + (decoration.gameObject != null
+                        && decoration.gameObject.activeInHierarchy)
+                    + " renderer=" + (renderer == null ? "无" : (renderer.enabled ? "开" : "关"))
+                    + " sprite=" + (renderer == null || renderer.sprite == null
+                        ? "null" : renderer.sprite.name)
+                    + " mesh=" + (visual != null && visual.meshRendererObj != null
+                        && visual.meshRendererObj.activeSelf ? "画" : "关")
+                    + " spriteMask=" + (mask == null ? "无" : (mask.enabled ? "开" : "关"))
+                    + " sort=" + sorting
+                    + " rect=" + screenRect
+                    + ").");
+            }
+        }
+
         /// <summary>单次求值允许改写的遮罩件数上限（分摊 O(n) 的缓存重算）。</summary>
         private const int MaskWritesPerEval = 8;
 
@@ -246,6 +352,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
         public void Analyze(PreviewTimelineContext context)
         {
+            activeInstance = this;
             // **把原生切到老遮罩管线，只切一次。**
             //
             // V15 管线对每件可见遮罩件逐帧重合成 RT（`ApplyAlphaMaskToRT`），
@@ -254,7 +361,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
             //
             // **必须只切一次**：这是全局位，逐帧对齐会让管理器反复重建装饰物的
             // 着色路径 —— 那是我之前引入过一次 120~150ms/帧的回归。
-            ApplyLegacyMaskPipeline(true);
+            ApplyLegacyMaskPipeline(Main.Settings == null || Main.Settings.UseLegacySpriteMask);
+            lastLegacyMaskSetting = Main.Settings == null || Main.Settings.UseLegacySpriteMask;
 
             // **分析过就一定要重画一次。**
             //
@@ -267,6 +375,13 @@ namespace ADOFAIEditorStudio.Preview.Domains
             lastEvaluatedFrame = -1000;
 
             states.Clear();
+            // **遮罩候选也要清。** 这个列表以前只增不清：每重分析一次就多塞
+            // 一份同样内容的旧 state，里面还引用着上一次会话的组件。
+            // ApplyMaskPass 每帧只有 8 次预算，旧条目越多，真正该更新的遮罩
+            // 越可能轮不到 —— 表现就是遮罩件停在旧尺寸上。
+            maskCandidateStates.Clear();
+            probeEntries.Clear();
+            simplifyMaskApplied = false;
             scrDecorationManager manager = scrDecorationManager.instance;
             if (manager == null || manager.allDecorations == null)
             {
@@ -475,6 +590,21 @@ namespace ADOFAIEditorStudio.Preview.Domains
             lastEvaluatedFrame = Time.frameCount;
             hasEvaluated = true;
             lastEvaluatedTime = frameTime;
+
+            // 设置里切「旧版遮罩」要当场生效（否则得重开工作台）。
+            // 只在值真的变化时切换全局位 —— 每帧对齐会让管理器重建着色路径。
+            bool wantLegacyMask = Main.Settings == null || Main.Settings.UseLegacySpriteMask;
+            if (wantLegacyMask != lastLegacyMaskSetting)
+            {
+                lastLegacyMaskSetting = wantLegacyMask;
+                ApplyLegacyMaskPipeline(wantLegacyMask);
+                for (int i = 0; i < states.Count; i++)
+                {
+                    states[i].HasVisibleApplied = false;
+                    states[i].MaskingApplied = false;
+                    states[i].MaskingDepthApplied = false;
+                }
+            }
 
             if (reseed)
             {
@@ -851,6 +981,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 state.FrameMasking = masking;
                 state.FrameVisible = visible;
                 state.FrameOpacity = opacity;
+                state.FrameParallax = parallax;
 
                 // **PACL2 式脏值门控**：这一帧算出来的值和上次写下去的一样，
                 // 就整件跳过 —— 后面所有写入（变换 / 可见性 / 遮罩）都不做。
@@ -1077,6 +1208,28 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     if (ApplyImage(decoration, imageFilename))
                     {
                         state.AppliedImage = imageFilename;
+                        state.LastImageLogTime = -1000f;
+                    }
+                    else if (Main.Settings != null && Main.Settings.DecorationProbe
+                        && frame.Time - state.LastImageLogTime >= 2f)
+                    {
+                        // 换图失败 = 画面停在上一张，看起来就是「这件装饰物不见了」。
+                        // 这里把「要的那张在 customSprites 里到底有没有」直接写出来，
+                        // 省得再猜是加载失败还是求值没发事件。
+                        state.LastImageLogTime = frame.Time;
+                        scrDecorationManager imageManager = scrDecorationManager.instance;
+                        TextureManager imageHolder = imageManager == null
+                            ? null : imageManager.imageHolder;
+                        bool present = imageHolder != null
+                            && imageHolder.customSprites != null
+                            && imageHolder.customSprites.ContainsKey(imageFilename);
+                        Main.Logger.Log("[DecoProbe] 换图失败 t=" + frame.Time.ToString("F3")
+                            + " tag=" + ProbeTag(state)
+                            + " 需要=" + (imageFilename ?? "")
+                            + " 已加载=" + present
+                            + " 当前=" + (state.AppliedImage ?? "")
+                            + " 图库=" + (imageHolder == null || imageHolder.customSprites == null
+                                ? "无" : imageHolder.customSprites.Count.ToString()) + ".");
                     }
                     statImageTicks += System.Diagnostics.Stopwatch.GetTimestamp() - imgStart;
                 }
@@ -1101,7 +1254,50 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 }
             }
 
+            // **视差每帧都要重算。**
+            //
+            // 原生 `scrParallax` 在自定义谱面里被 `Awake` 关掉了组件，位置只在
+            // `UpdatePosition()` 时算一次。相机一移动，挂在上面的装饰物就停在
+            // 旧位置 —— 对 100% 视差的遮罩（本谱 p2.5）来说，它不再盖住画面，
+            // 被它裁的 VisibleInsideMask 背景（p2.0.1 = cyan）就整片消失。
+            //
+            // 这里按原生 UpdatePosition 的同一组输入补一次 SetTrans：
+            // startPosition / posCamAtStart 都是「这件装饰物的落点」，
+            // 不是相机位置（原生那行就是这么写的，别被名字骗了）。
+            for (int i = 0; i < states.Count; i++)
+            {
+                DecorationState state = states[i];
+                scrDecoration decoration = state == null ? null : state.Decoration;
+                if (decoration == null || decoration.parallax == null)
+                {
+                    continue;
+                }
+                if (state.FrameParallax.x == 0f && state.FrameParallax.y == 0f)
+                {
+                    continue;
+                }
+                Vector2 anchor = state.HasTransformApplied ? state.AppliedPosition : state.Position;
+                decoration.parallax.SetNewStartPosition(anchor);
+                decoration.parallax.posCamAtStart = anchor;
+                decoration.parallax.SetTrans();
+            }
+
             ApplyMaskPass(frame);
+            // **探针绝不能让求值器停摆。** 它抛一次异常，引擎就会把整个
+            // DecorationCore 域停用，画面直接少一大片 —— 比它要查的 bug 更糟。
+            try
+            {
+                ProbeDecorations(frame);
+            }
+            catch (Exception exception)
+            {
+                Main.Logger.Warning("[DecoProbe] 探针异常，已自动关闭：" + exception.Message);
+                if (Main.Settings != null)
+                {
+                    Main.Settings.DecorationProbe = false;
+                }
+                probeEntries.Clear();
+            }
         }
 
         private static bool ApplyImage(scrDecoration decoration, string filename)
@@ -1196,6 +1392,12 @@ namespace ADOFAIEditorStudio.Preview.Domains
             }
 
             states.Clear();
+            maskCandidateStates.Clear();
+            probeEntries.Clear();
+            if (activeInstance == this)
+            {
+                activeInstance = null;
+            }
         }
 
         private static Dictionary<string, List<MoveEvent>> BuildTaggedEvents(PreviewTimelineContext context)
@@ -1281,7 +1483,42 @@ namespace ADOFAIEditorStudio.Preview.Domains
         {
             if (Main.Settings == null || Main.Settings.SimplifyDecorationMasks)
             {
+                // **「简化遮罩」必须真的把裁剪关掉。**
+                //
+                // 原来这里只是 return，遮罩类型就不再写下去 —— 但组件上的
+                // `maskInteraction` 还停在加载时的 VisibleInsideMask，
+                // 等于什么都没简化：该被裁掉的照样被裁。
+                if (!simplifyMaskApplied)
+                {
+                    simplifyMaskApplied = true;
+                    for (int i = 0; i < states.Count; i++)
+                    {
+                        DecorationState state = states[i];
+                        scrVisualDecoration visual = state == null
+                            ? null : state.Decoration as scrVisualDecoration;
+                        if (visual == null || visual.isMask())
+                        {
+                            continue;
+                        }
+                        if (visual.spriteRenderer != null)
+                        {
+                            visual.spriteRenderer.maskInteraction = SpriteMaskInteraction.None;
+                        }
+                    }
+                    Main.Logger.Log("[StaticPreview/DecorationCore] 遮罩裁剪已整体关闭（简化遮罩）");
+                }
                 return;
+            }
+            if (simplifyMaskApplied)
+            {
+                // 关掉简化之后，让下一轮把每件的遮罩类型重新写一遍。
+                simplifyMaskApplied = false;
+                for (int i = 0; i < states.Count; i++)
+                {
+                    states[i].MaskingApplied = false;
+                    states[i].MaskingDepthApplied = false;
+                    states[i].HasVisibleApplied = false;
+                }
             }
             int budget = 8;
             for (int i = 0; i < maskCandidateStates.Count && budget > 0; i++)
@@ -1308,6 +1545,308 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 state.MaskingApplied = true;
                 budget--;
             }
+        }
+
+        /// <summary>
+        /// 装饰物探针：模型说该显示、组件却没画时记一行；恢复时再记一行。
+        ///
+        /// 判据刻意只看**渲染结果**（spriteRenderer 有没有开、sprite 在不在、
+        /// mesh 路径有没有在画），不读 `GetVisible()` —— 后者把 alpha 折进去了，
+        /// 正好会把「不透明度 0」误报成「组件坏了」。
+        /// </summary>
+        private void ProbeDecorations(PreviewEvaluationFrame frame)
+        {
+            if (Main.Settings == null || !Main.Settings.DecorationProbe)
+            {
+                if (probeEntries.Count > 0)
+                {
+                    probeEntries.Clear();
+                }
+                return;
+            }
+
+            int visibleCount = 0;
+            int drawnCount = 0;
+            int missingCount = 0;
+            for (int i = 0; i < states.Count; i++)
+            {
+                DecorationState state = states[i];
+                scrDecoration decoration = state == null ? null : state.Decoration;
+                scrVisualDecoration visual = decoration as scrVisualDecoration;
+                // 粒子没有 spriteRenderer；遮罩件本来就不画本体 —— 都不在这个判据里。
+                if (visual == null || visual.isMask())
+                {
+                    continue;
+                }
+
+                bool wantShown = state.FrameVisible
+                    && state.FrameOpacity > 0.02f
+                    && state.AppliedScale.x > 0.001f
+                    && state.AppliedScale.y > 0.001f;
+                if (wantShown)
+                {
+                    visibleCount++;
+                }
+
+                SpriteRenderer renderer = visual.spriteRenderer;
+                bool active = visual.gameObject.activeInHierarchy;
+                bool spriteDrawing = active && renderer != null
+                    && renderer.enabled && renderer.sprite != null;
+                bool meshDrawing = active && visual.meshRendererObj != null
+                    && visual.meshRendererObj.activeSelf;
+                bool drawing = spriteDrawing || meshDrawing;
+                if (drawing)
+                {
+                    drawnCount++;
+                }
+
+                int id = decoration.GetInstanceID();
+                ProbeEntry entry;
+                if (!probeEntries.TryGetValue(id, out entry))
+                {
+                    entry = new ProbeEntry { LastLogTime = -1000f };
+                    probeEntries.Add(id, entry);
+                }
+
+                if (!wantShown || drawing)
+                {
+                    if (entry.Missing)
+                    {
+                        entry.Missing = false;
+                        ProbeLog(frame, state, visual, renderer, meshDrawing, "恢复");
+                    }
+                    continue;
+                }
+
+                missingCount++;
+                bool wasMissing = entry.Missing;
+                entry.Missing = true;
+                if (wasMissing && frame.Time - entry.LastLogTime < 1.5f)
+                {
+                    continue;
+                }
+                entry.LastLogTime = frame.Time;
+                ProbeLog(frame, state, visual, renderer, meshDrawing, "缺失");
+            }
+
+            if (frame.Time - probeSummaryTime >= 2f)
+            {
+                probeSummaryTime = frame.Time;
+                string visibleTags = string.Empty;
+                string maskTags = string.Empty;
+                string clipTags = string.Empty;
+                for (int i = 0; i < states.Count; i++)
+                {
+                    DecorationState state = states[i];
+                    bool summaryShown = state.FrameVisible
+                        && state.FrameOpacity > 0.02f
+                        && state.AppliedScale.x > 0.001f
+                        && state.AppliedScale.y > 0.001f;
+                    if (summaryShown)
+                    {
+                        scrVisualDecoration summaryVisual = state.Decoration as scrVisualDecoration;
+                        SpriteRenderer summaryRenderer = summaryVisual == null
+                            ? null : summaryVisual.spriteRenderer;
+                        Vector3 world = state.Decoration.pivotTrans == null
+                            ? Vector3.zero
+                            : state.Decoration.pivotTrans.position;
+                        // 第三个数字是 Unity 自己的 isVisible：0 表示模型要它显示、
+                        // 引擎却判定它不在任何相机的画面里（位置飞了，或被裁掉）。
+                        visibleTags += ProbeTag(state) + "("
+                            + state.AppliedScale.x.ToString("0.##") + ","
+                            + (summaryRenderer == null ? "无" : (summaryRenderer.isVisible ? "1" : "0"))
+                            + "," + world.x.ToString("0") + "," + world.y.ToString("0")
+                            + ",L" + summaryVisual.gameObject.layer
+                            + ":" + (summaryRenderer == null ? "?" : summaryRenderer.sortingLayerName)
+                            + ":" + (summaryRenderer == null ? "?" : summaryRenderer.sortingOrder.ToString())
+                            + ") ";
+                        if (state.FrameMasking == MaskingType.VisibleInsideMask)
+                        {
+                            // 被遮罩裁的件：`isVisible` 看不出来（遮罩是 shader/RT 层的），
+                            // 只能自己算它和每片遮罩的世界包围盒有没有交集。
+                            clipTags += ProbeTag(state) + "(" + ProbeMaskCoverage(state) + ") ";
+                        }
+                    }
+                    if (state.Masking != MaskingType.Mask || state.Decoration == null)
+                    {
+                        continue;
+                    }
+                    // 遮罩件自己也要对账：模型给的缩放 vs 组件上真实的缩放。
+                    // 两者不一致 = 遮罩尺寸没写下去，被它裁的装饰物会整片消失。
+                    Vector3 componentScale = state.Decoration.pivotTrans == null
+                        ? Vector3.zero
+                        : state.Decoration.pivotTrans.localScale;
+                    bool? enabled = ProbeMaskEnabled(state.Decoration as scrVisualDecoration);
+                    Vector3 maskWorld = state.Decoration.pivotTrans == null
+                        ? Vector3.zero
+                        : state.Decoration.pivotTrans.position;
+                    maskTags += ProbeTag(state)
+                        + "(模型=" + state.AppliedScale.x.ToString("0.##")
+                        + " 组件=" + componentScale.x.ToString("0.##")
+                        + " mask=" + (enabled.HasValue ? (enabled.Value ? "开" : "关") : "无")
+                        + " pos=" + maskWorld.x.ToString("0") + "," + maskWorld.y.ToString("0")
+                        + " par=" + state.FrameParallax.x.ToString("0.##")
+                        + " visible=" + state.FrameVisible + ") ";
+                }
+                Main.Logger.Log("[DecoProbe] 汇总 t=" + frame.Time.ToString("F2")
+                    + " 共" + states.Count + " 模型可见=" + visibleCount
+                    + " 实际在画=" + drawnCount + " 缺失=" + missingCount
+                    + " | 可见: " + visibleTags);
+                if (maskTags.Length > 0)
+                {
+                    Main.Logger.Log("[DecoProbe] 遮罩 t=" + frame.Time.ToString("F2")
+                        + " " + maskTags);
+                }
+                if (clipTags.Length > 0)
+                {
+                    Main.Logger.Log("[DecoProbe] 遮罩裁剪 t=" + frame.Time.ToString("F2")
+                        + " " + clipTags);
+                }
+            }
+        }
+
+        private static string ProbeTag(DecorationState state)
+        {
+            return state == null || state.Decoration == null
+                || state.Decoration.sourceLevelEvent == null
+                ? "?"
+                : AuthorString(state.Decoration.sourceLevelEvent, "tag", "?");
+        }
+
+        /// <summary>
+        /// 算一件 VisibleInsideMask 装饰物和每片遮罩的世界包围盒关系。
+        ///
+        /// 遮罩裁剪发生在 shader / RT 层，`Renderer.isVisible` 完全看不出来，
+        /// 所以只能自己比尺寸。返回「命中几片 + 最近那片的信息」，
+        /// 命中 0 就是「模型说该显示、但没有任何遮罩会露出它」。
+        /// </summary>
+        private string ProbeMaskCoverage(DecorationState state)
+        {
+            scrVisualDecoration visual = state.Decoration as scrVisualDecoration;
+            if (visual == null || visual.spriteRenderer == null
+                || visual.spriteRenderer.sprite == null || visual.pivotTrans == null)
+            {
+                return "尺寸未知";
+            }
+
+            Vector3 decoScale = visual.pivotTrans.lossyScale;
+            Vector3 decoBounds = visual.spriteRenderer.sprite.bounds.size;
+            Vector2 decoCenter = visual.pivotTrans.position;
+            Vector2 decoSize = new Vector2(
+                Mathf.Abs(decoBounds.x * decoScale.x),
+                Mathf.Abs(decoBounds.y * decoScale.y));
+
+            int hits = 0;
+            float best = float.MaxValue;
+            string nearest = string.Empty;
+            for (int i = 0; i < states.Count; i++)
+            {
+                DecorationState mask = states[i];
+                if (mask == null || mask.Masking != MaskingType.Mask)
+                {
+                    continue;
+                }
+                scrVisualDecoration maskVisual = mask.Decoration as scrVisualDecoration;
+                if (maskVisual == null || maskVisual.spriteRenderer == null
+                    || maskVisual.spriteRenderer.sprite == null || maskVisual.pivotTrans == null)
+                {
+                    continue;
+                }
+                bool? enabled = ProbeMaskEnabled(maskVisual);
+                if (enabled.HasValue && !enabled.Value)
+                {
+                    continue;
+                }
+
+                Vector3 maskScale = maskVisual.pivotTrans.lossyScale;
+                Vector3 maskBounds = maskVisual.spriteRenderer.sprite.bounds.size;
+                Vector2 maskCenter = maskVisual.pivotTrans.position;
+                Vector2 maskSize = new Vector2(
+                    Mathf.Abs(maskBounds.x * maskScale.x),
+                    Mathf.Abs(maskBounds.y * maskScale.y));
+                if (maskSize.x < 0.01f || maskSize.y < 0.01f)
+                {
+                    // 尺寸为 0 的遮罩什么都盖不住，不能算命中
+                    // （之前 0x0 的遮罩因为中心重合被当成命中，掩盖了真问题）。
+                    continue;
+                }
+
+                // 轴对齐矩形的最短距离（忽略旋转；这里只用来判断「有没有可能盖住」）。
+                float gapX = Mathf.Max(0f,
+                    Mathf.Abs(decoCenter.x - maskCenter.x) - (decoSize.x + maskSize.x) * 0.5f);
+                float gapY = Mathf.Max(0f,
+                    Mathf.Abs(decoCenter.y - maskCenter.y) - (decoSize.y + maskSize.y) * 0.5f);
+                float distance = Mathf.Sqrt(gapX * gapX + gapY * gapY);
+                if (distance <= 0f)
+                {
+                    hits++;
+                }
+                if (distance < best)
+                {
+                    best = distance;
+                    nearest = ProbeTag(mask) + "@" + maskCenter.x.ToString("0") + ","
+                        + maskCenter.y.ToString("0") + " 尺寸="
+                        + maskSize.x.ToString("0") + "x" + maskSize.y.ToString("0");
+                }
+            }
+
+            return "命中=" + hits + " " +
+                (nearest.Length == 0 ? "无遮罩" : "最近=" + nearest + " 距=" + best.ToString("0"));
+        }
+
+        private static readonly FieldInfo SpriteMaskFieldInfo =
+            typeof(scrVisualDecoration).GetField("spriteMask",
+                BindingFlags.Public | BindingFlags.Instance);
+        /// <summary>
+        /// 读老管线那颗 SpriteMask 的 enabled。类型在 UnityEngine.SpriteMaskModule
+        /// 里、本工程没有引用那个模块（直接写类型名会 CS1069），只能走反射。
+        ///
+        /// **必须按 Renderer 强转**：SpriteMask 继承的是 Renderer，不是 Behaviour；
+        /// 走 PropertyInfo 或按 Behaviour 转都会失败（前者还会抛
+        /// InvalidCastException，把整个装饰物域停掉）。
+        /// </summary>
+        private static bool? ProbeMaskEnabled(scrVisualDecoration visual)
+        {
+            if (visual == null || SpriteMaskFieldInfo == null)
+            {
+                return null;
+            }
+            try
+            {
+                Renderer maskRenderer = SpriteMaskFieldInfo.GetValue(visual) as Renderer;
+                return maskRenderer == null ? (bool?)null : maskRenderer.enabled;
+            }
+            catch (Exception)
+            {
+                // 读不到就算了：这一格显示「无」，不影响别的诊断。
+                return null;
+            }
+        }
+
+        private static void ProbeLog(PreviewEvaluationFrame frame, DecorationState state,
+            scrVisualDecoration visual, SpriteRenderer renderer, bool meshDrawing, string status)
+        {
+            string tag = state.Decoration.sourceLevelEvent == null
+                ? "?"
+                : AuthorString(state.Decoration.sourceLevelEvent, "tag", "?");
+            SpriteAlphaMask mask = visual.spriteAlphaMask;
+            Main.Logger.Log("[DecoProbe] " + status
+                + " t=" + frame.Time.ToString("F3")
+                + " tag=" + tag
+                + " image=" + (state.AppliedImage ?? "")
+                + " 模型(visible=" + state.FrameVisible
+                + " opacity=" + state.FrameOpacity.ToString("F2")
+                + " scale=" + state.AppliedScale.x.ToString("F2") + "x"
+                + state.AppliedScale.y.ToString("F2")
+                + " depth=" + state.AppliedDepth
+                + " masking=" + state.FrameMasking + ")"
+                + " 组件(active=" + visual.gameObject.activeInHierarchy
+                + " renderer=" + (renderer == null ? "无" : (renderer.enabled ? "开" : "关"))
+                + " sprite=" + (renderer == null || renderer.sprite == null
+                    ? "null" : renderer.sprite.name)
+                + " mesh=" + (meshDrawing ? "画" : "关")
+                + " spriteMask=" + (mask == null ? "无" : (mask.enabled ? "开" : "关"))
+                + ").");
         }
 
         private static void ApplyLegacyMaskPipeline(bool legacy)

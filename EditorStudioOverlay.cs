@@ -1596,6 +1596,9 @@ namespace ADOFAIEditorStudio
             }
             // 帧耗时诊断：开关关着时它内部第一行就返回。
             PreviewDiagnostics.Tick();
+            // 原版 / AES 双探针：F9 导出当前活着的装饰物状态。
+            // 放在编辑器 active 判断之前 —— 原版播放（非编辑器场景）时也要能按。
+            DecorationLiveDump.Tick();
             if (visible)
             {
                 LogLargeSurfacesOnce();
@@ -1734,7 +1737,7 @@ namespace ADOFAIEditorStudio
                 // 工作台一起消失，正看着的东西也没了 —— 那是两件事，退出得逐层来。
                 //
                 // 顺序按「谁在最上面」：粒子浮窗 → 创建工程 → 保存提示 →
-                // 说明 / 版本说明 → 关工作台。
+                // 设置窗口 → 说明 / 版本说明 → 关工作台。
                 //
                 // 前三个都不在 uGUI 那棵窗口树上（`OpenWindow` 只认说明与版本
                 // 两扇），所以得单独问一句。
@@ -1751,6 +1754,11 @@ namespace ADOFAIEditorStudio
                 {
                     // 同理：Esc 等于「取消」，那个动作就不做了。
                     AnswerConfirmSave(3);
+                }
+                else if (SettingsWindowVisible)
+                {
+                    // 设置窗口压在工台上，Esc 先关它 —— 和上面几层同一个规矩。
+                    CloseSettingsWindow();
                 }
                 else
                 {
@@ -1898,6 +1906,7 @@ namespace ADOFAIEditorStudio
             BuildLayer("更新窗口", delegate { BuildVersionWindow(designRoot); });
             BuildLayer("创建工程", delegate { BuildProjectCreateWindow(designRoot); });
             BuildLayer("保存提示", delegate { BuildConfirmSaveWindow(designRoot); });
+            BuildLayer("设置窗口", delegate { BuildSettingsWindow(designRoot); });
 
             built = true;
             // **按当前可见性决定激活，不要无条件关掉。**
@@ -1985,21 +1994,45 @@ namespace ADOFAIEditorStudio
             float x = 18f;
             x = AddMenuButton(parent, "文件", x, y, FileMenuEntries());
             x = AddMenuButton(parent, "工程", x, y, ProjectMenuEntries());
-            x = AddMenuButton(parent, "偏好", x, y, PreferenceMenuEntries());
-            AddMenuButton(parent, "设置", x, y, SettingsMenuEntries());
+            // 「偏好」已经并进设置窗口的左侧列表，这里的菜单按钮不再保留。
+            // 「设置」不再是下拉：点一下直接开窗口（用户 2026-10-26 的要求）。
+            AddMenuButton(parent, "设置", x, y, OpenSettingsWindow);
         }
 
         private float AddMenuButton(RectTransform parent, string name, float x, float y,
             System.Collections.Generic.List<MenuEntry> entries)
         {
+            // 下拉型：点一下开菜单，条目内容由 entries 决定。
+            return AddMenuButton(parent, name, x, y,
+                delegate { ToggleMenu(name, buttonRectOf[name], entries); }, entries);
+        }
+
+        /// <summary>
+        /// 直接干活的菜单按钮（现在的「设置」）：点一下不展开，直接调 onClick。
+        ///
+        /// 和下拉型共用同一套建按钮的代码 —— 两个如果各写一份，
+        /// 字号、内边距、注册到 buttonRectOf 的时机迟早会走样。
+        /// </summary>
+        private float AddMenuButton(RectTransform parent, string name, float x, float y,
+            System.Action onClick)
+        {
+            return AddMenuButton(parent, name, x, y, onClick, null);
+        }
+
+        private float AddMenuButton(RectTransform parent, string name, float x, float y,
+            System.Action onClick, System.Collections.Generic.List<MenuEntry> entries)
+        {
             const float width = 68f;
             TextMeshProUGUI label;
             Button button = CreateButton(name, parent, x, y + 3f, width, MenuBarHeight - 6f,
-                name, false, delegate { ToggleMenu(name, buttonRectOf[name], entries); }, out label);
+                name, false, onClick, out label);
             label.fontSize = 13f;
             label.color = TextPrimary;
             buttonRectOf[name] = button.GetComponent<RectTransform>();
-            menuEntries[name] = entries;
+            if (entries != null)
+            {
+                menuEntries[name] = entries;
+            }
             return x + width + 2f;
         }
 
@@ -2275,14 +2308,13 @@ namespace ADOFAIEditorStudio
             };
         }
 
-        private System.Collections.Generic.List<MenuEntry> PreferenceMenuEntries()
-        {
-            return new System.Collections.Generic.List<MenuEntry>
-            {
-                new MenuEntry { Label = "（开发中）", Placeholder = true },
-            };
-        }
-
+        /// <summary>
+        /// 「设置」下拉的旧内容。现在点「设置」直接开窗口，这份暂时没有入口。
+        ///
+        /// 里面那两个开发者开关和「清空媒体缓存」**仍然要能用到**，只是还没搬：
+        /// 等设置窗口的「常规设置」页接功能时，把它们挪进去或另给入口。
+        /// 在那之前原样留着 —— 删掉就等于把功能弄丢了。
+        /// </summary>
         private System.Collections.Generic.List<MenuEntry> SettingsMenuEntries()
         {
             var list = new System.Collections.Generic.List<MenuEntry>
@@ -2775,28 +2807,17 @@ namespace ADOFAIEditorStudio
             "<size=20><b>v" + ModVersion + " 更新内容</b></size>",
             "",
             "<b>新增</b>",
-            "<b>· 左下角入口按钮</b>：原生风格圆形按钮，贴在播放键右侧、底边对齐，随分辨率自适应；F8 仍可用。",
-            "<b>· 定位到播放头</b>（Ctrl+K）：把时间轴横向滚到播放头位置；自动翻页已取消。",
-            "<b>· 固定 / 自由排版</b>（Ctrl+L，标题行最右那颗）：固定 = 按事件类型顺序自动分层，自由 = 行号完全归你。",
-            "<b>· 高级滤镜「滤镜」下拉</b>：可滚动、名称走游戏本地化，写回仍是原始类名。",
+            "<b>· 「设置」改成窗口</b>：顶栏「设置」点一下直接开窗，左边是竖列（常规设置 / 偏好 / 开发者），右边是内容页。",
+            "<b>· 常规设置里多了「时间轴排版」</b>：一个开关（固定 / 自由），和原来的时间轴标题行按钮、Ctrl+L 是同一个状态。",
+            "<b>· 偏好</b>页暂时为空。",
+            "<b>· 开发者</b>页收排查用的开关：装饰物探针（默认关）、简化遮罩、旧版遮罩，以及「导出装饰物状态」按钮。",
+            "<b>· 关闭方式</b>：右上角 ×，或 Esc —— Esc 先关窗口，再按一次才退出工作台。",
             "",
-            "<b>改好的</b>",
-            "<b>· 拖动块跟手</b>：横向、纵向都跟；拖到视口边缘自动滚动。",
-            "<b>· 多选整批拖</b>：Ctrl 多选后一起换行，保持组内相对行距，一次 Ctrl+Z 全部退回。",
-            "<b>· 带偏移吸附</b>：整拍 / 整拍+原偏移 / 原位置三档，拖动时显示原位竖线。",
-            "<b>· 重叠描红</b>：拖到会重叠的位置描红边，松手整批回退。",
-            "<b>· Ctrl+S 一体保存</b>：谱面与排版（.aesprj）一起存；Ctrl+Alt+S 只存排版。",
+            "<b>调整</b>",
+            "<b>· 时间轴标题行的排版按钮已移入设置窗口</b>；顶栏的「偏好」菜单一并删除。",
             "",
-            "<b>修好的</b>",
-            "<b>· 大谱面滚动后块消失</b>：块对象池只增不复用，满上限就截断，已改为复用。",
-            "<b>· 末尾块滚不到</b>：横向范围按谱面时长算，已扩展到最后一个块。",
-            "<b>· 首次排版与「重置排版」不一致</b>：重排被残缺数据提前消耗，已修正。",
-            "<b>· 缩放上下限失效</b>：BPM 读不到时上下限一起变 0，已修正。",
-            "<b>· 禁用属性后不还原</b>：装饰物位置、MoveTrack 位置偏移勾掉后画面不回原位，已修正。",
-            "<b>· 固定播放头</b>：Shift+滚轮无响应、空格不能播放、中键拖动播放头漂移，已修正。",
-            "",
-            "<b>移除</b>",
-            "<b>· ImGui 全部删除</b>：最后四扇窗改为原生 uGUI，不再分发 cimgui.dll / ImGui.NET.dll，包体约 297 KB。",
+            "<b>注意</b>",
+            "<b>· 原来的「设置」下拉已取消</b>：里面两个开发者开关和「清空媒体缓存」暂时没有入口，下一步会搬进窗口。",
         });
 
         /// <summary>群号。ImGui 那扇说明窗口的标题也要用，所以是 internal。</summary>
@@ -2884,7 +2905,7 @@ namespace ADOFAIEditorStudio
             "   拖块改的时间，都能一次撤回。",
             "<b>· Ctrl+S 保存</b>：走原生 SaveLevel，存出来和原版逐字节一样；排版一起存进 .aesprj。",
             "<b>· 入口按钮</b>：编辑器左下角那颗圆形按钮（或 F8）打开工作台。",
-            "<b>· 固定 / 自由排版</b>（Ctrl+L）：固定按事件类型自动分层，自由由你拖。",
+            "<b>· 固定 / 自由排版</b>：设置窗口 → 常规设置，或 Ctrl+L。固定按事件类型自动分层，自由由你拖。",
             "",
             "<size=17><b>快捷键</b></size>",
             "<b>F8</b>                工作台开 / 关",
@@ -2948,7 +2969,443 @@ namespace ADOFAIEditorStudio
                 "点这里进 Q 群交流：" + QqGroupNumber, OpenQqGroup);
         }
 
+        // ---------------------------------------------------------- 设置窗口
+
+        // 用户要求（2026-10-26）：顶栏「设置」不再弹下拉，改成点一下就开一扇窗口；
+        // 窗口里**先只做壳** —— 左边竖列、右边空页，具体开关以后再往里搬。
+        //
+        // 先做壳的理由：窗口的层级、遮罩、Esc、关闭出口一改就动到整套弹窗的规矩。
+        // 把这些跑通、让用户看顺眼之后，功能再一页页填进来就不用推翻布局。
+
+        private const float SettingsCardWidth = 1040f;
+        private const float SettingsCardHeight = 700f;
+        private const float SettingsNavWidth = 232f;
+        private const float SettingsNavItemHeight = 38f;
+        private const float SettingsNavItemGap = 4f;
+
+        /// <summary>
+        /// 左列的分页顺序。以后加页只往这两个数组后面接 —— 顺序、标题、说明
+        /// 放在一起，免得"列表上有一项、右边却打开另一页"这种错位。
+        /// </summary>
+        private static readonly string[] SettingsPageTitles = { "常规设置", "偏好", "开发者" };
+        private static readonly string[] SettingsPageHints =
+        {
+            // 常规页有自己的控件（时间轴排版），这一行留空，不再写占位说明。
+            string.Empty,
+            "偏好暂时不收任何东西。",
+            // 开发者页的说明写在页面里（和常规页一样），这里留空。
+            string.Empty,
+        };
+
+        /// <summary>
+        /// 开发者页的分组小标题。探针和两个遮罩开关都是排查用的，
+        /// 平时不该出现在常规设置里 —— 用户一眼看过去会以为那是常用功能。
+        /// </summary>
+        private const string DeveloperSectionNote = "排查用开关，平时不用动。";
+
+        private RectTransform settingsWindowLayer;
+        private TextMeshProUGUI settingsPageTitle;
+        private TextMeshProUGUI settingsPageBody;
+        private RectTransform settingsGeneralPage;
+        private RectTransform settingsDeveloperPage;
+        private readonly System.Collections.Generic.List<Image> settingsNavFills
+            = new System.Collections.Generic.List<Image>();
+        private readonly System.Collections.Generic.List<TextMeshProUGUI> settingsNavLabels
+            = new System.Collections.Generic.List<TextMeshProUGUI>();
+        private int settingsPageIndex;
+
+        /// <summary>左列那块底：比卡片亮一档，窗口里才分得出"列表"和"内容"。</summary>
+        private static Color SettingsNavFill { get { return UiTheme.Current.SurfaceOverlay; } }
+
+        /// <summary>
+        /// 建「设置」窗口的壳：遮罩 + 居中卡片 + 左竖列 + 右侧空页。
+        ///
+        /// 遮罩和卡片都吃射线（和说明窗口同一套理由）：不吃的话点击会穿到
+        /// 后面的工作台上，在窗口底下偷偷改东西。关它只留两个出口 ——
+        /// 右上角 ×、Esc；点遮罩不关，免得手一滑点歪就没了。
+        /// </summary>
+        private void BuildSettingsWindow(RectTransform parent)
+        {
+            RectTransform layer = CreateTopLeftRect("SettingsLayer", parent,
+                0f, 0f, DesignWidth, DesignHeight);
+            layer.gameObject.SetActive(false);
+            settingsWindowLayer = layer;
+
+            Image shade = CreateTopLeftRect("SettingsShade", layer, 0f, 0f,
+                DesignWidth, DesignHeight).gameObject.AddComponent<Image>();
+            shade.color = new Color(0f, 0f, 0f, 0.55f);
+            shade.raycastTarget = true;
+
+            // 和另外几扇弹窗同一套壳：实心底、自己吃射线（见 CreateDialogCard）。
+            RectTransform card;
+            CreateDialogCard("SettingsCard", layer, SettingsCardWidth, SettingsCardHeight,
+                out card);
+
+            CreateText("SettingsTitle", card, 28f, 16f, 260f, 30f, "设置",
+                UiType.Title, AccentSecondary, TextAlignmentOptions.MidlineLeft, true);
+
+            TextMeshProUGUI closeLabel;
+            CreateButton("SettingsClose", card, SettingsCardWidth - 52f, 16f, 30f, 30f,
+                "×", false, CloseSettingsWindow, out closeLabel);
+            closeLabel.fontSize = UiType.Body;
+
+            float navTop = PanelHeadingRule + 20f;
+            float navHeight = SettingsCardHeight - navTop - 24f;
+
+            // 左列自己垫一层实心底：不垫的话，选中项那块高亮会像"飘在卡片上"，
+            // 看不出这一列是一个整体。这一层也要实色 —— 半透明的底会露出卡片色，
+            // 选中态就分不出深浅了。
+            Image navWell = CreateImage("SettingsNavWell", card, 24f, navTop,
+                SettingsNavWidth, navHeight, SettingsNavFill);
+            navWell.raycastTarget = true;
+
+            float itemX = 24f + 8f;
+            float itemWidth = SettingsNavWidth - 16f;
+            float itemY = navTop + 10f;
+            for (int index = 0; index < SettingsPageTitles.Length; index++)
+            {
+                // 闭包要按值捕获：直接写 index 的话每个按钮点下去都是最后一页。
+                int page = index;
+                RectTransform item = CreateTopLeftRect("SettingsNavItem" + index,
+                    card, itemX, itemY, itemWidth, SettingsNavItemHeight);
+                Image fill = item.gameObject.AddComponent<Image>();
+                fill.color = new Color(0f, 0f, 0f, 0f);
+                fill.raycastTarget = true;
+                Button button = item.gameObject.AddComponent<Button>();
+                button.targetGraphic = fill;
+                button.transition = Selectable.Transition.None;
+                button.navigation = new Navigation { mode = Navigation.Mode.None };
+                button.onClick.AddListener(delegate { SelectSettingsPage(page); });
+
+                TextMeshProUGUI itemLabel = CreateText("Label", item, 12f, 0f,
+                    itemWidth - 20f, SettingsNavItemHeight, SettingsPageTitles[index],
+                    UiType.BodyLg, TextSecondary, TextAlignmentOptions.MidlineLeft, false);
+                settingsNavFills.Add(fill);
+                settingsNavLabels.Add(itemLabel);
+                itemY += SettingsNavItemHeight + SettingsNavItemGap;
+            }
+
+            float contentX = 24f + SettingsNavWidth + 28f;
+            float contentWidth = SettingsCardWidth - contentX - 24f;
+            settingsPageTitle = CreateText("SettingsPageTitle", card, contentX,
+                navTop, contentWidth, 30f, string.Empty, UiType.Title, TextPrimary,
+                TextAlignmentOptions.MidlineLeft, true);
+            settingsPageBody = CreateText("SettingsPageBody", card, contentX,
+                navTop + 38f, contentWidth, 60f, string.Empty, 15f, TextMuted,
+                TextAlignmentOptions.TopLeft, false);
+            settingsPageBody.overflowMode = TextOverflowModes.Overflow;
+
+            // 「常规设置」的正文：时间轴排版这一行。
+            // 内容挂在独立容器里，切页时整块收起来，免得两页的控件叠在一起。
+            settingsGeneralPage = CreateTopLeftRect("SettingsGeneralPage", card,
+                contentX, navTop + 44f, contentWidth, 300f);
+            BuildSettingsGeneralPage(contentWidth);
+
+            // 「开发者」页：探针 / 简化遮罩 / 旧版遮罩 / 导出。
+            settingsDeveloperPage = CreateTopLeftRect("SettingsDeveloperPage", card,
+                contentX, navTop + 44f, contentWidth, 300f);
+            BuildSettingsDeveloperPage(contentWidth);
+
+            SelectSettingsPage(0);
+        }
+
+        /// <summary>
+        /// 「常规设置」页的正文。
+        ///
+        /// 只留真正会天天改的那一项（时间轴排版）。探针和两个遮罩开关
+        /// 是排查时才用的，已经挪到「开发者」页 —— 放在这里会让常规设置
+        /// 读起来像一张调试面板。
+        /// </summary>
+        private void BuildSettingsGeneralPage(float width)
+        {
+            // 开关本体照参数栏那套「生效」开关搭：46×22 的轨道 + 16 的方块，
+            // 亮 = 开、暗 = 关。**不用两个文字按钮** —— 那读起来像两条命令，
+            // 而这个东西始终只有一个状态。
+            AddSettingsSwitch(settingsGeneralPage, "时间轴排版", 0f, "固定", "自由",
+                delegate { return Main.Settings != null && Main.Settings.FixedTimelineLayout; },
+                ApplyLayoutMode);
+
+            TextMeshProUGUI hint = CreateText("LayoutHint", settingsGeneralPage,
+                0f, 46f, width - 8f, 80f,
+                "固定：按事件类型自动分层，自由：行号完全由你拖。\n"
+                + "排查用的开关（装饰物探针 / 简化遮罩 / 旧版遮罩）在「开发者」页。",
+                UiType.Body, TextMuted, TextAlignmentOptions.TopLeft, false);
+            hint.overflowMode = TextOverflowModes.Overflow;
+
+            RefreshSettingsSwitches();
+        }
+
+        /// <summary>
+        /// 「开发者」页：装饰物探针、两条遮罩逃生通道、导出装饰物状态。
+        ///
+        /// 这一页的开关只影响**预览怎么画**和日志写不写，不改谱面；
+        /// 所以放在设置里而不是时间轴工具栏上 —— 它们不是日常操作。
+        /// </summary>
+        private void BuildSettingsDeveloperPage(float width)
+        {
+            AddSettingsSwitch(settingsDeveloperPage, "装饰物探针", 0f, "开", "关",
+                delegate { return Main.Settings == null || Main.Settings.DecorationProbe; },
+                delegate (bool on)
+                {
+                    if (Main.Settings == null)
+                    {
+                        return;
+                    }
+                    Main.Settings.DecorationProbe = on;
+                    Main.SaveSettings();
+                });
+            // 遮罩的两条逃生通道：画面里「被裁掉的东西」排查时先关遮罩看看。
+            AddSettingsSwitch(settingsDeveloperPage, "简化遮罩", 40f, "开", "关",
+                delegate { return Main.Settings != null && Main.Settings.SimplifyDecorationMasks; },
+                delegate (bool on)
+                {
+                    if (Main.Settings == null)
+                    {
+                        return;
+                    }
+                    Main.Settings.SimplifyDecorationMasks = on;
+                    Main.SaveSettings();
+                });
+            AddSettingsSwitch(settingsDeveloperPage, "旧版遮罩", 80f, "开", "关",
+                delegate { return Main.Settings == null || Main.Settings.UseLegacySpriteMask; },
+                delegate (bool on)
+                {
+                    if (Main.Settings == null)
+                    {
+                        return;
+                    }
+                    Main.Settings.UseLegacySpriteMask = on;
+                    Main.SaveSettings();
+                });
+            AddSettingsSwitch(settingsDeveloperPage, "轨道探针", 120f, "开", "关",
+                delegate { return Main.Settings != null && Main.Settings.TrackProbe; },
+                delegate (bool on)
+                {
+                    if (Main.Settings == null)
+                    {
+                        return;
+                    }
+                    Main.Settings.TrackProbe = on;
+                    Main.SaveSettings();
+                });
+
+            TextMeshProUGUI hint = CreateText("DeveloperHint", settingsDeveloperPage,
+                0f, 166f, width - 8f, 110f,
+                DeveloperSectionNote + "\n"
+                + "探针：把「该显示却没画出来」的装饰物写进日志（默认开）。\n"
+                + "轨道探针：每 0.5 秒记录一遍轨道格的渲染器与屏幕坐标，用来查「轨道不见了」。\n"
+                + "简化遮罩：不裁剪，所有装饰物直接画；旧版遮罩：开 = SpriteMask，关 = V15 合成。",
+                UiType.Body, TextMuted, TextAlignmentOptions.TopLeft, false);
+            hint.overflowMode = TextOverflowModes.Overflow;
+
+            // 导出是给「整片不见了」用的：拖到出问题的格子点一次，
+            // 日志里就有全部装饰物的模型/组件对照。探针关着也能用。
+            TextMeshProUGUI dumpLabel;
+            CreateButton("DumpDecorations", settingsDeveloperPage, 0f, 268f, 180f, 32f,
+                "导出装饰物状态", false,
+                delegate { Preview.Domains.DecorationCorePreviewDomain.DumpAll(); },
+                out dumpLabel);
+            dumpLabel.fontSize = UiType.Body;
+
+            RefreshSettingsSwitches();
+        }
+
+        /// <summary>设置页里的一行开关。读/写都走委托，两个开关共用一套搭法。</summary>
+        private sealed class SettingsSwitch
+        {
+            internal Func<bool> Read;
+            internal Action<bool> Write;
+            internal string OnText;
+            internal string OffText;
+            internal TextMeshProUGUI State;
+            internal Image Track;
+            internal Image Knob;
+        }
+
+        private readonly System.Collections.Generic.List<SettingsSwitch> settingsSwitches
+            = new System.Collections.Generic.List<SettingsSwitch>();
+
+        /// <summary>
+        /// 加一行「标签 + 状态字 + 开关」。`page` 是这一行挂在哪一页的容器上，
+        /// y 是这一行在容器里的顶边距。
+        ///
+        /// 每次点击都重新读一遍再取反：开关的真实状态以 Settings 为准，
+        /// 不在 UI 里再存一份，否则 Ctrl+L 之类的外部改动会和界面对不上。
+        /// </summary>
+        private void AddSettingsSwitch(RectTransform page, string label, float y,
+            string onText, string offText, Func<bool> read, Action<bool> write)
+        {
+            if (page == null)
+            {
+                return;
+            }
+            int index = settingsSwitches.Count;
+            CreateText("SwitchLabel" + index, page, 0f, y, 96f, 34f,
+                label, UiType.BodyLg, TextPrimary, TextAlignmentOptions.MidlineLeft, false);
+
+            SettingsSwitch row = new SettingsSwitch
+            {
+                Read = read,
+                Write = write,
+                OnText = onText,
+                OffText = offText
+            };
+            row.State = CreateText("SwitchState" + index, page,
+                100f, y, 40f, 34f, string.Empty, UiType.Body, TextSecondary,
+                TextAlignmentOptions.MidlineLeft, false);
+
+            RectTransform track = CreateTopLeftRect("SwitchTrack" + index,
+                page, 144f, y + 6f, 46f, 22f);
+            row.Track = track.gameObject.AddComponent<Image>();
+            row.Track.raycastTarget = true;
+            Button button = track.gameObject.AddComponent<Button>();
+            button.targetGraphic = row.Track;
+            button.transition = Selectable.Transition.None;
+            button.navigation = new Navigation { mode = Navigation.Mode.None };
+            SettingsSwitch captured = row;
+            button.onClick.AddListener(delegate
+            {
+                captured.Write(!captured.Read());
+                RefreshSettingsSwitches();
+            });
+
+            row.Knob = CreateImage("SwitchKnob" + index, track, 3f, 3f, 16f, 16f, Accent);
+            row.Knob.raycastTarget = false;
+
+            settingsSwitches.Add(row);
+        }
+
+        /// <summary>设置窗口里点「固定 / 自由」。</summary>
+        private void ApplyLayoutMode(bool fixedLayout)
+        {
+            if (TimelineView != null)
+            {
+                TimelineView.SetFixedTimelineLayout(fixedLayout);
+            }
+            RefreshSettingsSwitches();
+        }
+
+        /// <summary>
+        /// 刷所有开关的显示。每次打开窗口 / 切回这一页都要重刷：
+        /// Ctrl+L 也能改排版状态，不重刷的话开关会停在上次点过的样子。
+        /// </summary>
+        private void RefreshSettingsSwitches()
+        {
+            for (int i = 0; i < settingsSwitches.Count; i++)
+            {
+                SettingsSwitch row = settingsSwitches[i];
+                bool on = row.Read();
+                if (row.State != null)
+                {
+                    row.State.text = on ? row.OnText : row.OffText;
+                }
+                if (row.Track != null)
+                {
+                    row.Track.color = on ? new Color(1f, 1f, 1f, 0.18f) : PanelRule;
+                }
+                if (row.Knob != null)
+                {
+                    // 24 是靠右（46 - 16 - 3 - 3），3 是靠左。
+                    SetTopLeftRect(row.Knob.rectTransform, on ? 24f : 3f, 3f, 16f, 16f);
+                }
+            }
+        }
+
+        /// <summary>切左列的页。现在每页只有标题和一句说明，功能接进来时在这里分发。</summary>
+        private void SelectSettingsPage(int index)
+        {
+            if (index < 0 || index >= SettingsPageTitles.Length)
+            {
+                return;
+            }
+            settingsPageIndex = index;
+            for (int i = 0; i < settingsNavFills.Count; i++)
+            {
+                bool selected = i == index;
+                // 选中 = 一块浅底 + 亮字。这套界面的"选中"只有这一种表达，
+                // 别再叠下划线或边框 —— 标签条已经用了下划线，两种混用就分不清主次。
+                settingsNavFills[i].color = selected
+                    ? Selected
+                    : new Color(0f, 0f, 0f, 0f);
+                settingsNavLabels[i].color = selected ? TextPrimary : TextSecondary;
+                settingsNavLabels[i].fontStyle = selected ? FontStyles.Bold : FontStyles.Normal;
+            }
+            if (settingsPageTitle != null)
+            {
+                settingsPageTitle.text = SettingsPageTitles[index];
+            }
+            if (settingsPageBody != null)
+            {
+                settingsPageBody.text = SettingsPageHints[index];
+            }
+            if (settingsGeneralPage != null)
+            {
+                settingsGeneralPage.gameObject.SetActive(index == 0);
+            }
+            if (settingsDeveloperPage != null)
+            {
+                settingsDeveloperPage.gameObject.SetActive(index == 2);
+            }
+            // 两页都有开关，切页都刷一遍：探针/遮罩可能被别处（旧配置、
+            // 导出流程）改过，进来时按 Settings 的真实值显示。
+            RefreshSettingsSwitches();
+        }
+
+        private bool SettingsWindowVisible
+        {
+            get { return settingsWindowLayer != null && settingsWindowLayer.gameObject.activeSelf; }
+        }
+
+        /// <summary>顶栏「设置」点一下就走这里 —— 不展开下拉，直接开窗。</summary>
+        private void OpenSettingsWindow()
+        {
+            if (settingsWindowLayer == null)
+            {
+                return;
+            }
+            // 别的下拉还开着的话先收掉：浮层是后加的兄弟节点，会压在新窗口上面。
+            CloseMenu();
+            SelectSettingsPage(settingsPageIndex);
+            settingsWindowLayer.SetAsLastSibling();
+            settingsWindowLayer.gameObject.SetActive(true);
+            if (EventSystem.current != null)
+            {
+                EventSystem.current.SetSelectedGameObject(null);
+            }
+        }
+
+        private void CloseSettingsWindow()
+        {
+            if (!SettingsWindowVisible)
+            {
+                return;
+            }
+            settingsWindowLayer.gameObject.SetActive(false);
+        }
+
         // ---------------------------------------------------------- 两个要答复的弹窗
+
+        /// <summary>
+        /// 弹窗卡片：**实心**，不带圆角贴图。
+        ///
+        /// 圆角贴图在半径 0（本主题的 CornerLarge 就是 0）时，每个像素算出来的
+        /// alpha 只有 0.5（见 GetRoundedSprite 的距离判定），卡片会透出后面的
+        /// 游戏画面。弹窗要压住底下的内容，所以这里直接用不带 sprite 的 Image，
+        /// 颜色本身不透明就是实心。
+        ///
+        /// 顺带把「吃射线」也一起开掉：卡片不吃射线的话，指针落在窗口空白处
+        /// 会穿到遮罩上，挂在卡片上的 ScrollRect 收不到滚轮。
+        /// </summary>
+        private Image CreateDialogCard(string name, RectTransform parent,
+            float width, float height, out RectTransform card)
+        {
+            Image image = CreateImage(name, parent,
+                (DesignWidth - width) * 0.5f, (DesignHeight - height) * 0.5f,
+                width, height, Panel);
+            image.raycastTarget = true;
+            card = image.rectTransform;
+            return image;
+        }
 
         /// <summary>
         /// 遮罩 + 居中卡片的外壳。两个弹窗共用 —— 它们的差别只有正文和按钮，
@@ -2966,12 +3423,7 @@ namespace ADOFAIEditorStudio
             shade.color = new Color(0f, 0f, 0f, 0.55f);
             shade.raycastTarget = true;
 
-            card = CreateRoundedPanel(name + "Card", layer,
-                (DesignWidth - cardWidth) * 0.5f, (DesignHeight - cardHeight) * 0.5f,
-                cardWidth, cardHeight, Panel, CornerLarge).rectTransform;
-            Image cardImage = card.GetComponent<Image>();
-            AddPanelBorder(cardImage, CornerLarge);
-            cardImage.raycastTarget = true;
+            CreateDialogCard(name + "Card", layer, cardWidth, cardHeight, out card);
             return layer;
         }
 
@@ -3224,19 +3676,9 @@ namespace ADOFAIEditorStudio
 
             const float cardWidth = 920f;
             const float cardHeight = 780f;
-            RectTransform card = CreateRoundedPanel(name + "Card", window.Layer,
-                (DesignWidth - cardWidth) * 0.5f, (DesignHeight - cardHeight) * 0.5f,
-                cardWidth, cardHeight, Panel, CornerLarge).rectTransform;
-            Image cardImage = card.GetComponent<Image>();
-            AddPanelBorder(cardImage, CornerLarge);
-
-            // **卡片自己必须吃射线。**
-            //
-            // `CreateRoundedPanel` 建出来的图默认 `raycastTarget = false`，
-            // 于是指针落在窗口内部的空白处时，射线会**穿过去打到遮罩上**，
-            // 而遮罩没有 IScrollHandler —— 滚轮就这么没了，挂在卡片上的
-            // ScrollRect 永远收不到它。（别处用圆角面板时都要手动开这一句。）
-            cardImage.raycastTarget = true;
+            // 实心底 + 吃射线都在 CreateDialogCard 里（见那边的说明）。
+            RectTransform card;
+            CreateDialogCard(name + "Card", window.Layer, cardWidth, cardHeight, out card);
 
             CreateText(name + "Title", card, 28f, 16f, cardWidth - 100f, 30f, titleText,
                 UiType.Title, AccentSecondary, TextAlignmentOptions.MidlineLeft, true);

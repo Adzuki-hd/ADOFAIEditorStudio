@@ -47,36 +47,39 @@ namespace ADOFAIEditorStudio.Preview.Domains
         {
             int index = PreviewKeyframeSearch.FindLastAtOrBefore(keyframes, frame.Time);
             bool enabled = index >= 0 && keyframes[index].Enabled;
-            if (lastApplied.HasValue && lastApplied.Value == enabled)
+
+            scrController controller = scrController.instance;
+            if (controller == null)
             {
                 return;
             }
 
-            scrController controller = scrController.instance;
-            if (controller != null)
+            if (!lastApplied.HasValue || lastApplied.Value != enabled)
             {
                 controller.EnableHallOfMirrors(enabled);
                 lastApplied = enabled;
+            }
 
-                // **预览里不保留"不擦背景"这件事。**
-                //
-                // 原生的 HallOfMirrors 只有一个副作用：
-                //
-                //   Bgcamstatic.clearFlags = enabled ? Depth : Color;
-                //
-                // 也就是开着的时候，背景相机**不擦颜色缓冲**，于是上一帧还没
-                // 被覆盖的像素留在屏幕上 —— 那正是"镜厅"无限反射的错觉来源。
-                // 它是**随时间累积**的效果，游戏里逐帧播放没问题；但工作台是
-                // 随机访问的求值器：拖到某一刻时缓冲区里留的是"上一次显示过的
-                // 画面"，于是表现为「上一帧以半透明形式叠在现在这一帧上」，
-                // 拖动时还会闪。用户实测：删掉前面的镜厅事件，重影立刻消失。
-                //
-                // 所以记录状态归记录，渲染这边强制回到 Color：预览每帧都从
-                // 干净的颜色缓冲开始。
-                scrCamera camera = scrCamera.instance;
-                if (camera != null && camera.Bgcamstatic != null)
+            // **和原版对齐：镜厅开着时背景相机不擦颜色（Depth）。**
+            //
+            // 之前为了让拖动不出现残影，这里无条件强制 Color —— 那等于把镜厅
+            // 关掉了，整屏亮度/颜色都和原版对不上（用户实测：原版关掉镜厅后
+            // 颜色才和 AES 一样）。
+            //
+            // 现在的折中：
+            //   · 拖动播放头 / 跳转那一类随机访问 → Color，每帧从干净缓冲开始；
+            //   · 正常播放 → Depth，保留原版镜厅的累积效果。
+            // 镜厅本来就是随时间累积的视觉效果，逐帧播放才是它该有的样子。
+            scrCamera camera = scrCamera.instance;
+            if (camera != null && camera.Bgcamstatic != null)
+            {
+                bool scrubbing = EditorPlaybackBridge.IsTimelineScrubActive;
+                UnityEngine.CameraClearFlags wanted = enabled && !scrubbing
+                    ? UnityEngine.CameraClearFlags.Depth
+                    : UnityEngine.CameraClearFlags.Color;
+                if (camera.Bgcamstatic.clearFlags != wanted)
                 {
-                    camera.Bgcamstatic.clearFlags = UnityEngine.CameraClearFlags.Color;
+                    camera.Bgcamstatic.clearFlags = wanted;
                 }
             }
         }

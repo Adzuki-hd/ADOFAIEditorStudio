@@ -222,7 +222,44 @@ namespace ADOFAIEditorStudio.Preview.Domains
             BuildFloorBuckets(context.Floors.Count);
             BuildChunkIndex(context);
             LogEventTable(context);
+            LogOpacityEvents();
             Main.Logger.Log("[StaticPreview/MoveTrack] analyzed " + events.Count + " events.");
+        }
+
+        /// <summary>
+        /// 只读：把「会把轨道淡掉」的 MoveTrack 事件连同它解出的范围
+        /// 全部打出来。轨道探针打开时跑一次，用来回答
+        /// 「到底哪条事件把 214 格之后的轨道藏了」。
+        /// </summary>
+        private void LogOpacityEvents()
+        {
+            if (Main.Settings == null || !Main.Settings.TrackProbe)
+            {
+                return;
+            }
+
+            int logged = 0;
+            for (int i = 0; i < events.Count; i++)
+            {
+                MoveEvent e = events[i];
+                if (!e.HasOpacity || e.Opacity > 0.99f)
+                {
+                    continue;
+                }
+                logged++;
+                if (logged > 24)
+                {
+                    break;
+                }
+                Main.Logger.Log("[MoveTrackOpacity] #" + i
+                    + " start=" + e.Start.ToString("0.00")
+                    + " dur=" + e.Duration.ToString("0.00")
+                    + " floors=" + e.StartFloor + ".." + e.EndFloor
+                    + " gap=" + e.GapLength
+                    + " opacity=" + e.Opacity.ToString("0.00")
+                    + ".");
+            }
+            Main.Logger.Log("[MoveTrackOpacity] hidden-event count=" + logged + ".");
         }
 
         /// <summary>

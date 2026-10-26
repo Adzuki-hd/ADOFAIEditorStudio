@@ -42,3 +42,30 @@ desktop.ini
 # 工具的输出图（布局预览、图标自检），是产物不是源码
 tools/layout-preview/*.png
 tools/icons/selftest.png
+
+# ---------------------------------------------------------------------------
+# 公开仓库只保留源码。
+# 下面这些只在本机保留，不进仓库，也不在历史里（历史已重写）。
+# 2026-10-27 恢复：0.34.1 期间临时开发把这段删掉了，内部文件又被推了上去。
+# ---------------------------------------------------------------------------
+/CLAUDE.md
+/.claude/
+/.workbuddy/
+/开发计划.md
+/测试清单.md
+/交接回执-*.md
+/交接-*.md
+/功能说明.md
+/复制说明.md
+/uGUI迁移状态.md
+/ADOFAIEditorStudio-反馈收集表.xlsx
+/tools/
+/FrameCacheSpike/
+/restart-and-install.ps1
+/pack-release.ps1
+/install-after-game-exit.ps1
+/rollback-to-baseline.ps1
+/queue-install-after-game-exit.cmd
+/Logo.png
+/Logo.rgba
+/Preview/PREVIEW_COVERAGE.md

@@ -2,7 +2,7 @@
   "Id": "ADOFAIEditorStudio",
   "DisplayName": "ADOFAI Editor Studio",
   "Author": "Adzuki",
-  "Version": "0.34.1",
+  "Version": "0.35.0",
   "ManagerVersion": "0.32.5",
   "AssemblyName": "ADOFAIEditorStudio.dll",
   "EntryMethod": "ADOFAIEditorStudio.Main.Load",

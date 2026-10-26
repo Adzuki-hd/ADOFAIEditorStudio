@@ -165,6 +165,20 @@ namespace ADOFAIEditorStudio
         // 可见或重新变不透明时，会在同一帧就被放到正确位置。
         public bool CullHiddenDecorations = true;
         public bool CullTransparentDecorations = true;
+        // 装饰物探针（**默认关**，设置 → 开发者里打开）：预览里一旦有
+        // 「求值说该显示、组件却没画」的装饰物，就往日志写一行
+        // （tag / 图片 / 渲染器 / sprite / mesh）；每 2 秒还有一条汇总。
+        // 这是排查「画面里装饰物不见了」的唯一可靠证据 —— 只看代码分不清
+        // 是求值判了隐藏，还是组件上的图像被清掉了。
+        //
+        // **默认关**的理由：它是诊断工具，不是功能。510 件装饰物的谱面上，
+        // 汇总那一条就是几百个 tag，正式版一直开着等于往玩家日志里灌噪声。
+        // 排查时到设置里打开即可，和其它探针（轨道探针等）保持一致。
+        public bool DecorationProbe = false;
+        // 轨道探针（默认关）：逐 0.5 秒把「当前格 + 几个固定格」的渲染器
+        // 状态写进日志 —— 渲染器开关、屏幕坐标、颜色 alpha、排序层。
+        // 用来区分「轨道被相机甩出屏幕」和「轨道被画成透明/没画」。
+        public bool TrackProbe = false;
         // 时间轴定位以原生引擎优先。旧的静态求值器
         // 只作为兼容回退保留，不是默认路径。
         public bool UseStaticTimelineEvaluation = false;

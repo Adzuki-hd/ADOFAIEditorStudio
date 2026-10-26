@@ -7,7 +7,7 @@
     <RootNamespace>ADOFAIEditorStudio</RootNamespace>
     <!-- 和 Info.json 的 Version 保持一致。UMM 用的是 Info.json 那个，
          这里只是程序集版本，两边对不上会让人分不清哪个是真的。 -->
-    <Version>0.29.2</Version>
+    <Version>0.35.0</Version>
     <Nullable>disable</Nullable>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <!-- ImGui 已整体删除（2026-10-24），不再需要 unsafe 代码。 -->
