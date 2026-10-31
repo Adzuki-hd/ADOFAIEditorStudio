@@ -301,25 +301,34 @@ namespace ADOFAIEditorStudio
                 {
                     return null;
                 }
+                // **`@` 之前是 `OWNER/REPO`，之后是 `REF/path`。**
+                //
+                // 这里原来是「在第一个 `/` 处切开 owner 和 repo」，切出来
+                // 只有 owner、repo 名字整个丢了 —— 生成的地址形如
+                // `raw.githubusercontent.com/OWNER/REF/path`，永远 404。
+                // 因为旧清单给的是 GitHub Releases 直链（不含 `jsdelivr.net/gh/`），
+                // 这个函数一直返回 null，bug 从没暴露；2026-10-31 把下载地址
+                // 换成 jsDelivr 之后它才第一次真正跑起来，当场对出来是错的。
                 string tail = url.Substring(at + marker.Length);
-                int slash = tail.IndexOf('/');
-                if (slash <= 0)
+                int atSign = tail.IndexOf('@');
+                if (atSign <= 0)
                 {
                     return null;
                 }
-                string ownerRepo = tail.Substring(0, slash);
-                string rest = tail.Substring(slash + 1);
-                int atSign = rest.IndexOf('@');
-                if (atSign < 0)
+                string ownerRepo = tail.Substring(0, atSign);
+                // owner 和 repo 两段都要有，否则拼出来的地址必然是坏的。
+                if (ownerRepo.IndexOf('/') <= 0
+                    || ownerRepo[ownerRepo.Length - 1] == '/')
                 {
                     return null;
                 }
-                int pathSlash = rest.IndexOf('/', atSign);
-                if (pathSlash < 0)
+                string rest = tail.Substring(atSign + 1);
+                int pathSlash = rest.IndexOf('/');
+                if (pathSlash <= 0)
                 {
                     return null;
                 }
-                string reference = rest.Substring(atSign + 1, pathSlash - atSign - 1);
+                string reference = rest.Substring(0, pathSlash);
                 string path = rest.Substring(pathSlash + 1);
                 return "https://raw.githubusercontent.com/" + ownerRepo + "/"
                     + reference + "/" + path;
