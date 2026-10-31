@@ -798,6 +798,15 @@ namespace ADOFAIEditorStudio
 
         private void Update()
         {
+            // 【临时探针】参数栏一直是"整帧减去已知各段"之后对不上账的嫌疑之一，
+            // 先量出来。取到数就拆掉这层壳。
+            long __watch = System.Diagnostics.Stopwatch.GetTimestamp();
+            UpdateMeasured();
+            PreviewDiagnostics.RecordSince("Prop.U", __watch);
+        }
+
+        private void UpdateMeasured()
+        {
             if (!built || owner == null || !owner.IsVisible)
             {
                 return;

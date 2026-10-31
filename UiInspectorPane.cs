@@ -234,6 +234,14 @@ namespace ADOFAIEditorStudio
 
         private void Update()
         {
+            // 【临时探针】见 EditorPropertyPanel.Update 里的说明。
+            long __watch = System.Diagnostics.Stopwatch.GetTimestamp();
+            UpdateMeasured();
+            PreviewDiagnostics.RecordSince("Insp.U", __watch);
+        }
+
+        private void UpdateMeasured()
+        {
             if (overlay == null || panel == null || !overlay.IsVisible)
             {
                 return;

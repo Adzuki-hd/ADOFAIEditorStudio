@@ -11,8 +11,99 @@ namespace ADOFAIEditorStudio.Preview
         private static readonly MoveTrackPreviewDomain MoveTrack = new MoveTrackPreviewDomain();
         private static readonly List<IPreviewDomain> Domains = BuildDomains();
 
+        /// <summary>
+        /// 【临时探针·重建耗时】上一次重建时每个域 Analyze 花了多少毫秒，
+        /// 下标与 `Domains` 对齐。只在重建时写，用途见 `TryBegin` 里那段说明。
+        /// </summary>
+        private static readonly double[] lastAnalyzeMs = new double[64];
+
+        /// <summary>把 Stopwatch 时间戳差换算成毫秒。</summary>
+        private static double MsSince(long startTimestamp)
+        {
+            return (System.Diagnostics.Stopwatch.GetTimestamp() - startTimestamp)
+                * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        }
+
         /// <summary>上一次求值的播放头时间，用来识别"跳转"。</summary>
         private static float lastEvaluatedTime;
+
+        /// <summary>
+        /// 帧内去重（B1）：上一次成功求值所在的帧号与时间。
+        /// 同一帧用同一个时间再进来一次时整趟跳过 —— 见 TryEvaluate 里那段说明。
+        /// </summary>
+        private static int lastEvalFrame = -1;
+        private static float lastEvalTime = float.NaN;
+
+        /// <summary>
+        /// 同帧脏位：外部在同帧内改了谱面时置起来，让下一次 TryEvaluate
+        /// 不要因为「同帧同时间」被跳过。
+        /// </summary>
+        private static bool sameFrameDirty;
+
+        // ---- 【临时探针】B1 帧内去重到底该不该开 ----
+        //
+        // B1 现在是硬关着的（见 TryEvaluate 里的说明），理由是"打开后
+        // `MoveTrack.WriteCount` 恒为 0、轨道消失动画失效"。可那只是现象，
+        // 没有量过"一帧到底被调几次"。如果实际是 2~4 次，那么**所有域**都在
+        // 白算 2~4 倍 —— 这是比任何单个域优化都大一个数量级的杠杆；
+        // 如果实际只有 1 次，那 B1 从头到尾就是个无效开关，不用再管。
+        //
+        // 三个数各自回答一个问题：
+        //   Ev.Calls  = 本帧到目前为止进 TryEvaluate 几次（>1 才说明有重复）
+        //   Ev.SameT  = 其中"和上一次传入的时间相同"几次（去重要靠它命中）
+        //   Ev.Dup    = 真正会被 B1 跳过几次（还要求同帧且没有脏位）
+        // 全部按帧号自动清零，取本帧最后一次写入的值，所以是"本帧累计"。
+        private static int probeEvalFrame = -1;
+        private static int probeEvalCalls;
+        private static int probeEvalSameTime;
+        private static int probeEvalDup;
+        private static float probeEvalLastTime = float.NaN;
+
+        /// <summary>上一次调 `Physics2D.SyncTransforms` 的帧号（B2：一帧最多一次）。</summary>
+        private static int lastSyncFrame = -1;
+
+        /// <summary>
+        /// **自上次物理同步以来，我们真正改动过多少个 Transform。**
+        ///
+        /// 为什么要有这个计数：`Physics2D.SyncTransforms()` 的开销**不按改动量走，
+        /// 按场景里碰撞体的规模走**。2600 格的谱实测一次 0.66~1.08ms（`Sc.Sync`），
+        /// 而稳态播放帧里我们一笔 Transform 都没写（`ScW.Pos/Rot/Scale` 恒为 0）——
+        /// 也就是说每帧都在花 1ms 同步一堆根本没变的东西。
+        ///
+        /// 它的唯一用途是让**同一帧内**的脚本射线/重叠查询读到新位置；
+        /// 物理模拟步之前 Unity 自己会同步一次，所以「没写过就跳过」是安全的。
+        /// 同一帧里要拾取的话，`EditorSceneInteraction.PickObject` 会自己先同步。
+        ///
+        /// 任何真正写格/球 Transform 的路径都要调 <see cref="NoteTransformWritten"/>。
+        /// </summary>
+        private static int transformWritesSinceSync;
+
+        /// <summary>上一次无条件同步的帧号（防漏记的兜底，见同步处的说明）。</summary>
+        private static int lastSafetySyncFrame = -1;
+
+        /// <summary>
+        /// 登记「这一帧我们改动了 Transform」。见 `transformWritesSinceSync` 的说明。
+        /// 逐格写的时候别在循环里逐次调，循环外按计数调一次就行。
+        ///
+        /// **只给「格」记账，不要给球/星球/装饰物记账。**
+        /// 那些东西游戏自己每帧就在写（scrPlanet.LateUpdate 之类），原版从来没为它们
+        /// 同步过——给它们记账等于每帧都点亮一次，0.85ms 的同步就永远省不掉（实测过）。
+        /// </summary>
+        internal static void NoteTransformWritten()
+        {
+            transformWritesSinceSync++;
+        }
+
+        /// <summary>
+        /// 宣告「这一帧的数据变了，别用帧内去重」。
+        ///
+        /// 调用方：属性提交、撤销/重做、媒体拖放、重新 Analyze 之后。
+        /// 漏调不会崩，只是那一次可能读到上一趟的结果。
+        /// </summary>
+        internal static void InvalidateSameFrame()
+        {
+            sameFrameDirty = true;
+        }
         /// <summary>
         /// 一帧里播放头挪出这么多秒，就认定是拖动 / 瞬间点击而不是正常播放
         /// （正常一帧约 0.016 秒）。见 TryEvaluate 里"跳转让各域作废历史"。
@@ -195,12 +286,29 @@ namespace ADOFAIEditorStudio.Preview
             {
                 return;
             }
+            // 【临时探针 · Scaffold 拆解】两段分开计时。
+            bool probe = PreviewDiagnostics.Enabled;
+            long t0 = probe ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+
             SuppressEditorScaffolding(scnEditor.instance);
+            if (probe)
+            {
+                long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+                PreviewDiagnostics.RecordPart("Sc.Suppress",
+                    (t1 - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+                t0 = t1;
+            }
 
             // MoveTrack 的格 transform 必须在这里写，不能放在求值里：
             // 游戏的原生组件跑在求值器之后，会把它们重置回烘焙值。
             // 和上面那两条引导线是同一个道理。
             MoveTrack.ApplyPendingWrites();
+            if (probe)
+            {
+                long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+                PreviewDiagnostics.RecordPart("Sc.Write",
+                    (t1 - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+            }
         }
 
         /// <summary>
@@ -308,12 +416,25 @@ namespace ADOFAIEditorStudio.Preview
 
             try
             {
+                // 【临时探针·重建耗时】会话重建一次就写一行，把「上下文快照」
+                // 和「各域 Analyze」分开计时。
+                //
+                // 为什么要这一段：拖动松手会触发一次全量重建，而那几秒里
+                // 现有诊断只能看到 `Overlay.U` 一个总数（段表是 120 帧的
+                // 窗口平均，还会把尖峰摊平）。不加这一段，就永远不知道该
+                // 砍哪一半。只在重建时写，平时零成本。
+                long totalStart = System.Diagnostics.Stopwatch.GetTimestamp();
                 End();
+
+                long contextStart = System.Diagnostics.Stopwatch.GetTimestamp();
                 context = new PreviewTimelineContext(editor);
+                double contextMs = MsSince(contextStart);
+
                 PrepareEditorScenery();
                 int enabledCount = 0;
                 for (int i = 0; i < Domains.Count; i++)
                 {
+                    long domainStart = System.Diagnostics.Stopwatch.GetTimestamp();
                     try
                     {
                         Domains[i].Analyze(context);
@@ -326,6 +447,7 @@ namespace ADOFAIEditorStudio.Preview
                         Main.Logger.Error("Static preview domain " + Domains[i].Name
                             + " failed to analyze: " + exception);
                     }
+                    lastAnalyzeMs[i] = MsSince(domainStart);
                 }
 
                 if (enabledCount == 0)
@@ -336,6 +458,18 @@ namespace ADOFAIEditorStudio.Preview
                 active = true;
                 Main.Logger.Log("Static preview evaluator ready with " + enabledCount
                     + "/" + Domains.Count + " domains.");
+
+                // 按域逐条列出毫秒数。18 个域名一次写完，读日志时不用再
+                // 靠减法反推是哪个域吃掉的时间。
+                System.Text.StringBuilder analyzeLine = new System.Text.StringBuilder(512);
+                analyzeLine.Append("[RebuildCost] 上下文快照=").Append(contextMs.ToString("0.0"))
+                    .Append("ms 重建合计=").Append(MsSince(totalStart).ToString("0.0")).Append("ms |");
+                for (int i = 0; i < Domains.Count; i++)
+                {
+                    analyzeLine.Append(' ').Append(Domains[i].Name)
+                        .Append('=').Append(lastAnalyzeMs[i].ToString("0.0"));
+                }
+                Main.Logger.Log(analyzeLine.ToString());
                 return true;
             }
             catch (Exception exception)
@@ -379,6 +513,12 @@ namespace ADOFAIEditorStudio.Preview
                     lastValidateMs = (float)(
                         (System.Diagnostics.Stopwatch.GetTimestamp() - validateStart)
                         * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+                    // 【临时探针】快照校验这笔一直只算不报 —— 它发生在
+                    // `engineStart` 之前，所以既不算进任何「域」，也不算进
+                    // `Sc.Rest`（那个是 engine 总耗时减域合计）。结果是
+                    // `OU.D` 和「域合计」之间总差出 0.5ms 左右，没人知道是谁的。
+                    // 先让它现形，再决定要不要动 `FloorChecksPerFrame`。
+                    PreviewDiagnostics.RecordPart("Ev.Validate", lastValidateMs);
                 }
                 if (!matches)
                 {
@@ -388,6 +528,55 @@ namespace ADOFAIEditorStudio.Preview
 
                 long engineStart = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
                 float frameTime = Mathf.Max(0f, time);
+
+                // **B1 暂时关闭（回归调查中）。**
+                //
+                // 打开后实测 `MoveTrack.WriteCount` 恒为 0、轨道消失动画失效。
+                // 怀疑「同帧同时间」的判据在拖动/播放路径上误命中：
+                // 那些路径可能就是**故意**在同一时间点重复求值来驱动逐帧效果
+                //（`ffxFloorDisappearPlus` 这类）。
+                // 在查清之前先关掉，保持每趟都算。
+                //
+                // **先量再开（Ev.Calls / Ev.SameT / Ev.Dup）**：上面的怀疑如果成立，
+                // Ev.Dup 会明显大于 0 且 Ev.Calls 远大于 1 —— 那就是真有人在同帧
+                // 同时间反复调；如果 Ev.Dup 恒为 0，说明 B1 从来没命中过，
+                // 当初"打开后 WriteCount=0"另有原因，不该靠关这个开关来躲。
+                if (Time.frameCount != probeEvalFrame)
+                {
+                    probeEvalFrame = Time.frameCount;
+                    probeEvalCalls = 0;
+                    probeEvalSameTime = 0;
+                    probeEvalDup = 0;
+                    probeEvalLastTime = float.NaN;
+                }
+                probeEvalCalls++;
+                bool probeSameTime = Mathf.Abs(frameTime - probeEvalLastTime) <= 0.00001f;
+                if (probeSameTime)
+                {
+                    probeEvalSameTime++;
+                }
+                if (probeSameTime && !sameFrameDirty && lastEvalFrame == Time.frameCount)
+                {
+                    probeEvalDup++;
+                }
+                probeEvalLastTime = frameTime;
+                PreviewDiagnostics.RecordFlag("Ev.Calls", probeEvalCalls);
+                PreviewDiagnostics.RecordFlag("Ev.SameT", probeEvalSameTime);
+                PreviewDiagnostics.RecordFlag("Ev.Dup", probeEvalDup);
+                PreviewDiagnostics.RecordFlag("Ev.T", (int)(frameTime * 1000f));
+
+                const bool frameDedupEnabled = false;
+                if (frameDedupEnabled
+                    && !sameFrameDirty
+                    && lastEvalFrame == Time.frameCount
+                    && Mathf.Abs(frameTime - lastEvalTime) <= 0.00001f)
+                {
+                    error = null;
+                    return true;
+                }
+                sameFrameDirty = false;
+                lastEvalFrame = Time.frameCount;
+                lastEvalTime = frameTime;
 
                 // **「掉帧」演出：整帧定格。**
                 //
@@ -399,6 +588,11 @@ namespace ADOFAIEditorStudio.Preview
                 // 必须在**跑各域之前**做：只冻相机的话，同一帧里的
                 // SetFilter / Bloom / MoveDecorations 照样会变，还是闪。
                 CameraPreviewDomain holdOwner = CameraPreviewDomain.Active;
+                // 【临时探针】定格判定每帧都会把整条相机事件链从头重放一遍
+                // （`EvaluateChannels` 从 t=0 扫到播放头，成本随位置线性增长），
+                // 而同一帧稍后相机域自己又会重放一次。这笔钱此前混在 `Sc.Rest` 里。
+                long holdStart = profile && holdOwner != null
+                    ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
                 if (holdOwner != null)
                 {
                     float heldTime = holdOwner.ResolveFrameHold(context, frameTime);
@@ -406,6 +600,12 @@ namespace ADOFAIEditorStudio.Preview
                     {
                         frameTime = heldTime;
                     }
+                }
+                if (profile && holdOwner != null)
+                {
+                    PreviewDiagnostics.RecordPart("Cam.Hold",
+                        (System.Diagnostics.Stopwatch.GetTimestamp() - holdStart)
+                        * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
                 }
 
                 // **播放头跳转 → 让各域作废它们的历史状态。**
@@ -482,7 +682,71 @@ namespace ADOFAIEditorStudio.Preview
                 // gizmo 重新点亮，只在求值里压等于白压。
 
                 syncStart = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
-                Physics2D.SyncTransforms();
+                // **B2：一帧最多同步一次。**
+                //
+                // 原来每次求值都调 —— 而一帧有 2~4 次调用（见上面 B1 那段），
+                // 等于把 2600 格 + 500 装饰物被写过的 Transform 反复刷进物理世界。
+                // 真正需要物理一致性的拾取路径（`EditorSceneInteraction.PickObject`）
+                // 自己会先同步一次，这里不需要每趟都做。
+                //
+                // 帧内去重后同一帧本来只会走到这里一次；这条是给「同帧不同时间」
+                // （比如拖动时每帧两次精确采样）兜底。
+                if (lastSyncFrame != Time.frameCount)
+                {
+                    lastSyncFrame = Time.frameCount;
+
+                    // **只在真的写过 Transform 时同步。**（2026-10-30）
+                    //
+                    // 上面那段是「一帧最多一次」，那是 4 倍变 1 倍；
+                    // 这一条是「没必要就不做」，把 1 次也省掉。
+                    //
+                    // 实测（杪夏谱 2600 格）：稳态播放帧 `ScW.Pos/Rot/Scale` 恒为 0，
+                    // 我们一笔 Transform 都没写，但每帧仍要花 `Sc.Sync`=0.66~1.08ms
+                    // 把 2600 个碰撞体刷一遍。同步的代价只跟场景规模有关，跟改动量无关。
+                    //
+                    // 安全性：`SyncTransforms` 只影响**同一帧内脚本发起**的射线/重叠查询；
+                    // 物理模拟步之前 Unity 自己会同步。已知的脚本查询方
+                    // （`EditorSceneInteraction.PickObject`）本来就会自己先同步一次。
+                    //
+                    // 兜底：每 30 帧无条件同步一次。这一条不是给已知路径的——
+                    // 是防「以后新增了写 Transform 的地方忘了调 NoteTransformWritten」，
+                    // 那种情况最坏也只会连续 30 帧（约 0.18 秒）读到旧碰撞体。
+                    // 分摊下来每帧 0.03ms，换掉这个隐患值得。
+                    //
+                    // **autoSync 开着的时候整段都跳过。**（2026-10-31）
+                    //
+                    // 实测：`Sc.Sync` 高值窗口集中在谱面时间 257.8~304.4 秒那一段，
+                    // 那正是 MoveTrack 连续动格的段落 —— 每帧都在写 Transform，
+                    // 于是每帧都触发一次显式同步，120 帧窗口平均 0.86ms
+                    // （不是「每 30 帧一次」：真是那样的话平均值应该是 0.03）。
+                    // 而那一段帧耗时正好从 7.1ms 抬到 9.5ms。
+                    //
+                    // 但不必要：`PhysicsStepSuppressor` 在播放期把
+                    // `Physics2D.autoSyncTransforms` 置成了 true（关掉自动步进之后，
+                    // 查询前必须靠它把碰撞体同步进 broadphase），所以 Unity 在**每次
+                    // 查询之前自己会同步**，我们这一下是纯重复工作。
+                    // 而且时序上我们同步的是上一帧的写入（MoveTrack 的真正落地在
+                    // LateUpdate），连「同帧查询读到新位置」这个设计目的都没达到。
+                    //
+                    // 保留安全网本身：它只在 autoSync 被关掉（别的 mod 改的、
+                    // 或游戏版本改了行为）时才生效，那种环境里它是唯一的兜底。
+                    // 写入计数每帧清零：下一帧重新按「这一帧有没有写」判断，
+                    // 不会因为跳过同步而越攒越多。
+                    bool wroteTransforms = transformWritesSinceSync > 0;
+                    bool safetySyncDue = Time.frameCount - lastSafetySyncFrame >= 30;
+                    bool autoSyncHandles = Physics2D.autoSyncTransforms;
+                    if (!autoSyncHandles && (wroteTransforms || safetySyncDue))
+                    {
+                        lastSafetySyncFrame = Time.frameCount;
+                        Physics2D.SyncTransforms();
+                    }
+                    transformWritesSinceSync = 0;
+                    if (profile)
+                    {
+                        // 探针：1 = 这一帧是「autoSync 兜住了，我们没同步」。
+                        PreviewDiagnostics.RecordFlag("Sc.SyncSkip", autoSyncHandles ? 1 : 0);
+                    }
+                }
                 if (profile)
                 {
                     lastEngineMs = (float)(
@@ -491,6 +755,17 @@ namespace ADOFAIEditorStudio.Preview
                         (System.Diagnostics.Stopwatch.GetTimestamp() - syncStart)
                         * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
 
+                    // 【临时探针】把这两笔也报出来。整帧减去 Overlay.U 之后那
+                    // 9~10ms 到底是谁的，一直只是推断（"播放态原生开销"）。
+                    // 这两笔能量化的先量化：物理同步（`Sc.Sync`）和
+                    // 引擎里各域之外的那部分（`Sc.Rest` = 引擎总耗时 − 各域之和）。
+                    PreviewDiagnostics.RecordPart("Sc.Sync", lastSyncMs);
+                    double domainSum = 0.0;
+                    for (int i = 0; i < Domains.Count; i++)
+                    {
+                        domainSum += lastDomainMs[i];
+                    }
+                    PreviewDiagnostics.RecordPart("Sc.Rest", lastEngineMs - domainSum);
                 }
                 return true;
             }

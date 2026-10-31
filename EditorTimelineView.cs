@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using ADOFAI;
@@ -780,6 +780,24 @@ private static float MinimumPixelsPerSecond
         private readonly List<TimelineItem>[] laneItems = new List<TimelineItem>[LaneCount];
         private readonly List<TimelineItem> layoutItems = new List<TimelineItem>();
         private readonly List<List<RowInterval>> layoutRows = new List<List<RowInterval>>();
+        /// <summary>
+        /// 事件 → 它在排版里的那一格。**这是把 `FindItemForEvent` 从 O(总事件数)
+        /// 降到 O(1) 的那张表。**
+        ///
+        /// 为什么必须建：`UpdateBlocks` 里每个可见块每帧都要 `FindItemForEvent`
+        /// 找回自己对应的 `TimelineItem`，而那个函数以前是**遍历全部行、全部区间**
+        /// 逐个 `ReferenceEquals` 比。静止时这一整段被视图快照早退挡掉，所以看不出
+        /// 问题；一旦开了「固定播放头」，视口每帧都在滚，早退永远不成立，
+        /// 这笔成本就变成「可见块数 × 总事件数」——本谱面量级是几百乘几千，
+        /// 每帧几十万次引用比较。实测固定播放头让 `Timeline.U` 从 0.22ms
+        /// 涨到 0.73ms，涨的这 0.51ms 主要就是它。
+        ///
+        /// 表在 `RebuildDynamicRows` 末尾重建（`layoutRows` 只有那里会改），
+        /// 所以和排版始终同步。查不到时仍走一次线性扫描兜底 —— 宁可偶尔慢，
+        /// 不能因为漏登记就返回 null 把块画错。
+        /// </summary>
+        private readonly Dictionary<LevelEvent, TimelineItem> itemByEvent
+            = new Dictionary<LevelEvent, TimelineItem>();
         private readonly List<TimelineMarker> markerPool = new List<TimelineMarker>();
         /// <summary>
         /// 块稳定 ID → 画它的那个对象。
@@ -1039,6 +1057,111 @@ private static float MinimumPixelsPerSecond
         private bool viewInitialized;
         private bool visualsDirty = true;
         private bool layoutDirty = true;
+
+        /// <summary>
+        /// 时间读数上一次**已经拼好**的两段毫秒整数（当前 / 总长）。
+        ///
+        /// 两个都没变就直接跳过格式化与赋值：静止时这个读数每帧都被赋同一个
+        /// 字符串（旧实现每帧 5 个短字符串），而 `timeText.text` 一赋值还会
+        /// 连带 TMP 重新排版——纯白烧。
+        ///
+        /// **判等用毫秒整数而不是 float**：浮点抖动在第 4 位小数以后，
+        /// 直接比 float 会让缓存几乎每帧都失效，等于没缓存。
+        /// </summary>
+        private int timeTextCurrentMs = int.MinValue;
+        private int timeTextTotalMs = int.MinValue;
+
+        /// <summary>
+        /// `UpdateBlocks` 的「视图快照」：绑定时用的那几个几何量 + 数据/选中指纹
+        /// + 脏标记版本。全都没变就整个块绑定阶段直接早退。
+        ///
+        /// 为什么要这层：`UpdateBlocks` 每帧要把可见块重新绑一遍（TMP 文本、
+        /// 颜色、图标、缓速曲线、RectTransform），而静止时这些输入一个都没变。
+        /// 实测它是时间轴每帧最大的一块固定开销。
+        /// </summary>
+        private float boundViewStart;
+        private float boundPixelsPerSecond;
+        private float boundScrollOffset;
+        private float boundRowHeight;
+        private float boundBodyWidth;
+        private float boundViewportWidth;
+        private float boundViewportHeight;
+        private int boundBlockCount;
+        private int boundDataFingerprint;
+        private int boundSelectionFingerprint;
+
+        /// <summary>`blocksDirtyVersion` 上次绑定时的值；对不上就说明有人置脏了。</summary>
+        private int boundDirtyVersion;
+
+        /// <summary>
+        /// 脏标记的自增版本号。**每次置脏 +1**，早退判等只比它，不用清位——
+        /// 省掉"清脏"这一步，就不会出现"置脏和清脏在同一帧互相覆盖"。
+        ///
+        /// **谁会 +1**：所有「只改 `BlockPlacement.Row`、不改谱面」的入口 ——
+        /// 目前是 `ApplyBlockRows`（拖行号）和 `RepackRowsByTypePriority`
+        /// （缩放/载入后重排）。这两处以前只置 `visualsDirty`，而早退判据
+        /// 不看 `visualsDirty`，于是行号变了照样早退，块要等 30 帧兜底才动
+        /// —— 表现就是"缩放之后块位置停一下才跟上"。
+        ///
+        /// 改谱面的那些入口不用碰它：它们会让 `dataFingerprint` 或
+        /// `externalChartDirtyVersion` 变，早退自然失效。
+        /// </summary>
+        private int blocksDirtyVersion;
+
+        /// <summary>视图快照是否已经建立过（首帧必须完整跑一遍）。</summary>
+        private bool blocksBoundOnce;
+
+        /// <summary>
+        /// 越过早退的连续帧数。**兜底指纹**：脏标记万一漏挂，最多连跳
+        /// `BlocksForceRefreshFrames` 帧就强制重刷一次，绝不会永久停在旧画面上
+        /// （这是明确的回归要求——宁可偶尔多刷一帧，也不能"改了不刷新"）。
+        /// </summary>
+        private int blocksSkippedFrames;
+        private const int BlocksForceRefreshFrames = 30;
+
+        // ---- CollectBlocks 整体早退的快照与兜底 ----
+        //
+        // `CollectBlocks` 主循环每帧固定花 1.92ms，其中 93% 是每块一次的
+        // `GetEventStartTime` / `GetEventDuration`（各自一次
+        // `LevelEvent.TryGet<float>` 字符串字典查找 + 拆箱）。做法不是逐项优化，
+        // 而是**静止帧整体早退**：输入一样，跑出来的 `blockViews` 也一样。
+        /// <summary>上一帧真正跑完 `CollectBlocks` 时记下的判等快照（首次必跑）。</summary>
+        private bool collectBoundOnce;
+        private int collectBoundDataFingerprint;
+        private int collectBoundDirtyVersion;
+        private int collectBoundExternalVersion;
+        private int collectBoundPlacementCount;
+
+        /// <summary>
+        /// 连续跳过 `CollectBlocks` 的帧数。攒到 `BlocksForceRefreshFrames` 就强制
+        /// 真跑一次 —— 和第 1 轮 `UpdateBlocks` 的兜底同理：脏点万一漏挂，
+        /// 最多错半秒，不会永久停在旧画面上。
+        /// </summary>
+        private int blocksSkippedCollectFrames;
+
+        /// <summary>
+        /// 谱面数据被**外部**改动的全局版本号。
+        ///
+        /// 为什么需要它：`CollectBlocks` 早退不能只看 `dataFingerprint` ——
+        /// 那个要等 `RefreshData` 轮询（0.5s 一次）才更新，而撤销/属性提交是
+        /// **同一帧**就把谱面改回去的。只看指纹的话，撤销之后块的位置最多会错
+        /// 半秒 —— 正是那段"必须现算、不能抄 `item.StartTime`"的注释在防的竞态。
+        ///
+        /// 改谱面的入口分散在多个类里（撤销/重做、属性提交、粘贴、媒体拖放、
+        /// 联机远端编辑、原生撤销），但它们**全部汇聚到**
+        /// `EditorPlaybackBridge.RequestEvaluatorRebuild` —— 在那里置脏，
+        /// 一处覆盖全部，避免"发现一个补一个"。
+        /// </summary>
+        private static int externalChartDirtyVersion;
+
+        /// <summary>
+        /// 由 `EditorPlaybackBridge.RequestEvaluatorRebuild` 调用：谱面被改了，
+        /// 时间轴下一次 `CollectBlocks` 必须重算（不能早退）。
+        /// </summary>
+        internal static void NotifyChartChangedExternally()
+        {
+            externalChartDirtyVersion++;
+        }
 
 
         // 只滚动分类框时用它，避免为一格滚动重建整个布局。
@@ -1450,9 +1573,12 @@ private static float MinimumPixelsPerSecond
                         owner.SetSceneSelectionStatus(string.Empty);
                     }
                 }
+
             }
 
             visualsDirty = true;
+            // 多选集合变了，块描边要立刻重绑。
+            MarkBlocksDirty();
         }
 
         /// <summary>框选：把与框相交的块全部放进多选。</summary>
@@ -1475,6 +1601,8 @@ private static float MinimumPixelsPerSecond
             }
 
             visualsDirty = true;
+            // 框选改的是多选集合，块描边要立刻重绑。
+            MarkBlocksDirty();
             if (owner != null)
             {
                 owner.SetSceneSelectionStatus(multiSelection.Count == 0
@@ -1780,6 +1908,8 @@ private static float MinimumPixelsPerSecond
             }
             selectedEvent = created[0];
             visualsDirty = true;
+            // 粘贴后选中集换了，块上的描边要立刻跟上。
+            MarkBlocksDirty();
 
             status = "已粘贴 " + created.Count + " 个事件到第 " + seq + " 格";
             return true;
@@ -1910,6 +2040,9 @@ private static float MinimumPixelsPerSecond
             ClampViewStart();
             ClampVerticalScroll();
             visualsDirty = true;
+            // 面板尺寸变了，块的位置/宽度全得重算 —— 立即置脏，
+            // 别等 30 帧兜底。
+            MarkBlocksDirty();
         }
 
         /// <summary>
@@ -1934,21 +2067,54 @@ private static float MinimumPixelsPerSecond
             {
                 return;
             }
+            // **时间轴每帧耗时（诊断）。** 之前这里是最大测量盲区：整帧里那笔
+            // "说不清在哪"的时间很可能就在时间轴。下面三段（块收集 / 块重绑 /
+            // 标尺）各自包一层计时，由 RecordPart 的内部门控决定是否真正记录。
+            long __timelineWatch = System.Diagnostics.Stopwatch.GetTimestamp();
 
             float now = Time.unscaledTime;
             // 供预览层判断"现在是拖动定位"：那期间不写粒子装饰物的位置，
             // 否则原生 SetPosition 每帧清一次粒子，看着就是冻住。
             ParticleWatch.ScrubbingActive = scrubbing || centerBrowseScrubbing
                 || centeredScrubActive;
+
+            // **下面这些以前没有单独计时。** 实测 Timeline.U 能到 7.15ms，
+            // 而 Collect / UpdateBlocks / Ruler 三项加起来只有 0.02ms ——
+            // 剩下 7ms 全落在这几段"看不见"的代码里，不做拆解就永远只能猜。
+            // 逐段计时的开关在 RecordPart 内部，诊断关着时只剩取时间戳。
+            long __segWatch = System.Diagnostics.Stopwatch.GetTimestamp();
             RelayoutIfResized();
+            PreviewDiagnostics.RecordPart("T.Resize", Since(__segWatch));
+
+            __segWatch = System.Diagnostics.Stopwatch.GetTimestamp();
             DiagCheckStuckBlockDrag();
+            PreviewDiagnostics.RecordPart("T.StuckDrag", Since(__segWatch));
+
+            __segWatch = System.Diagnostics.Stopwatch.GetTimestamp();
             HandleKeyboardShortcuts();
+            PreviewDiagnostics.RecordPart("T.Keys", Since(__segWatch));
+
+            __segWatch = System.Diagnostics.Stopwatch.GetTimestamp();
             RefreshFeatureButtons();
             RefreshLaneButtons();
+            PreviewDiagnostics.RecordPart("T.Buttons", Since(__segWatch));
+
             // **块数据每帧重建。**
+            long __collectWatch = System.Diagnostics.Stopwatch.GetTimestamp();
             CollectBlocks();
+            PreviewDiagnostics.RecordPart("Timeline.Collect",
+                (System.Diagnostics.Stopwatch.GetTimestamp() - __collectWatch)
+                * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+            long __updateBlocksWatch = System.Diagnostics.Stopwatch.GetTimestamp();
             UpdateBlocks();
+            PreviewDiagnostics.RecordPart("Timeline.UpdateBlocks",
+                (System.Diagnostics.Stopwatch.GetTimestamp() - __updateBlocksWatch)
+                * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+            long __rulerWatch = System.Diagnostics.Stopwatch.GetTimestamp();
             UpdateRuler();
+            PreviewDiagnostics.RecordPart("Timeline.Ruler",
+                (System.Diagnostics.Stopwatch.GetTimestamp() - __rulerWatch)
+                * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
 
             // 拖播放头期间每帧把粒子放起来：定位会重建装饰物，
             // 只靠"提交后放一次"仍有空档（用户反馈会卡住）。
@@ -1965,7 +2131,9 @@ private static float MinimumPixelsPerSecond
             }
             if (now >= nextDataRefresh)
             {
+                long __refreshWatch = System.Diagnostics.Stopwatch.GetTimestamp();
                 RefreshData(false);
+                PreviewDiagnostics.RecordPart("T.DataRefresh", Since(__refreshWatch));
                 nextDataRefresh = now + DataRefreshInterval;
                 if (decoPane != null)
                 {
@@ -1974,17 +2142,22 @@ private static float MinimumPixelsPerSecond
             }
             if (now >= nextSelectionRefresh)
             {
+                long __selWatch = System.Diagnostics.Stopwatch.GetTimestamp();
                 int fingerprint = ComputeSelectionFingerprint();
                 if (fingerprint != selectionFingerprint)
                 {
                     selectionFingerprint = fingerprint;
                     visualsDirty = true;
+                    // 选中变了要重画描边：置脏让下一帧就重绑，
+                    // 而不是等这条 0.12s 粒度的轮询下一次才发现。
+                    MarkBlocksDirty();
                 }
                 if (decoPane != null)
                 {
                     decoPane.MarkSelectionDirty();
                 }
                 nextSelectionRefresh = now + SelectionRefreshInterval;
+                PreviewDiagnostics.RecordPart("T.SelRefresh", Since(__selWatch));
             }
 
             EditorPlaybackSnapshot snapshot = EditorPlaybackBridge.ReadSnapshot();
@@ -2086,14 +2259,34 @@ private static float MinimumPixelsPerSecond
                 }
             }
 
+            long __segWatch2 = System.Diagnostics.Stopwatch.GetTimestamp();
             ApplyScrollSmoothing();
+            PreviewDiagnostics.RecordPart("T.Scroll", Since(__segWatch2));
 
+            __segWatch2 = System.Diagnostics.Stopwatch.GetTimestamp();
             if (visualsDirty)
             {
                 RefreshGeometry();
             }
+            PreviewDiagnostics.RecordPart("T.Geometry", Since(__segWatch2));
 
+            __segWatch2 = System.Diagnostics.Stopwatch.GetTimestamp();
             UpdatePlayhead(snapshot);
+            PreviewDiagnostics.RecordPart("T.Playhead", Since(__segWatch2));
+
+            PreviewDiagnostics.RecordPart("Timeline.U",
+                (System.Diagnostics.Stopwatch.GetTimestamp() - __timelineWatch)
+                * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+        }
+
+        /// <summary>
+        /// 从某个时间戳到现在多少毫秒。和别处 `RecordPart` 的写法统一，
+        /// 只是把那段重复的换算收成一句，免得八处各写一遍容易抄错。
+        /// </summary>
+        private static double Since(long timestamp)
+        {
+            return (System.Diagnostics.Stopwatch.GetTimestamp() - timestamp)
+                * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
         }
 
         public void OnScroll(PointerEventData eventData)
@@ -2673,6 +2866,8 @@ private static float MinimumPixelsPerSecond
                 changed = true;
                 layoutDirty = true;
                 visualsDirty = true;
+                // 行高压根就是块绑定的几何输入（行距/块高），必须置脏。
+                MarkBlocksDirty();
 
                 // 让光标下始终是谱面的同一处，而不是保持同一个
                 // 行号——行号已经不再对应固定位置了。
@@ -2933,6 +3128,21 @@ private static float MinimumPixelsPerSecond
 
         private readonly List<BlockPlacement> blockPlacements = new List<BlockPlacement>();
         private readonly List<BlockView> blockViews = new List<BlockView>();
+
+        /// <summary>
+        /// `EnsureBlockPlacements` 每帧要的「按 SourceOrder 排序的全量事件清单」缓存。
+        ///
+        /// 为什么缓存它：这个列表（`ordered`）在谱面没变时每一帧都一模一样，
+        /// 但原来每帧都重新 `new` 一个、把 7 个车道各 AddRange 一遍、再跑一趟
+        /// 3000 元素排序 —— 实测这一块占掉了时间轴每帧 2.7ms 里的大头。
+        /// `laneItems` 只在 `RefreshData` 重建（指纹变了才重建），所以这个缓存
+        /// 跟着 `dataFingerprint` 走就稳：指纹没变，缓存一定有效。
+        /// </summary>
+        private readonly List<TimelineItem> cachedOrdered = new List<TimelineItem>();
+        /// <summary>构建 cachedOrdered 时的谱面指纹；对不上就重建缓存。</summary>
+        private int cachedOrderedFingerprint;
+        /// <summary>cachedOrdered 是否已构建过（首次是 false，逼它先排一次）。</summary>
+        private bool cachedOrderedValid;
 
         /// <summary>
         /// 刚**消失**的事件记着它最后一次待的行号，撤销回来时按这张表领回去。
@@ -3213,6 +3423,9 @@ private static float MinimumPixelsPerSecond
             removedRows.Clear();
             EnsureBlockPlacements();
             visualsDirty = true;
+            // 整张重排过了：每个块的行号和纵向位置全变了，块绑定必须立即重刷
+            // （这符合规格里"布局重排要置脏"，别依赖 30 帧兜底）。
+            MarkBlocksDirty();
             // 整张重排过了，这就是一份没存过的新布局。
             projectDirty = true;
         }
@@ -3272,19 +3485,36 @@ private static float MinimumPixelsPerSecond
             //
             // 位置是玩家的资产（自动排列只在初次加载谱面跑一次），所以清单必须完整。
             // "看不见"改在 `CollectBlocks` 里滤 —— 那只是画不画的问题。
-            List<TimelineItem> ordered = new List<TimelineItem>();
-            for (int lane = 0; lane < LaneCount; lane++)
+            //
+            // **缓存 `ordered`**：谱面没变（`dataFingerprint` 没动）时，这份按
+            // SourceOrder 排序的全量清单上一帧是什么、这一帧还是什么。原来每帧
+            // 重新拼 + 排序 3000 个引用，实测占掉时间轴每帧 2.7ms 里的大头。
+            // 现在只在指纹变化（= `laneItems` 刚被 `RefreshData` 重建过）时重算。
+            //
+            // 失效判据用 `dataFingerprint` 而不是内容比对：`RefreshData` 只在
+            // 指纹真的变了才重建 `laneItems` 并更新指纹（见那边的早退），
+            // 所以「laneItems 变了」当且仅当「dataFingerprint 变了」，两者等价。
+            // 首次（cachedOrderedValid == false）先强制拼一次。
+            if (!cachedOrderedValid || cachedOrderedFingerprint != dataFingerprint)
             {
-                ordered.AddRange(laneItems[lane]);
-            }
-            // 上面是按车道拼的，不是文件序 —— 必须按 SourceOrder 重排。
-            ordered.Sort(delegate(TimelineItem a, TimelineItem b)
-            {
-                return a.SourceOrder.CompareTo(b.SourceOrder);
-            });
+                cachedOrdered.Clear();
+                for (int lane = 0; lane < LaneCount; lane++)
+                {
+                    cachedOrdered.AddRange(laneItems[lane]);
+                }
+                // 上面是按车道拼的，不是文件序 —— 必须按 SourceOrder 重排。
+                cachedOrdered.Sort(delegate(TimelineItem a, TimelineItem b)
+                {
+                    return a.SourceOrder.CompareTo(b.SourceOrder);
+                });
 
-            // 身份要在**按时间重排之前**算好 —— 再往下 `ordered` 就被按时间排序了。
-            EnsureEventKeys(ordered);
+                // 身份要在**按时间重排之前**算好 —— 再往下 `ordered` 就被按时间排序了。
+                EnsureEventKeys(cachedOrdered);
+
+                cachedOrderedFingerprint = dataFingerprint;
+                cachedOrderedValid = true;
+            }
+            List<TimelineItem> ordered = cachedOrdered;
 
             // **工程认不出来，就当没有工程。**
             //
@@ -3858,9 +4088,85 @@ private static float MinimumPixelsPerSecond
             }
         }
 
+        /// <summary>
+        /// 这一帧能不能整体跳过 `CollectBlocks`。
+        ///
+        /// 判据必须覆盖「谱面内容变了、但 `dataFingerprint` 还没被轮询更新」的那些
+        /// 路径 —— 撤销 / 属性提交 / 粘贴 / 增删 / 联机全都经过
+        /// `RequestEvaluatorRebuild`，那条线由 `externalChartDirtyVersion` 兜着。
+        ///
+        /// **不确定的一律按"不早退"处理**：宁可多跑一帧，也不能"改了不刷新"。
+        /// </summary>
+        private bool CollectBlocksUnchanged()
+        {
+            if (!collectBoundOnce || blockDragActive || imBlockDrag)
+            {
+                return false;
+            }
+            // 兜底：连跳够多帧强制真跑一次（漏挂的脏点最多错半秒）。
+            if (blocksSkippedCollectFrames >= BlocksForceRefreshFrames)
+            {
+                return false;
+            }
+            // **位置表还是空的 = 首次排版还没发生。**
+            // `EnsureBlockPlacements` 里那条「清单必须和谱面对得上才许排版」的
+            // 分支要靠连续调用推进；跳过会让首次排版被拖到 30 帧兜底之后，
+            // 甚至排在清单到位之前（那正是"首次进去排版乱"的老 bug）。
+            if (blockPlacements.Count == 0)
+            {
+                return false;
+            }
+            if (collectBoundDataFingerprint != dataFingerprint
+                || collectBoundDirtyVersion != blocksDirtyVersion
+                || collectBoundExternalVersion != externalChartDirtyVersion
+                || collectBoundPlacementCount != blockPlacements.Count)
+            {
+                return false;
+            }
+            // `EnsureBlockPlacements` 自己的「该重排 / 该应用缩放」标志：为真时
+            // 它要做装箱或改缩放，不能跳过。
+            //
+            // `repackOnNextRebuild` **故意不算在内**：它只在
+            // `RebindBlockPlacements` 的尾部被消费，而那个函数在「顺序没变」时
+            // 自己就早退（`SamePlacementOrder`），也就是说这个待办本来就要等
+            // 下一次真重绑（= 数据变了、我们不会早退的那一帧）才生效 ——
+            // 而且它在首次排版后会一直为 true，算进来等于让早退永远不生效。
+            if (forcePlacementRebuild || pendingZoomToMaximum)
+            {
+                return false;
+            }
+            // 换谱面：路径变了 `EnsureBlockPlacements` 要清位置表重新装箱。
+            // 空路径是场景切换的中间态，按"还是同一张谱"处理（同那边的判据）。
+            string chartPath = EditorProjectSession.GetCurrentLevelPath();
+            if (!string.IsNullOrEmpty(chartPath)
+                && !string.Equals(projectChartPath, chartPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+            // BPM 变了而且还没有工程时，`EnsureBlockPlacements` 要补一次重排
+            // （首次打开读到的可能是上一张谱残留的 BPM，见那边的说明）。
+            if (projectRows == null && autoArrangedBpm > 0f
+                && Mathf.Abs(ChartBpm - autoArrangedBpm) > 0.5f)
+            {
+                return false;
+            }
+            return true;
+        }
+
         /// <summary>摊平给 ImGui 画。按行升序排，因为画的时候是"一层层往下盖"。</summary>
         internal void CollectBlocks()
         {
+            // ===== 整体早退（第 2 轮真优化）：静止帧整个跳过 =====
+            // 输入（谱面/选中/视图/位置表/外部改动版本）全都没变时，
+            // 跑主循环只会算出和上一帧一模一样的 `blockViews` —— 白烧 1.92ms。
+            // 拖动中永不早退（块要跟手），30 帧兜底在 `CollectBlocksUnchanged` 里。
+            if (CollectBlocksUnchanged())
+            {
+                blocksSkippedCollectFrames++;
+                return;
+            }
+            blocksSkippedCollectFrames = 0;
+
             EnsureBlockPlacements();
             blockViews.Clear();
             int rows = 0;
@@ -3977,6 +4283,16 @@ private static float MinimumPixelsPerSecond
             // 块：多空转 4000 次约 0.2ms，比排序便宜一个数量级。
             //
             // **顺序从此没有意义 —— 谁都不能再假设 `BlockViews` 是按行号有序的。**
+
+            // **记下这一帧真正跑完时的判等快照**，下一帧整体早退就看它。
+            // 放在方法最末尾：中途任何 return（包括上面 drag 分支之外的所有路径）
+            // 都不会被误记成"已跑完"。
+            collectBoundOnce = true;
+            blocksSkippedCollectFrames = 0;
+            collectBoundDataFingerprint = dataFingerprint;
+            collectBoundDirtyVersion = blocksDirtyVersion;
+            collectBoundExternalVersion = externalChartDirtyVersion;
+            collectBoundPlacementCount = blockPlacements.Count;
         }
 
         // -------------------------------- ImGui 版块拖动：**这条是改谱面的**
@@ -4067,6 +4383,9 @@ private static float MinimumPixelsPerSecond
             }
             imBlockDragPressTime = pointerTime;
             imBlockDrag = true;
+            // ImGui 那条拖动也置脏：拖动期间早退被那条"拖动中永不早退"挡住，
+            // 但一开始这一笔能让块立刻进入跟随状态。
+            MarkBlocksDirty();
             return true;
         }
 
@@ -4173,6 +4492,8 @@ private static float MinimumPixelsPerSecond
                 return;
             }
             imBlockDrag = false;
+            // 拖动结束：块要落回提交/还原后的位置，立即重绑。
+            MarkBlocksDirty();
 
             TimelineItem item = imBlockDragOrigin.Item;
             scnEditor editor = scnEditor.instance;
@@ -4384,6 +4705,8 @@ private static float MinimumPixelsPerSecond
             // 见 SyncSceneSelection —— ImGui 点块这条路上原来漏了这一步。）
             SyncSceneSelection(item);
             visualsDirty = true;
+            // 单选换了块，描边要立刻重绑。
+            MarkBlocksDirty();
         }
 
         /// <summary>
@@ -5286,6 +5609,8 @@ private static float MinimumPixelsPerSecond
                 verticalScrollOffset = keptScroll;
                 layoutDirty = true;
                 visualsDirty = true;
+                // 谱面数据重建成空集了，块清单也得跟着重绑。
+                MarkBlocksDirty();
                 return;
             }
 
@@ -5337,6 +5662,12 @@ private static float MinimumPixelsPerSecond
                 // 放置事件面板的图标同样依赖谱面数据，一并刷新。
                 RefreshEventPalette();
             }
+
+            // **真正重建完 laneItems 了，块绑定必须立即置脏。**
+            // 不能只靠 dataFingerprint：那个判等虽然也变了，但把这一笔显式记上，
+            // 脏标记的语义才是完整的（数据变了 = 必须重绑），也免得哪天
+            // 指纹的算法改动把这层保障带走。
+            MarkBlocksDirty();
         }
 
         // ==== 以下方法从备份原样拼回（英文注释）====
@@ -5622,6 +5953,28 @@ private static float MinimumPixelsPerSecond
             // 表头池、行底衬池、标尺池全建出来。现在时间轴是 ImGui 画的，
             // 那些池子一个都不用了，连创建一起删了。
             layoutItems.Sort(CompareTimelineItems);
+
+            // **重建「事件 → 排版格」索引。** `layoutRows` 只在这里被改，所以放在
+            // 这里就永远同步（见 `itemByEvent` 的说明）。同一个事件在同一帧里
+            // 只会有一段区间，重复时保留先出现的那一个，行为和原来的线性扫描一致
+            // （线性扫描也是返回第一个命中的）。
+            itemByEvent.Clear();
+            for (int r = 0; r < layoutRows.Count; r++)
+            {
+                List<RowInterval> intervals = layoutRows[r];
+                for (int i = 0; i < intervals.Count; i++)
+                {
+                    TimelineItem indexed = intervals[i].Item;
+                    if (indexed == null || indexed.Event == null)
+                    {
+                        continue;
+                    }
+                    if (!itemByEvent.ContainsKey(indexed.Event))
+                    {
+                        itemByEvent.Add(indexed.Event, indexed);
+                    }
+                }
+            }
 
             layoutDirty = false;
             ClampVerticalScroll();
@@ -6605,6 +6958,10 @@ private static float MinimumPixelsPerSecond
                 }
                 placement.Row = row;
             }
+            // **脚底置脏。** 早退判据只看 `blocksDirtyVersion`，不看
+            // `visualsDirty`；不 +1 的话缩放重排完照样早退，块位置要等
+            // 30 帧兜底才更新（见字段声明处的说明）。
+            blocksDirtyVersion++;
             visualsDirty = true;
         }
 
@@ -6796,6 +7153,8 @@ private static float MinimumPixelsPerSecond
 
             // 起点表清掉：横纵都不再提交。
             dragOrigins.Clear();
+            // 行号已退回原值，得让 `CollectBlocks` 重跑（它不看 visualsDirty）。
+            blocksDirtyVersion++;
             visualsDirty = true;
             return true;
         }
@@ -6851,6 +7210,8 @@ private static float MinimumPixelsPerSecond
                     }
                 }
             }
+            // 行号变了就得让 `CollectBlocks` 重跑一遍（见字段声明处的说明）。
+            blocksDirtyVersion++;
             visualsDirty = true;
         }
 
@@ -6913,6 +7274,8 @@ private static float MinimumPixelsPerSecond
                     blockPlacements[i].Row = Mathf.Max(0, dragRowSnapshot[i]);
                 }
             }
+            // 整张行表换回快照了，`CollectBlocks` 必须重跑。
+            blocksDirtyVersion++;
             visualsDirty = true;
         }
 
@@ -6960,6 +7323,17 @@ private static float MinimumPixelsPerSecond
                 return null;
             }
 
+            // 快路径：索引命中就是一次字典查找。`UpdateBlocks` 每帧每个可见块都
+            // 要调这里，固定播放头下几百块 × 几千事件，线性扫是每帧几十万次比较
+            // （见 `itemByEvent` 的说明）。
+            TimelineItem indexed;
+            if (itemByEvent.TryGetValue(target, out indexed))
+            {
+                return indexed;
+            }
+
+            // 兜底：索引里没有（理论上不该发生）就退回线性扫描，
+            // 保证「查得到就是查得到」，不会因为漏登记把块画错。
             for (int r = 0; r < layoutRows.Count; r++)
             {
                 List<RowInterval> intervals = layoutRows[r];
@@ -7035,6 +7409,9 @@ private static float MinimumPixelsPerSecond
             // 谁先松手谁说了算，另一个人的努力白费，而且双方都不知道。
 
             blockDragActive = true;
+            // 拖动开始：块从这一刻起要跟着光标走，置脏让本帧就重绑一次
+            // （之后拖动期间 `BlocksViewUnchanged` 里那条"拖动中永早退"会接管）。
+            MarkBlocksDirty();
             blockDragItem = item;
             blockDragMarker = marker;
             // 拉长/缩短不参与纵向挪行（见 UpdateBlockDragPointer）。
@@ -7224,6 +7601,9 @@ private static float MinimumPixelsPerSecond
                 return;
             }
             blockDragActive = false;
+            // 拖动结束：松手后块要落回提交/还原后的位置，立即重绑。
+            // 放在这个赋值之后就置脏，下面的几条提前 return 也都被覆盖到。
+            MarkBlocksDirty();
             blockDragItem = null;
             blockDragMarker = null;
             dragPointerValid = false;
@@ -7354,6 +7734,8 @@ private static float MinimumPixelsPerSecond
                     + " members=" + dragOrigins.Count);
             }
             blockDragActive = false;
+            // 拖动被取消：位置已经退回快照，块要按退回后的位置重绑。
+            MarkBlocksDirty();
             blockDragItem = null;
             blockDragMarker = null;
             dragPointerValid = false;
@@ -7472,7 +7854,9 @@ private static float MinimumPixelsPerSecond
             item.StartTime = GetEventStartTime(editor, levelEvent);
             item.Duration = GetEventDuration(editor, levelEvent);
 
-            EditorPlaybackBridge.RequestEvaluatorRebuild("timeline-drag");
+            // 带上事件本身：相机、滤镜、粒子这类事件不会改动格的烘焙状态，
+            // 重建时可以直接跳过那 1.7 秒的全量烘焙（见 IsFloorStateNeutral）。
+            EditorPlaybackBridge.RequestEvaluatorRebuild("timeline-drag", levelEvent);
             EditorCommandHistory.RecordBlockDrag(
                 editor,
                 levelEvent,
@@ -7490,6 +7874,9 @@ private static float MinimumPixelsPerSecond
             if (Main.Settings != null && Main.Settings.VerboseDiagnostics)
             {
                 Main.Logger.Log("[TimelineDrag] commit " + item.Name
+                    + " type=" + levelEvent.eventType
+                    + (levelEvent.info != null && levelEvent.info.isDecoration ? "(装饰)" : "")
+                    + " 需烘焙=" + (EditorPlaybackBridge.EventNeedsFloorBake(levelEvent) ? "是" : "否")
                     + " floor " + oldFloor + "->" + newFloor
                     + " angle " + oldAngleOffset.ToString("0.###") + "->" + newAngleOffset.ToString("0.###")
                     + (hadDuration
@@ -8009,8 +8396,23 @@ private static float MinimumPixelsPerSecond
             // 这个文本对象现在只是**数据的载体**（ImGui 那边读它的 `.text` 去画），
             // 和"摆不摆 uGUI 播放头"是两件不相干的事。
             float current = Mathf.Max(0f, snapshot.CurrentTime);
-            timeText.text = FormatTime(current) + " / "
-                + FormatTime(Mathf.Max(totalDuration, snapshot.Duration, current));
+            // 嵌套 Max 而不是三参 `Mathf.Max(a, b, c)`：那个重载是 params，
+            // 每帧都要多分配一个 float[]（D5 顺手清掉的一笔）。
+            float total = Mathf.Max(totalDuration, Mathf.Max(snapshot.Duration, current));
+            int currentMs = Mathf.RoundToInt(current * 1000f);
+            int totalMs = Mathf.RoundToInt(total * 1000f);
+            // **没变就不重拼、不重赋值。** 静止不动时这两个毫秒数一帧一个样，
+            // 旧实现照样每帧拼 5 个短字符串再写一次 text。
+            if (currentMs != timeTextCurrentMs || totalMs != timeTextTotalMs)
+            {
+                timeTextCurrentMs = currentMs;
+                timeTextTotalMs = totalMs;
+                TimeTextBuilder.Length = 0;
+                AppendTime(TimeTextBuilder, current);
+                TimeTextBuilder.Append(" / ");
+                AppendTime(TimeTextBuilder, total);
+                timeText.text = TimeTextBuilder.ToString();
+            }
 
             float x = (current - viewStartTime) * pixelsPerSecond;
             bool inside = viewInitialized && x >= 0f && x <= bodyWidth;
@@ -8106,6 +8508,12 @@ private static float MinimumPixelsPerSecond
             verticalScrollOffset = 0f;
             layoutDirty = true;
             visualsDirty = true;
+            // **车道切换必须立即置脏。** 关掉一个车道后那些块要从 `BlockViews`
+            // 里消失，而几何量（viewStart/缩放/滚动/行高）一个都没变 ——
+            // 不置脏的话要等 30 帧兜底才会重绑。
+            // 挂在这里而不是 `ToggleLane`：`ToggleLane` / `SetAllLanes`
+            // 两条路都汇到这一个函数，挂一次就全覆盖。
+            MarkBlocksDirty();
             UpdateFilterVisuals();
         }
 
@@ -8186,6 +8594,8 @@ private static float MinimumPixelsPerSecond
             SyncSceneSelection(item);
             UpdateSummary();
             visualsDirty = true;
+            // 点击换选中，描边要立刻重绑。
+            MarkBlocksDirty();
         }
 
         /// <summary>
@@ -8895,10 +9305,56 @@ private static float MinimumPixelsPerSecond
 
         private static string FormatTime(float seconds)
         {
-            seconds = Mathf.Max(0f, seconds);
+            TimeTextBuilder.Length = 0;
+            AppendTime(TimeTextBuilder, Mathf.Max(0f, seconds));
+            return TimeTextBuilder.ToString();
+        }
+
+        /// <summary>
+        /// 时间读数专用的 StringBuilder（`FormatTime` 和"当前 / 总长"那条
+        /// 一次性拼接共用）。
+        ///
+        /// 为什么不每次拼字符串：这个格式每帧都要用，旧实现一次格式化要
+        /// new 两个中间字符串、一次拼接再 new 一个——60fps 下就是 12~30KB/s
+        /// 的持续 GC 垃圾。`RulerTimeBuilder` 已经是这个先例。
+        /// </summary>
+        private static readonly System.Text.StringBuilder TimeTextBuilder =
+            new System.Text.StringBuilder(24);
+
+        /// <summary>
+        /// 把一段秒数按 `mm:ss.000` 追加到 builder 末尾。
+        ///
+        /// 不用 `minutes.ToString("00")` / `remainder.ToString("00.000")`：
+        /// 那两条每次各 new 一个中间字符串，而且 `ToString` 的格式串会吃
+        /// 系统区域设置里的小数点符号——时间读数必须固定是 `:` 和 `.`。
+        /// 按十进制位直接 Append，零中间分配、符号也固定。
+        /// </summary>
+        private static void AppendTime(System.Text.StringBuilder builder, float seconds)
+        {
             int minutes = Mathf.FloorToInt(seconds / 60f);
             float remainder = seconds - minutes * 60f;
-            return minutes.ToString("00") + ":" + remainder.ToString("00.000");
+            // 毫秒取整和上面缓存判等用的是同一个换算，两边才对得上。
+            // 59.9995 以上会进位成 60.000——旧实现 `ToString("00.000")`
+            // 也是这个结果，照旧保留，免得读数在临界点上和以前不一样。
+            int milliseconds = Mathf.RoundToInt(remainder * 1000f);
+            int wholeSeconds = milliseconds / 1000;
+            int fraction = milliseconds % 1000;
+
+            if (minutes < 10)
+            {
+                builder.Append('0');
+            }
+            builder.Append(minutes);
+            builder.Append(':');
+            if (wholeSeconds < 10)
+            {
+                builder.Append('0');
+            }
+            builder.Append(wholeSeconds);
+            builder.Append('.');
+            builder.Append((char)('0' + fraction / 100));
+            builder.Append((char)('0' + fraction / 10 % 10));
+            builder.Append((char)('0' + fraction % 10));
         }
 
         private static readonly System.Text.StringBuilder RulerTimeBuilder =
@@ -10069,11 +10525,25 @@ private static float MinimumPixelsPerSecond
             }
         }
 
-        // 齿标：一条竖线 + 一个时间文字。池子按屏宽最多 32 组。
-        private readonly List<Image> tickLinePool = new List<Image>();
+        // 齿标：一条竖线 + 一个格号文字。
+        //
+        // **文字仍然是每个刻度一个 TMP 对象**（文字没法并进一个网格里而不丢
+        // 字形缓存的批处理），**线已经不是了** —— 全部并进下面的自绘 Graphic。
         private readonly List<TextMeshProUGUI> tickLabelPool = new List<TextMeshProUGUI>();
 
-        private readonly List<Image> gridLinePool = new List<Image>();
+        // **格线和刻度线各自只留一个 Graphic。**
+        //
+        // 原来它们是 220 个 + 64 个 Image。uGUI 的 CanvasUpdateRegistry
+        // 每帧无条件跑一遍 ClipperRegistry.Cull()，而视口上挂着 RectMask2D，
+        // 于是每一个 MaskableGraphic 每帧都要做 4 次 GetWorldCorners 加
+        // 4 次矩阵乘 —— **和它脏没脏无关**，纯按对象个数计费。两百多条
+        // 1 像素宽的线就是两百多份。
+        //
+        // 合并之后这两个数变成 2。绘制结果逐像素不变：同样是那些四边形、
+        // 同样的颜色和 1 像素线宽、同样的层序，只是从"两百个对象各画一条"
+        // 变成"一个对象里两百个四边形"。
+        private VerticalLineStripGraphic gridLineGraphic;
+        private VerticalLineStripGraphic tickLineGraphic;
 
         /// <summary>
         /// 画标尺：**刻度写的是格子编号**（`floor.seqID`），不是秒。
@@ -10092,6 +10562,12 @@ private static float MinimumPixelsPerSecond
             CollectRuler();
 
             List<RulerTick> ticks = RulerTicks;
+            EnsureTickGraphic();
+            // 自绘 Graphic 的 rect 只是给它一个合理的包围盒（面板拉高后会变），
+            // 顶点坐标全都落在这块 rect 里。值没变时 SetTopLeft 自己会跳过写入。
+            SetTopLeft(tickLineGraphic.rectTransform, 0f, 0f,
+                viewport.rect.width, viewport.rect.height);
+            tickLineGraphic.BeginLines();
             int used = 0;
             for (int i = 0; i < ticks.Count && used < 64; i++)
             {
@@ -10100,14 +10576,10 @@ private static float MinimumPixelsPerSecond
                 {
                     continue;
                 }
-                EnsureRulerSlot(used + 1);
+                EnsureRulerLabelSlot(used + 1);
 
-                Image line = tickLinePool[used];
-                if (!line.gameObject.activeSelf)
-                {
-                    line.gameObject.SetActive(true);
-                }
-                SetTopLeft(line.rectTransform, tick.X, RulerHeight - 9f, 1f, 8f);
+                // 竖线不再是单个 Image，直接塞进这个 Graphic 的待画列表。
+                tickLineGraphic.AddLine(tick.X, RulerHeight - 9f, 1f, 8f);
 
                 TextMeshProUGUI label = tickLabelPool[used];
                 if (!label.gameObject.activeSelf)
@@ -10118,13 +10590,10 @@ private static float MinimumPixelsPerSecond
                 SetTopLeft(label.rectTransform, tick.X + 3f, 1f, 56f, 16f);
                 used++;
             }
+            tickLineGraphic.SubmitLines();
 
-            for (int i = used; i < tickLinePool.Count; i++)
+            for (int i = used; i < tickLabelPool.Count; i++)
             {
-                if (tickLinePool[i].gameObject.activeSelf)
-                {
-                    tickLinePool[i].gameObject.SetActive(false);
-                }
                 if (tickLabelPool[i].gameObject.activeSelf)
                 {
                     tickLabelPool[i].gameObject.SetActive(false);
@@ -10133,57 +10602,70 @@ private static float MinimumPixelsPerSecond
 
             // 格线：比刻度密，铺满从标尺下沿到视口底。
             List<RulerLine> lines = RulerLines;
-            int gridUsed = 0;
-            for (int i = 0; i < lines.Count && gridUsed < 220; i++)
+            EnsureGridGraphic();
+            SetTopLeft(gridLineGraphic.rectTransform, 0f, 0f,
+                viewport.rect.width, viewport.rect.height);
+            gridLineGraphic.BeginLines();
+            float gridHeight = Mathf.Max(0f, viewport.rect.height - RulerHeight);
+            if (gridHeight > 0f)
             {
-                float x = lines[i].X;
-                if (x < 0f || x > viewport.rect.width)
+                int gridUsed = 0;
+                for (int i = 0; i < lines.Count && gridUsed < 220; i++)
                 {
-                    continue;
-                }
-                EnsureGridSlot(gridUsed + 1);
-                Image grid = gridLinePool[gridUsed];
-                if (!grid.gameObject.activeSelf)
-                {
-                    grid.gameObject.SetActive(true);
-                }
-                SetTopLeft(grid.rectTransform, x, RulerHeight, 1f,
-                    Mathf.Max(0f, viewport.rect.height - RulerHeight));
-                gridUsed++;
-            }
-            for (int i = gridUsed; i < gridLinePool.Count; i++)
-            {
-                if (gridLinePool[i].gameObject.activeSelf)
-                {
-                    gridLinePool[i].gameObject.SetActive(false);
+                    float x = lines[i].X;
+                    if (x < 0f || x > viewport.rect.width)
+                    {
+                        continue;
+                    }
+                    gridLineGraphic.AddLine(x, RulerHeight, 1f, gridHeight);
+                    gridUsed++;
                 }
             }
+            gridLineGraphic.SubmitLines();
         }
 
-        private void EnsureGridSlot(int count)
+        private void EnsureGridGraphic()
         {
-            while (gridLinePool.Count < count)
+            if (gridLineGraphic != null)
             {
-                Image grid = CreateImage("GridLine" + gridLinePool.Count,
-                    gridLayer != null ? gridLayer : blockLayer,
-                    0f, 0f, 1f, 10f, new Color(1f, 1f, 1f, 0.06f));
-                grid.raycastTarget = false;
-                gridLinePool.Add(grid);
+                return;
             }
+
+            // 挂在 gridLayer 下面，层序和原来那 220 个 Image 一样：
+            // 整套格线都压在每一个事件块**下面**。
+            RectTransform rect = CreateRect("GridLines",
+                gridLayer != null ? gridLayer : blockLayer,
+                0f, 0f, bodyWidth, bodyHeight);
+            gridLineGraphic = rect.gameObject.AddComponent<VerticalLineStripGraphic>();
+            gridLineGraphic.color = new Color(1f, 1f, 1f, 0.06f);
+            gridLineGraphic.raycastTarget = false;
         }
 
-        private void EnsureRulerSlot(int count)
+        private void EnsureTickGraphic()
         {
-            while (tickLinePool.Count < count)
+            if (tickLineGraphic != null)
             {
-                // **齿标要够亮。** 标尺底色是全透明的（靠模块底色透上来），
-                // 1px / 22% 白 + 弱化文字叠在 #0B0B0B 上几乎看不见 ——
-                // 用户反馈「齿标变透明了」就是这个。线和字都提一档。
-                Image line = CreateImage("Tick" + tickLinePool.Count, viewport,
-                    0f, 0f, 1f, 8f, new Color(1f, 1f, 1f, 0.55f));
-                line.raycastTarget = false;
-                tickLinePool.Add(line);
+                return;
+            }
 
+            // **挂在 viewport 下，而且是"用到才建"。** 原来那批 Tick Image 就是
+            // 第一次跑到标尺时才逐个 append 到 viewport 末尾的，没有
+            // SetAsLastSibling —— 所以这个 Graphic 也必须在同一时机懒建，
+            // 才能拿到同一个兄弟位置，不至于被压到播放头下面去。
+            RectTransform rect = CreateRect("TickLines", viewport,
+                0f, 0f, bodyWidth, bodyHeight);
+            tickLineGraphic = rect.gameObject.AddComponent<VerticalLineStripGraphic>();
+            // **齿标要够亮。** 标尺底色是全透明的（靠模块底色透上来），
+            // 1px / 22% 白 + 弱化文字叠在 #0B0B0B 上几乎看不见 ——
+            // 用户反馈「齿标变透明了」就是这个。线和字都提一档。
+            tickLineGraphic.color = new Color(1f, 1f, 1f, 0.55f);
+            tickLineGraphic.raycastTarget = false;
+        }
+
+        private void EnsureRulerLabelSlot(int count)
+        {
+            while (tickLabelPool.Count < count)
+            {
                 TextMeshProUGUI label = CreateText("TickLabel" + tickLabelPool.Count,
                     viewport, 0f, 0f, 56f, 16f, string.Empty, 10f,
                     Palette.TextPrimary, TextAlignmentOptions.MidlineLeft, false);
@@ -10314,6 +10796,49 @@ private static float MinimumPixelsPerSecond
         }
 
         /// <summary>
+        /// 把块绑定标记为过期（下一帧必须重绑）。
+        ///
+        /// 挂点：`RefreshData` 结束、拖动开始/结束、车道切换、`Relayout`、
+        /// 行高调整、选中变化。**漏挂不会永久卡死**——`UpdateBlocks` 那边
+        /// 有每 `BlocksForceRefreshFrames` 帧一次的强制重刷兜底。
+        /// </summary>
+        private void MarkBlocksDirty()
+        {
+            blocksDirtyVersion++;
+        }
+
+        /// <summary>
+        /// 这一帧能不能跳过 `UpdateBlocks`：视图几何、数据指纹、选中指纹、
+        /// 脏标记版本全都和上次绑定时一致，就说明绑出来的结果一定一样。
+        ///
+        /// **拖动中永远返回 false**：拖动时块要跟着光标走，而它改的是
+        /// `blockPlacements[i].Time`，上面这些量全都不变——只靠快照会把块冻住。
+        /// </summary>
+        private bool BlocksViewUnchanged()
+        {
+            if (!blocksBoundOnce || blockDragActive || imBlockDrag)
+            {
+                return false;
+            }
+            // 兜底：连跳够多帧就强制重刷一次，防止哪个置脏点漏了。
+            if (blocksSkippedFrames >= BlocksForceRefreshFrames)
+            {
+                return false;
+            }
+            return Mathf.Approximately(boundViewStart, viewStartTime)
+                && Mathf.Approximately(boundPixelsPerSecond, Mathf.Max(1f, pixelsPerSecond))
+                && Mathf.Approximately(boundScrollOffset, verticalScrollOffset)
+                && Mathf.Approximately(boundRowHeight, rowHeight)
+                && Mathf.Approximately(boundBodyWidth, bodyWidth)
+                && Mathf.Approximately(boundViewportWidth, viewport.rect.width)
+                && Mathf.Approximately(boundViewportHeight, viewport.rect.height)
+                && boundBlockCount == blockViews.Count
+                && boundDataFingerprint == dataFingerprint
+                && boundSelectionFingerprint == selectionFingerprint
+                && boundDirtyVersion == blocksDirtyVersion;
+        }
+
+        /// <summary>
         /// 把这一帧可见的块绑到池子里。几何直接照 ImGui 主体那套公式：
         /// 横轴按 `PixelsPerSecond`，纵轴按行号 × 行距，标尺高度以上被裁掉。
         /// </summary>
@@ -10323,6 +10848,15 @@ private static float MinimumPixelsPerSecond
             {
                 return;
             }
+
+            // **视图快照早退。** 静止时几何、数据、选中一样没变，
+            // 重绑出来的东西和上一帧一模一样，整段可以跳过。
+            if (BlocksViewUnchanged())
+            {
+                blocksSkippedFrames++;
+                return;
+            }
+            blocksSkippedFrames = 0;
 
             float pixelsPerSecond = Mathf.Max(1f, PixelsPerSecond);
             float viewStart = ViewStartSeconds;
@@ -10483,6 +11017,22 @@ private static float MinimumPixelsPerSecond
                 }
                 freeMarkers.Add(pair.Value);
             }
+
+            // **记下这一帧的视图快照**，下一帧早退就靠它判等。
+            // 放在整段最后：中途任何一处 return 都不会误记成"已绑定"。
+            blocksBoundOnce = true;
+            blocksSkippedFrames = 0;
+            boundViewStart = viewStartTime;
+            boundPixelsPerSecond = Mathf.Max(1f, pixelsPerSecond);
+            boundScrollOffset = verticalScrollOffset;
+            boundRowHeight = rowHeight;
+            boundBodyWidth = bodyWidth;
+            boundViewportWidth = viewport.rect.width;
+            boundViewportHeight = viewport.rect.height;
+            boundBlockCount = blockViews.Count;
+            boundDataFingerprint = dataFingerprint;
+            boundSelectionFingerprint = selectionFingerprint;
+            boundDirtyVersion = blocksDirtyVersion;
         }
 
         private void ActivatePaletteEvent(int slot)
@@ -10901,6 +11451,100 @@ private static float MinimumPixelsPerSecond
             if (rect.sizeDelta != size)
             {
                 rect.sizeDelta = size;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 把一整排竖线画进**同一个**网格的 Graphic。
+    ///
+    /// 为什么要有它：时间轴遮罩下原本挂着 220 条格线 + 64 条刻度线，每条都是
+    /// 一个独立的 `Image`。uGUI 的 `CanvasUpdateRegistry.PerformUpdate` 每帧
+    /// 无条件跑一遍 `ClipperRegistry.Cull()`，视口上挂着 `RectMask2D`，于是
+    /// 每一个 `MaskableGraphic` 每帧都要做 4 次 `GetWorldCorners` 加 4 次矩阵
+    /// 乘 —— **跟脏没脏完全无关**，纯按对象个数收费。两百多个 1 像素宽的线
+    /// 就交了两百多份这种税，外加两百多次合批重算。
+    ///
+    /// 合并成一个 Graphic 之后，那个数量变成 1，而画出来的东西一个像素都不差：
+    /// 同样的四边形（左上角 x、上边 y、宽、高），同样的 1 像素线宽，同样的
+    /// 颜色和 alpha，同样的兄弟层序，同样被 `RectMask2D` 裁。
+    ///
+    /// 用法：`BeginLines()` → 若干次 `AddLine(...)` → `SubmitLines()`。
+    /// 每帧都可以这么来一次，但 `SubmitLines()` 会跟上次提交的比一遍，
+    /// 一模一样就不标脏 —— 视口没动时不会白白重建网格。
+    /// </summary>
+    internal sealed class VerticalLineStripGraphic : MaskableGraphic
+    {
+        // 每条线是 (左上角 x, 上边 y, 宽, 高)，坐标系和 SetTopLeft 一致：
+        // 原点在父节点左上角，y 向下为正。
+        private readonly List<Vector4> pending = new List<Vector4>();
+        private readonly List<Vector4> submitted = new List<Vector4>();
+
+        internal void BeginLines()
+        {
+            pending.Clear();
+        }
+
+        internal void AddLine(float x, float top, float width, float height)
+        {
+            pending.Add(new Vector4(x, top, width, height));
+        }
+
+        internal void SubmitLines()
+        {
+            if (SameAsSubmitted())
+            {
+                return;
+            }
+
+            submitted.Clear();
+            submitted.AddRange(pending);
+            SetVerticesDirty();
+        }
+
+        private bool SameAsSubmitted()
+        {
+            if (submitted.Count != pending.Count)
+            {
+                return false;
+            }
+            for (int i = 0; i < pending.Count; i++)
+            {
+                if (submitted[i] != pending[i])
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        protected override void OnPopulateMesh(VertexHelper vh)
+        {
+            vh.Clear();
+            Color32 tint = color;
+            for (int i = 0; i < submitted.Count; i++)
+            {
+                Vector4 line = submitted[i];
+                if (line.z <= 0f || line.w <= 0f)
+                {
+                    continue;
+                }
+
+                // 左上轴心：局部原点就是左上角，x 向右为正、y 向下为负。
+                float left = line.x;
+                float right = line.x + line.z;
+                float top = -line.y;
+                float bottom = -(line.y + line.w);
+
+                // 顶点顺序照抄 Image.GenerateSimpleSprite（左下 → 左上 →
+                // 右上 → 右下），三角形绕向才不会和 uGUI 其它网格相反。
+                int start = vh.currentVertCount;
+                vh.AddVert(new Vector3(left, bottom, 0f), tint, Vector2.zero);
+                vh.AddVert(new Vector3(left, top, 0f), tint, Vector2.zero);
+                vh.AddVert(new Vector3(right, top, 0f), tint, Vector2.zero);
+                vh.AddVert(new Vector3(right, bottom, 0f), tint, Vector2.zero);
+                vh.AddTriangle(start, start + 1, start + 2);
+                vh.AddTriangle(start + 2, start + 3, start);
             }
         }
     }

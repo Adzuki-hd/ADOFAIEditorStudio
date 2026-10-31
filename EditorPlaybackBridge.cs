@@ -731,6 +731,9 @@ namespace ADOFAIEditorStudio
         private static bool staticCameraStateCaptured;
         private static bool staticCameraWasEnabled;
         private static bool staticCameraSkipUpdate;
+        /// <summary>缩略图相机的原始 enabled，冻结时记下来、还原时用。</summary>
+        private static bool thumbnailCameraStateCaptured;
+        private static bool thumbnailCameraWasEnabled;
         private static readonly List<scrPlanet> staticPreviewDisabledPlanets =
             new List<scrPlanet>();
         private static readonly EvaluatorPreviewBackend evaluatorBackend = new EvaluatorPreviewBackend();
@@ -2781,6 +2784,14 @@ namespace ADOFAIEditorStudio
 
         private static void LogTrackBWindowFrame(string label)
         {
+            // 原来这条逐帧日志没有任何门控：Track B 窗口期间每帧拼一次
+            // StringBuilder、几十次 ToString 和一次同步 Console.WriteLine，
+            // 实测单条日志就能吃掉一整帧（UMM 的 Logger 是同步写控制台）。
+            // 现在挂上 VerboseDiagnostics 门 —— 需要排查 Track B 时再开。
+            if (Main.Settings == null || !Main.Settings.VerboseDiagnostics)
+            {
+                return;
+            }
             if (trackBStartFrame < 0 && trackBPostCommitFrames <= 0)
             {
                 return;
@@ -5899,6 +5910,35 @@ namespace ADOFAIEditorStudio
                 camera.enabled = false;
             }
 
+            // **缩略图相机在预览播放期间没有意义，关掉。**
+            //
+            // 编辑器里第 4 台相机是 `scnEditor.thumbnailMaker` 身上的 Camera：
+            // 它每帧把第 17 层渲进一张 512×512 的 HDR RenderTexture，
+            // 而那张图只在**发布谱面时**由 `WorkshopThumbnailMaker.MakeThumbnail`
+            // 读一次（它自己调 `cam.Render()` 现渲染，见反编译 13443-13451 行）。
+            // 预览播放时没有任何界面显示它 —— 纯白跑一趟渲染。
+            //
+            // **必须关 Camera 组件，不能关 GameObject**：`scnEditor.Update`
+            // 每帧都在 `thumbnailMaker.gameObject.SetActive(true)`
+            // （反编译 44008 行），关 GameObject 下一帧就被打回来；
+            // 而它不碰 Camera.enabled。反过来，`MakeThumbnail` 用的
+            // `cam.Render()` 在组件禁用时依然有效，所以发布缩略图不受影响。
+            scnEditor editorForThumbnail = scnEditor.instance;
+            if (editorForThumbnail != null)
+            {
+                WorkshopThumbnailMaker maker = editorForThumbnail.thumbnailMaker;
+                Camera thumbnailCamera = maker == null ? null : maker.GetComponent<Camera>();
+                if (thumbnailCamera != null)
+                {
+                    if (!thumbnailCameraStateCaptured)
+                    {
+                        thumbnailCameraStateCaptured = true;
+                        thumbnailCameraWasEnabled = thumbnailCamera.enabled;
+                    }
+                    thumbnailCamera.enabled = false;
+                }
+            }
+
             scrPlayerManager playerManager = scrPlayerManager.instance;
             if (playerManager == null || playerManager.players == null)
             {
@@ -5951,6 +5991,19 @@ namespace ADOFAIEditorStudio
                 }
                 staticCameraStateCaptured = false;
                 Main.Logger.Log("[StaticPreview] restored native camera and planet updates.");
+            }
+
+            if (thumbnailCameraStateCaptured)
+            {
+                thumbnailCameraStateCaptured = false;
+                scnEditor editorForThumbnail = scnEditor.instance;
+                WorkshopThumbnailMaker maker =
+                    editorForThumbnail == null ? null : editorForThumbnail.thumbnailMaker;
+                Camera thumbnailCamera = maker == null ? null : maker.GetComponent<Camera>();
+                if (thumbnailCamera != null)
+                {
+                    thumbnailCamera.enabled = thumbnailCameraWasEnabled;
+                }
             }
         }
 
@@ -6027,6 +6080,10 @@ namespace ADOFAIEditorStudio
             }
 
             int prepared = 0;
+            // 【临时探针·重建耗时】这一段在重建里对每一格调 PrepFloor，
+            // 而 PrepFloor 会为每格造一条 duration=0 的 DOTween。
+            // 2620 格的谱面就是 2620 条，所以要单独量出来。
+            long prepareStart = System.Diagnostics.Stopwatch.GetTimestamp();
             for (int i = 0; i < editor.floors.Count; i++)
             {
                 scrFloor floor = editor.floors[i];
@@ -6046,7 +6103,8 @@ namespace ADOFAIEditorStudio
             }
 
             Main.Logger.Log("[EvaluatorOwned] prepared track colour on "
-                + prepared + "/" + editor.floors.Count + " floors.");
+                + prepared + "/" + editor.floors.Count + " floors in "
+                + MsSince(prepareStart).ToString("0.0") + "ms.");
         }
 
         private static void EndEvaluatorOwnedPreview()
@@ -6136,17 +6194,76 @@ namespace ADOFAIEditorStudio
             //
             // 编辑器态在会话结束时补回来（见 EndEvaluatorOwnedPreview），
             // 所以退出预览后偏移照常显示。
-            RebakeFloors(editor, false);
+            // 【临时探针·重建耗时】把这条重建链分成四段分别计时。
+            //
+            // 拖动松手会无条件走一次全量重建（见 CommitBlockDrag →
+            // RequestEvaluatorRebuild），而实测一次重建能让帧间隔涨到
+            // 3.0~3.7 秒。现有诊断只能看到 `Overlay.U` 这一个总数——
+            // 段表还是 120 帧的窗口平均，会把尖峰摊平，所以必须在这里
+            // 自己切开，才能知道该砍哪一段。
+            long rebuildStart = System.Diagnostics.Stopwatch.GetTimestamp();
+            // 【快通道】重建时要不要重新烘焙格。
+            //
+            // 原生 ApplyEventsToFloors 实测一次 1.6~1.8 秒，而它的开销是
+            // **按格、按事件原件增删** 的：每格先 GetComponents<ffxPlusBase>()
+            // 再逐个 DestroyImmediate，然后为每个事件 AddComponent 一个新的
+            // ffx*。所以它跟"改了哪个事件"几乎无关 —— 哪怕只是把一个相机
+            // 事件往右挪一格，也照样全量重来。
+            //
+            // 但相机、滤镜、粒子、闪光这类事件在烘焙里根本没有任何分支，
+            // 动它们不会改变任何格的烘焙状态（判断依据见 IsFloorStateNeutral）。
+            // 这种情况下重新烘焙是纯浪费，跳过即可。
+            //
+            // 跳过不是"假设没事"，还有一道签名闸（见 ComputeFloorBakeSignature）：
+            // 预览跑起来会直接改写格的 transform（MoveTrack / AnimateTrack /
+            // FreeRoam 那些域），如果它顺带弄脏了格的数据字段，签名就对不上，
+            // 这时照样老老实实烘焙。两种结果都会打进日志，能直接看出
+            // 到底是"确实不用烘"还是"每次都被签名闸拦回来"。
+            bool skipBake = false;
+            // 日志里要说清"为什么烘焙/为什么跳过"，否则下次再看日志
+            // 又得靠猜——是编辑类型要求烘焙，还是签名被预览弄脏了。
+            string bakeDecision;
+            if (!preserveTransport)
+            {
+                bakeDecision = "首建";
+            }
+            else if (floorBakeRequired)
+            {
+                bakeDecision = "编辑需要";
+            }
+            else if (!floorBakeSignatureValid)
+            {
+                bakeDecision = "签名无效";
+            }
+            else if (ComputeFloorBakeSignature(editor) == floorBakeSignature)
+            {
+                skipBake = true;
+                bakeDecision = "按签名跳过";
+            }
+            else
+            {
+                bakeDecision = "签名漂移";
+            }
+
+            if (!skipBake)
+            {
+                RebakeFloors(editor, false);
+            }
+            double rebakeMs = MsSince(rebuildStart);
+            long tryBeginStart = System.Diagnostics.Stopwatch.GetTimestamp();
             if (!evaluatorBackend.TryBegin(editor, out error))
             {
                 Main.Logger.Log("[EvaluatorOwned] evaluator unavailable: " + error);
                 return;
             }
+            double tryBeginMs = MsSince(tryBeginStart);
 
             float resumeTime = previewClockTime;
             bool resumeRunning = previewClockRunning;
 
+            long beginStart = System.Diagnostics.Stopwatch.GetTimestamp();
             BeginEvaluatorOwnedPreview(editor);
+            double beginMs = MsSince(beginStart);
             if (preserveTransport)
             {
                 previewClockTime = resumeTime;
@@ -6164,15 +6281,31 @@ namespace ADOFAIEditorStudio
             // 而歌曲仍然静音——songposition_minusi 从不推进，
             // 画面停住直到播放头被拖动。在这里重启，
             // 才让重建对播放不可见。
+            long audioStart = System.Diagnostics.Stopwatch.GetTimestamp();
             if (previewClockRunning)
             {
                 StartEvaluatorPreviewAudio(previewClockTime);
             }
+            double audioMs = MsSince(audioStart);
 
             previewClockLastUnscaledTime = Time.unscaledTime;
             evaluatorOwnedActive = true;
             Main.Logger.Log("[EvaluatorOwned] session started; domains="
                 + evaluatorBackend.ActiveDomainCount + "/" + evaluatorBackend.DomainCount + ".");
+            Main.Logger.Log("[RebuildCost] 烘焙=" + rebakeMs.ToString("0.0")
+                + "ms(" + bakeDecision + ")"
+                + " 试开始=" + tryBeginMs.ToString("0.0")
+                + "ms 接管=" + beginMs.ToString("0.0")
+                + "ms 音频=" + audioMs.ToString("0.0")
+                + "ms 合计=" + MsSince(rebuildStart).ToString("0.0") + "ms"
+                + (preserveTransport ? "（重建）" : "（首建）"));
+        }
+
+        /// <summary>把 Stopwatch 时间戳差换算成毫秒。</summary>
+        private static double MsSince(long startTimestamp)
+        {
+            return (System.Diagnostics.Stopwatch.GetTimestamp() - startTimestamp)
+                * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
         }
 
         /// <summary>
@@ -6213,6 +6346,12 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
+            // 走到这里才开始真正烘焙；签名先作废，烘焙成功后再重算。
+            // 中途抛异常的话签名保持无效，下一次重建就不会被误判成
+            // "格状态还是上一次烘焙的样子"。
+            floorBakeSignatureValid = false;
+
+            bool applied = false;
             bool saved = controller.paused;
             try
             {
@@ -6221,7 +6360,18 @@ namespace ADOFAIEditorStudio
                     ControllerPausedField.SetValue(controller, paused);
                 }
 
+                // 【临时探针·烘焙内部拆分】只读计时，见 BakeProbe。
+                // 打开 VerboseDiagnostics 才会挂补丁，平时这条分支纯空转。
+                bool probing = Main.Settings != null && Main.Settings.VerboseDiagnostics
+                    && BakeProbe.Begin();
+                long bakeStart = System.Diagnostics.Stopwatch.GetTimestamp();
                 level.ApplyEventsToFloors(editor.floors);
+                double bakeMs = MsSince(bakeStart);
+                applied = true;
+                if (probing)
+                {
+                    BakeProbe.End(bakeMs);
+                }
             }
             catch (Exception exception)
             {
@@ -6233,6 +6383,17 @@ namespace ADOFAIEditorStudio
                 {
                     ControllerPausedField.SetValue(controller, saved);
                 }
+                // 抛异常时也要收枪，否则补丁会一直累计，日志被污染。
+                BakeProbe.Armed = false;
+            }
+
+            if (applied)
+            {
+                floorBakeSignature = ComputeFloorBakeSignature(editor);
+                floorBakeSignatureValid = true;
+                // 刚烘焙完，格状态就是最新的；下一次重建只要没有
+                // 新的"影响格"的改动，就可以走跳过烘焙的快通道。
+                floorBakeRequired = false;
             }
 
             try
@@ -6259,6 +6420,167 @@ namespace ADOFAIEditorStudio
         private static readonly FieldInfo ControllerPausedField =
             typeof(scrController).GetField(
                 "_paused", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        /// <summary>
+        /// 下一次重建是否必须重新烘焙格。默认 true（保守），
+        /// 只有确知这次编辑和格状态无关时才由 <see cref="RequestEvaluatorRebuild(string, ADOFAI.LevelEvent)"/> 放行。
+        /// </summary>
+        private static bool floorBakeRequired = true;
+
+        /// <summary>上一次成功烘焙后格的签名。</summary>
+        private static int floorBakeSignature;
+
+        /// <summary>签名是否有效。烘焙没成功（早退或抛异常）时为 false。</summary>
+        private static bool floorBakeSignatureValid;
+
+        /// <summary>
+        /// 把"预览快照会读取的格字段"揉成一个整数签名。
+        ///
+        /// 字段清单刻意与 <see cref="PreviewFloorSnapshot"/> 的构造函数一一对应 ——
+        /// 那边的 20 多个字段就是预览眼里的"格状态"全部。签名只用来判断
+        /// "上一次烘焙之后，格状态有没有被别人改动过"，所以不需要抗碰撞，
+        /// 一个普通的多项式哈希就够。
+        ///
+        /// 代价：3516 格 × 20 个字段 ≈ 7 万次纯托管字段读取，实测 1~2ms 量级，
+        /// 相比它可能省掉的 1.7 秒完全可以接受。
+        /// </summary>
+        private static int ComputeFloorBakeSignature(scnEditor editor)
+        {
+            unchecked
+            {
+                int hash = 17;
+                List<scrFloor> floors = editor == null ? null : editor.floors;
+                int count = floors == null ? 0 : floors.Count;
+                hash = hash * 31 + count;
+                for (int i = 0; i < count; i++)
+                {
+                    scrFloor floor = floors[i];
+                    if (floor == null)
+                    {
+                        hash = hash * 31 - 1;
+                        continue;
+                    }
+
+                    hash = hash * 31 + floor.entryTime.GetHashCode();
+                    hash = hash * 31 + floor.entryBeat.GetHashCode();
+                    hash = hash * 31 + floor.speed.GetHashCode();
+                    hash = hash * 31 + (floor.isCCW ? 1 : 0);
+                    hash = hash * 31 + (floor.midSpin ? 1 : 0);
+                    hash = hash * 31 + (floor.freeroam ? 1 : 0);
+                    hash = hash * 31 + floor.extraBeats.GetHashCode();
+                    hash = hash * 31 + floor.angleCorrectionType.GetHashCode();
+                    hash = hash * 31 + floor.holdLength;
+                    hash = hash * 31 + floor.holdDistance.GetHashCode();
+                    hash = hash * 31 + floor.numPlanets;
+                    hash = hash * 31 + floor.radiusScale.GetHashCode();
+                    hash = hash * 31 + ((int)floor.planetEase).GetHashCode();
+                    hash = hash * 31 + floor.planetEaseParts;
+                    hash = hash * 31 + ((int)floor.planetEasePartBehavior).GetHashCode();
+                    hash = hash * 31 + floor.entryangle.GetHashCode();
+                    hash = hash * 31 + floor.exitangle.GetHashCode();
+                    hash = hash * 31 + floor.angleLength.GetHashCode();
+                    hash = hash * 31 + (floor.stickToFloor ? 1 : 0);
+                    hash = hash * 31 + floor.startPos.GetHashCode();
+                    hash = hash * 31 + floor.offsetPos.GetHashCode();
+                    hash = hash * 31 + floor.startRot.GetHashCode();
+                    hash = hash * 31 + floor.rotationOffset.GetHashCode();
+                    hash = hash * 31 + floor.startScale.GetHashCode();
+                    hash = hash * 31 + floor.opacityVal.GetHashCode();
+                }
+
+                return hash;
+            }
+        }
+
+        /// <summary>
+        /// 这个事件被移动之后是否必须重新烘焙格。给日志用，判断逻辑同上。
+        /// </summary>
+        internal static bool EventNeedsFloorBake(ADOFAI.LevelEvent levelEvent)
+        {
+            return !IsFloorStateNeutral(levelEvent);
+        }
+
+        /// <summary>
+        /// 移动这个事件是否**不会**改变任何格的烘焙状态。
+        ///
+        /// 判断依据是反编译出来的两条烘焙路径，不是凭印象列的：
+        ///
+        ///   scnGame.ApplyEventsToFloors(List&lt;scrFloor&gt;, …)      —— 21280 行起
+        ///     case 只出现在：AnimateTrack / AutoPlayTiles / ChangeTrack /
+        ///     ColorTrack / FreeRoam(+Remove/Twirl/Warning) / Hide / Hold /
+        ///     MultiPlanet / PositionTrack / ScaleMargin / SetPlanetRotation /
+        ///     SetSpeed / TileDimensions / Twirl
+        ///   scnGame.ApplyCoreEventsToFloors(…)                     —— 22111 行起
+        ///     case 只出现在：Checkpoint / FreeRoam / Hold / MultiPlanet /
+        ///     Multitap / Pause / ScaleRadius / TileDimensions / Twirl
+        ///
+        /// 这两个 switch 是整条烘焙链里唯一写格状态的地方（把两段里所有
+        /// `floorX.字段 = ` 的赋值统计一遍，写到的字段全部落在这些分支内）。
+        /// 所以不在上面的类型，无论怎么挪动 floor / angleOffset / duration，
+        /// 都不会让任何格的快照字段变化。
+        ///
+        /// **默认返回 false（要烘焙）**：任何没想清楚的情况一律走原路，
+        /// 宁可慢也不错。要往里加类型，必须先在上面两条路径里确认它没有分支。
+        /// </summary>
+        private static bool IsFloorStateNeutral(ADOFAI.LevelEvent levelEvent)
+        {
+            if (levelEvent == null)
+            {
+                return false;
+            }
+
+            // 装饰物事件：**这两个类型都可以走快通道。**
+            //
+            // MoveDecorations —— 它只是"某段装饰动画从哪一格开始"，既不改任何格
+            // 状态，也不改装饰物挂在哪一格。
+            //
+            // AddDecoration —— 挪它确实会改装饰物的挂靠格（scrDecoration.Setup
+            // 里 parentFloorNum = Math.Clamp(ev.floor, …)，反编译 57244 行），
+            // 但那条修复**我们自己已经做过了**：CommitBlockDrag 在提交时就会调
+            // scnEditor.UpdateDecorationObject，而它正是转去 scrDecoration.Setup，
+            // 挂靠格、pivot、startPos 全部重算完再回来。烘焙里那次
+            // FinishUpdateDecorations 只是"格位置变过之后重锚"，而快通道的前提
+            // 正是格没变，所以它对这次编辑是多余的。
+            //
+            // 注意这两条判断必须排在 info.isDecoration 之前：实测拖动
+            // MoveDecorations 事件时 info.isDecoration 并不为真（装饰事件信息表里
+            // 那个字段的语义和我们想的不一样），只按类型判断才可靠。
+            if (levelEvent.eventType == ADOFAI.LevelEventType.MoveDecorations
+                || levelEvent.eventType == ADOFAI.LevelEventType.AddDecoration)
+            {
+                return true;
+            }
+
+            // 其余装饰类事件（装饰属性子事件等）一律保守烘焙。
+            if (levelEvent.info != null && levelEvent.info.isDecoration)
+            {
+                return false;
+            }
+
+            switch (levelEvent.eventType)
+            {
+                case ADOFAI.LevelEventType.MoveCamera:
+                case ADOFAI.LevelEventType.SetFilter:
+                case ADOFAI.LevelEventType.SetFilterAdvanced:
+                case ADOFAI.LevelEventType.AddParticle:
+                case ADOFAI.LevelEventType.SetParticle:
+                case ADOFAI.LevelEventType.EmitParticle:
+                case ADOFAI.LevelEventType.Flash:
+                case ADOFAI.LevelEventType.Bloom:
+                case ADOFAI.LevelEventType.HallOfMirrors:
+                case ADOFAI.LevelEventType.ShakeScreen:
+                case ADOFAI.LevelEventType.MoveTrack:
+                case ADOFAI.LevelEventType.Bookmark:
+                case ADOFAI.LevelEventType.EditorComment:
+                case ADOFAI.LevelEventType.CallMethod:
+                case ADOFAI.LevelEventType.PlaySound:
+                case ADOFAI.LevelEventType.SetHitsound:
+                case ADOFAI.LevelEventType.SetHoldSound:
+                    return true;
+                default:
+                    return false;
+            }
+        }
 
         private static void EndEvaluatorOwnedScrub()
         {
@@ -6289,6 +6611,40 @@ namespace ADOFAIEditorStudio
 
         internal static void RequestEvaluatorRebuild(string reason)
         {
+            RequestEvaluatorRebuild(reason, null);
+        }
+
+        /// <summary>
+        /// 带编辑对象的置脏版本。
+        ///
+        /// editedEvent 是刚被提交的那个事件。只有确知它与格状态无关
+        /// （见 IsFloorStateNeutral）时，下一次重建才会尝试跳过烘焙；
+        /// 传 null（绝大多数入口，包括撤销、粘贴、媒体拖放）一律按
+        /// "必须烘焙"处理——这条快速通道只服务于时间轴拖动。
+        /// </summary>
+        internal static void RequestEvaluatorRebuild(string reason, ADOFAI.LevelEvent editedEvent)
+        {
+            // **时间轴和预览求值器是两条独立的消费路径。**
+            // 求值器没接管时（下面的 `evaluatorOwnedActive` 早退）时间轴照样要
+            // 更新块的位置，所以这条置脏必须在早退**之前**。
+            //
+            // 改谱面的入口分散在多个类里（撤销/重做、属性提交、粘贴、媒体拖放、
+            // 联机远端编辑、原生撤销），但全部经过这里 —— 一处置脏覆盖全部。
+            EditorTimelineView.NotifyChartChangedExternally();
+
+            // **同帧去重也要让路。**
+            //
+            // 求值器加了「同帧同时间只算一次」的门（见 PreviewEvaluationEngine
+            // 里 B1 那段）。改谱面之后，同一帧再求值必须真的重算 ——
+            // 不置这个位的话，改完值画面要等下一帧才更新。
+            Preview.PreviewEvaluationEngine.InvalidateSameFrame();
+
+            // **烘焙需求也必须在早退之前记下来。**
+            // 会话没活着时这里就走人了，而置脏的下一次重建可能发生在
+            // 很久以后（比如用户回到预览面板），到时候必须还记得
+            // "这次改动要不要重新烘焙"。
+            floorBakeRequired = floorBakeRequired || !IsFloorStateNeutral(editedEvent);
+
             if (!evaluatorOwnedActive)
             {
                 // 没什么可重建；下一次 EnsureEvaluatorSession 会重新分析。
@@ -6296,7 +6652,13 @@ namespace ADOFAIEditorStudio
             }
 
             // End() 会销毁各域的状态；之前活着的东西会在下面重建。
+            //
+            // 【临时探针·重建耗时】这一段跑在**松手那一帧**里（不是下一帧），
+            // 而它不在 `Overlay.U` 的计时范围（OnEndDrag 由 EventSystem 驱动）。
+            // 所以必须单独量，否则松手帧上那部分时间在报表里是隐形的。
+            long endStart = System.Diagnostics.Stopwatch.GetTimestamp();
             evaluatorBackend.End();
+            Main.Logger.Log("[RebuildCost] 松手销毁域=" + MsSince(endStart).ToString("0.0") + "ms");
             evaluatorOwnedActive = false;
             evaluatorRebuildPending = true;
             Main.Logger.Log("[EvaluatorOwned] rebuild requested by " + reason + ".");

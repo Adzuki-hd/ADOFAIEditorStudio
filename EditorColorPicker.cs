@@ -415,7 +415,10 @@ namespace ADOFAIEditorStudio
 
         private void Update()
         {
+            // 【临时探针】见 EditorPropertyPanel.Update 里的说明。
+            long __watch = System.Diagnostics.Stopwatch.GetTimestamp();
             FlushSecondaryDisplays();
+            PreviewDiagnostics.RecordSince("Picker.U", __watch);
         }
 
         private void RefreshSvTexture()

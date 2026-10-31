@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using ADOFAI;
 using DG.Tweening;
@@ -8,6 +8,16 @@ namespace ADOFAIEditorStudio.Preview
 {
     internal sealed class PreviewTimelineContext
     {
+        /// <summary>
+        /// TimeVerify 的总开关，默认关。
+        ///
+        /// 它是查「事件时间解析」bug 的一次性工具，不是常驻诊断，所以
+        /// 不跟 VerboseDiagnostics 共用开关——总闸一开，它就在每次重建里
+        /// 多跑 1.1 万次比较加一条同步日志。要复查那个 bug 时，
+        /// 连同 Settings.xml 的 VerboseDiagnostics 一起打开即可。
+        /// </summary>
+        private const bool EnableTimeVerify = false;
+
         private static readonly PreviewEventSnapshot[] EmptyEvents = new PreviewEventSnapshot[0];
         private readonly Dictionary<LevelEventType, List<PreviewEventSnapshot>> eventsByType =
             new Dictionary<LevelEventType, List<PreviewEventSnapshot>>();
@@ -27,12 +37,21 @@ namespace ADOFAIEditorStudio.Preview
         {
             Editor = editor;
             EditorInstanceId = editor.GetInstanceID();
+
+            // 【临时探针·重建耗时】把构造函数拆成五段计时。
+            //
+            // 实测一次重建里「上下文快照」要 545~573ms，而它内部到底
+            // 是格快照慢、事件索引慢、还是签名慢，光看总数分不出来。
+            // 这里只在构造时写一行日志（一次重建一行）。
+            long ctxStart = System.Diagnostics.Stopwatch.GetTimestamp();
+
             floorBindings = editor.floors == null ? new scrFloor[0] : editor.floors.ToArray();
             floors = new PreviewFloorSnapshot[floorBindings.Length];
             for (int i = 0; i < floorBindings.Length; i++)
             {
                 floors[i] = new PreviewFloorSnapshot(floorBindings[i], i);
             }
+            long afterFloors = System.Diagnostics.Stopwatch.GetTimestamp();
 
             scrController controller = scrController.instance;
             TileSize = controller == null ? 1f : controller.tileSize;
@@ -64,12 +83,23 @@ namespace ADOFAIEditorStudio.Preview
             }
 
             int sequence = 0;
+            long afterTables = System.Diagnostics.Stopwatch.GetTimestamp();
             AddEventsToIndex(editor.events, ref sequence);
+            long afterEvents = System.Diagnostics.Stopwatch.GetTimestamp();
             AddEventsToIndex(editor.decorations, ref sequence);
+            long afterDecorations = System.Diagnostics.Stopwatch.GetTimestamp();
             eventCount = editor.events == null ? 0 : editor.events.Count;
             decorationCount = editor.decorations == null ? 0 : editor.decorations.Count;
             eventSignature = ComputeSourceSignature(editor.events);
             decorationSignature = ComputeSourceSignature(editor.decorations);
+            long afterSignatures = System.Diagnostics.Stopwatch.GetTimestamp();
+
+            Main.Logger.Log("[RebuildCost] 上下文分解 格=" + MsBetween(ctxStart, afterFloors)
+                + "ms 计时表=" + MsBetween(afterFloors, afterTables)
+                + "ms 事件=" + MsBetween(afterTables, afterEvents)
+                + "ms 装饰=" + MsBetween(afterEvents, afterDecorations)
+                + "ms 签名=" + MsBetween(afterDecorations, afterSignatures)
+                + "ms 合计=" + MsBetween(ctxStart, afterSignatures) + "ms");
 
             // 0 格是倒计时格。原生 FirstFloorAngleSetup 把
             // 行星放在 pi * (0.5 - adjustedCountdownTicks) 处，而不是格的
@@ -78,7 +108,30 @@ namespace ADOFAIEditorStudio.Preview
             scrConductor conductor = scrConductor.instance;
             AdjustedCountdownTicks = conductor == null ? 0f : conductor.adjustedCountdownTicks;
 
-            VerifyEventTimesAgainstNative(editor);
+            // **纯诊断，默认不跑。** 这段每次重建都要做 1.1 万次比较
+            // （实测 compared=11597），末尾还无条件写一条日志——UMM 的
+            // Logger 内部是同步 Console.WriteLine，等于一次同步 I/O。
+            // 它还报出 mismatched=8903（77% 不匹配），可能指向一个真实的
+            // 时间解析 bug，但尚未确认；原始证据已由取证留档
+            // （取证-TimeVerify留档-2026-10-28.md）。将来要查那个 bug 时，
+            // 把下面的 EnableTimeVerify 改成 true 即可复现。
+            //
+            // 2026-10-31 起它有自己的开关，不再挂在 VerboseDiagnostics 上。
+            // 原因：VerboseDiagnostics 是看帧率诊断（[诊断] 行、逐域耗时）
+            // 的总闸，而 TimeVerify 是查时间解析 bug 的一次性工具，两者
+            // 用途无关。它跟着总闸走，就会在查拖动卡顿时被顺带打开——
+            // 实测这次拖一次要重建 3 次，等于白付 3 遍 1.1 万次比较。
+            if (EnableTimeVerify && Main.Settings != null && Main.Settings.VerboseDiagnostics)
+            {
+                VerifyEventTimesAgainstNative(editor);
+            }
+        }
+
+        /// <summary>把两个 Stopwatch 时间戳之差换算成毫秒（【临时探针】用）。</summary>
+        private static string MsBetween(long from, long to)
+        {
+            return ((to - from) * 1000.0 / System.Diagnostics.Stopwatch.Frequency)
+                .ToString("0.0");
         }
 
         internal scnEditor Editor { get; private set; }
@@ -158,7 +211,14 @@ namespace ADOFAIEditorStudio.Preview
 
         // 同时约束了每帧开销（64 个时约 0.15ms）和一个被换掉的格最多
         // 藏多久不被发现（3516 / 64 = 55 帧，165fps 下约三分之一秒）。
-        private const int FloorChecksPerFrame = 64;
+        //
+        // **2026-10-31：64 → 32。** 补上 `Ev.Validate` 这条探针之后第一次
+        // 拿到实测值：这一项恒定 **0.12ms/帧**，不随谱面位置变，也不随
+        // 播放/暂停变 —— 等于每帧白付 165Hz 预算的 2%。而它防的是
+        // 「格数量不变、但某个格对象被换掉」这一种编辑，检出延迟从
+        // 0.35 秒变 0.7 秒（2600 格 / 32 / 150fps）没有实际差别：
+        // 增删格由上面的数量检查立刻抓到，内容改动由下面的哈希抓到。
+        private const int FloorChecksPerFrame = 32;
         private int floorCheckCursor;
 
         // 60fps 下约 0.25s。上面那些便宜的引用/数量检查仍然每帧都跑，
@@ -171,6 +231,30 @@ namespace ADOFAIEditorStudio.Preview
         /// ffxPlusBase 组件的起始时间作对比。任何不一致都意味着
         /// 求值器会把效果放在错误的时间上，用户看到的就是
         /// 效果提前触发。只读，绝不修改场景状态。
+        ///
+        /// **2026-10-30 修：这个校验器本身写错过，77% 的「不匹配」是它的锅。**
+        ///
+        /// 旧实现拿 `effect.sourceLevelEvent.floor`（**作者写事件的原始格号**）
+        /// 去 `eventsByType` 桶里找第一条 `Floor` 相等的快照。可是原生
+        /// `scnGame.ApplyEvent(evnt, bpm, pitch, floors, offset, customFloorID)`
+        /// 被 RepeatEvents 循环调用时，传进去的 `customFloorID` 是**目标格**
+        /// （`scnGame.cs:1059`），组件建在那个目标格上，`SetStartTime` 用的
+        /// 也是目标格的 `entryTime`。于是：
+        ///
+        ///   · 展开实例的格号 = 目标格，而 `sourceLevelEvent.floor` 仍是原格；
+        ///   · 拿原格去桶里找，命中的是**没展开的那一条**，它的时间当然对不上。
+        ///
+        /// 证据：原报告 `compared=11597`，而这张谱作者只写了 936 个事件 ——
+        /// 多出来的近万次比较全部是 RepeatEvents 展开出来的实例，
+        /// 而它们一条都不可能匹配成功。8903/11597 ≈ 77% 正好是展开项占比。
+        ///
+        /// 现在改成三件事：
+        ///   1. 用 `effect.floorID`（原生实际建在哪个格）而不是原始格号；
+        ///   2. 同一格同类型可能有多条展开实例，**取时间差最小的一条**，
+        ///      而不是拿桶里第一条了事；
+        ///   3. 额外统计「找不到候选」的条数 —— 它是一个独立的信号：
+        ///      候选缺失说明我们的索引比原生少建了东西，和「时间算错」
+        ///      是两种不同的问题，混在一个数字里没法归因。
         /// </summary>
         private void VerifyEventTimesAgainstNative(scnEditor editor)
         {
@@ -180,6 +264,7 @@ namespace ADOFAIEditorStudio.Preview
             }
 
             int compared = 0;
+            int unmatched = 0;
             int mismatched = 0;
             float worstDelta = 0f;
             string worstDetail = "none";
@@ -203,25 +288,42 @@ namespace ADOFAIEditorStudio.Preview
                     List<PreviewEventSnapshot> bucket;
                     if (!eventsByType.TryGetValue(effect.sourceLevelEvent.eventType, out bucket))
                     {
+                        unmatched++;
                         continue;
                     }
 
+                    // **按原生真正的落格取候选。** floorID 是 ApplyEvent 写进去的
+                    // 「这个组件建在哪一格」，对 RepeatEvents 展开实例它是目标格；
+                    // 对普通事件它等于作者写的格。用 sourceLevelEvent.floor 会
+                    // 把展开实例和它的原始事件错配到一起（根因见上面的说明）。
+                    int nativeFloor = effect.floorID;
+                    float native = Convert.ToSingle(effect.startTime);
+
+                    // 同格同类型可能有多条（RepeatEvents 展开 + 作者本就写了多条）。
+                    // 取时间差最小的一条：我们和原生是各自独立算的，唯一合理的
+                    // 判据是「有没有算到同一个值」，不是「桶里第一条长什么样」。
                     PreviewEventSnapshot match = null;
+                    float bestDelta = float.MaxValue;
                     for (int j = 0; j < bucket.Count; j++)
                     {
-                        if (bucket[j].Floor == effect.sourceLevelEvent.floor)
+                        if (bucket[j].Floor != nativeFloor)
                         {
+                            continue;
+                        }
+                        float candidateDelta = Mathf.Abs(native - (float)bucket[j].StartTime);
+                        if (candidateDelta < bestDelta)
+                        {
+                            bestDelta = candidateDelta;
                             match = bucket[j];
-                            break;
                         }
                     }
                     if (match == null)
                     {
+                        unmatched++;
                         continue;
                     }
 
                     compared++;
-                    float native = Convert.ToSingle(effect.startTime);
                     float mine = (float)match.StartTime;
                     float delta = Mathf.Abs(native - mine);
                     if (delta > 0.02f)
@@ -230,7 +332,7 @@ namespace ADOFAIEditorStudio.Preview
                         if (delta > worstDelta)
                         {
                             worstDelta = delta;
-                            worstDetail = effect.sourceLevelEvent.eventType + "@f" + match.Floor
+                            worstDetail = effect.sourceLevelEvent.eventType + "@f" + nativeFloor
                                 + " native=" + native.ToString("F3")
                                 + " mine=" + mine.ToString("F3");
                         }
@@ -239,6 +341,7 @@ namespace ADOFAIEditorStudio.Preview
             }
 
             Main.Logger.Log("[TimeVerify] compared=" + compared
+                + " unmatched=" + unmatched
                 + " mismatched=" + mismatched
                 + " worstDelta=" + worstDelta.ToString("F3")
                 + " worst=" + worstDetail + ".");

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
@@ -1527,12 +1527,36 @@ namespace ADOFAIEditorStudio
         {
             if (visible && built)
             {
+                // 【临时探针 · Overlay.L 拆解】三段分开计时，定位那 2.2ms 在哪。
+                bool probe = PreviewDiagnostics.Enabled;
+                long t0 = probe ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+
                 ApplyPreviewViewport();
+                if (probe)
+                {
+                    long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    PreviewDiagnostics.RecordPart("OL.Viewport",
+                        (t1 - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+                    t0 = t1;
+                }
                 EditorPlaybackBridge.EnforcePreviewZoomLock();
+                if (probe)
+                {
+                    long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    PreviewDiagnostics.RecordPart("OL.ZoomLock",
+                        (t1 - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+                    t0 = t1;
+                }
                 // 编辑器专属的装饰（位置轨道的滚动虚线、粒子发射器图标）
                 // 只能在这里压：游戏自己的 Update 会在本帧稍后把它们
                 // 重新点亮，放在求值阶段压等于白压。
                 Preview.PreviewEvaluationEngine.TickEditorScaffoldingLate();
+                if (probe)
+                {
+                    long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+                    PreviewDiagnostics.RecordPart("OL.Scaffold",
+                        (t1 - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+                }
             }
             else
             {
@@ -1590,16 +1614,36 @@ namespace ADOFAIEditorStudio
 
         private void UpdateCore()
         {
+            // 【临时探针 · UpdateCore 分段】域求值以外那几段一起算进 Overlay.U，
+            // 尖峰帧上 Overlay.U 会冲到 5~19ms 而域只有 2~4ms —— 说明钱花在
+            // 下面这些"界面刷新"上，但看不出是哪一段。这里把 UpdateCore 切成
+            // 五段，尖峰帧一眼就能点名。收口时整段删掉。
+            long __mark = System.Diagnostics.Stopwatch.GetTimestamp();
+
+            // **物理抑制放在最前面，早于 `settings == null` 的提前返回。**
+            // 它改的是引擎全局状态，`Tick()` 里带着"什么时候该还回去"的
+            // 状态机；把它挂在设置对象后面，等于让"设置没配好"这种与物理
+            // 无关的情况也能把还原逻辑一起跳过。
+            PhysicsStepSuppressor.Tick();
             if (settings == null)
             {
                 return;
             }
             // 帧耗时诊断：开关关着时它内部第一行就返回。
             PreviewDiagnostics.Tick();
+            // 【临时探针·游戏自身每帧回调】把「没人认领的那 1.3~1.5ms」拆到
+            // 具体行为上。同样只在 VerboseDiagnostics 打开时工作。
+            BehaviourProbe.Tick();
+            // 工作台是否可见 —— 和 St.Play 一起，日志里的每个样本才归得了类。
+            PreviewDiagnostics.NoteVisible(visible);
+            // 帧率跳动日志：自己一个开关，和上面那份诊断报表互不影响。
+            // 放在 `built` 门之前 —— 工作台还没建好、或者关着的时候，
+            // 帧率一样会掉，一样要能记下来。
+            FrameRateLog.Tick(visible);
             // 原版 / AES 双探针：F9 导出当前活着的装饰物状态。
             // 放在编辑器 active 判断之前 —— 原版播放（非编辑器场景）时也要能按。
             DecorationLiveDump.Tick();
-            if (visible)
+            if (visible && PreviewDiagnostics.Enabled)
             {
                 LogLargeSurfacesOnce();
             }
@@ -1691,9 +1735,14 @@ namespace ADOFAIEditorStudio
 
             UiPreviewChrome.Refresh(previewChrome, StatusText);
             RefreshModeSwitch();
+            __mark = MarkSpan("OU.A", __mark);
 
-            // 面板状态取证（临时）：每 2 秒一次，看左右两栏到底有没有内容。
-            if (Time.frameCount - lastPanelProbeFrame >= 120)
+            // 面板状态取证：原来每 2 秒无条件跑一次（工作台关着也跑），
+            // 其中 ProbeDrawn 每次要对整棵 UI 做三次 GetComponentsInChildren<Image>。
+            // 这是排查期留下的临时探针，挂上「诊断开启 + 工作台可见」双门：
+            // 默认不再产生任何开销，排查时开 VerboseDiagnostics 即可复现。
+            if (visible && PreviewDiagnostics.Enabled
+                && Time.frameCount - lastPanelProbeFrame >= 120)
             {
                 lastPanelProbeFrame = Time.frameCount;
                 try
@@ -1720,8 +1769,9 @@ namespace ADOFAIEditorStudio
 
             }
 
-            // 点击取证（临时）：可见期间每次左键按下，打一行命中链。
-            if (Input.GetMouseButtonDown(0))
+            // 点击取证：原来每次左键都额外做一次全屏 RaycastAll 并打日志
+            // （工作台关着也一样），同样是排查期遗留。挂同一道双门。
+            if (visible && PreviewDiagnostics.Enabled && Input.GetMouseButtonDown(0))
             {
                 StartCoroutine(LogRaycastPeek());
             }
@@ -1787,6 +1837,7 @@ namespace ADOFAIEditorStudio
             // 工作台一直用就会一直复发。每帧清一次是标准做法，
             // 代价只是把已经是 null 的引用再写一遍 null。
             ClearUiButtonSelection();
+            __mark = MarkSpan("OU.B", __mark);
 
             if (!visible)
             {
@@ -1814,7 +1865,9 @@ namespace ADOFAIEditorStudio
 
             UpdateNonPreviewPointerCapture();
 
+            __mark = MarkSpan("OU.C", __mark);
             EditorPlaybackBridge.TickPreview(previewViewport);
+            __mark = MarkSpan("OU.D", __mark);
             RefreshPlaybackState();
             TickProjectWorkspace();
 
@@ -1825,6 +1878,20 @@ namespace ADOFAIEditorStudio
                 multiplayerPanel.Tick();
             }
             TickLoadingScreen();
+            MarkSpan("OU.E", __mark);
+        }
+
+        /// <summary>
+        /// 【临时探针】记一段耗时并返回新的起点时间戳。
+        /// 和 `PreviewDiagnostics.RecordPart` 走同一条账，于是它会自动出现在
+        /// `段` 里，也会跟着「最差帧」快照一起被打出来。
+        /// </summary>
+        private static long MarkSpan(string name, long startTicks)
+        {
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            PreviewDiagnostics.RecordPart(name,
+                (now - startTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+            return now;
         }
 
         private void BuildRuntimeUi()
@@ -2361,6 +2428,12 @@ namespace ADOFAIEditorStudio
                     break;
                 case "SimplifyDecorationMasks":
                     settings.SimplifyDecorationMasks = !settings.SimplifyDecorationMasks;
+                    // **切换后立刻重算一帧。**
+                    //
+                    // 装饰物求值在「播放头时间没变」时会整帧早退，而遮罩开关
+                    // 是晚于那两条早退才读到的。不置脏的话，暂停状态下点开关
+                    // 画面一动不动 —— 用户看到的就是「开/关都一样」。
+                    Preview.Domains.DecorationCorePreviewDomain.PositionSeedDirty = true;
                     break;
             }
             Main.SaveSettings();
@@ -2806,18 +2879,37 @@ namespace ADOFAIEditorStudio
         {
             "<size=20><b>v" + ModVersion + " 更新内容</b></size>",
             "",
+            "<b>修复</b>",
+            "<b>· 遮罩装饰物</b>：铺满屏幕的大图不再整段盖住轨道，遮罩小窗能正常出现，窗口范围也不会越用越偏；从透明度 0 起步的遮罩之后抬起同样能正常生效。",
+            "<b>· 慢速装饰物移动</b>：时长很长、位移很大的装饰物（比如整段尾声都在缓慢平移的那种）不再一格一格地跳，而是连续平滑地移动。",
+            "<b>· 颜色渐入渐出</b>：颜色预览的缓动现在会真的走完，不再被游戏每帧重算覆盖成终点色。",
+            "<b>· 脉冲颜色曲线</b>：Blink 改为匀速从第一色渐变到第二色、Switch 改为半周期直接切换 —— 此前两者的曲线弄反了，现在与原版一致。",
+            "<b>· 退出预览还原</b>：结束预览后轨道会恢复成谱面本身的颜色和动画，不会停在最后一帧。",
+            "<b>· 时间轴事件块刷新</b>：撤销、重做、粘贴、修改属性等任何改动谱面的操作之后，事件块都会立即刷新，不再停在旧位置。",
+            "<b>· 简化遮罩即时生效</b>：暂停状态下切换「简化遮罩」会立刻重算一帧，不再出现点了开关画面却一动不动。",
+            "",
             "<b>新增</b>",
-            "<b>· 「设置」改成窗口</b>：顶栏「设置」点一下直接开窗，左边是竖列（常规设置 / 偏好 / 开发者），右边是内容页。",
-            "<b>· 常规设置里多了「时间轴排版」</b>：一个开关（固定 / 自由），和原来的时间轴标题行按钮、Ctrl+L 是同一个状态。",
-            "<b>· 偏好</b>页暂时为空。",
-            "<b>· 开发者</b>页收排查用的开关：装饰物探针（默认关）、简化遮罩、旧版遮罩，以及「导出装饰物状态」按钮。",
-            "<b>· 关闭方式</b>：右上角 ×，或 Esc —— Esc 先关窗口，再按一次才退出工作台。",
+            "<b>· 轨道覆盖探针</b>（设置 → 开发者）：播放头每进一格，就把覆盖这一格的 MoveTrack 事件（范围 / 不透明度 / 缓动）列进日志，专门查「这一段为什么和原版不一样」。",
+            "<b>· 帧率日志</b>（设置 → 开发者）：每秒记录平均帧率、本段最差帧、掉帧数、当前格与播放状态，专门对付「画面一顿一顿、平均帧率却好看」的情况。",
             "",
             "<b>调整</b>",
-            "<b>· 时间轴标题行的排版按钮已移入设置窗口</b>；顶栏的「偏好」菜单一并删除。",
+            "<b>· 开发者页重排</b>：整体加高、控件间距重排，给两个新开关腾出位置；同时把「装饰物探针」的说明从「默认开」更正为「默认关」，与实际默认值一致。",
             "",
-            "<b>注意</b>",
-            "<b>· 原来的「设置」下拉已取消</b>：里面两个开发者开关和「清空媒体缓存」暂时没有入口，下一步会搬进窗口。",
+            "<b>优化</b>",
+            "<b>· 拖动不再整谱烘焙</b>：在时间轴拖动相机、滤镜、粒子、闪光、装饰物这类不影响轨道的事件后松手，不再把整张谱重新烘焙。",
+            "<b>· 时间轴无变化不重算</b>：画面没有变化时不再每帧重算块位置、事件清单和时间读数。",
+            "<b>· 标尺整块绘制</b>：刻度线与背景格线改为一次性整块画出，谱面很长时拖动与滚动更跟手。",
+            "<b>· 播放少渲染一张图</b>：关掉只用于发布时生成封面的缩略图相机，不再每帧白白多渲染一张图。",
+            "<b>· 物理同步按需</b>：播放时不再每帧把整张谱的格位置刷进物理世界，只在格子真的移动过时才同步。",
+            "<b>· 轨道预览按需计算</b>：播放时只处理画面内或本帧真正发生变化的格子，不再对整张谱逐格重算。",
+            "<b>· 相机特效复用</b>：相机事件每帧不再从头重算两遍。",
+            "<b>· 装饰物预览缓存</b>：事件密集的段落只补算新播完的事件，已播完的历史事件缓存复用，不再整段重放。",
+            "<b>· 装饰物每帧刷新</b>：装饰物改为每帧更新位置，不再与每帧移动的相机之间产生相对抖动。",
+            "<b>· 自由漫游出场</b>：球格位置只在真的移动时才更新，减少每帧多余的物理刷新。",
+            "<b>· 工作台入口按钮</b>：左下角按钮只在数值变化时更新尺寸、位置、图标和底色，播放键位置改为每 0.25 秒核对一次。",
+            "<b>· 诊断统计默认不跑</b>：两处排查期逐帧统计改为只有开启诊断才运行。",
+            "<b>· 物理步进默认关闭</b>：播放时默认关掉 2D 物理的自动步进，减少每帧无谓的物理计算。场景里有几千个碰撞体却没有一个刚体，推进的是一个空模拟；游戏自己对 2D 物理只做射线与重叠查询，不受影响。兜底是「场景里只要查出任何刚体就不抑制」，播放结束 / 离开编辑器 / 关掉 mod 都会还原。",
+            "<b>· 去掉逐帧调试日志</b>：播放过程中每帧写一条的调试日志已关闭，避免日志写入本身拖慢画面。",
         });
 
         /// <summary>群号。ImGui 那扇说明窗口的标题也要用，所以是 internal。</summary>
@@ -3101,9 +3193,9 @@ namespace ADOFAIEditorStudio
                 contentX, navTop + 44f, contentWidth, 300f);
             BuildSettingsGeneralPage(contentWidth);
 
-            // 「开发者」页：探针 / 简化遮罩 / 旧版遮罩 / 导出。
+            // 「开发者」页：探针 / 简化遮罩 / 旧版遮罩 / 帧率日志 / 导出。
             settingsDeveloperPage = CreateTopLeftRect("SettingsDeveloperPage", card,
-                contentX, navTop + 44f, contentWidth, 300f);
+                contentX, navTop + 44f, contentWidth, 380f);
             BuildSettingsDeveloperPage(contentWidth);
 
             SelectSettingsPage(0);
@@ -3155,7 +3247,7 @@ namespace ADOFAIEditorStudio
                     Main.SaveSettings();
                 });
             // 遮罩的两条逃生通道：画面里「被裁掉的东西」排查时先关遮罩看看。
-            AddSettingsSwitch(settingsDeveloperPage, "简化遮罩", 40f, "开", "关",
+            AddSettingsSwitch(settingsDeveloperPage, "简化遮罩", 34f, "开", "关",
                 delegate { return Main.Settings != null && Main.Settings.SimplifyDecorationMasks; },
                 delegate (bool on)
                 {
@@ -3166,7 +3258,7 @@ namespace ADOFAIEditorStudio
                     Main.Settings.SimplifyDecorationMasks = on;
                     Main.SaveSettings();
                 });
-            AddSettingsSwitch(settingsDeveloperPage, "旧版遮罩", 80f, "开", "关",
+            AddSettingsSwitch(settingsDeveloperPage, "旧版遮罩", 68f, "开", "关",
                 delegate { return Main.Settings == null || Main.Settings.UseLegacySpriteMask; },
                 delegate (bool on)
                 {
@@ -3177,7 +3269,7 @@ namespace ADOFAIEditorStudio
                     Main.Settings.UseLegacySpriteMask = on;
                     Main.SaveSettings();
                 });
-            AddSettingsSwitch(settingsDeveloperPage, "轨道探针", 120f, "开", "关",
+            AddSettingsSwitch(settingsDeveloperPage, "轨道探针", 102f, "开", "关",
                 delegate { return Main.Settings != null && Main.Settings.TrackProbe; },
                 delegate (bool on)
                 {
@@ -3188,20 +3280,49 @@ namespace ADOFAIEditorStudio
                     Main.Settings.TrackProbe = on;
                     Main.SaveSettings();
                 });
+            // 轨道覆盖探针：播放头每进一格，打印这一格被哪些 MoveTrack 事件覆盖。
+            // 查「这一段为什么和原版不一样」时用 —— 事件表只打前 40 条，
+            // 后面那几条真正起作用的事件看不到。
+            AddSettingsSwitch(settingsDeveloperPage, "轨道覆盖探针", 136f, "开", "关",
+                delegate { return Main.Settings != null && Main.Settings.TrackCoverageProbe; },
+                delegate (bool on)
+                {
+                    if (Main.Settings == null)
+                    {
+                        return;
+                    }
+                    Main.Settings.TrackCoverageProbe = on;
+                    Main.SaveSettings();
+                });
+            // 帧率跳动日志：每秒三行，专门看「画面一顿一顿、平均帧率却好看」。
+            // 和诊断报表分开 —— 那份是 2 秒一段的平均值，抖动会被抹平。
+            AddSettingsSwitch(settingsDeveloperPage, "帧率日志", 170f, "开", "关",
+                delegate { return Main.Settings != null && Main.Settings.FrameRateLog; },
+                delegate (bool on)
+                {
+                    if (Main.Settings == null)
+                    {
+                        return;
+                    }
+                    Main.Settings.FrameRateLog = on;
+                    Main.SaveSettings();
+                });
 
             TextMeshProUGUI hint = CreateText("DeveloperHint", settingsDeveloperPage,
-                0f, 166f, width - 8f, 110f,
+                0f, 208f, width - 8f, 110f,
                 DeveloperSectionNote + "\n"
-                + "探针：把「该显示却没画出来」的装饰物写进日志（默认开）。\n"
+                + "探针：把「该显示却没画出来」的装饰物写进日志（默认关）。\n"
                 + "轨道探针：每 0.5 秒记录一遍轨道格的渲染器与屏幕坐标，用来查「轨道不见了」。\n"
-                + "简化遮罩：不裁剪，所有装饰物直接画；旧版遮罩：开 = SpriteMask，关 = V15 合成。",
+                + "轨道覆盖探针：播放头每进一格，列出覆盖它的 MoveTrack 事件（范围/不透明度/缓动）。\n"
+                + "简化遮罩：不裁剪，所有装饰物直接画；旧版遮罩：开 = SpriteMask，关 = V15 合成。\n"
+                + "帧率日志：每秒三行，含平均帧率、本段最差帧、掉帧数、当前格与播放状态。",
                 UiType.Body, TextMuted, TextAlignmentOptions.TopLeft, false);
             hint.overflowMode = TextOverflowModes.Overflow;
 
             // 导出是给「整片不见了」用的：拖到出问题的格子点一次，
             // 日志里就有全部装饰物的模型/组件对照。探针关着也能用。
             TextMeshProUGUI dumpLabel;
-            CreateButton("DumpDecorations", settingsDeveloperPage, 0f, 268f, 180f, 32f,
+            CreateButton("DumpDecorations", settingsDeveloperPage, 0f, 326f, 180f, 32f,
                 "导出装饰物状态", false,
                 delegate { Preview.Domains.DecorationCorePreviewDomain.DumpAll(); },
                 out dumpLabel);

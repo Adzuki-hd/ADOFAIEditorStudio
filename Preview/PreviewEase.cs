@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using DG.Tweening;
 
 namespace ADOFAIEditorStudio.Preview
@@ -89,9 +88,21 @@ namespace ADOFAIEditorStudio.Preview
         /// </summary>
         private const int EaseLutSize = 512;
 
-        /// <summary>每种 Ease 一张 0..1 的归一化表，按需生成，之后只读。</summary>
-        private static readonly Dictionary<Ease, float[]> EaseLut
-            = new Dictionary<Ease, float[]>();
+        /// <summary>
+        /// `DG.Tweening.Ease` 一共多少个值：Unset=0 … INTERNAL_Custom=37，共 38 个。
+        /// 值域固定，所以表可以按 `(int)ease` 直接下标访问，不需要字典。
+        /// </summary>
+        private const int EaseLutSlots = 38;
+
+        /// <summary>
+        /// 每种 Ease 一张 0..1 的归一化表，**下标就是 `(int)ease`**；
+        /// 某张表为 null 表示还没建过，首次访问时一次填满，之后只读。
+        ///
+        /// 为什么不用 Dictionary：一帧要采样 1 万–5 万次（见 `EasedValue` 的说明），
+        /// 每次一次枚举键哈希 + 桶探测纯属白烧；Ease 是固定枚举，
+        /// 天生适合当数组下标。
+        /// </summary>
+        private static readonly float[][] EaseLut = new float[EaseLutSlots][];
 
         /// <summary>
         /// 按原生 tween 的方式求缓动值（带查表缓存）。
@@ -111,41 +122,116 @@ namespace ADOFAIEditorStudio.Preview
         private static float SampleEase(Ease ease, float ratio)
         {
             float clamped = ratio < 0f ? 0f : (ratio > 1f ? 1f : ratio);
-            int index = (int)(clamped * EaseLutSize + 0.5f);
-            if (index < 0)
+
+            // **Linear 不查表。**
+            //
+            // 它本身就是 y = x，而查表会把 ratio 量化到 1/EaseLutSize 的
+            // 最近一格 —— 等于把一条直线切成 512 级台阶。短事件（几拍到
+            // 几十拍）一格只差几毫秒，看不出来；但谱面里那种
+            // `duration: 1000` 拍、铺满整个尾声的缓慢移动，每一级台阶要
+            // 等 0.2 秒才跳一次，用户看到的就是「一卡一卡类似步进」。
+            //
+            // 实测对账（2026-10-31，谱面《杪夏》2285 格）：
+            //   · 事件 `fg1`：duration = 1000 拍、ease = Linear、
+            //     positionOffset.y = 444。
+            //   · `TileSize` = 1.5，所以总位移 = 444 × 1.5 = 666。
+            //   · 666 / 512 = 1.301 —— 日志里每一级台阶的高度正是 1.301，
+            //     而且每 34 帧才跳一次，帧时间列却是每帧连续推进的。
+            // 三个数逐位吻合，根因没有别的解释。
+            //
+            // `Ease.Unset` 一起走这条路：DOTween 里它就是「不缓动」，
+            // `DOVirtual.EasedValue` 对它返回的同样是线性值。
+            if (ease == Ease.Linear || ease == Ease.Unset)
             {
-                index = 0;
-            }
-            else if (index > EaseLutSize)
-            {
-                index = EaseLutSize;
+                return clamped;
             }
 
-            float[] table;
-            if (!EaseLut.TryGetValue(ease, out table))
+            float scaled = clamped * EaseLutSize;
+            int easeIndex = (int)ease;
+            // **越界保护不能省。** 枚举值可能来自谱面数据里的整数强转，
+            // 真塞进一个 38 及以上的值，下标访问会当场抛 IndexOutOfRange——
+            // 而这里正是每帧几万次的热点路径，崩一次整帧就没了。
+            // 越界时退回单点现算，行为和旧字典实现一致（那个会给任意值建表）。
+            if (easeIndex < 0 || easeIndex >= EaseLutSlots)
             {
-                table = new float[EaseLutSize + 1];
-                for (int i = 0; i < table.Length; i++)
-                {
-                    table[i] = float.NaN;
-                }
-                EaseLut[ease] = table;
+                return ComputeEaseValue(ease, (int)(scaled + 0.5f));
             }
 
-            float cached = table[index];
-            // 0 是合法值（Linear / In 的起点），所以用"是否算过"另存一位：
-            // 把未计算标记成 NaN，NaN != NaN 即可判断。
-            if (cached.Equals(float.NaN) || float.IsNaN(cached))
+            float[] table = EaseLut[easeIndex];
+            if (table == null)
             {
-                float amplitude = DOTween.defaultEaseOvershootOrAmplitude;
-                if (IsFlashEase(ease))
-                {
-                    amplitude = (int)amplitude;
-                }
-                cached = DOVirtual.EasedValue(0f, 1f, (float)index / EaseLutSize, ease, amplitude);
-                table[index] = cached;
+                // **整表一次填满。** 原来是用 NaN 当"这一格还没算过"的哨兵、
+                // 逐格 lazy 填，于是每次采样都得多做两条 NaN 分支
+                // （0 是合法值，没法用 0 表示没算过）。整张表只有
+                // EaseLutSize+1 = 513 个值、每个 Ease 最多填一次，
+                // 预计算的 513 次比热点路径上的两条分支便宜得多。
+                table = BuildEaseTable(ease);
+                EaseLut[easeIndex] = table;
             }
-            return cached;
+
+            // **Flash 家族保持最近邻。**
+            //
+            // 它的曲线本身就是按 `ceil(ratio * 振幅)` 分段的锯齿（见类注释），
+            // 台阶是原生行为。插值会把锯齿抹成斜坡，等于改掉原版的样子。
+            if (IsFlashEase(ease))
+            {
+                int flashIndex = (int)(scaled + 0.5f);
+                if (flashIndex < 0)
+                {
+                    flashIndex = 0;
+                }
+                else if (flashIndex > EaseLutSize)
+                {
+                    flashIndex = EaseLutSize;
+                }
+                return table[flashIndex];
+            }
+
+            // **其余缓动在相邻采样点之间线性插值。**
+            //
+            // 只取最近邻的话，任何缓动碰上上面那种超长事件都会变成
+            // 512 级台阶。插值多两次浮点运算，换来连续曲线，而且比最近邻
+            // 更接近原生 `DOVirtual.EasedValue` 的精确值。
+            int lower = (int)scaled;
+            if (lower < 0)
+            {
+                lower = 0;
+            }
+            else if (lower > EaseLutSize - 1)
+            {
+                lower = EaseLutSize - 1;
+            }
+            float from = table[lower];
+            return from + (table[lower + 1] - from) * (scaled - lower);
+        }
+
+        /// <summary>
+        /// 把一张 0..1 的归一化表一次填满（`EaseLutSize + 1` 个采样点）。
+        /// </summary>
+        private static float[] BuildEaseTable(Ease ease)
+        {
+            float[] table = new float[EaseLutSize + 1];
+            for (int i = 0; i < table.Length; i++)
+            {
+                table[i] = ComputeEaseValue(ease, i);
+            }
+            return table;
+        }
+
+        /// <summary>
+        /// 单点现算一个采样值。**Flash 家族的振幅截断在这里做**：
+        /// 与 `TweenSettingsExtensions.SetEase` 一致，先把振幅截成整数，
+        /// 否则终点会错位（原因见类注释）。填表和越界回退共用这一份，
+        /// 免得两条路的语义哪天走散。
+        /// </summary>
+        private static float ComputeEaseValue(Ease ease, int index)
+        {
+            float amplitude = DOTween.defaultEaseOvershootOrAmplitude;
+            if (IsFlashEase(ease))
+            {
+                amplitude = (int)amplitude;
+            }
+            return DOVirtual.EasedValue(0f, 1f, (float)index / EaseLutSize, ease, amplitude);
         }
 
         /// <summary>

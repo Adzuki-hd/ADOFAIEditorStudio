@@ -94,6 +94,12 @@ namespace ADOFAIEditorStudio.Preview.Domains
         internal struct PendingWrite
         {
             internal scrFloor Floor;
+            /// <summary>
+            /// 这一格在谱面里的序号。合成之后要拿它更新 `dirtyFloors` ——
+            /// 那个集合按**格号**存（不是格对象），而合成表的键是格对象。
+            /// 两个域各自知道自己扫到的是第几格，顺手带过来，省一次反查。
+            /// </summary>
+            internal int FloorIndex;
             // 要写哪几个通道。MoveTrack 四个都写；AnimateTrack 只写它
             // 真正驱动的那些——它从不碰的通道绝不能被写回，否则会盖掉
             // MoveTrack 设的值（有张谱面用 MoveTrack(opacity 0) 藏后面的格，
@@ -103,12 +109,106 @@ namespace ADOFAIEditorStudio.Preview.Domains
             internal bool WriteScale;
             internal bool WriteOpacity;
             internal Vector3 Position;
-            internal Quaternion Rotation;
+            /// <summary>
+            /// 目标旋转的 **z 欧拉角**（本域只写纯 Z 轴旋转）。
+            /// 存 float 而不是 Quaternion：帧末比较写不写时只比一个角度，
+            /// 不必构造四元数再算 acos。
+            /// </summary>
+            internal float RotationZ;
             internal Vector3 Scale;
             internal float Opacity;
+
+            /// <summary>
+            /// 这笔写入是**只为防漂移**排进来的（目标值和上次一样，
+            /// 只是轮到了它那一槽强制重排）。
+            ///
+            /// 这种写入在 `ApplyPendingWrites` 里本该什么都不做 —— 目标值
+            /// 早就在 Transform 上了。可它现在仍要读三次 `floor.transform`
+            /// （position / eulerAngles / localScale），每次都是一趟
+            /// native interop，只为了比较出"相等"。排查实测：稳态播放时
+            /// `ScW.Queued` 恒为 88（= 总格数 / 30 的错峰片），而
+            /// `ScW.Pos/Rot/Scale` 恒为 0 —— 也就是说这 88 笔**全部**是
+            /// 这种白排，`Sc.Write` 那 0.11~0.13ms 全花在三次读回上。
+            ///
+            /// 当这笔写入下辖的每个通道都已经被我们接管（见 `floorTakeOverMask`），
+            /// 读回来的值必然是目标值：接管把原生 tween 从 `floor.moveTweens`
+            /// 里 Kill 掉了，`scrFloor.LateUpdate` 只读 position 不写，
+            /// `scrFloor.Update` 只写 `floorRenderer.color`。所以这三次读
+            /// 可以整段跳过，只留透明度那一笔（`floor.opacity` 是普通
+            /// 托管字段，读它零 native 开销）。
+            /// </summary>
+            internal bool ForceOnly;
+
+            /// <summary>
+            /// 两笔写入要表达的目标值是不是同一个。
+            ///
+            /// 只比**值**，不比 `Floor` 引用之外的身份信息 —— 调用方保证是同一格。
+            ///
+            /// 容差刻意取得比 `ApplyPendingWrites` 里的写入阈值**松一倍**
+            /// （写入是 sqr&gt;1e-6 / 0.02° / 0.002，这里用 4e-6 / 0.04° / 0.004）。
+            /// 为什么必须更松：两者相等的话，一个正好卡在阈值附近抖动的值会
+            /// **每帧都被判定为"变了"而重新入队，又在写入时被判为"没变"而跳过**
+            /// —— 那就是白排一趟，优化等于没做。
+            ///
+            /// 松一倍仍然远小于任何真实动画的每帧变化量（1 秒完成的位移在 165fps
+            /// 下每帧走完全程的 0.6‰），所以不会吃掉真正该写的那一帧。
+            /// </summary>
+            internal bool SameTarget(PendingWrite other)
+            {
+                if (WritePosition != other.WritePosition
+                    || WriteRotation != other.WriteRotation
+                    || WriteScale != other.WriteScale
+                    || WriteOpacity != other.WriteOpacity)
+                {
+                    return false;
+                }
+                if ((Position - other.Position).sqrMagnitude > 0.000004f)
+                {
+                    return false;
+                }
+                if (Mathf.Abs(Mathf.DeltaAngle(RotationZ, other.RotationZ)) > 0.04f)
+                {
+                    return false;
+                }
+                if ((Scale - other.Scale).sqrMagnitude > 0.000004f)
+                {
+                    return false;
+                }
+                return Mathf.Abs(Opacity - other.Opacity) <= 0.004f;
+            }
         }
 
+        /// <summary>
+        /// 每一格每隔这么多帧无条件重排一次，兜住「原生在我们写完之后又改了
+        /// Transform」那种情况。165fps 下约 0.18 秒。
+        /// 见 `lastQueuedTargets` 的完整说明。
+        ///
+        /// **按格错峰，不是全表一起重排**：重排日由 `ForceRewriteDue` 按格的
+        /// 哈希取模决定。全表一起重排的话，每 30 帧就有一帧要重新排 4000 多笔
+        /// （≈2ms）——那正是这个优化要消灭的开销，只是从每帧挪到了隔 30 帧。
+        /// 错峰之后每帧只处理 1/30，摊平到约 0.07ms，而且任意一刻任何一格的
+        /// 上次重排都不超过这个间隔。
+        /// </summary>
+        private const int ForceRewriteIntervalFrames = 30;
+
         private readonly List<PendingWrite> pendingWrites = new List<PendingWrite>();
+
+        /// <summary>
+        /// **本帧合成后的格状态：每格至多一条。**
+        ///
+        /// 原来 MoveTrack 和 AnimateTrack 各自往队列里塞一条，同一格可能排两笔
+        /// （MoveTrack 全部通道 + AnimateTrack 它碰的那几个），靠入队先后来表达
+        /// 「后写者胜」。那样没法判"这一格这一帧到底要不要写"——两笔互相覆盖，
+        /// 逐笔比较必然是错的。
+        ///
+        /// 所以先合成：MoveTrack 打底（它四个通道都写），AnimateTrack 把它真正
+        /// 驱动的通道覆盖上去。这一格这一帧的最终目标就确定了，比较才有了意义。
+        ///
+        /// 合成与原来"先后写两条"**逐通道等价**：ApplyPendingWrites 里每笔写入
+        /// 独立判断、独立写通道，AnimateTrack 的 WriteXxx 为假的通道它本来就不碰。
+        /// </summary>
+        private readonly Dictionary<scrFloor, PendingWrite> frameTargets
+            = new Dictionary<scrFloor, PendingWrite>();
 
         // 本帧被排了位置写入的格。AnimateTrack 每格都要问一次
         // 「这一格的位置有没有人写」，线性扫队列会退化成 O(格数²)。
@@ -120,17 +220,106 @@ namespace ADOFAIEditorStudio.Preview.Domains
         /// 见 Evaluate 里那段说明。
         /// </summary>
         private readonly HashSet<int> dirtyFloors = new HashSet<int>();
-        /// <summary>求值顺序的临时集合（可见 ∪ 脏），复用以免每帧分配。</summary>
+        /// <summary>求值顺序的临时集合（可见 ∪ 脏 ∪ 错峰片），复用以免每帧分配。</summary>
         private readonly HashSet<int> evaluationScratch = new HashSet<int>();
 
         /// <summary>
-        /// 交一笔延迟写入。AnimateTrack 用它排在自己那些格上，
-        /// 排在 MoveTrack 之后，于是在帧末下发时仍然赢过 MoveTrack——
-        /// 与两者原来直写时的先后关系一致。
+        /// 这一帧是不是全谱都求值了（取不到相机时分块失效，退回全量）。
+        /// AnimateTrack 要据此决定是跟着本帧的格集合走，还是自己全扫一遍。
+        /// </summary>
+        private bool evaluatedAllFloors;
+
+        /// <summary>
+        /// 本帧求值过的格号集合。**AnimateTrack 按它扫，不再自己全谱扫一遍。**
+        ///
+        /// 两个域必须同进同退：只让一个域跳过某一格的话，合成表里那一格就只剩
+        /// 另一个域的值，帧末写下去等于把出现/消失动画撤销了。
+        /// </summary>
+        internal HashSet<int> EvaluatedFloors
+        {
+            get { return evaluationScratch; }
+        }
+
+        /// <summary>这一帧是不是全谱都求值了。见 `evaluatedAllFloors`。</summary>
+        internal bool AllFloorsEvaluatedThisFrame
+        {
+            get { return evaluatedAllFloors; }
+        }
+
+        /// <summary>
+        /// **上一次真正排进队列的每格目标值。** 用来判断「这一帧还值不值得再排一次」。
+        ///
+        /// 为什么需要：实测一帧排 4299 笔待写，而真正写进 Transform 的是 **0 笔**
+        /// —— 也就是说 99.6% 的队列项在 `ApplyPendingWrites` 里逐项比较完之后
+        /// 什么都没做，光这一趟就吃掉 2ms/帧（占 `Overlay.L` 的 99%）。
+        ///
+        /// 产生空转的原因不是求值错了，而是 `dirtyFloors` 的语义：它记的是
+        /// 「偏离烘焙基线」的格，于是一个在 t=10 就被挪走、之后一直停在原地的
+        /// 格会永远留在集合里，每帧重新求值、重新入队、再被判定为「不用写」。
+        ///
+        /// 判据放在**入队时**而不是出队时：入队时目标值就在手上，
+        /// 且不用碰 `transform`；出队时必须已经读过 Transform 才能比。
+        ///
+        /// **但"上一帧排过同样的值"不等于"Transform 上已经是这个值"** ——
+        /// 原生组件有可能在上一帧的 LateUpdate 之后把它改掉。所以这条优化
+        /// 配了一条强制刷新：见 `ForceRewriteDue`。
+        ///
+        /// 表的大小由谱面格数封顶（只增不减，但每格最多一条，且 Analyze /
+        /// 会话结束会整个清掉），不随播放时长增长。
+        /// </summary>
+        private readonly Dictionary<scrFloor, PendingWrite> lastQueuedTargets
+            = new Dictionary<scrFloor, PendingWrite>();
+
+        /// <summary>
+        /// 这一格这一帧轮不轮得到强制重排。
+        ///
+        /// 把重排日按格错开：第 i 格在 `帧号 % 30 == i % 30` 那一帧轮到。
+        /// 每帧只有一个槽到期，于是全表每 30 帧被完整重排一遍，但每一帧
+        /// 只多排 1/30 的格——全表一起重排的话，每 30 帧就有一帧要重新排
+        /// 4000 多笔（≈2ms），那正是这个优化要消灭的开销，只是从"每帧"
+        /// 挪到了"隔 30 帧"。
+        ///
+        /// **用格号而不是对象哈希**：Evaluate 里的错峰求值片用的是
+        /// `格号 % 30 == 帧号 % 30`，两边必须对齐——否则轮到的格那一帧
+        /// 根本没被求值，也就不在合成表里，强制重排永远不会发生。
+        /// </summary>
+        private static bool ForceRewriteDue(int floorIndex)
+        {
+            return (Time.frameCount - floorIndex) % ForceRewriteIntervalFrames == 0;
+        }
+
+        /// <summary>
+        /// 交一笔延迟写入。AnimateTrack 用它把**自己驱动的通道**覆盖到
+        /// 本帧的合成目标上（MoveTrack 已经打好了底）。
+        ///
+        /// 它不再自己往队列里排——同一格这一帧只应该有**一条**目标，
+        /// 否则「值有没有变」无从判断。见 `frameTargets` 的说明。
         /// </summary>
         internal void QueueWrite(PendingWrite write)
         {
-            pendingWrites.Add(write);
+            scrFloor floor = write.Floor;
+            if (floor == null)
+            {
+                return;
+            }
+
+            PendingWrite merged;
+            if (frameTargets.TryGetValue(floor, out merged))
+            {
+                // MoveTrack 这一帧已经给这格定了底，只覆盖它管的通道。
+                // **不能整条替换**：AnimateTrack 从不碰的通道（比如只驱动
+                // 透明度的那一族）留着 MoveTrack 的值，替换会把它抹回 0/基线。
+                if (write.WritePosition) { merged.WritePosition = true; merged.Position = write.Position; }
+                if (write.WriteRotation) { merged.WriteRotation = true; merged.RotationZ = write.RotationZ; }
+                if (write.WriteScale) { merged.WriteScale = true; merged.Scale = write.Scale; }
+                if (write.WriteOpacity) { merged.WriteOpacity = true; merged.Opacity = write.Opacity; }
+            }
+            else
+            {
+                merged = write;
+            }
+
+            frameTargets[floor] = merged;
         }
 
         private static long ChunkKey(int x, int y)
@@ -163,6 +352,9 @@ namespace ADOFAIEditorStudio.Preview.Domains
             events.Clear();
             // 会话重建：脏格集作废，全部按烘焙状态重新起步。
             dirtyFloors.Clear();
+            // 去重缓存同样作废：格子对象可能换了，旧的「上次排过什么」不再可信。
+            lastQueuedTargets.Clear();
+            frameTargets.Clear();
             if (animateTrack != null)
             {
                 animateTrack.Analyze(context);
@@ -355,17 +547,22 @@ namespace ADOFAIEditorStudio.Preview.Domains
         /// </summary>
         private static void RestoreBaseline(scrFloor floor, FloorDefault baseline)
         {
+            // 只有真写了才登记「物理世界需要重新同步」（见 NoteTransformWritten）。
+            bool wrote = false;
+
             Vector3 wantedPosition = new Vector3(
                 baseline.Position.x, baseline.Position.y, floor.transform.position.z);
             if ((floor.transform.position - wantedPosition).sqrMagnitude > 0.000001f)
             {
                 floor.transform.position = wantedPosition;
+                wrote = true;
             }
 
             Quaternion wantedRotation = Quaternion.Euler(0f, 0f, baseline.Rotation.eulerAngles.z);
             if (Quaternion.Angle(floor.transform.rotation, wantedRotation) > 0.02f)
             {
                 floor.transform.rotation = wantedRotation;
+                wrote = true;
             }
 
             // z 分量不动，跟各域写缩放的方式一致。
@@ -374,6 +571,12 @@ namespace ADOFAIEditorStudio.Preview.Domains
             if ((floor.transform.localScale - wantedScale).sqrMagnitude > 0.000001f)
             {
                 floor.transform.localScale = wantedScale;
+                wrote = true;
+            }
+
+            if (wrote)
+            {
+                PreviewEvaluationEngine.NoteTransformWritten();
             }
 
             // **不恢复 opacity。**
@@ -521,6 +724,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // 这里再清一次是防它没跑（比如工作台中途被关掉）。
             pendingWrites.Clear();
             positionWriteFloors.Clear();
+            frameTargets.Clear();
 
             // **播放头跳转时把全部格子标脏一帧。**
             //
@@ -531,9 +735,15 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // 实测跳转那一帧会因此打出 changed=2003/2003。
 
             bool chunked = CollectVisibleFloors();
+            // 【临时探针】求值循环与帧末合成分开计时：这两段加起来才是
+            // 引擎里那一笔 `域 MoveTrack=…`，不拆开就不知道该砍哪一段。
+            bool probe = PreviewDiagnostics.Enabled;
+            long probeStart = probe ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
+            int evaluatedFloors = 0;
+            evaluatedAllFloors = !chunked;
             if (chunked)
             {
-                // **可见区块 ∪ 脏格集。**
+                // **可见区块 ∪ 脏格集 ∪ 错峰片。**
                 //
                 // 只求值可见区块的话，被摄像机甩到区块外的格子**再也不会被
                 // 求值**，于是永远停在上一次写入的状态。实测 Offshore（2003 格）
@@ -545,8 +755,16 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 // 正常播放之所以正常：它没有瞬间跳转，唯一的瞬间动作
                 // （回开头）还是带动画的。
                 //
-                // 脏格集 = 当前不在烘焙状态的格。它必然只有正在动的那一带
-                // （实测远小于总格数），所以不牺牲这条优化本身。
+                // **脏格集的判据 2026-10-30 改过**，见 EvaluateFloor 末尾：
+                // 从「偏离烘焙基线」改成「目标值相对上一帧变了」。
+                // 旧判据的本意是保底，实测却把 2046/2619 格钉成永久脏格，
+                // 每帧全谱重算（`MT.Loop=1.70ms` 里绝大部分是它），
+                // 而这一帧真正需要重写的只有 0~2 笔（`ScW.Queued`）。
+                //
+                // 错峰片：每帧把 `格号 % 30 == 帧号 % 30` 的那一片也带上。
+                // 屏幕外、目标值也没变的格会因此每 30 帧被完整重算一次，
+                // 于是"屏幕外停着不动的格永远没人看"这件事有了上界（约 0.18 秒），
+                // 代价是每帧多算 1/30 的格。
                 evaluationScratch.Clear();
                 for (int i = 0; i < visibleFloors.Count; i++)
                 {
@@ -561,18 +779,34 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     }
                 }
 
+                int totalFloors = frame.Context.Floors.Count;
+                int staleSlot = Time.frameCount % ForceRewriteIntervalFrames;
+                for (int floorIndex = staleSlot; floorIndex < totalFloors; floorIndex += ForceRewriteIntervalFrames)
+                {
+                    evaluationScratch.Add(floorIndex);
+                }
+
                 foreach (int floorIndex in evaluationScratch)
                 {
                     EvaluateFloor(frame, floorIndex);
                 }
+                evaluatedFloors = evaluationScratch.Count;
             }
             else
             {
                 // 没有分块索引或取不到相机：退回全量，别让画面缺格。
-                for (int floorIndex = 0; floorIndex < frame.Context.Floors.Count; floorIndex++)
+                int count = frame.Context.Floors.Count;
+                for (int floorIndex = 0; floorIndex < count; floorIndex++)
                 {
                     EvaluateFloor(frame, floorIndex);
                 }
+                evaluatedFloors = count;
+            }
+
+            if (probe)
+            {
+                RecordSince("MT.Loop", probeStart);
+                probeStart = System.Diagnostics.Stopwatch.GetTimestamp();
             }
 
             // 之后才跑，好让出现/消失动画对它涉及的格有最后发言权，
@@ -582,6 +816,169 @@ namespace ADOFAIEditorStudio.Preview.Domains
             if (animateTrack != null)
             {
                 animateTrack.Evaluate(frame);
+            }
+
+            if (probe)
+            {
+                RecordSince("AT.Eval", probeStart);
+                probeStart = System.Diagnostics.Stopwatch.GetTimestamp();
+            }
+
+            // 两域都投完票了，现在才谈得上「这一格这一帧的最终目标是什么」。
+            FlushFrameTargets();
+
+            if (probe)
+            {
+                RecordSince("MT.Flush", probeStart);
+                PreviewDiagnostics.RecordFlag("ScW.Eval", evaluatedFloors);
+                // MoveTrack 这一帧拥有（有 MoveTrack 事件）的格数。它和
+                // ScW.Targets 的差额就是「只被 AnimateTrack 碰到的格」——
+                // 全局出现/消失动画会把每一格都扫一遍，那才是合成表总是满的
+                // 真正原因。
+                PreviewDiagnostics.RecordFlag("ScW.Own", positionWriteFloors.Count);
+                ProbeNativeTweens(frame);
+            }
+        }
+
+        /// <summary>
+        /// 【临时探针】数一遍全谱还活着多少个原生 tween。
+        ///
+        /// 用途：判断"整帧里那 9~10ms 的原生开销"里有多少是 2619 个格子上
+        /// 还挂着的 DOTween 组件每帧在跑。`PreviewEase.TakeOverChannel`
+        /// 会把接管过的通道从 `floor.moveTweens` 里摘掉，而我们现在只对
+        /// **求值过的格**（可见 ∪ 脏 ∪ 错峰片）做接管——屏幕外的格那些
+        /// 原生 tween 就一直在跑。这个数字决定那条实不实。
+        ///
+        /// 每 120 帧数一次（全谱走一遍是 2619 次字典访问，不必每帧做）。
+        /// </summary>
+        private void ProbeNativeTweens(PreviewEvaluationFrame frame)
+        {
+            if (Time.frameCount - lastTweenProbeFrame < 120)
+            {
+                return;
+            }
+            lastTweenProbeFrame = Time.frameCount;
+
+            int total = 0;
+            int floorsWithTweens = 0;
+            int playing = 0;
+            int active = 0;
+            int count = frame.Context.Floors.Count;
+            for (int i = 0; i < count; i++)
+            {
+                scrFloor floor = frame.Context.GetFloorBinding(i);
+                if (floor == null || floor.moveTweens == null || floor.moveTweens.Count == 0)
+                {
+                    continue;
+                }
+                total += floor.moveTweens.Count;
+                floorsWithTweens++;
+                foreach (KeyValuePair<TweenType, Tween> pair in floor.moveTweens)
+                {
+                    Tween tween = pair.Value;
+                    if (tween == null)
+                    {
+                        continue;
+                    }
+                    // `active` = 还没被 Kill；`IsPlaying` = 真的在时间线上跑。
+                    // 前者留着不花每帧的钱，后者才要 DOTween 每帧推值。
+                    if (tween.active) { active++; }
+                    // **必须先判 `active` 再问 `IsPlaying()`。**
+                    //
+                    // DOTween 的 `IsPlaying()` 对已经被 Kill 的 tween 会走
+                    // `Debugger.LogInvalidTween`，每次同步写一行
+                    // "This Tween has been killed and is now invalid"。
+                    // 而重建时 `PrepareFloorTrackColours` 会给每一格造一条
+                    // duration=0、当帧就 autoKill 的 tween 并留在
+                    // `floor.moveTweens` 里——2620 格就是 2620 条死 tween。
+                    //
+                    // 探针每 120 帧扫一遍，于是每遍刷 2620 行警告：实测某次
+                    // 会话日志 793,860 行、占全文 98%，全是这一行写出来的。
+                    // 那不只是刷屏，还是同步的 Console.WriteLine。
+                    if (tween.active && tween.IsPlaying()) { playing++; }
+                }
+            }
+            PreviewDiagnostics.RecordFlag("SC.Tweens", total);
+            PreviewDiagnostics.RecordFlag("SC.TwFloor", floorsWithTweens);
+            PreviewDiagnostics.RecordFlag("SC.TwAct", active);
+            PreviewDiagnostics.RecordFlag("SC.TwPlay", playing);
+            // DOTween 全局正在播放的 tween 总数——这才是每帧真正被推进的数量。
+            PreviewDiagnostics.RecordFlag("SC.DtPlay", DOTween.TotalPlayingTweens());
+        }
+
+        private int lastTweenProbeFrame = -1000;
+
+        /// <summary>【临时探针】记一段耗时，配合 Evaluate 里的分段计时。</summary>
+        private static void RecordSince(string name, long startTimestamp)
+        {
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            PreviewDiagnostics.RecordPart(name,
+                (now - startTimestamp) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+        }
+
+        /// <summary>
+        /// 把本帧的合成目标转成待写队列：**只有值真的变了才排**，
+        /// 同时维护 `dirtyFloors`。
+        ///
+        /// 必须在两域都求值完之后调用（见 Evaluate 末尾）。这一步之前
+        /// `pendingWrites` 是空的，而球的圆心、运镜都靠
+        /// `TryGetPendingPosition` 读它——所以这一步不能拖到 LateUpdate，
+        /// 必须留在 MoveTrack 求值的最后一行：引擎里 FreeRoam / Planet / Camera
+        /// 都排在 MoveTrack 之后、`ApplyPendingWrites` 之前。
+        ///
+        /// **`dirtyFloors` 的判据 2026-10-30 换成「相对上一帧有没有变」。**
+        ///
+        /// 旧判据是「偏离烘焙基线」，记的是**静止状态**而不是**变化**：
+        /// 一张谱里被 MoveTrack 永久挪开的格会一直"偏离基线"，实测 2046/2619 格
+        /// 被钉成永久脏格，每帧全谱重算（`MT.Loop=1.70ms` 主要是它），
+        /// 而同一时刻真正需要重写的只有 0~2 笔（`ScW.Queued`）——
+        /// 说明那 2046 格重算出来的结果和上一帧一模一样。
+        ///
+        /// 判据必须放在这里而不是 EvaluateFloor：只有合成之后才知道这一格
+        /// 这一帧到底要变成什么。在 MoveTrack 那边判的话，"透明度被
+        /// AnimateTrack 覆盖"的格会拿 MoveTrack 自己的透明度和合成值比，
+        /// 每次都判成变了，脏格集又会涨回去。
+        /// </summary>
+        private void FlushFrameTargets()
+        {
+            foreach (KeyValuePair<scrFloor, PendingWrite> pair in frameTargets)
+            {
+                PendingWrite wanted = pair.Value;
+
+                PendingWrite previous;
+                bool changed = !lastQueuedTargets.TryGetValue(pair.Key, out previous)
+                    || !previous.SameTarget(wanted);
+
+                // 动画跑着的格每帧都变 → 一直脏 → 一直求值，行为不变；
+                // 停在终态的格变一次就不再脏，屏幕外的就不再每帧重算。
+                if (changed)
+                {
+                    dirtyFloors.Add(wanted.FloorIndex);
+                }
+                else
+                {
+                    dirtyFloors.Remove(wanted.FloorIndex);
+                }
+
+                if (!changed)
+                {
+                    // 目标值和上次排的完全一样：Transform 上早就是这个值了，
+                    // 再排一遍只会在 ApplyPendingWrites 里白跑一趟。
+                    // （上一轮的 4299 笔待写里 99.6% 是这种。）
+                    // 只有轮到强制重排那一槽的格才放行，见 ForceRewriteDue。
+                    if (!ForceRewriteDue(wanted.FloorIndex))
+                    {
+                        continue;
+                    }
+
+                    // 放行的这批是**纯防漂移**写入：目标值没变过。
+                    // 打上标记，让 ApplyPendingWrites 跳过一次都不需要的
+                    // Transform 读回（见 PendingWrite.ForceOnly 的说明）。
+                    wanted.ForceOnly = true;
+                }
+
+                pendingWrites.Add(wanted);
+                lastQueuedTargets[pair.Key] = wanted;
             }
         }
 
@@ -606,6 +1003,9 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 // 会在整个会话余下时间里一直保持淡出和位移。
                 RestoreBaseline(floor, baseline);
                 dirtyFloors.Remove(floorIndex);
+                // 这一格本帧不参与写入，把它从去重缓存里摘掉：
+                // 它此后若被别的路径重新主张，那是全新的值，不该被旧记录挡掉。
+                lastQueuedTargets.Remove(floor);
                 return;
             }
 
@@ -685,42 +1085,38 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // 因为原生组件会在本帧稍后把这些值重置回烘焙状态。
 
             Vector3 wantedPosition = new Vector3(position.x, position.y, floor.transform.position.z);
-            Quaternion wantedRotation = Quaternion.Euler(0f, 0f, rotation);
             Vector3 wantedScale = new Vector3(scale.x / 100f, scale.y / 100f, baseline.Scale.z);
             float wantedOpacity = Mathf.Clamp01(opacity / 100f);
 
-            pendingWrites.Add(new PendingWrite
-            {
-                Floor = floor,
-                WritePosition = true,
-                WriteRotation = true,
-                WriteScale = true,
-                WriteOpacity = true,
-                Position = wantedPosition,
-                Rotation = wantedRotation,
-                Scale = wantedScale,
-                Opacity = wantedOpacity
-            });
+            // 用 default 起手：这段是逐字段赋值，而结构体新增字段后
+            // 每处构造点都必须把它也赋上，否则编译器会报「使用了未赋值的
+            // 局部变量」。从 default 起手，新字段自动落到零值，
+            // 以后再增字段也不会漏。
+            PendingWrite wanted = default(PendingWrite);
+            wanted.Floor = floor;
+            wanted.FloorIndex = floorIndex;
+            wanted.WritePosition = true;
+            wanted.WriteRotation = true;
+            wanted.WriteScale = true;
+            wanted.WriteOpacity = true;
+            wanted.Position = wantedPosition;
+            wanted.RotationZ = rotation;
+            wanted.Scale = wantedScale;
+            wanted.Opacity = wantedOpacity;
+
+            // **只登记本帧目标，不排队。**
+            //
+            // 队列要等 AnimateTrack 也投完票再统一生成（见 FlushFrameTargets）：
+            // 同一格同一帧只能有一条最终目标，"这一格要不要写"才有唯一答案。
+            // 上一版在这里直接比较入队，结果同一格被两域各排一笔、互相覆盖，
+            // 比较永远不可能命中，优化等于没做。
+            frameTargets[floor] = wanted;
             positionWriteFloors.Add(floor);
 
-            // **这一格偏离烘焙状态了吗？** 偏离的进"脏格集"，于是每帧都会被
-            // 求值——哪怕被摄像机甩到可见区块之外。播放头往回跳时（瞬间点击、
-            // 极快拖动），只有这样它才有人把它写回去。回到烘焙状态就移出，
-            // 所以这个集合的大小只跟"当前正在动的那一带"成正比。
-            bool deviated = (wantedPosition - baseline.Position).sqrMagnitude > 0.000001f
-                || Quaternion.Angle(
-                    wantedRotation,
-                    Quaternion.Euler(0f, 0f, baseline.Rotation.eulerAngles.z)) > 0.05f
-                || (wantedScale - baseline.Scale).sqrMagnitude > 0.000001f
-                || Mathf.Abs(wantedOpacity - baseline.Opacity) > 0.002f;
-            if (deviated)
-            {
-                dirtyFloors.Add(floorIndex);
-            }
-            else
-            {
-                dirtyFloors.Remove(floorIndex);
-            }
+            // `dirtyFloors` 的维护挪到 FlushFrameTargets 里做 —— 判据要用
+            // **合成之后**的值（含 AnimateTrack 覆盖的通道），在这里判会把
+            // "被 AnimateTrack 覆盖了透明度"的格永远判成变了。
+            // 见 FlushFrameTargets 里那段说明。
         }
 
         /// <summary>
@@ -782,9 +1178,29 @@ namespace ADOFAIEditorStudio.Preview.Domains
         internal void ApplyPendingWrites()
         {
             if (pendingWrites.Count == 0)            {
+                // 队列空也要打诊断：去重之后这会是常态，
+                // 不打就会一直看着上一帧的旧数字，误以为队列还是 4000 多笔。
+                RecordWriteFlags(0, 0, 0, 0);
                 return;
             }
 
+            // **通道接管位掩码：同一个通道摘过一次就不用再摘。**
+            //
+            // `TakeOverChannel` 只是把游戏原生 tween 从 `floor.moveTweens`
+            // 里杀掉并移除 —— 摘过之后词典里就没有了，之后再查必然落空。
+            // 可我们每帧对每格调 4 次（Position / PositionX / PositionY /
+            // Rotation），4000+ 笔就是 1.6 万次空转的 `TryGetValue`。
+            //
+            // 位掩码记住「这一格已经摘过哪些通道」，摘过的直接跳过。
+            // 只省字典查询，不改变任何写入行为 —— 这是本次优化里
+            // 唯一不影响轨道的部分。
+            // 诊断：队列长度 vs 真正写下去的笔数。
+            // 两者之差就是「变化检测」挡掉的空转——如果队列很长而实际写入很少，
+            // 2ms 花在遍历和比较上；如果两者接近，那就是真在写。
+            int writePositionCount = 0;
+            int writeRotationCount = 0;
+            int writeOpacityCount = 0;
+            int writeScaleCount = 0;
             for (int i = 0; i < pendingWrites.Count; i++)
             {
                 PendingWrite write = pendingWrites[i];
@@ -794,44 +1210,111 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     continue;
                 }
 
+                int taken = floorTakeOverMask.TryGetValue(floor, out int mask) ? mask : 0;
+
+                // 这笔是不是「纯防漂移」写入，且它下辖的每个姿态通道都已经
+                // 在我们手里？是的话，Transform 上必定已经是目标值 ——
+                // 三次读回可以整段跳过（见 PendingWrite.ForceOnly）。
+                // 透明度不参与这个判断：`floor.opacity` 是普通托管字段，
+                // 读它不花钱，而且它确实可能被别处动过，必须照常比较。
+                bool skipPoseReads = write.ForceOnly;
+                if (skipPoseReads)
+                {
+                    int poseMask = 0;
+                    if (write.WritePosition)
+                    {
+                        poseMask |= TakeOverPositionMask;
+                    }
+                    if (write.WriteRotation)
+                    {
+                        poseMask |= TakeOverRotationMask;
+                    }
+                    if (write.WriteScale)
+                    {
+                        poseMask |= TakeOverScaleMask;
+                    }
+                    // poseMask == 0 表示这笔只写透明度，那就没什么可跳的。
+                    if (poseMask == 0 || (taken & poseMask) != poseMask)
+                    {
+                        skipPoseReads = false;
+                    }
+                }
+
                 if (write.WritePosition)
                 {
-                    if ((floor.transform.position - write.Position).sqrMagnitude > 0.000001f)
+                    if (!skipPoseReads
+                        && (floor.transform.position - write.Position).sqrMagnitude > 0.000001f)
                     {
                         floor.transform.position = write.Position;
+                        writePositionCount++;
                     }
                     // 游戏的 ffxMoveFloorPlus 用 PositionX/PositionY，
                     // 别的特效可能用整体的 Position，一并接管。
-                    PreviewEase.TakeOverChannel(floor, TweenType.Position);
-                    PreviewEase.TakeOverChannel(floor, TweenType.PositionX);
-                    PreviewEase.TakeOverChannel(floor, TweenType.PositionY);
+                    if ((taken & TakeOverPositionMask) != TakeOverPositionMask)
+                    {
+                        PreviewEase.TakeOverChannel(floor, TweenType.Position);
+                        PreviewEase.TakeOverChannel(floor, TweenType.PositionX);
+                        PreviewEase.TakeOverChannel(floor, TweenType.PositionY);
+                        taken |= TakeOverPositionMask;
+                    }
                 }
 
                 if (write.WriteRotation)
                 {
-                    if (Quaternion.Angle(floor.transform.rotation, write.Rotation) > 0.02f)
+                    // 纯 Z 轴旋转：目标角入队时已经算好，这里只在真要写时构造四元数。
+                    //
+                    // **2026-10-30：比较方式从 `Quaternion.Angle` 换成 `DeltaAngle`。**
+                    // 两者判的是同一件事（绕 Z 转了多少度），但 `Quaternion.Angle`
+                    // 内部要构造四元数再做一次 acos —— 而这里每帧要跑 4000 多笔，
+                    // 其中 99.6% 的结果是「不需要写」。A3 那轮已经在别处把
+                    // `Quaternion.Angle` 换成 `DeltaAngle`，这里是最后一处遗留。
+                    // 读 transform.eulerAngles.z 与目标 z 角直接比，语义等价、零 acos。
+                    if (!skipPoseReads)
                     {
-                        floor.transform.rotation = write.Rotation;
+                        float currentZ = floor.transform.eulerAngles.z;
+                        if (Mathf.Abs(Mathf.DeltaAngle(currentZ, write.RotationZ)) > 0.02f)
+                        {
+                            Quaternion wantedRotation = Quaternion.Euler(0f, 0f, write.RotationZ);
+                            floor.transform.rotation = wantedRotation;
+                            floor.tweenRot = wantedRotation.eulerAngles;
+                            writeRotationCount++;
+                        }
                     }
 
-                    // **必须同步影子状态。** 游戏的旋转不是直接写在 transform 上的：
-                    // tween 写 floor.tweenRot，再由它的 OnUpdate 每帧
-                    // 推给 transform.eulerAngles。只改 transform 的话，
-                    // 那个驻留的 tween 下一帧就把旧值推回来——
-                    // 这正是「MoveTrack 看起来从没生效」的根因。
-                    floor.tweenRot = write.Rotation.eulerAngles;
-                    PreviewEase.TakeOverChannel(floor, TweenType.Rotation);
+                    // **必须同步影子状态。**
+                    //
+                    // 游戏的旋转不是直接写在 transform 上的：tween 写
+                    // floor.tweenRot，再由它的 OnUpdate 每帧推给
+                    // transform.eulerAngles。只改 transform 的话，那个驻留的
+                    // tween 下一帧就把旧值推回来 —— 这正是「MoveTrack 看起来
+                    // 从没生效」的根因。
+                    //
+                    // 上面分支里已经写过一次；这里再兜一次，覆盖「角度没变但
+                    // 原生 tween 改了影子值」的情况。纯内存写，不进 Unity。
+                    floor.tweenRot = new Vector3(0f, 0f, write.RotationZ);
+
+                    if ((taken & TakeOverRotationMask) == 0)
+                    {
+                        PreviewEase.TakeOverChannel(floor, TweenType.Rotation);
+                        taken |= TakeOverRotationMask;
+                    }
                 }
 
                 if (write.WriteScale)
                 {
-                    if ((floor.transform.localScale - write.Scale).sqrMagnitude > 0.000001f)
+                    if (!skipPoseReads
+                        && (floor.transform.localScale - write.Scale).sqrMagnitude > 0.000001f)
                     {
                         floor.transform.localScale = write.Scale;
+                        writeScaleCount++;
                     }
-                    PreviewEase.TakeOverChannel(floor, TweenType.Scale);
-                    PreviewEase.TakeOverChannel(floor, TweenType.ScaleX);
-                    PreviewEase.TakeOverChannel(floor, TweenType.ScaleY);
+                    if ((taken & TakeOverScaleMask) != TakeOverScaleMask)
+                    {
+                        PreviewEase.TakeOverChannel(floor, TweenType.Scale);
+                        PreviewEase.TakeOverChannel(floor, TweenType.ScaleX);
+                        PreviewEase.TakeOverChannel(floor, TweenType.ScaleY);
+                        taken |= TakeOverScaleMask;
+                    }
                 }
 
                 if (write.WriteOpacity)
@@ -839,18 +1322,72 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     if (Mathf.Abs(floor.opacity - write.Opacity) > 0.002f)
                     {
                         floor.SetOpacity(write.Opacity);
+                        writeOpacityCount++;
                     }
-                    PreviewEase.TakeOverChannel(floor, TweenType.Opacity);
+                    if ((taken & TakeOverOpacityMask) == 0)
+                    {
+                        PreviewEase.TakeOverChannel(floor, TweenType.Opacity);
+                        taken |= TakeOverOpacityMask;
+                    }
                 }
+
+                floorTakeOverMask[floor] = taken;
             }
 
+            // 位姿通道只要真落进过 Transform，就登记一次物理同步需求。
+            // opacity 走 SpriteRenderer，和碰撞体无关，不算。
+            if (writePositionCount + writeRotationCount + writeScaleCount > 0)
+            {
+                PreviewEvaluationEngine.NoteTransformWritten();
+            }
+
+            RecordWriteFlags(writePositionCount, writeRotationCount, writeScaleCount, writeOpacityCount);
             pendingWrites.Clear();
         }
+
+        /// <summary>
+        /// 落诊断计数。这些数字是判断「去重到底有没有生效」的唯一依据：
+        ///   · `ScW.Targets` —— 本帧求值了多少格（合成的目标条数）
+        ///   · `ScW.Queued`  —— 去重之后真正排进队列的笔数
+        ///   · `ScW.Pos/Rot/Scale/Opac` —— 队列里最终真的写进 Transform 的笔数
+        /// 正常情况下应当看到 `Targets ≈ 4000`、`Queued` 只有几十，静止时接近 0。
+        /// </summary>
+        private void RecordWriteFlags(int pos, int rot, int scale, int opac)
+        {
+            if (!PreviewDiagnostics.Enabled)
+            {
+                return;
+            }
+            PreviewDiagnostics.RecordFlag("ScW.Targets", frameTargets.Count);
+            PreviewDiagnostics.RecordFlag("ScW.Queued", pendingWrites.Count);
+            PreviewDiagnostics.RecordFlag("ScW.Dirty", dirtyFloors.Count);
+            PreviewDiagnostics.RecordFlag("ScW.Visible", visibleFloors.Count);
+            PreviewDiagnostics.RecordFlag("ScW.Pos", pos);
+            PreviewDiagnostics.RecordFlag("ScW.Rot", rot);
+            PreviewDiagnostics.RecordFlag("ScW.Scale", scale);
+            PreviewDiagnostics.RecordFlag("ScW.Opac", opac);
+        }
+
+        // 通道接管位掩码：每个 bit 代表「这一格的某个通道已经从原生 tween 手里摘过」。
+        private const int TakeOverPositionMask = 1;
+        private const int TakeOverRotationMask = 2;
+        private const int TakeOverScaleMask = 4;
+        private const int TakeOverOpacityMask = 8;
+
+        /// <summary>
+        /// 每格已接管的通道（位掩码）。见 ApplyPendingWrites 里的说明。
+        /// 会话重建时清空 —— 新会话的格子上可能有新的原生 tween。
+        /// </summary>
+        private readonly Dictionary<scrFloor, int> floorTakeOverMask
+            = new Dictionary<scrFloor, int>();
 
         public void EndSession()
         {
             events.Clear();
             defaults = new FloorDefault[0];
+            floorTakeOverMask.Clear();
+            lastQueuedTargets.Clear();
+            frameTargets.Clear();
             if (animateTrack != null)
             {
                 animateTrack.EndSession();
@@ -867,6 +1404,25 @@ namespace ADOFAIEditorStudio.Preview.Domains
             {
                 dirtyFloors.Add(i);
             }
+            // **去重缓存必须一起作废。**
+            //
+            // 跳转是最需要真正重写的场景：原生可能在对面的位置上把格挪到了
+            // 完全不同的地方，而"上一帧我们排过什么"在这里没有任何参考价值 ——
+            // 留着它会让跳转那一帧被去重掉，表现为"拖回去轨道不还原"。
+            lastQueuedTargets.Clear();
+            frameTargets.Clear();
+
+            // **接管掩码一起作废。**
+            //
+            // `PendingWrite.ForceOnly` 靠这个掩码判断「这格的姿态通道在我们手里，
+            // Transform 上必然就是目标值，读回可以跳过」。跳转之后这个前提不成立：
+            // 原生可能重新给格挂上了 tween（换格引用、重新烤谱都会），
+            // 那时 Transform 上的值不再等于我们记的目标值。
+            // 清掉掩码让跳转后第一帧重新走一遍完整的「读回 → 比较 → 写 → 接管」，
+            // 代价只有一帧，之后掩码会被重新填回来。
+            // 严格说只有 `changed == false` 走强制重排的那批依赖它，而那些格
+            // 本来就不需要还原；但「宁可多写一帧」比「万一漏掉一次还原」便宜得多。
+            floorTakeOverMask.Clear();
         }
 
         private static void ResolveRange(PreviewTimelineContext context, PreviewEventSnapshot levelEvent,

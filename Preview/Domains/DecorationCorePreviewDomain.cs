@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Reflection;
 using ADOFAI;
@@ -79,6 +79,38 @@ namespace ADOFAIEditorStudio.Preview.Domains
             internal int Order;
         }
 
+        /// <summary>
+        /// 一件装饰物「把事件链回放到某个时刻之后」的全部可变量。
+        ///
+        /// 单独抽成结构体是为了**增量回放**（见 `FoldFinishedEvents`）：
+        /// 前后两次求值之间只有末尾几条事件会变，中间那一大段已经播完的
+        /// 事件每帧重放一遍纯属浪费。把可变量打包成一个值，就能把
+        /// 「已经播完的前缀」整份缓存下来，每帧只折叠新播完的那几条。
+        ///
+        /// 字段和原来求值主循环里的局部变量一一对应，一个都不能少 ——
+        /// 少记一个，增量结果就会和整段重放对不上。
+        /// </summary>
+        private struct DecorModel
+        {
+            internal Vector2 Position;
+            internal Vector2 Pivot;
+            internal float Rotation;
+            internal Vector2 Scale;
+            internal Color Color;
+            internal float Opacity;
+            internal int Depth;
+            internal bool HasDepthState;
+            internal DecPlacementType Placement;
+            internal Vector2 Parallax;
+            internal Vector2 ParallaxOffset;
+            internal bool Visible;
+            internal MaskingType Masking;
+            internal bool UseMaskingDepth;
+            internal int MaskingFrontDepth;
+            internal int MaskingBackDepth;
+            internal string Image;
+        }
+
         private sealed class DecorationState
         {
             internal scrDecoration Decoration;
@@ -104,6 +136,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
             /// <summary>遮罩目标 tag（`maskingTarget`），决定这片遮罩管谁。</summary>
             internal string MaskingTarget;
+
             internal string AppliedMaskingTarget;
 
             // ── 写入去重缓存 ────────────────────────────────────────────
@@ -127,6 +160,33 @@ namespace ADOFAIEditorStudio.Preview.Domains
             internal bool Settled;
             internal float SettledAt;
             internal float NextEventStart;
+
+            // ── 增量回放游标 ────────────────────────────────────────────
+            //
+            // **为什么要它**：回放循环原来是「从第 0 条重放到当前时刻」，每帧
+            // 每件装饰物都做一遍 O(cut)。密集段落里一件 200 多格就有
+            // 200~300 条事件、同时活跃 170 多件，实测单次求值要重放
+            // 4.8 万~5.5 万条事件、3.1~3.8ms —— 占整个装饰物域 96%。
+            // 而其中绝大多数事件早就播完了，结果只取决于「前缀」，
+            // 跟当前这一帧毫无关系。
+            //
+            // 于是把**已经播完且连成一段前缀**的事件折进 `Folded`：
+            // `Events[0..FoldIndex)` 的结果已经存在那儿了，每帧只要从
+            // `FoldIndex` 往后重放。折叠只在「确实有新事件播完」时才前进，
+            // 稳态下每帧的代价是个位数条。
+            //
+            // **为什么必须是连成一段的前缀**：事件是顺序生效的，一条还在跑的
+            // 事件排在第 k 条时，它后面的第 k+1 条不能先折进去 —— 那样
+            // 折出来的中间值相当于「后一条先作用、前一条后作用」，
+            // 和顺序重放不是一回事（位置尤其明显：LastPosition 是相对增量，
+            // 相对谁很关键）。
+            internal DecorModel Folded;
+            internal int FoldIndex;
+            internal bool FoldValid;
+            /// <summary>折叠时的时间。早于它一律作废（倒拖回去后事件可能又没播完）。</summary>
+            internal float FoldTime;
+            /// <summary>折叠时的 tileSize。格长变了，折进去的像素值就不再成立。</summary>
+            internal float FoldTileSize;
             internal bool HasVisibleApplied;
             internal bool AppliedVisible;
             internal float AppliedOpacity;
@@ -134,6 +194,24 @@ namespace ADOFAIEditorStudio.Preview.Domains
             internal MaskingType FrameMasking;
             internal bool FrameVisible;
             internal float FrameOpacity;
+            /// <summary>
+            /// 本帧的遮罩深度范围。遮罩件的 SpriteMask 靠它决定「能裁到哪些
+            /// 排序层上的图」，原版在 SetMaskingDepth 里按同样的值算。
+            /// 不往下写的话，`VisibleOutsideMask` 会退化成「整片可见」——
+            /// 一张铺满屏幕的大图就能把轨道整段盖住（杪夏第 214 格）。
+            /// </summary>
+            internal bool FrameUseMaskingDepth;
+            internal int FrameMaskingFrontDepth = -1;
+            internal int FrameMaskingBackDepth = -1;
+            /// <summary>
+            /// 作者到底写没写过这两个深度值。
+            ///
+            /// 原生 `SetMaskingDepth(front, back)` 对没写的那一端会取
+            /// 「当前 SpriteMask 自己算出来的范围」，而不是当成 -1 ——
+            /// 这个区别决定遮罩裁到哪一层，不能混。
+            /// </summary>
+            internal bool FrameHasMaskingFrontDepth;
+            internal bool FrameHasMaskingBackDepth;
             /// <summary>
             /// 本帧算出来的视差（百分比）。种子可能是 0，事件才算数，
             /// 所以每帧都要把本帧值存下来给视差重算和探针用。
@@ -165,6 +243,10 @@ namespace ADOFAIEditorStudio.Preview.Domains
             /// 排序号，不是每帧都该重复做的事。
             /// </summary>
             internal bool MaskingDepthApplied;
+            /// <summary>上次推下去的深度参数，用来去重（见 MaskingDepthApplied）。</summary>
+            internal bool AppliedDepthUseMasking;
+            internal int AppliedMaskingFrontDepth = int.MinValue;
+            internal int AppliedMaskingBackDepth = int.MinValue;
 
             /// <summary>
             /// 本域是否把行星的世界坐标预加进了这个装饰物的 pivotPosVec。
@@ -333,6 +415,27 @@ namespace ADOFAIEditorStudio.Preview.Domains
         private bool hasEvaluated;
         private float lastEvaluatedTime = float.NaN;
         private int lastEvaluatedFrame = -1000;
+
+        // 【临时探针】见求值主循环开头的说明，用来拆 `Deco.Model` 的两半。
+        private static int probeBusy;
+        private static int probeEventTicks;
+        /// <summary>
+        /// 【临时探针】本帧直接吃缓存、根本没重放的条数。
+        /// 和 `Deco.Evts`（真正重放的条数）加起来才是「不做增量时要跑多少」。
+        /// </summary>
+        private static int probeCached;
+
+        /// <summary>
+        /// 【临时探针】本帧真正花在「回放历史事件」循环里的时间（Stopwatch 计数）。
+        ///
+        /// 为什么要单独量这一块：`Deco.Model` 把「读状态、查两次 AuthorHasKey、
+        /// 二分定位、回放 cut 条事件、解析跟随行星」全算在一起。它涨到 2.9ms 时，
+        /// 光看这个数分不清是**回放的条数太多**（482 件 × 平均上百条事件）还是
+        /// 别的那几项贵。两种情况改法完全不同：前者要上增量游标 / 分段快照，
+        /// 后者只要把 AuthorHasKey 之类挪到 Analyze 阶段预计算。
+        /// 所以直接把这一段单独计时，和 `Deco.Evts`（回放条数）一比就有答案。
+        /// </summary>
+        private long statReplayTicks;
 
         // 临时：统计每帧各类工作量（定位 25ms 花在哪），修完删。
 
@@ -576,13 +679,29 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 return;
             }
 
-            // **每两帧推一次。**
+            // **每帧推一次（2026-10-31：2 → 1）。**
             //
-            // 这个域的开销几乎全在 Unity 的 setter 上（105 件装饰物 × 位置/旋转/
-            // 缩放/颜色/视差/深度），实测单次 79~99ms 且随播放推进变多
-            // （进入动画的装饰物越来越多）。装饰物是背景元素，30Hz 更新肉眼看不出，
-            // 换来的是整体帧率翻倍。改这个数字即可调（1 = 每帧）。
-            const int EvaluateStride = 2;
+            // 这条门控是「装饰物域越玩越卡」那个时代的产物 —— 当时的账单是
+            // 单次 79~99ms、105 件装饰物全量重放，所以隔帧跳过换来整体帧率翻倍。
+            // 后来两条优化把那个问题的根换掉了：
+            //   · 定型跳过 —— 没有活动事件的装饰物整件 `continue`；
+            //   · 折叠缓存 —— 播完的前缀只算一次。
+            // 现在同一段谱面（256.9s，正好是 2285 格之后）实测 `DecorationCore`
+            // 只有 0.00~0.01ms；整份日志里中位 0.20ms、p90 0.51ms —— 而这**已经
+            // 是隔帧之后减半的值**。也就是说这条门控现在能再省的只剩 0.2ms 上下，
+            // 换来的是可见的画面缺陷：
+            //
+            // **装饰物位置每两帧才更新一次，而相机每帧都在走。** 单看装饰物是
+            // 一顿一顿的，叠上相机就变成两者的相对抖动。谱面 2285 格之后的
+            // `fg` / `fg1` / `fg2` 是 `duration=1000` 拍、`Linear` 的超长慢速移动
+            // （1000 拍在 128 BPM 下是 468 秒，几乎铺满整个尾声），整段都在这种
+            // 情况下播放 —— 用户看到的就是「一卡一卡类似步进，没有平缓」。
+            //
+            // 改成 1 以后「同一帧只算一次」这件事没有丢：求值器一帧会调这个域
+            // 3~4 次，第二次进来时 `Time.frameCount - lastEvaluatedFrame == 0 < 1`，
+            // 照样被挡掉。所以这条门控从「隔帧」退化成「同帧去重」，正好是它
+            // 现在唯一还付得起的那部分价值。
+            const int EvaluateStride = 1;
             if (!reseed && hasEvaluated && Time.frameCount - lastEvaluatedFrame < EvaluateStride)
             {
                 return;
@@ -620,6 +739,9 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     dirty.Position = AuthorPosition(dirty.Decoration);
                     dirty.HasTransformApplied = false;
                     dirty.Settled = false;
+                    // 种子变了，折进去的旧前缀就是拿旧种子算的 —— 作废，
+                    // 让这一帧从作者数据重新播种重放。
+                    dirty.FoldValid = false;
                 }
             }
 
@@ -640,6 +762,17 @@ namespace ADOFAIEditorStudio.Preview.Domains
             hiddenCulling = Main.Settings != null && Main.Settings.CullHiddenDecorations;
             cullTransparent = Main.Settings != null && Main.Settings.CullTransparentDecorations;
 
+            // 【临时探针】把 `Deco.Model` 拆成两个可判定的量：
+            //   Deco.Busy = 本帧真正参与求值的件数（越过定型跳过的那些）
+            //   Deco.Evts = 这些件这一帧一共重放了多少条事件
+            // 744 行那个回放循环是从第 0 条事件开始的 O(cut)，而每帧会求值多次。
+            // 不先量出这两个数，就分不清 1.94ms 是「件数太多」还是「每件重放的历史太长」，
+            // 也就不知道该改增量游标还是该改定型判定。
+            probeBusy = 0;
+            probeEventTicks = 0;
+            probeCached = 0;
+            statReplayTicks = 0;
+
             for (int i = 0; i < states.Count; i++)
             {
                 DecorationState state = states[i];
@@ -649,15 +782,9 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     continue;
                 }
 
-                Vector2 position = state.Position;
-                Vector2 pivot = state.Pivot;
-                float rotation = state.Rotation;
-                Vector2 scale = state.Scale;
-                Color color = state.Color;
-                float opacity = state.Opacity;
-                int depth = state.Depth;
-                DecPlacementType placement = state.Placement;
-                Vector2 parallax = state.Parallax;
+                // 种子不再在这里逐个读出来 —— 它们整包进了 `DecorModel`，
+                // 由下面「增量回放」那块统一从 `state` / 折叠缓存里取。
+                // 定型跳过的那件装饰物于是连这 17 次字段读都省了。
                 long modelStart = System.Diagnostics.Stopwatch.GetTimestamp();
                 // **定型期整件跳过。**
                 //
@@ -673,14 +800,16 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     continue;
                 }
 
-                Vector2 parallaxOffset = state.ParallaxOffset;
-                bool visible = state.Visible;
-                bool hasDepthState = state.HasDepthState;
-                MaskingType masking = state.Masking;
-                bool useMaskingDepth = state.UseMaskingDepth;
-                int maskingFrontDepth = state.MaskingFrontDepth;
-                int maskingBackDepth = state.MaskingBackDepth;
-                string imageFilename = state.DefaultImage;
+                probeBusy++;
+
+                // 作者是否写过这两个值：种子里读到的是"作者写的或默认 -1"，
+                // 无法区分，所以直接查源事件有没有这个键。
+                // （这两项不进 `DecorModel`：它们是「作者写没写」的静态事实，
+                // 不随回放变化。）
+                bool hasMaskingFrontDepth = AuthorHasKey(
+                    state.Decoration.sourceLevelEvent, "maskingFrontDepth");
+                bool hasMaskingBackDepth = AuthorHasKey(
+                    state.Decoration.sourceLevelEvent, "maskingBackDepth");
 
                 // **先把"当前时刻之前的事件"用二分定位，再从后往前找仍在跑的那几条。**
                 //
@@ -693,6 +822,70 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 float nextEventStart = cut < eventCount
                     ? (float)state.Events[cut].Start
                     : float.PositiveInfinity;
+
+                // ── 增量回放的入口：续跑缓存，还是从头重放 ─────────────────
+                //
+                // 缓存的含义是「`Events[0..FoldIndex)` 全部播完之后的状态」。
+                // 它成立需要四件事，缺一条就得作废：
+                //   · 时间没倒回去 —— 倒回去之后那些事件可能又没播完；
+                //   · 缓存前缀还在 cut 之内 —— 播放头退到前缀中间就无从续起；
+                //   · 格长没变 —— 位置/缩放/视差的目标值都是`tileSize * 作者值`，
+                //     格长一变，折进去的像素值就不成立了；
+                //   · 标记本身有效（`FoldValid`）。
+                bool reuseFold = state.FoldValid
+                    && frame.Time >= state.FoldTime
+                    && cut >= state.FoldIndex
+                    && frame.Context.TileSize == state.FoldTileSize;
+                DecorModel model = reuseFold
+                    ? state.Folded
+                    : new DecorModel
+                    {
+                        Position = state.Position,
+                        Pivot = state.Pivot,
+                        Rotation = state.Rotation,
+                        Scale = state.Scale,
+                        Color = state.Color,
+                        Opacity = state.Opacity,
+                        Depth = state.Depth,
+                        HasDepthState = state.HasDepthState,
+                        Placement = state.Placement,
+                        Parallax = state.Parallax,
+                        ParallaxOffset = state.ParallaxOffset,
+                        Visible = state.Visible,
+                        Masking = state.Masking,
+                        UseMaskingDepth = state.UseMaskingDepth,
+                        MaskingFrontDepth = state.MaskingFrontDepth,
+                        MaskingBackDepth = state.MaskingBackDepth,
+                        Image = state.DefaultImage,
+                    };
+                int foldFrom = reuseFold ? state.FoldIndex : 0;
+                // 先把「入口状态」记回去：这一帧就算一条事件都没新播完，
+                // 上面的有效性也已经重新校验过了（时间只进不退），
+                // `FoldTime` 跟着走，下帧的 `frame.Time >= FoldTime` 才成立。
+                state.Folded = model;
+                state.FoldIndex = foldFrom;
+                state.FoldValid = true;
+                state.FoldTime = frame.Time;
+                state.FoldTileSize = frame.Context.TileSize;
+
+                // 拆回局部变量：下面那一大段写入逻辑逐字未改，用的还是这些老名字。
+                Vector2 position = model.Position;
+                Vector2 pivot = model.Pivot;
+                float rotation = model.Rotation;
+                Vector2 scale = model.Scale;
+                Color color = model.Color;
+                float opacity = model.Opacity;
+                int depth = model.Depth;
+                DecPlacementType placement = model.Placement;
+                Vector2 parallax = model.Parallax;
+                Vector2 parallaxOffset = model.ParallaxOffset;
+                bool visible = model.Visible;
+                bool hasDepthState = model.HasDepthState;
+                MaskingType masking = model.Masking;
+                bool useMaskingDepth = model.UseMaskingDepth;
+                int maskingFrontDepth = model.MaskingFrontDepth;
+                int maskingBackDepth = model.MaskingBackDepth;
+                string imageFilename = model.Image;
 
                 bool anyActive = false;
                 const int ActiveLookBack = 256;
@@ -713,7 +906,16 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     }
                 }
 
-                for (int eventIndex = 0; eventIndex < cut; eventIndex++)
+                // 【临时探针】只量「回放历史事件」这一圈循环本身。
+                // 计时点包住 for，但**不包含**前面的二分和后面的定型判定，
+                // 目的是把「条数多」和「别的事情贵」分开。
+                long replayStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                probeCached += foldFrom;
+                // `folding`：从 `foldFrom` 起**连续的那一段已播完前缀**还要不要
+                // 继续往后折。碰到第一条还在跑的事件就转 false —— 它后面的
+                // 绝不能先折进去，否则相当于让后来的事件先生效，顺序就反了。
+                bool folding = true;
+                for (int eventIndex = foldFrom; eventIndex < cut; eventIndex++)
                 {
                     MoveEvent value = state.Events[eventIndex];
 
@@ -721,6 +923,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
                         ? 1f
                         : Mathf.Clamp01((frame.Time - (float)value.Start) / value.Duration);
                     float eased = PreviewEase.EasedValue(0f, 1f, ratio, value.Ease);
+
                     if (value.HasVisible)
                     {
                         // 原生在效果一开始就设可见性
@@ -839,8 +1042,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     {
                         // 绝对量，跟 pivotOffset 一样：原生算
                         // "targetParallaxOffset = tileSize * parallaxOffset" 然后直接 tween 到
-        // 那个值。加上基线让它漂移的方式
-        // 和 pivot 一样。
+                        // 那个值。加上基线让它漂移的方式
+                        // 和 pivot 一样。
                         float offsetX = float.IsNaN(value.ParallaxOffset.x)
                             ? parallaxOffset.x
                             : value.ParallaxOffset.x * frame.Context.TileSize;
@@ -857,7 +1060,67 @@ namespace ADOFAIEditorStudio.Preview.Domains
                         // 来做逐帧动画。
                         imageFilename = value.ImageFilename;
                     }
+
+                    // ── 增量回放的记账 ──────────────────────────────────
+                    //
+                    // 这条事件**已经播完**：`ratio` 被 `Clamp01` 顶到 1，所以
+                    // 「现在作用一次」和「以后任意时刻作用一次」结果一模一样
+                    // —— 它身上已经没有任何随时间变化的东西了。前面几条也都
+                    // 播完的话，「到这条为止的结果」就被冻住了，存下来，
+                    // 下帧从它的下一条开始重放。
+                    //
+                    // **结果和整段重放逐位相同**，不是近似：前缀里每条事件的
+                    // `ratio` 在折叠时和将来重放时都恰好是 1，参与运算的中间值
+                    // 又是同一串，浮点结果自然一模一样。所以这个改动不会改变
+                    // 任何一帧的画面。
+                    //
+                    // **判据必须是「播完」而不是「在 cut 之内」**：cut 里的
+                    // 最后几条往往正是还在跑的那几条，折进去就冻在半路的插值上。
+                    if (folding)
+                    {
+                        // **判据用循环里已经算出来的 `ratio`，不要另写一个式子。**
+                        //
+                        // 原来这里写的是 `frame.Time >= (float)value.Start + value.Duration`：
+                        // 那是「起点 + 时长」的 float 加法，和上面算 ratio 的
+                        // `(frame.Time - (float)value.Start) / Duration` 不是同一个
+                        // 浮点表达式。加法向下舍入时，会在 ratio 还小于 1 的那一帧
+                        // 就通过判据，把一份没走完的插值折进前缀并推过这条事件，
+                        // 此后永不重算（只有倒放/重建才恢复）。
+                        // `ratio >= 1f` 就是「这条事件本身已经走到终值」的定义，
+                        // 而 Duration <= 0 时 ratio 恰好是 1f，行为不变。
+                        if (ratio >= 1f)
+                        {
+                            state.Folded = new DecorModel
+                            {
+                                Position = position,
+                                Pivot = pivot,
+                                Rotation = rotation,
+                                Scale = scale,
+                                Color = color,
+                                Opacity = opacity,
+                                Depth = depth,
+                                HasDepthState = hasDepthState,
+                                Placement = placement,
+                                Parallax = parallax,
+                                ParallaxOffset = parallaxOffset,
+                                Visible = visible,
+                                Masking = masking,
+                                UseMaskingDepth = useMaskingDepth,
+                                MaskingFrontDepth = maskingFrontDepth,
+                                MaskingBackDepth = maskingBackDepth,
+                                Image = imageFilename,
+                            };
+                            state.FoldIndex = eventIndex + 1;
+                        }
+                        else
+                        {
+                            folding = false;
+                        }
+                    }
                 }
+                // 【临时探针】回放循环到此结束，记下这一件花了多少。
+                probeEventTicks += cut - foldFrom;
+                statReplayTicks += System.Diagnostics.Stopwatch.GetTimestamp() - replayStart;
 
                 // 无条件写入。
                 //
@@ -982,6 +1245,14 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 state.FrameVisible = visible;
                 state.FrameOpacity = opacity;
                 state.FrameParallax = parallax;
+                // 遮罩深度范围也随帧更新：这几项由 AddDecoration / MoveDecorations
+                // 的 useMaskingDepth / maskingFrontDepth / maskingBackDepth 驱动，
+                // 遮罩件必须按它们重算 SpriteMask 的排序范围（见 WriteMaskingDepthFast）。
+                state.FrameUseMaskingDepth = useMaskingDepth;
+                state.FrameMaskingFrontDepth = maskingFrontDepth;
+                state.FrameMaskingBackDepth = maskingBackDepth;
+                state.FrameHasMaskingFrontDepth = hasMaskingFrontDepth;
+                state.FrameHasMaskingBackDepth = hasMaskingBackDepth;
 
                 // **PACL2 式脏值门控**：这一帧算出来的值和上次写下去的一样，
                 // 就整件跳过 —— 后面所有写入（变换 / 可见性 / 遮罩）都不做。
@@ -1254,6 +1525,14 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 }
             }
 
+            // 【临时探针】把上面三个量送进日志。
+            PreviewDiagnostics.RecordFlag("Deco.Busy", probeBusy);
+            PreviewDiagnostics.RecordFlag("Deco.Evts", probeEventTicks);
+            PreviewDiagnostics.RecordFlag("Deco.Cache", probeCached);
+            // 回放循环本身花的时间，单位毫秒，和 `Deco.Model` 同一口径（每次求值一份）。
+            PreviewDiagnostics.RecordDomain("Deco.Replay",
+                statReplayTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+
             // **视差每帧都要重算。**
             //
             // 原生 `scrParallax` 在自定义谱面里被 `Awake` 关掉了组件，位置只在
@@ -1282,7 +1561,14 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 decoration.parallax.SetTrans();
             }
 
+            // 遮罩通道单独计时（Deco.Mask 子项）：它只遍历真正带遮罩的那几十件，
+            // 与主循环互不相干，混在 DecorationCore 总耗时里会互相掩盖。
+            long maskStart = System.Diagnostics.Stopwatch.GetTimestamp();
             ApplyMaskPass(frame);
+            PreviewDiagnostics.RecordDomain("Deco.Mask",
+                (System.Diagnostics.Stopwatch.GetTimestamp() - maskStart)
+                * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+            PreviewDiagnostics.RecordFlag("Deco.MaskCandidates", maskCandidateStates.Count);
             // **探针绝不能让求值器停摆。** 它抛一次异常，引擎就会把整个
             // DecorationCore 域停用，画面直接少一大片 —— 比它要查的 bug 更糟。
             try
@@ -1520,8 +1806,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     states[i].HasVisibleApplied = false;
                 }
             }
-            int budget = 8;
-            for (int i = 0; i < maskCandidateStates.Count && budget > 0; i++)
+            int wrote = 0;
+            for (int i = 0; i < maskCandidateStates.Count; i++)
             {
                 DecorationState state = maskCandidateStates[i];
                 scrVisualDecoration visual = state.Decoration as scrVisualDecoration;
@@ -1529,21 +1815,79 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 {
                     continue;
                 }
+
+                // **遮罩类型只由作者值 / 事件决定，不看不透明度。**
+                //
+                // 原来这里有一句 `if (!FrameVisible || FrameOpacity <= 0.004f) wanted = None;`，
+                // 它把「看不见的件」的 maskInteraction 抹成 None。对**被遮的件**
+                // 来说这是错的：作者常用 `opacity: 0` 起步、后面再抬起来，
+                // 类型一旦被抹掉，恢复写入又要排队（见下面预算那段），
+                // 于是大图永远停在「不裁剪」——整片盖住轨道，小窗不出现
+                // （杪夏第 214 格的两张 4-3.png 就是这个）。
+                //
+                // 原生语义也不是这样：`maskingType` 与不透明度无关，
+                // opacity 只进 rendererColor；遮罩件不可见时由 SetVisible
+                // 关 `spriteMask.enabled`，类型本身不变。
                 MaskingType wanted = state.FrameMasking;
-                if (!state.FrameVisible || state.FrameOpacity <= 0.004f)
+
+                // **遮罩件先写深度范围**（类型和深度是两个独立开关）。
+                //
+                // **必须去重**：`SetMaskingDepth` 对「作者没写的那一端」是拿
+                // SpriteMask **当前**的排序号反推的（原生 `-frontSortingOrder - 1`）。
+                // 每帧无脑调用会让范围自己往前爬（实测每轮 +2），
+                // 裁出来的窗口越走越偏。只在参数真的变了时写。
+                if (wanted == MaskingType.Mask)
                 {
-                    wanted = MaskingType.None;
+                    bool depthChanged = !state.MaskingDepthApplied
+                        || state.AppliedDepthUseMasking != state.FrameUseMaskingDepth
+                        || state.AppliedMaskingFrontDepth != state.FrameMaskingFrontDepth
+                        || state.AppliedMaskingBackDepth != state.FrameMaskingBackDepth;
+                    if (depthChanged)
+                    {
+                        WriteMaskingDepthFast(visual,
+                            state.FrameUseMaskingDepth,
+                            state.FrameHasMaskingFrontDepth, state.FrameMaskingFrontDepth,
+                            state.FrameHasMaskingBackDepth, state.FrameMaskingBackDepth);
+                        state.AppliedDepthUseMasking = state.FrameUseMaskingDepth;
+                        state.AppliedMaskingFrontDepth = state.FrameMaskingFrontDepth;
+                        state.AppliedMaskingBackDepth = state.FrameMaskingBackDepth;
+                        state.MaskingDepthApplied = true;
+                    }
                 }
-                // `VisibleOutsideMask` 现在也照常应用：遮罩处理已经移出主循环，
-                // 每帧最多写 8 件，先看帧率能不能扛住。
-                if (state.MaskingApplied && state.AppliedMasking == wanted)
+
+                // **和组件上的实际值比对，不只信自己的缓存。**
+                //
+                // 缓存会失配：简化遮罩开关、原生自己的可见性刷新、重新 Analyze
+                // 都可能背着本域改组件。只信缓存就永远自愈不了。
+                MaskingType actual = ReadMaskingType(visual) ?? MaskingType.None;
+                if (actual == wanted && state.MaskingApplied && state.AppliedMasking == wanted)
                 {
                     continue;
                 }
+
                 WriteMaskingTypeFast(visual, wanted);
                 state.AppliedMasking = wanted;
                 state.MaskingApplied = true;
-                budget--;
+                wrote++;
+
+                // **类型变了要按新类型重算 enabled。**
+                //
+                // 原生 `SetMaskingType` 在 legacy 分支里会补
+                //   spriteRenderer.enabled = !isMask();  spriteMask.enabled = isMask();
+                // 我们绕开原生 setter 自己写字段，这两行必须自己补 ——
+                // 否则遮罩件从 None 变成 Mask 时 `spriteMask` 永远是关的，
+                // 小窗自然出不来。
+                bool visibleNow = state.FrameVisible && !state.Decoration.forceHide;
+                visual.SetVisible(visibleNow);
+                state.HasVisibleApplied = true;
+                state.AppliedVisible = visibleNow;
+            }
+
+            // 一轮写不完不该静默：这是"某段画面不对"最难查的一类。
+            // 预算已经取消，正常情况下写完就是写完；这里只在真的超过阈值时报警。
+            if (wrote > 64 && Main.VerboseLog)
+            {
+                Main.Logger.Log("[DecorationCore] 遮罩类型本轮改写 " + wrote + " 件（正常应只在状态切换时发生）");
             }
         }
 
@@ -1880,6 +2224,24 @@ namespace ADOFAIEditorStudio.Preview.Domains
         private static bool legacyMaskApplied;
         private static bool legacyMaskOriginal;
 
+        /// <summary>
+        /// 把「遮罩类型」和「遮罩深度范围」一起写下去 —— **两个都得写**。
+        ///
+        /// 只写 `maskInteraction` 是不够的：遮罩件的 `SpriteMask` 还有一个
+        /// 排序范围（`frontSortingOrder` ~ `backSortingOrder`），它决定这个
+        /// 遮罩**能裁到哪些层上的图**。原版在创建装饰物和遮罩参数变化时都会调
+        /// `SetMaskingDepth(customRange, frontDepth, backDepth)` 重算它。
+        ///
+        /// 不写这一项的后果（实测）：杪夏第 214 格有两张 `4-3.png`，
+        /// `maskingType: VisibleOutsideMask` + `useMaskingDepth: true` +
+        /// `maskingBackDepth: -100`，尺寸 500×500 铺满屏幕。原版靠深度范围
+        /// 把它们裁在轨道之外；我们不写 → SpriteMask 用默认范围 →
+        /// 「遮罩外可见」变成整片可见 → **整段轨道和装饰物被大图盖住**，
+        /// 一直到 282 格那批 `opacity: 0` 把它们关掉才恢复。
+        ///
+        /// 公式照抄原生 `SetMaskingDepth`：深度按 `depth >= 0 → "Bg" : "Default"`
+        /// 选层，排序号是 `-depth`（front 还要 +1）。
+        /// </summary>
         private static void WriteMaskingTypeFast(scrVisualDecoration decoration, MaskingType type)
         {
             if (decoration == null)
@@ -1907,6 +2269,50 @@ namespace ADOFAIEditorStudio.Preview.Domains
             {
                 maskingTypeField.SetValue(decoration, type);
             }
+        }
+
+        /// <summary>
+        /// 写遮罩的排序深度范围。和 <see cref="WriteMaskingTypeFast"/> 配套，
+        /// 参数语义和原生 `scrVisualDecoration.SetMaskingDepth(bool, int?, int?)` 一致：
+        /// 传 null 表示"这一端沿用当前 SpriteMask 自己算出来的范围"。
+        ///
+        /// 只在值真的变了才写 —— `SpriteMask` 的这几个属性每帧写会触发
+        /// 渲染状态重建，而本谱 500 多件装饰物里绝大多数整段不动。
+        /// </summary>
+        private static void WriteMaskingDepthFast(scrVisualDecoration decoration,
+            bool customRange, bool useFront, int frontDepth, bool useBack, int backDepth)
+        {
+            if (decoration == null)
+            {
+                return;
+            }
+            SpriteMask mask = decoration.spriteMask;
+            if (mask == null)
+            {
+                return;
+            }
+
+            mask.isCustomRangeActive = customRange;
+
+            // 原生：没给的那一端取「当前 SpriteMask 自己算出来的范围」。
+            int front = useFront
+                ? frontDepth
+                : -mask.frontSortingOrder - 1;
+            int back = useBack
+                ? backDepth
+                : -mask.backSortingOrder;
+            // 原生在这里会交换，保证 front <= back。
+            if (back < front)
+            {
+                int swap = front;
+                front = back;
+                back = swap;
+            }
+
+            mask.frontSortingLayerID = SortingLayer.NameToID(front >= 0 ? "Bg" : "Default");
+            mask.frontSortingOrder = -front + 1;
+            mask.backSortingLayerID = SortingLayer.NameToID(back >= 0 ? "Bg" : "Default");
+            mask.backSortingOrder = -back;
         }
 
         private static MaskingType? ReadMaskingType(scrVisualDecoration decoration)
@@ -2051,10 +2457,6 @@ namespace ADOFAIEditorStudio.Preview.Domains
         }
 
         /// <summary>
-        /// 读作者写的数值（`LevelEvent.data` 里可能是 int / float / double，
-        /// 直接 `Get&lt;float&gt;` 会 InvalidCast 掉成默认值，所以走 Convert）。
-        /// </summary>
-        /// <summary>
         /// 读作者写的整数。**不能用 `LevelEvent.GetInt`** —— 那是硬转换
         /// （`(T)value`），谱面里同一个字段在不同作者手里可能是 int / float / 字符串，
         /// 类型对不上就抛 `InvalidCastException`，而这个异常发生在 `Analyze` 里，
@@ -2081,6 +2483,23 @@ namespace ADOFAIEditorStudio.Preview.Domains
             {
                 return fallback;
             }
+        }
+
+        /// <summary>
+        /// 作者的这条事件里到底有没有这个键。
+        ///
+        /// 用在遮罩深度上：原生 `SetMaskingDepth(front, back)` 对**没写**的那一端
+        /// 取「当前 SpriteMask 自己算出来的范围」，而不是当成 -1。所以必须能区分
+        /// "作者写了 -1" 和 "作者根本没写"——只看读出来的值分不开（默认值也是 -1）。
+        /// </summary>
+        private static bool AuthorHasKey(ADOFAI.LevelEvent levelEvent, string key)
+        {
+            if (levelEvent == null || string.IsNullOrEmpty(key))
+            {
+                return false;
+            }
+            object value;
+            return levelEvent.TryGet<object>(key, out value) && value != null;
         }
 
         /// <summary>

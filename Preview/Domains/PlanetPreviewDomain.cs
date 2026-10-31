@@ -888,6 +888,16 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // 于是还剩一颗差半圈。现在是只写停着那颗。
             chosen.cosmeticRadius = (float)radius;
             chosen.transform.position = position;
+            // **这里刻意不调 NoteTransformWritten。**
+            //
+            // 球的位置本来就是**游戏自己每帧在写**（scrPlanet.LateUpdate 按它自己的
+            // angle 推 transform.position），原版从来没有为它调过 SyncTransforms，
+            // 说明"同一帧的物理查询读到新球位"根本不是游戏依赖的东西——
+            // 物理模拟步之前 Unity 自己会同步。
+            //
+            // 这里一记，就等于每帧都给"需要同步"点亮一次，把
+            // `Physics2D.SyncTransforms` 那 0.85ms 又全额请回来（实测过）。
+            // 只有**格**的 Transform（用户要拾取/拖动的东西）才值得记账。
 
             // 停着的那颗（游戏认定的 isChosen）写全套角度。
             double ballCosmetic = renderedAngle - angle;

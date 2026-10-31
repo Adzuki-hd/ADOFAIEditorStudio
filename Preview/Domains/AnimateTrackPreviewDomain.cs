@@ -536,46 +536,79 @@ namespace ADOFAIEditorStudio.Preview.Domains
             PreviewTimelineContext context = frame.Context;
 
             LogDisappearSchedule(frame.Time);
+
+            // **只扫本帧真正要通盘的格，不再全谱扫一遍。**
+            //
+            // 原来这里是 `for (0 .. floors.Length)`，也就是每帧对全谱每一格
+            // 都算一遍段值。实测 2619 格里只有 265 格在视野内（`ScW.Visible`），
+            // 其余都是屏幕外——算了也没人看，而且它们的值上一帧已经写过，
+            // 这一帧多半一模一样（实测 `ScW.Queued` 只有 0~2 笔）。
+            //
+            // 判据与 MoveTrack 共用同一份集合（可见 ∪ 脏 ∪ 每 30 帧轮到的错峰片）：
+            // 两个域必须**同进同退**。只让一个域跳过的话，合成里那一格就只剩
+            // 另一个域的值，帧末会把它写回去，等于把出现/消失动画撤销掉。
+            //
+            // 屏幕外的格没人求值不会出错：它的目标值上一帧已经写进过 Transform，
+            // 而它重新进入视野的那一帧就会被重算——渲染发生在求值之后。
+            if (ownerTrack != null && !ownerTrack.AllFloorsEvaluatedThisFrame)
+            {
+                foreach (int floorIndex in ownerTrack.EvaluatedFloors)
+                {
+                    if (floorIndex < 0 || floorIndex >= floors.Length)
+                    {
+                        continue;
+                    }
+                    EvaluateFloorAnimation(frame, floorIndex);
+                }
+                return;
+            }
+
             for (int floorIndex = 0; floorIndex < floors.Length; floorIndex++)
             {
-                FloorAnimation animation = floors[floorIndex];
-                if (animation == null || animation.Segments.Count == 0)
-                {
-                    continue;
-                }
+                EvaluateFloorAnimation(frame, floorIndex);
+            }
+        }
 
-                scrFloor binding = context.GetFloorBinding(floorIndex);
-                if (binding == null)
-                {
-                    continue;
-                }
+        private void EvaluateFloorAnimation(PreviewEvaluationFrame frame, int floorIndex)
+        {
+            FloorAnimation animation = floors[floorIndex];
+            if (animation == null || animation.Segments.Count == 0)
+            {
+                return;
+            }
 
-                Vector3 position = animation.BasePosition;
-                float rotation = animation.BaseRotation;
-                Vector2 scale = new Vector2(animation.BaseScale.x, animation.BaseScale.y) * 100f;
-                float opacity = 100f;
-                // 动画真正驱动哪些通道。它从不碰的通道
-                // 绝不能被写回：本域跑在 MoveTrack 之后，是为了能在它
-                // 动画的格属性上胜出，但把没管的通道也一起写
-                // 会盖掉 MoveTrack 刚设好的值——有张谱面用
-                // MoveTrack(NoMove, opacity 0) 藏住后面的格，结果隐藏被撤销了，
-                // 因为全局消失动画把不透明度改写回了基线。
-                bool touchedPosition = false;
-                bool touchedRotation = false;
-                bool touchedScale = false;
-                bool touchedOpacity = false;
+            scrFloor binding = frame.Context.GetFloorBinding(floorIndex);
+            if (binding == null)
+            {
+                return;
+            }
 
-                // 最后启动的那一段。段升序，所以扫到第一个「还没开始」
-                // 就能停。
-                int lastStarted = -1;
-                for (int i = 0; i < animation.Segments.Count; i++)
+            Vector3 position = animation.BasePosition;
+            float rotation = animation.BaseRotation;
+            Vector2 scale = new Vector2(animation.BaseScale.x, animation.BaseScale.y) * 100f;
+            float opacity = 100f;
+            // 动画真正驱动哪些通道。它从不碰的通道
+            // 绝不能被写回：本域跑在 MoveTrack 之后，是为了能在它
+            // 动画的格属性上胜出，但把没管的通道也一起写
+            // 会盖掉 MoveTrack 刚设好的值——有张谱面用
+            // MoveTrack(NoMove, opacity 0) 藏住后面的格，结果隐藏被撤销了，
+            // 因为全局消失动画把不透明度改写回了基线。
+            bool touchedPosition = false;
+            bool touchedRotation = false;
+            bool touchedScale = false;
+            bool touchedOpacity = false;
+
+            // 最后启动的那一段。段升序，所以扫到第一个「还没开始」
+            // 就能停。
+            int lastStarted = -1;
+            for (int i = 0; i < animation.Segments.Count; i++)
+            {
+                if (animation.Segments[i].Start > frame.Time)
                 {
-                    if (animation.Segments[i].Start > frame.Time)
-                    {
-                        break;
-                    }
-                    lastStarted = i;
+                    break;
                 }
+                lastStarted = i;
+            }
 
                 // 这一帧还有没有别人（MoveTrack）在写这一格。位置和不透明度
                 // 两处判据用的是同一个值：有别人在管这一格，本域就让位。
@@ -723,21 +756,28 @@ namespace ADOFAIEditorStudio.Preview.Domains
                             scale.x / 100f, scale.y / 100f, animation.BaseScale.z);
                     }
                     if (touchedOpacity) { binding.SetOpacity(Mathf.Clamp01(opacity / 100f)); }
-                    continue;
+                    // 直写了 Transform 就得登记物理同步需求（见 NoteTransformWritten）。
+                    if (touchedPosition || touchedRotation || touchedScale)
+                    {
+                        PreviewEvaluationEngine.NoteTransformWritten();
+                    }
+                    return;
                 }
                 ownerTrack.QueueWrite(new MoveTrackPreviewDomain.PendingWrite
                 {
                     Floor = binding,
+                    FloorIndex = floorIndex,
                     WritePosition = touchedPosition,
                     WriteRotation = touchedRotation,
                     WriteScale = touchedScale,
                     WriteOpacity = touchedOpacity,
                     Position = position,
-                    Rotation = Quaternion.Euler(0f, 0f, rotation),
+                    // 只入队 z 角，不再入队四元数（帧末真要写时才 Euler 出来）。
+                    // 本域的旋转就是 Euler(0,0,rotation)，所以 z 角就是 rotation 本身。
+                    RotationZ = rotation,
                     Scale = new Vector3(scale.x / 100f, scale.y / 100f, animation.BaseScale.z),
                     Opacity = Mathf.Clamp01(opacity / 100f)
                 });
-            }
         }
 
         private int lastScheduleLogFrame = -10000;

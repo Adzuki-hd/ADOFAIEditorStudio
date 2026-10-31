@@ -44,6 +44,29 @@ namespace ADOFAIEditorStudio
         private bool hovered;
         private bool pressed;
 
+        // ---- D4 判等写入 ----
+        //
+        // 这颗按钮挂在自己一张小 Canvas 上（见 Install），而 Unity 的 Canvas 重建
+        // 以整张画布为单位：任何一处 RectTransform / Image 变脏都会把这张画布的
+        // 布局和几何整遍重算。之前 `Place` 每帧无条件写 sizeDelta / position /
+        // offsetMin / offsetMax / fontSize，`Update` 每帧无条件写 background.color
+        // —— 也就是说**工作台关着（正常游玩 / 编辑）的每一帧**都白重建一张画布。
+        // 判等写法是「先读组件当前值，和目标不同才写」——稳态帧组件值早已等于
+        // 目标，比较完就跳过，一张画布都不用碰。
+
+        // ---- 播放键矩形降频重查 ----
+        //
+        // `ScreenRect` 里是 GetComponentInParent&lt;Canvas&gt; + GetWorldCorners +
+        // 两次 WorldToScreenPoint，还 new 一个 Vector3[4]，这是每帧最贵的一笔。
+        // 播放键在静止时不会动，0.25 秒查一次足够；只有屏幕尺寸（窗口缩放 /
+        // 分辨率切换）真的变了才需要立即重查，否则拖动窗口那几十帧会有一瞬错位。
+        private const float PlayRectCheckInterval = 0.25f;
+        private float lastPlayRectCheckTime = -1f;
+        private int lastScreenWidth;
+        private int lastScreenHeight;
+        private bool hasCachedPlayRect;
+        private static Rect cachedPlayRect;
+
         /// <summary>原生那两颗按钮是**白底 + 灰描边 + 黑图形**，这里照抄。</summary>
         private static readonly Color IdleColor = Color.white;
         private static readonly Color HoverColor = new Color(0.88f, 0.88f, 0.88f, 1f);
@@ -128,6 +151,14 @@ namespace ADOFAIEditorStudio
 
         private void Update()
         {
+            // 【临时探针】见 EditorPropertyPanel.Update 里的说明。
+            long __watch = System.Diagnostics.Stopwatch.GetTimestamp();
+            UpdateMeasured();
+            PreviewDiagnostics.RecordSince("Open.U", __watch);
+        }
+
+        private void UpdateMeasured()
+        {
             EditorStudioOverlay overlay = Main.Overlay;
             bool show = overlay != null
                 && !overlay.IsVisible
@@ -169,9 +200,16 @@ namespace ADOFAIEditorStudio
 
             // 只改底色：图形始终是黑的（原生那两颗按钮也没有悬停变色，
             // 这里给一点反馈但不改变配色关系）。
-            background.color = pressed && inside
+            // **判等写入**：Image.color 的 setter 会调 SetVerticesDirty，无脑赋值
+            // 等于每帧重建这张小画布。悬停 / 按下状态没变时目标色和当前色相同，
+            // 跳过赋值，稳态帧零写入。
+            Color targetColor = pressed && inside
                 ? PressColor
                 : (hovered ? HoverColor : IdleColor);
+            if (background.color != targetColor)
+            {
+                background.color = targetColor;
+            }
         }
 
         /// <summary>
@@ -185,6 +223,84 @@ namespace ADOFAIEditorStudio
         {
             float diameter = MaxSize * 0.6f;
             Vector2 center = new Vector2(330f, 26f);
+
+            // **播放键矩形降频重查**：`ScreenRect` 是每帧最贵的一笔，而播放键
+            // 静止时不会动。0.25 秒重查一次；屏幕尺寸变了立即重查，避免窗口
+            // 缩放 / 切分辨率那一瞬错位。其余帧直接复用上一帧缓存的矩形。
+            RefreshPlayRectIfNeeded();
+            if (hasCachedPlayRect)
+            {
+                diameter = Mathf.Clamp(cachedPlayRect.height * SizeRatioToPlay, MinSize, MaxSize);
+                // 右边缘 + 一点缝；纵向**底边对齐播放键的底边**，所以看上去是
+                // 贴着底栏下沿站着，而不是悬在播放键中间那条线上。
+                center = new Vector2(
+                    cachedPlayRect.xMax + diameter * (GapRatio + 0.5f),
+                    cachedPlayRect.yMin + diameter * 0.5f);
+            }
+
+            // **判等写入**：这些 RectTransform 属性一变脏就重建整张画布。
+            // 静止时 diameter / center / inset / fontSize 全都不变，一样都不写。
+            Vector2 sizeDelta = new Vector2(diameter, diameter);
+            if (root.sizeDelta != sizeDelta)
+            {
+                root.sizeDelta = sizeDelta;
+            }
+            Vector3 position = new Vector3(center.x, center.y, 0f);
+            if (root.position != position)
+            {
+                root.position = position;
+            }
+
+            float inset = diameter * IconInsetRatio;
+            if (iconRect != null)
+            {
+                Vector2 insetMin = new Vector2(inset, inset);
+                Vector2 insetMax = new Vector2(-inset, -inset);
+                if (iconRect.offsetMin != insetMin || iconRect.offsetMax != insetMax)
+                {
+                    iconRect.offsetMin = insetMin;
+                    iconRect.offsetMax = insetMax;
+                }
+            }
+            if (fallback != null)
+            {
+                int fontSize = Mathf.RoundToInt(diameter * 0.28f);
+                if (fallback.fontSize != fontSize)
+                {
+                    fallback.fontSize = fontSize;
+                }
+            }
+
+            if (placing)
+            {
+                placing = false;
+                Main.Logger.Log("[AES按钮] 就位 center=" + center + " 直径=" + diameter
+                    + " 屏幕=" + Screen.width + "x" + Screen.height
+                    + (hasCachedPlayRect ? string.Empty : "（没找到播放键，退回固定坐标）"));
+            }
+        }
+
+        /// <summary>
+        /// 按「0.25 秒一次 + 屏幕尺寸变化立即」的节奏重查播放键矩形。
+        /// 把结果存进静态缓存 <see cref="cachedPlayRect"/>，没找到播放键时清空缓存。
+        /// </summary>
+        private void RefreshPlayRectIfNeeded()
+        {
+            bool screenChanged = Screen.width != lastScreenWidth
+                || Screen.height != lastScreenHeight;
+            float now = Time.unscaledTime;
+            bool intervalElapsed = now - lastPlayRectCheckTime >= PlayRectCheckInterval;
+
+            if (!screenChanged && !intervalElapsed)
+            {
+                return;
+            }
+
+            // 无论这次因为什么触发，都记下当前屏幕尺寸和时刻，下次按新基准判断。
+            lastScreenWidth = Screen.width;
+            lastScreenHeight = Screen.height;
+            lastPlayRectCheckTime = now;
+
             scnEditor scene = scnEditor.instance;
             RectTransform play = null;
             if (scene != null && scene.playPause != null)
@@ -193,35 +309,12 @@ namespace ADOFAIEditorStudio
             }
             if (play != null && play.rect.width > 1f)
             {
-                Rect rect = ScreenRect(play);
-                diameter = Mathf.Clamp(rect.height * SizeRatioToPlay, MinSize, MaxSize);
-                // 右边缘 + 一点缝；纵向**底边对齐播放键的底边**，所以看上去是
-                // 贴着底栏下沿站着，而不是悬在播放键中间那条线上。
-                center = new Vector2(
-                    rect.xMax + diameter * (GapRatio + 0.5f),
-                    rect.yMin + diameter * 0.5f);
+                cachedPlayRect = ScreenRect(play);
+                hasCachedPlayRect = true;
             }
-
-            root.sizeDelta = new Vector2(diameter, diameter);
-            root.position = new Vector3(center.x, center.y, 0f);
-
-            float inset = diameter * IconInsetRatio;
-            if (iconRect != null)
+            else
             {
-                iconRect.offsetMin = new Vector2(inset, inset);
-                iconRect.offsetMax = new Vector2(-inset, -inset);
-            }
-            if (fallback != null)
-            {
-                fallback.fontSize = Mathf.RoundToInt(diameter * 0.28f);
-            }
-
-            if (placing)
-            {
-                placing = false;
-                Main.Logger.Log("[AES按钮] 就位 center=" + center + " 直径=" + diameter
-                    + " 屏幕=" + Screen.width + "x" + Screen.height
-                    + (play == null ? "（没找到播放键，退回固定坐标）" : string.Empty));
+                hasCachedPlayRect = false;
             }
         }
 
@@ -232,10 +325,11 @@ namespace ADOFAIEditorStudio
             Camera camera = canvas != null && canvas.renderMode != RenderMode.ScreenSpaceOverlay
                 ? canvas.worldCamera
                 : null;
-            Vector3[] corners = new Vector3[4];
-            rect.GetWorldCorners(corners);
-            Vector2 min = RectTransformUtility.WorldToScreenPoint(camera, corners[0]);
-            Vector2 max = RectTransformUtility.WorldToScreenPoint(camera, corners[2]);
+            // 复用静态角点数组：这里每 0.25 秒才调一次，但原实现每次 new 一个
+            // Vector3[4] 纯属可避免的分配，提成静态后连同降频一起把分配也省了。
+            rect.GetWorldCorners(scrCorners);
+            Vector2 min = RectTransformUtility.WorldToScreenPoint(camera, scrCorners[0]);
+            Vector2 max = RectTransformUtility.WorldToScreenPoint(camera, scrCorners[2]);
             return new Rect(min.x, min.y, max.x - min.x, max.y - min.y);
         }
 
@@ -243,6 +337,9 @@ namespace ADOFAIEditorStudio
 
         private static Sprite circle;
         private static Sprite glyphSprite;
+
+        /// <summary>ScreenRect 复用的角点缓冲，避免每次 GetWorldCorners 分配数组。</summary>
+        private static readonly Vector3[] scrCorners = new Vector3[4];
 
         /// <summary>
         /// 白底 + 灰描边的圆 —— 原生「播放 / 回到开头」那两颗就是这个长相：

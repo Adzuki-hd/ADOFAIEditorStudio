@@ -186,7 +186,16 @@ namespace ADOFAIEditorStudio.Preview.Domains
             if (!exiting)
             {
                 // 还没到出场：格子保持原样（ColorFreeroam 已经上过色）。
-                ballTile.transform.position = origin;
+                //
+                // **同一个坐标不要每帧写回去。** Unity 不比较新旧值，
+                // 写一次就把 Transform 标脏一次，物理 broadphase 于是每帧
+                // 都要为它重建一遍。改成「真的变了才写」，顺便登记给
+                // 求值引擎的物理同步门槛（全项目只有本域漏了这一步）。
+                if (ballTile.transform.position != origin)
+                {
+                    ballTile.transform.position = origin;
+                    PreviewEvaluationEngine.NoteTransformWritten();
+                }
                 ballTile.SetOpacity(1f);
                 BallTilePosition = origin;
                 BallTileValid = true;
@@ -226,8 +235,14 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 tile.SetOpacity(tile == ballTile ? 1f - ballFade : 1f - otherFade);
             }
 
-            ballTile.transform.position = Vector3.LerpUnclamped(origin, endValue, moveEased);
-            BallTilePosition = ballTile.transform.position;
+            Vector3 ballPosition = Vector3.LerpUnclamped(origin, endValue, moveEased);
+            // 同上：只在真的挪动时写，并登记给物理同步门槛。
+            if (ballTile.transform.position != ballPosition)
+            {
+                ballTile.transform.position = ballPosition;
+                PreviewEvaluationEngine.NoteTransformWritten();
+            }
+            BallTilePosition = ballPosition;
             BallTileValid = true;
 
             // 原生 MoveCameraToTile 是 Tile 模式：相机贴着那格平移，终点是下一格。

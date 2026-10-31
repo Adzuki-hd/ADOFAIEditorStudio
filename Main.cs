@@ -53,6 +53,8 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private static bool OnUnload(ModEntry modEntry)
         {
+            // 同上：关游戏也要把物理模式还给引擎。
+            PhysicsStepSuppressor.ForceRestore();
             try
             {
                 EditorStudioOverlay overlay = Overlay;
@@ -118,6 +120,10 @@ namespace ADOFAIEditorStudio
             {
                 SaveSettings();
 
+                // **先把物理模式还原。** 我们接管的是引擎的全局状态，
+                // mod 不再管事了就不能把它留在"物理永不步进"上。
+                PhysicsStepSuppressor.ForceRestore();
+
                 // 模组被卸载时把联机会话收干净：删掉会话副本、
                 // 断开连接。不做的话那个副本会一直留在谱面目录里。
                 Multiplayer.MultiplayerSession.Stop();
@@ -165,6 +171,22 @@ namespace ADOFAIEditorStudio
         // 可见或重新变不透明时，会在同一帧就被放到正确位置。
         public bool CullHiddenDecorations = true;
         public bool CullTransparentDecorations = true;
+        // 播放时关掉 2D 物理的自动步进（**默认开**）。
+        //
+        // 为什么：播放态下 `固/Physics2DFixedUpdate` 稳定吃 3.7~4.3ms，
+        // 一个 12.8ms 的帧里有三分之一在这里。而场景里 `Rigidbody2D` 是 0 个
+        // （动态、运动学都是 0），反编译游戏本体也证实：`Rigidbody2D` 出现
+        // 0 次、`.Simulate(` 出现 0 次，13 处 `Physics2D.*` 全是查询
+        // （`RaycastAll` / `OverlapPointAll` / `OverlapCircleAll`）。
+        // 查询在 `SimulationMode2D.Script` 下照常工作，被取消的只有"自动步进"。
+        //
+        // 实测：切掉之后同一谱面同一视角，物理 4.0ms -> 0.02ms，
+        // 帧 12.8ms -> 6.9ms，画面与拾取无异常。详见 `PhysicsStepSuppressor`。
+        //
+        // 安全兜底也在这个开关里：场景里只要查出任何刚体就不抑制；
+        // 播放结束、离开编辑器场景、mod 被关掉都会还原成进来之前的模式。
+        // 万一哪里出问题，关掉这一项就完全回到引擎默认行为。
+        public bool SuppressPhysicsStep = true;
         // 装饰物探针（**默认关**，设置 → 开发者里打开）：预览里一旦有
         // 「求值说该显示、组件却没画」的装饰物，就往日志写一行
         // （tag / 图片 / 渲染器 / sprite / mesh）；每 2 秒还有一条汇总。
@@ -179,6 +201,15 @@ namespace ADOFAIEditorStudio
         // 状态写进日志 —— 渲染器开关、屏幕坐标、颜色 alpha、排序层。
         // 用来区分「轨道被相机甩出屏幕」和「轨道被画成透明/没画」。
         public bool TrackProbe = false;
+        // 轨道覆盖探针（默认关）：播放头每进入一个新格，就打印**这一格被哪些
+        // MoveTrack 事件覆盖**（起始时刻、时长、范围、不透明度、缓动）。
+        //
+        // 用来回答「这一格为什么和原版不一样」：一条 `duration: 0`、范围铺满
+        // 全谱的 `opacity: 0` 事件，会让那一段轨道在求值器里永久变透明；
+        // 只看画面分不清是哪一条干的，这里能直接点名。
+        //
+        // **默认关**：正常使用纯属噪声；只在排查「某段轨道/装饰物不对」时打开。
+        public bool TrackCoverageProbe = false;
         // 时间轴定位以原生引擎优先。旧的静态求值器
         // 只作为兼容回退保留，不是默认路径。
         public bool UseStaticTimelineEvaluation = false;
@@ -187,6 +218,18 @@ namespace ADOFAIEditorStudio
         // 这些 trace，用来诊断「拖动定位后再恢复播放」的缺陷。默认关闭：它们
         // 很吵，只在排查特定播放问题时才需要。
         public bool VerboseDiagnostics = false;
+
+        // 帧率跳动日志（**默认关**，设置 → 开发者里打开）：每秒往日志写三行，
+        // 每行带本段平均帧率、平均帧耗时、最差帧、掉帧计数、当前格、
+        // 当前时间、播放状态和工作台是否可见。
+        //
+        // 它和 `VerboseDiagnostics` 是两件事，不要合并：
+        // 那份报表是「120 帧 / 2 秒一行」的，按整段平均 —— 一个窗口里
+        // 有 3 帧掉到 40ms，平均只多 1ms，报表上完全看不出来。而做谱时
+        // 最难受的就是抖动。这一份用 1/3 秒的窗口，专门看抖动。
+        //
+        // **默认关**：三行一秒对正常使用是噪声，排查时才需要。
+        public bool FrameRateLog = false;
 
         // 预览时**完全不应用装饰物遮罩**。默认关：遮罩已改为只对屏幕内的
         // 装饰物生效，常态下开销可接受。只有当某张谱遮罩极多、帧率仍不够时，

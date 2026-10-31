@@ -69,3 +69,6 @@ tools/icons/selftest.png
 /Logo.png
 /Logo.rgba
 /Preview/PREVIEW_COVERAGE.md
+
+# 本机用的会话同步脚本（桌面端 ↔ VS Code 扩展），不属于项目源码。
+/sync-claude-session.ps1

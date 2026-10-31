@@ -590,7 +590,10 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 : defaultZoom;
             float zoom = baseZoom;
             probeContext = context;
-            EvaluateChannels(floorIndex, frame.Time, follow, ref resolved, ref rotation, ref zoom);
+            // 走带缓存的版本：这一趟的入参和 `ResolveFrameHold` 那趟一样时
+            // 直接拿它的结果，不再把事件链从头回放一遍（见 EvaluateChannelsForReuse）。
+            EvaluateChannelsForReuse(floorIndex, frame.Time, follow,
+                ref resolved, ref rotation, ref zoom);
 
             // freeroam 出场期间 zoom 从基准平滑到 1（原生的 ffxCameraPlus 带
             // zoom 目标，用的同一条 duration 和 outEase）。
@@ -738,7 +741,10 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 ? zoomBaseAtFloor[floorIndex]
                 : defaultZoom;
             probeContext = context;
-            EvaluateChannels(floorIndex, time, follow, ref position, ref rotation, ref zoom);
+            // 这一趟是**缓存来源**：同帧稍后 `Evaluate` 会用同样的入参再问一次，
+            // 那时直接取这里算好的结果。
+            EvaluateChannelsForReuse(floorIndex, time, follow,
+                ref position, ref rotation, ref zoom);
 
             if (float.IsNaN(position.x) || float.IsNaN(position.y)
                 || float.IsInfinity(position.x) || float.IsInfinity(position.y))
@@ -1565,6 +1571,62 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 rotationDuration, rotationEase, time);
             zoom = Sample(zoomOrigin, zoomTarget, zoomStart, zoomDuration,
                 zoomEase, time);
+        }
+
+        // ── 同帧去重复算 ────────────────────────────────────────────
+        //
+        // 每一帧会调用 `EvaluateChannels` **两次**：
+        //   1. `ResolveFrameHold`（引擎层，域循环之前）问「相机是不是被甩远了，
+        //      要不要定格」，它内部走一遍完整的事件链；
+        //   2. 紧接着相机域的 `Evaluate` 又从头走一遍，入参完全相同。
+        //
+        // `EvaluateChannels` 是纯计算（只读关键帧和上下文，只写 ref 出参，
+        // 不改任何字段），所以同帧同入参的第二次调用可以直接复用第一次的结果。
+        //
+        // 为什么值得：这条链从 t=0 回放到播放头，成本随位置**线性增长** ——
+        // 实测 `Cam.Hold` 从谱面开头的 0.00ms 涨到 240 秒处的 0.10ms。
+        // 而 165Hz 的整帧预算只有 6.06ms，这一项在动画段等于白占 1.7%。
+
+        private int reuseFrame = -1;
+        private int reuseFloorIndex = -1;
+        private float reuseTime;
+        private Vector2 reuseFollow;
+        private bool reuseFreeRoam;
+        private Vector2 reuseResolved;
+        private float reuseRotation;
+        private float reuseZoom;
+
+        /// <summary>
+        /// 同帧同入参就复用上一趟的结果，否则真算并把它记下来。
+        /// 键里必须带上 `FreeRoam` 状态：出场运镜会**替换**跟随分量，
+        /// 两次调用之间它若翻了，输入就不再相同。
+        /// </summary>
+        private void EvaluateChannelsForReuse(int floorIndex, float time,
+            Vector2 follow, ref Vector2 position, ref float rotation, ref float zoom)
+        {
+            bool freeRoam = FreeRoamPreviewDomain.ExitCameraActive;
+            if (reuseFrame == Time.frameCount
+                && reuseFloorIndex == floorIndex
+                && reuseTime.Equals(time)
+                && reuseFollow == follow
+                && reuseFreeRoam == freeRoam)
+            {
+                position = reuseResolved;
+                rotation = reuseRotation;
+                zoom = reuseZoom;
+                return;
+            }
+
+            EvaluateChannels(floorIndex, time, follow, ref position, ref rotation, ref zoom);
+
+            reuseFrame = Time.frameCount;
+            reuseFloorIndex = floorIndex;
+            reuseTime = time;
+            reuseFollow = follow;
+            reuseFreeRoam = freeRoam;
+            reuseResolved = position;
+            reuseRotation = rotation;
+            reuseZoom = zoom;
         }
 
         /// <summary>
