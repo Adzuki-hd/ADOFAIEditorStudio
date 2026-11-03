@@ -9303,6 +9303,15 @@ private static float MinimumPixelsPerSecond
             return eventType.ToString();
         }
 
+        /// <summary>
+        /// 给别处（装饰物列表那个「新建其它事件」弹层）取事件名的口子。
+        /// 显示名和事件块上标的是同一个，用户看到的词才一致。
+        /// </summary>
+        internal static string GetEventNameForPicker(LevelEventType eventType)
+        {
+            return GetEventName(eventType);
+        }
+
         private static string FormatTime(float seconds)
         {
             TimeTextBuilder.Length = 0;

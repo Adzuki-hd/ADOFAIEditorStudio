@@ -99,6 +99,8 @@ namespace ADOFAIEditorStudio
             internal TMP_InputField Field2;
             internal TextMeshProUGUI EnumLabel;
             internal Image Swatch;
+            /// <summary>上一帧画出来的评分数（`PropertyType.Rating`）。值变了才重建。</summary>
+            internal int RatingValue = -1;
         }
 
         // ── 对外 ─────────────────────────────────────────────────────────
@@ -258,7 +260,17 @@ namespace ADOFAIEditorStudio
             }
 
             RefreshValues();
+
+            // 评分（星星串）没法原地刷新，值变了就整块重建一次。
+            if (pendingRatingRebuild)
+            {
+                pendingRatingRebuild = false;
+                Rebuild();
+            }
         }
+
+        /// <summary>这一帧发现评分数变了，需要重建整块（星星是按钮，改不了文本）。</summary>
+        private bool pendingRatingRebuild;
 
         /// <summary>
         /// 选集以**时间轴那份**为准；批量时抓手取这一批的第一个。
@@ -324,6 +336,19 @@ namespace ADOFAIEditorStudio
             {
                 return;
             }
+            // **属性表里没有 `filterProperties` 这一项时的兜底。**
+            //
+            // 实测有谱面的 `SetFilterAdvanced` 属性表里根本没有这个键 ——
+            // 参数栏于是只显示「滤镜」下拉，下面的强度/扭曲/半径一个都不出来
+            // （用户原话：「滤镜畸变梦境有个扭曲参数，我没看见」）。
+            //
+            // 而事件数据里 `filter_*` 是实打实存在的。所以这里不看属性表，
+            // 直接按事件数据 + 滤镜类的字段表展开，补在最后。
+            if (target.eventType == LevelEventType.SetFilterAdvanced)
+            {
+                AddFilterRowsIfMissing();
+            }
+
             foreach (KeyValuePair<string, ADOFAI.PropertyInfo> pair in target.info.propertiesInfo)
             {
                 ADOFAI.PropertyInfo info = pair.Value;
@@ -331,6 +356,37 @@ namespace ADOFAIEditorStudio
                 {
                     continue;
                 }
+
+                // **`filterProperties` 要在 invisible 过滤之前处理。**
+                //
+                // 实测（`[FilterProps]` 探针）高级滤镜事件里它的元数据是
+                // `filterProperties: FilterProperties/invisible` —— **invisible 为真**。
+                // 而下面第一道闸就是 `if (info.invisible) continue;`，
+                // 所以展开代码要是写在它后面，一行都出不来。
+                //
+                // 原生那边这个属性是"容器"：它自己不出控件，只负责装那一串
+                // `filter_*` 子控件的宿主。所以 invisible 对它本来就该是"不画自己、
+                // 画子项"，而不是"整块跳过"。
+                if (info.type == PropertyType.FilterProperties)
+                {
+                    List<KeyValuePair<string, ADOFAI.PropertyInfo>> filterRows =
+                        EditorPropertyPanel.ExpandFilterProperties(target);
+                    if (filterRows != null && filterRows.Count > 0)
+                    {
+                        for (int i = 0; i < filterRows.Count; i++)
+                        {
+                            if (panel.InBatch && !panel.BatchHasKey(filterRows[i].Key))
+                            {
+                                continue;
+                            }
+                            visible.Add(filterRows[i]);
+                        }
+                        continue;
+                    }
+                    // 展不开（没选滤镜、类名找不到）时继续往下走，
+                    // 让原来的占位行露出来 —— 也好过整块消失。
+                }
+
                 if (info.invisible || info.controlType == ControlType.Hidden
                     || info.controlType == ControlType.ToggleGroup)
                 {
@@ -340,12 +396,195 @@ namespace ADOFAIEditorStudio
                 {
                     continue;
                 }
+
                 visible.Add(pair);
             }
         }
 
+        /// <summary>
+        /// `PropertyType.Rating` —— 一排可点的星星。
+        ///
+        /// 原生 `PropertyControl_Rating` 的语义很简单：点第 N 颗就把值设成 N，
+        /// 高亮 1..N 颗（`SetInt(Array.IndexOf(buttons, button) + 1)`）。
+        /// 值本身是个整数（评几星）。
+        ///
+        /// 这里不画星形贴图，用字符 ★ / ☆ —— 中文字体里就有，
+        /// 不必为五颗星额外引一张图。
+        /// </summary>
+        private void BuildRating(RectTransform host, float valueWidth,
+            ADOFAI.PropertyInfo info, string key, Row row)
+        {
+            const int maxStars = 10;
+            const float starWidth = 22f;
+
+            int current = Mathf.RoundToInt(
+                EditorPropertyPanel.SafeGet(target, info, 0f));
+            // 记下初始值：`RefreshValues` 拿它比对，值没变就不重建。
+            row.RatingValue = current;
+
+            RectTransform strip = CreateRect("Rating", host, 0f, 0f,
+                Mathf.Min(valueWidth, maxStars * starWidth), ControlHeight);
+            row.Field1 = null;
+
+            for (int i = 0; i < maxStars; i++)
+            {
+                int starIndex = i + 1;
+                bool filled = starIndex <= current;
+
+                RectTransform cell = CreateRect("Star" + starIndex, strip,
+                    i * starWidth, 0f, starWidth, ControlHeight);
+                Image hit = cell.gameObject.AddComponent<Image>();
+                hit.color = Color.clear;
+                hit.raycastTarget = true;
+
+                TextMeshProUGUI glyph = CreateText("Glyph", cell,
+                    0f, 0f, starWidth, ControlHeight,
+                    filled ? "★" : "☆", 15f,
+                    filled ? Accent : TextMuted, TextAlignmentOptions.Center);
+                glyph.raycastTarget = false;
+
+                Button button = cell.gameObject.AddComponent<Button>();
+                button.targetGraphic = hit;
+                button.transition = Selectable.Transition.None;
+                button.navigation = new Navigation { mode = Navigation.Mode.None };
+                // 再点同一颗就取消（回到 0 星）—— 否则 0 星没法表达。
+                int captured = starIndex;
+                button.onClick.AddListener(delegate
+                {
+                    int next = captured == current ? 0 : captured;
+                    CommitValue(target, key, next);
+                    Rebuild();
+                });
+            }
+        }
+
+        /// <summary>
+        /// `PropertyType.Export` —— 一个按钮，点开游戏的导出窗口。
+        ///
+        /// 那是游戏自己的谱面导出流程（`scnEditor.ShowExportWindow`），
+        /// 和 AES 无关，所以只做个入口，不自己实现。
+        /// </summary>
+        private void BuildExportButton(RectTransform host, float valueWidth)
+        {
+            RectTransform rect = CreateRect("Export", host, 0f, 0f, valueWidth, ControlHeight);
+            Image background = rect.gameObject.AddComponent<Image>();
+            background.color = HoverColor;
+            background.raycastTarget = true;
+
+            TextMeshProUGUI label = CreateText("Label", rect, 0f, 0f, valueWidth, ControlHeight,
+                "导出…", 12f, TextPrimary, TextAlignmentOptions.Center);
+            label.raycastTarget = false;
+
+            Button button = rect.gameObject.AddComponent<Button>();
+            button.targetGraphic = background;
+            button.transition = Selectable.Transition.None;
+            button.navigation = new Navigation { mode = Navigation.Mode.None };
+            button.onClick.AddListener(delegate
+            {
+                scnEditor editor = scnEditor.instance;
+                if (editor == null)
+                {
+                    return;
+                }
+                try
+                {
+                    editor.ShowExportWindow(0);
+                }
+                catch (Exception exception)
+                {
+                    Main.Logger.Error("[参数栏] 打开导出窗口失败：" + exception);
+                }
+            });
+        }
+
         // ── 重建 ─────────────────────────────────────────────────────────
 
+        /// <summary>
+        /// `PropertyType.Note` —— 一行说明文字。
+        ///
+        /// 原生把它当纯文本控件（`PropertyControl_Note`），内容取
+        /// `propertyInfo.noteKey` 那条本地化。高级滤镜页顶上那条
+        /// 「警告！…」就是它 —— 它在提醒作者某些滤镜会把画面糊掉之类。
+        ///
+        /// 文字取不到时退回键名本身，至少能看出"这里本来有一条提示"。
+        /// </summary>
+        private void BuildNote(RectTransform host, float availableWidth, ADOFAI.PropertyInfo info)
+        {
+            string key = info == null ? null : info.noteKey;
+            string text = null;
+            if (!string.IsNullOrEmpty(key))
+            {
+                try
+                {
+                    text = RDString.Get(key);
+                    if (string.Equals(text, key, StringComparison.Ordinal))
+                    {
+                        // 查不到时 RDString.Get 会把键原样返回，那种情况当作没有。
+                        text = null;
+                    }
+                }
+                catch
+                {
+                    text = null;
+                }
+            }
+            if (string.IsNullOrEmpty(text))
+            {
+                text = key ?? string.Empty;
+            }
+
+            TextMeshProUGUI label = CreateText("Note", host, 0f, 0f,
+                Mathf.Max(40f, availableWidth), ControlHeight, text,
+                12f, TextMuted, TextAlignmentOptions.TopLeft);
+            label.raycastTarget = false;
+            // 提示一般比一行长，允许折行 —— 截断等于把说明藏掉一半。
+            label.overflowMode = TextOverflowModes.Overflow;
+            label.textWrappingMode = TextWrappingModes.Normal;
+        }
+        /// <summary>
+        /// 属性表里没有 `filterProperties` 时，按事件数据自己补一组子参数行。
+        ///
+        /// 为什么要这一条：`SetFilterAdvanced` 的属性表**不是每张谱都一样** ——
+        /// 有的是新格式（带 `filterProperties` 那一项），有的是旧格式（没有）。
+        /// 旧格式下参数栏只显示「滤镜」一个下拉，强度/扭曲/半径全不见，
+        /// 而那些 `filter_*` 值明明就存在事件数据里。
+        ///
+        /// 这里只做属性表缺失时的补充，不重复展开 —— 有 `filterProperties`
+        /// 那一项时走 `CollectVisible` 里的正常分支。
+        /// </summary>
+        private void AddFilterRowsIfMissing()
+        {
+            if (target == null || target.info == null || target.info.propertiesInfo == null)
+            {
+                return;
+            }
+
+            // 属性表里有这一项就交给正常路径，别重复加。
+            foreach (KeyValuePair<string, ADOFAI.PropertyInfo> pair in target.info.propertiesInfo)
+            {
+                if (pair.Value != null && pair.Value.type == PropertyType.FilterProperties)
+                {
+                    return;
+                }
+            }
+
+            List<KeyValuePair<string, ADOFAI.PropertyInfo>> expanded =
+                EditorPropertyPanel.ExpandFilterProperties(target);
+            if (expanded == null || expanded.Count == 0)
+            {
+                return;
+            }
+
+            for (int i = 0; i < expanded.Count; i++)
+            {
+                // 批量模式下只保留每个事件都有的键（和正常路径同一条规矩）。
+                if (panel.InBatch && !panel.BatchHasKey(expanded[i].Key))
+                {
+                    continue;
+                }
+                visible.Add(expanded[i]);
+            }
+        }
         private void Rebuild()
         {
             if (root == null)
@@ -691,6 +930,26 @@ namespace ADOFAIEditorStudio
             row.Height = rowHeight;
             SetTopLeft(row.Rect, CardPad, y, available, rowHeight);
 
+            // **`Note` 是整行说明文字，没有标签列、也没有勾选框。**
+            // 让它占满整行宽度，否则一行字被挤在右侧一小块里读不下去。
+            if (info.type == PropertyType.Note)
+            {
+                row.Label.gameObject.SetActive(false);
+                row.EnableButton.gameObject.SetActive(false);
+                row.EnableRect.gameObject.SetActive(false);
+                row.Mixed.gameObject.SetActive(false);
+                ClearChildren(row.ValueHost);
+                row.ValueHost.gameObject.SetActive(true);
+                SetTopLeft(row.ValueHost, 0f, 0f, available, rowHeight);
+                BuildValue(row, info, key, row.ValueHost, available);
+                return;
+            }
+            row.EnableRect.gameObject.SetActive(true);
+            // 行对象是复用的：上一个绑定可能是 Note 行（把标签藏了），
+            // 换回普通属性时得重新显示出来。
+            row.Label.gameObject.SetActive(true);
+            row.EnableButton.gameObject.SetActive(true);
+
             string label = EditorPropertyPanel.ResolveLabel(target, info);
             if (row.Label.text != label)
             {
@@ -901,6 +1160,42 @@ namespace ADOFAIEditorStudio
                         break;
                     case PropertyType.ParticlePlayback:
                         BuildParticle(host, valueWidth);
+                        break;
+                    case PropertyType.Rating:
+                        // 星星评分。原生 `PropertyControl_Rating` 就是一排
+                        // 可点的星星，点第 N 颗写入整数 N。
+                        BuildRating(host, valueWidth, info, key, row);
+                        break;
+                    case PropertyType.Export:
+                        // 「导出」按钮。原生那个会拉起游戏的导出窗口
+                        // （`ShowExportWindow`），和谱面数据无关。
+                        BuildExportButton(host, valueWidth);
+                        break;
+                    case PropertyType.Array:
+                    case PropertyType.List:
+                        // **这两类故意不给控件。**
+                        //
+                        // `List` 在原生里只服务两个属性：`decorations` 和
+                        // `events` —— 那是原生自己那两栏列表，AES 有独立的
+                        // 装饰物栏和时间轴，不需要再来一份。
+                        //
+                        // `Array` 是内部数据结构（原生也没有任何控件，
+                        // 存盘时原样写回）。给它个"暂不支持"纯属噪声。
+                        CreateText("Passthrough", host, 0f, 0f, valueWidth, ControlHeight,
+                            "（由编辑器管理）", 11f, TextMuted,
+                            TextAlignmentOptions.MidlineLeft).raycastTarget = false;
+                        break;
+                    case PropertyType.Note:
+                        // **纯说明文字，不是可编辑的值。**
+                        //
+                        // 原生 `PropertyControl_Note` 就一句话：
+                        // `noteText.text = RDString.Get(propertyInfo.noteKey)` ——
+                        // 没有输入框、没有按钮，只是给作者看的提示
+                        // （高级滤镜那一页顶上那条"警告！..."就是它）。
+                        //
+                        // 以前这里走 default，显示成「暂不支持 Note」。
+                        // 那个"暂不支持"其实是我方没实现，不是游戏的问题。
+                        BuildNote(host, availableWidth, info);
                         break;
                     default:
                         CreateText("Unsupported", host, 0f, 0f, valueWidth, ControlHeight,
@@ -1622,12 +1917,43 @@ namespace ADOFAIEditorStudio
                             tile.Item1.ToString(CultureInfo.InvariantCulture));
                         break;
                     }
+                    case PropertyType.Rating:
+                    {
+                        // 星星是按钮串，没法像输入框那样改文本。
+                        // 值真变了（联机对方改、撤销）才整块重建，普通帧什么都不做。
+                        int nowStars = Mathf.RoundToInt(
+                            EditorPropertyPanel.SafeGet(target, info, 0f));
+                        if (row.RatingValue != nowStars)
+                        {
+                            row.RatingValue = nowStars;
+                            pendingRatingRebuild = true;
+                            return;
+                        }
+                        break;
+                    }
                 }
 
                 if (row.EnumLabel != null)
                 {
-                    string current = EditorPropertyPanel.ReadEnumName(target, info);
-                    string display = EditorPropertyPanel.DisplayEnumName(target, info, current);
+                    // **高级滤镜那一行单独走。**
+                    //
+                    // `filter` 的 PropertyType 是 String，值是滤镜类名；它的显示名
+                    // 要从滤镜表里查（`FilterDisplayFor`），不能走 `DisplayEnumName`
+                    // —— 那条路是按 Enum 类型名查本地化，对类名字符串查不到，
+                    // 会原样回落成 `CameraFilterPack_XXX` 这种又长又难看的字符串。
+                    string current;
+                    string display;
+                    if (IsAdvancedFilterProperty(info, row.Key))
+                    {
+                        current = EditorPropertyPanel.SafeGet<string>(target, info, null)
+                            ?? string.Empty;
+                        display = FilterDisplayFor(current);
+                    }
+                    else
+                    {
+                        current = EditorPropertyPanel.ReadEnumName(target, info);
+                        display = EditorPropertyPanel.DisplayEnumName(target, info, current);
+                    }
                     if (row.EnumLabel.text != display)
                     {
                         row.EnumLabel.text = display;
@@ -1951,6 +2277,13 @@ namespace ADOFAIEditorStudio
                 TextPrimary, TextAlignmentOptions.MidlineLeft);
             label.raycastTarget = false;
             label.overflowMode = TextOverflowModes.Ellipsis;
+            // **必须记进 row。**
+            //
+            // RefreshValues 是按行的 `EnumLabel` 来回填下拉显示的；这一行原来
+            // 建了个局部 label 就没管了，于是选完滤镜值写进了谱面、框上却还
+            // 显示旧名字 —— 用户看到的就是「点了，没反应」。
+            // 存的这一位让 RefreshValues 能刷到它（选中的高亮也靠它）。
+            row.EnumLabel = label;
 
             TextMeshProUGUI arrow = CreateText("Arrow", rect,
                 Mathf.Max(0f, valueWidth - 16f), 0f, 14f, ControlHeight, "▾", 11f,
@@ -2050,7 +2383,12 @@ namespace ADOFAIEditorStudio
                     string name = names[i];
                     // 显示名与写入值分开：滤镜下拉显示中文，但谱面里要写类名。
                     string rawValue = values != null && i < values.Length ? values[i] : name;
-                    bool selected = string.Equals(name, current, StringComparison.Ordinal);
+                    // **比的是写入值，不是显示名。**
+                    //
+                    // 滤镜那一路 `name` 是中文显示名、`current` 是谱面里的类名，
+                    // 直接比永远不等 —— 于是下拉里一项都不会高亮，用户分不清
+                    // 当前选的是哪个。
+                    bool selected = string.Equals(rawValue, current, StringComparison.Ordinal);
                     Button button = CreateButton(listContent, 0f, i * rowHeight,
                         width - 8f, rowHeight,
                         EditorPropertyPanel.DisplayEnumName(target, info, name),

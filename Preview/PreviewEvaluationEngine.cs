@@ -145,6 +145,13 @@ namespace ADOFAIEditorStudio.Preview
                 new FilterPreviewDomain(),
                 new FilterAdvancedPreviewDomain(),
                 new ParticlePreviewDomain(),
+                // 对象装饰物的外观（球颜色 / 轨道颜色样式图标）。
+                // 排在 DecorationCore 之后：那个域负责位置缩放那些通用属性，
+                // 这个只管 SetObject 特有的外观。
+                new SetObjectPreviewDomain(),
+                // PlaySound：只在**播放中**跨过事件时响一声，
+                // 拖播放头不响（理由见该域类注释）。
+                new PlaySoundPreviewDomain(),
                 // 必须排在 Planet 之前：它写 planet.transform.localScale，
                 // 而 Planet 域的圆环要靠那个缩放把自己除回去。
                 new ScalePlanetsPreviewDomain(),

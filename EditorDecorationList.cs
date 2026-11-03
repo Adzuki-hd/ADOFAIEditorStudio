@@ -126,6 +126,7 @@ namespace ADOFAIEditorStudio
 
         private static readonly string[] DecoTypeNames = { "图片", "文本", "粒子", "对象" };
 
+
         // ---------------------------------------------------------------- 行数据
 
         /// <summary>
@@ -318,6 +319,7 @@ namespace ADOFAIEditorStudio
             ClearBatch();
         }
 
+
         // ---------------------------------------------------------------- 构建
 
         private void BuildHeader()
@@ -455,8 +457,7 @@ namespace ADOFAIEditorStudio
         /// <summary>带图标的文字按钮，给批量开关用。图标留待图标读进来之后再补。</summary>
         private Button CreateBatchButton(string name, RectTransform parent, float x, float y,
             float width, string label, Action action, out Image iconImage)
-        {
-            Image background = CreateImage(name, parent, x, y, width, 22f, Palette.ButtonNormal);
+        {            Image background = CreateImage(name, parent, x, y, width, 22f, Palette.ButtonNormal);
             background.sprite = roundedSprite;
             background.type = Image.Type.Sliced;
             background.raycastTarget = true;

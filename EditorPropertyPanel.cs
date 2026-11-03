@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Reflection;
 using ADOFAI;
 using ADOFAIEditorStudio.Multiplayer;
 using ADOFAIEditorStudio.Ui;
@@ -2335,6 +2336,350 @@ namespace ADOFAIEditorStudio
         /// 原来的写法正是反的，而且**整个漏掉了 `customLocalizationKey`**：
         /// 相机设置那页的 `Relative To`、`Start Cam Low VFX` 就是这么漏的。
         /// </summary>
+        /// <summary>
+        /// 把高级滤镜的 `filterProperties` 展开成一组虚拟属性。
+        ///
+        /// 原生那套逻辑在 `PropertyControl_FilterProperties.ReloadFilterProperties`：
+        /// 按事件的 `filter` 字段拿到 `CameraFilterPack_*` 那个类，反射出它的
+        /// public 字段（只要 int / float / Color / Vector2），每个字段配一个
+        /// `PropertyInfo`，键名是 `filter_<字段名>`，显示名走
+        /// `editor.CameraFilterPackFields.<字段名>` 本地化。
+        ///
+        /// AES 这里不建原生控件，只生成 `PropertyInfo`，交给参数栏按常规属性
+        /// 画 —— 于是开关、数字框、颜色块、向量框全都自动复用，不需要另写一套。
+        ///
+        /// **为什么必须补这一段**：`filter_*` 的值是**真实存在谱面里**的
+        /// （例如 `"filter_Brightness": 95`），预览域也已经在读它们。
+        /// 不展开的话，用户在 AES 里只能选滤镜、调不了强度/饱和度/对比度，
+        /// 每次都得切回原生面板。
+        /// </summary>
+        /// <returns>展开出来的属性；不是高级滤镜事件、或读不到滤镜类型时返回 null。</returns>
+
+        internal static List<KeyValuePair<string, ADOFAI.PropertyInfo>> ExpandFilterProperties(
+            LevelEvent levelEvent)
+        {            if (levelEvent == null || levelEvent.eventType != LevelEventType.SetFilterAdvanced
+                || levelEvent.info == null)
+            {
+                return null;
+            }
+
+            string filterName;
+            try
+            {
+                filterName = levelEvent["filter"] as string;
+            }
+            catch
+            {
+                return null;
+            }
+
+            if (string.IsNullOrEmpty(filterName))
+            {
+                // 还没选滤镜，没有子参数可展开。
+                return null;
+            }
+
+            Type filterType = ResolveFilterType(filterName);
+            if (filterType == null)
+            {
+                return null;
+            }
+
+            // 原生取的是 `SetFilterAdvanced` 属性表里那条 `propertiesTemplate` 的
+            // `dict` 当元数据模板。取不到就拿当前事件自己的 info —— 两者都行，
+            // 这里只是给新建的 PropertyInfo 一个归属。
+            LevelEventInfo typeInfo = levelEvent.info;
+            if (GCS.levelEventsInfo != null)
+            {
+                LevelEventInfo advanced;
+                if (GCS.levelEventsInfo.TryGetValue("SetFilterAdvanced", out advanced)
+                    && advanced != null && advanced.propertiesInfo != null)
+                {
+                    ADOFAI.PropertyInfo template;
+                    if (advanced.propertiesInfo.TryGetValue("propertiesTemplate", out template)
+                        && template != null)
+                    {
+                        typeInfo = advanced;
+                    }
+                }
+            }
+
+            Dictionary<string, object> dict = new Dictionary<string, object>
+            {
+                { "name", "propertiesTemplate" },
+                { "type", "Float" }
+            };
+
+            // **拿一份新滤镜的实例来读字段默认值。**
+            //
+            // 原生 `ReloadFilterProperties` 一进来就
+            // `Activator.CreateInstance(type)`，之后每个字段的
+            // `value_default = field.GetValue(obj) * 单位倍率`。
+            //
+            // 这一步是「参数没补回来」的直接原因：换成另一个滤镜之后，
+            // 谱面里存的是**上一个滤镜**的 `filter_*` 键，新滤镜的字段一个
+            // 都没值。没有默认值就显示空白 —— 看起来就是"参数丢了"。
+            //
+            // 实例创建失败也不致命：那就退回"没值时显示空"，至少不崩。
+            object instance = null;
+            try
+            {
+                instance = Activator.CreateInstance(filterType);
+            }
+            catch (Exception exception)
+            {
+                Main.Logger.Warning("[PropertyPanel] 无法实例化滤镜 " + filterName
+                    + " 来读默认值：" + exception.Message);
+            }
+
+            List<KeyValuePair<string, ADOFAI.PropertyInfo>> result =
+                new List<KeyValuePair<string, ADOFAI.PropertyInfo>>();
+
+            FieldInfo[] fields = filterType.GetFields(
+                BindingFlags.Instance | BindingFlags.Public);
+            for (int i = 0; i < fields.Length; i++)
+            {
+                FieldInfo field = fields[i];
+                Type fieldType = field.FieldType;
+
+                bool isInt = fieldType == typeof(int);
+                bool isFloat = fieldType == typeof(float);
+                bool isColor = fieldType == typeof(Color);
+                bool isVector2 = fieldType == typeof(Vector2);
+                if (!isInt && !isFloat && !isColor && !isVector2)
+                {
+                    continue;
+                }
+
+                string key = "filter_" + field.Name;
+                PropertyType propertyType = isInt ? PropertyType.Int
+                    : isFloat ? PropertyType.Float
+                    : isColor ? PropertyType.Color
+                    : PropertyType.Vector2;
+
+                string unit = RDEditorUtils.FilterFieldToUnit(
+                    isInt || isFloat ? propertyType : PropertyType.Float, field.Name);
+
+                // 显示名：先走游戏本地化，查不到就用"拆驼峰"的名字（和原生一致）。
+                bool exists;
+                string label = RDString.GetWithCheck(
+                    "editor.CameraFilterPackFields." + field.Name, out exists);
+                if (!exists || string.IsNullOrEmpty(label))
+                {
+                    label = UnCamelCase(field.Name);
+                }
+                if (!string.IsNullOrEmpty(label) && label[0] == '_')
+                {
+                    label = label.Substring(1);
+                }
+
+                // **谱面里没有这个键时，用滤镜类的默认值垫上。**
+                //
+                // 原生在 `ReloadFilterProperties` 里是这么做的：有值就用谱面的，
+                // 没有就用 `Activator.CreateInstance` 读出来的字段默认值。
+                // 不垫的话换滤镜之后新字段全是空白 —— 用户看到的就是
+                // "参数没补回来"，而且一动它写进谱面的就是这个控件上的 0。
+                object defaultValue = null;
+                if (instance != null)
+                {
+                    try
+                    {
+                        object raw = field.GetValue(instance);
+                        if (isColor && raw is Color)
+                        {
+                            // 颜色在谱面里存的是 hex 字符串。
+                            defaultValue = ColorToHex((Color)raw);
+                        }
+                        else if (isVector2 && raw is Vector2)
+                        {
+                            defaultValue = raw;
+                        }
+                        else if (isInt)
+                        {
+                            defaultValue = raw;
+                        }
+                        else if (isFloat)
+                        {
+                            defaultValue = raw;
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        // 读不到就退回"空着"，不影响其它字段。
+                    }
+                }
+
+                ADOFAI.PropertyInfo info = new ADOFAI.PropertyInfo(dict, typeInfo)
+                {
+                    name = key,
+                    value_default = defaultValue,
+                    type = propertyType,
+                    customLabel = label,
+                    unit = unit,
+                    invisible = false,
+                    canBeDisabled = true,
+                    int_min = int.MinValue,
+                    int_max = int.MaxValue,
+                    float_min = float.NegativeInfinity,
+                    float_max = float.PositiveInfinity,
+                    minVec = new Vector2(float.NegativeInfinity, float.NegativeInfinity),
+                    maxVec = new Vector2(float.PositiveInfinity, float.PositiveInfinity)
+                };
+
+                result.Add(new KeyValuePair<string, ADOFAI.PropertyInfo>(key, info));
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// 换完滤镜之后，把不属于新滤镜的 `filter_*` 键从事件里删掉。
+        ///
+        /// 照原生 `PropertyControl_FilterProperties.ReloadFilterProperties` 末尾
+        /// 那一段：新滤镜的字段名收成一个集合，事件数据里凡是 `filter_` 开头
+        /// 但不在集合里的都删，`disabled` 里的同名项也一起删。
+        ///
+        /// 不删的后果：旧滤镜的参数留在谱面里，读谱时会尝试写进新滤镜组件
+        /// （字段同名就生效 —— 那是错的；不同名就变成一串无人认领的键）。
+        /// </summary>
+        private static void PruneFilterProperties(LevelEvent levelEvent, string filterName)
+        {
+            if (levelEvent == null)
+            {
+                return;
+            }
+
+            Type filterType = ResolveFilterType(filterName);
+            if (filterType == null)
+            {
+                // 拿不到新滤镜的字段表就什么都不删 —— 宁可留着，也不能把
+                // 用户手动写下、只是当前读不到的值抹掉。
+                return;
+            }
+
+            HashSet<string> keep = new HashSet<string>(StringComparer.Ordinal);
+            FieldInfo[] fields = filterType.GetFields(
+                BindingFlags.Instance | BindingFlags.Public);
+            for (int i = 0; i < fields.Length; i++)
+            {
+                keep.Add("filter_" + fields[i].Name);
+            }
+
+            Dictionary<string, object> data = levelEvent.GetData();
+            if (data != null)
+            {
+                List<string> stale = null;
+                foreach (KeyValuePair<string, object> pair in data)
+                {
+                    if (pair.Key.StartsWith("filter_", StringComparison.Ordinal)
+                        && !keep.Contains(pair.Key))
+                    {
+                        if (stale == null)
+                        {
+                            stale = new List<string>();
+                        }
+                        stale.Add(pair.Key);
+                    }
+                }
+                if (stale != null)
+                {
+                    for (int i = 0; i < stale.Count; i++)
+                    {
+                        data.Remove(stale[i]);
+                    }
+                }
+            }
+
+            if (levelEvent.disabled != null)
+            {
+                List<string> staleDisabled = null;
+                foreach (KeyValuePair<string, bool> pair in levelEvent.disabled)
+                {
+                    if (pair.Key.StartsWith("filter_", StringComparison.Ordinal)
+                        && !keep.Contains(pair.Key))
+                    {
+                        if (staleDisabled == null)
+                        {
+                            staleDisabled = new List<string>();
+                        }
+                        staleDisabled.Add(pair.Key);
+                    }
+                }
+                if (staleDisabled != null)
+                {
+                    for (int i = 0; i < staleDisabled.Count; i++)
+                    {
+                        levelEvent.disabled.Remove(staleDisabled[i]);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 按类名找滤镜类型。原生是
+        /// `Type.GetType($"{名字}, Assembly-CSharp-firstpass")` —— 滤镜全在
+        /// firstpass 那个程序集里。
+        /// </summary>
+        internal static Type ResolveFilterType(string filterName)
+        {
+            if (string.IsNullOrEmpty(filterName))
+            {
+                return null;
+            }
+            try
+            {
+                Type direct = Type.GetType(filterName + ", Assembly-CSharp-firstpass", false);
+                if (direct != null)
+                {
+                    return direct;
+                }
+            }
+            catch
+            {
+                // 落到下面的逐个程序集查找。
+            }
+
+            // 兜底：按名字在已加载的程序集里找。`Type.GetType` 依赖精确的
+            // 程序集名，哪天真换了包名就找不到，这一步能救回来。
+            Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            for (int i = 0; i < assemblies.Length; i++)
+            {
+                try
+                {
+                    Type found = assemblies[i].GetType(filterName, false);
+                    if (found != null)
+                    {
+                        return found;
+                    }
+                }
+                catch
+                {
+                    // 个别程序集反射会抛，跳过继续。
+                }
+            }
+            return null;
+        }
+
+        /// <summary>拆驼峰：`BrightnessContrast` → `Brightness Contrast`。</summary>
+        internal static string UnCamelCase(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+            {
+                return string.Empty;
+            }
+            System.Text.StringBuilder builder = new System.Text.StringBuilder(name.Length + 6);
+            for (int i = 0; i < name.Length; i++)
+            {
+                char c = name[i];
+                if (i > 0 && char.IsUpper(c) && !char.IsUpper(name[i - 1]))
+                {
+                    builder.Append(' ');
+                }
+                builder.Append(c);
+            }
+            return builder.ToString();
+        }
+
         internal static string ResolveLabel(LevelEvent levelEvent, ADOFAI.PropertyInfo info)
         {
             if (info == null)
@@ -4219,6 +4564,19 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
+            // **换滤镜时把上一套子参数清掉。**
+            //
+            // 原生 `PropertyControl_FilterProperties.ReloadFilterProperties` 末尾
+            // 会把不属于新滤镜的 `filter_*` 键从事件数据里删掉。不删的话：
+            // 从「亮度/饱和度/对比度」换成「电影模糊」之后，那三个旧键还留在
+            // 谱面里 —— 读谱时它们会被写进 blur 组件（字段同名时才生效，
+            // 不同名则变成脏数据），而且下次切回来还会被当成"用户设过"的值。
+            if (levelEvent.eventType == LevelEventType.SetFilterAdvanced
+                && string.Equals(key, "filter", StringComparison.Ordinal))
+            {
+                PruneFilterProperties(levelEvent, value as string);
+            }
+
             // 动一个值就意味着作者想让它生效；原生面板
             // 在编辑被禁用的属性时也是这么做的。
             bool disabled;
@@ -4260,15 +4618,18 @@ namespace ADOFAIEditorStudio
                 ADOFAI.PropertyInfo settingsInfo = FindInfo(levelEvent, key);
                 ApplySettingsSideEffects(settingsInfo);
 
-                // 改的是背景设置里那个颜色，原生还会顺手重铺一次背景
-                // （PropertyControl_Color.OnChange 里就有这一支）。
+                // **背景设置里改任何一项都要重铺一次背景。**
                 //
-                // **两条写入路径都要这一步**：uGUI 那条写在调色盘的提交里
-                // （CommitColorFromPicker），ImGui 那条是直接走 Commit 的 ——
-                // 收在这里两边就都盖到了。
-                if (settingsInfo != null
-                    && settingsInfo.type == PropertyType.Color
-                    && levelEvent.eventType == LevelEventType.BackgroundSettings)
+                // 原生的 PropertyControl_Color.OnChange 与 PropertyControl_Toggle.SetValue
+                // 里都有一支 `if (eventType == BackgroundSettings) SetBackground()`。
+                // 这里原来只认 Color 一种类型 —— 于是改背景图（File）、
+                // 改显示模式（Enum）、改缩放（Int）、改瓷片/形状颜色之外的开关
+                // 都只写进了存档，编辑器那边的背景对象纹丝不动。
+                //
+                // 重铺是廉价的（SetBackground 只碰 custBG / editorBG 几个字段），
+                // 而且预览域那边下一次求值会从这些字段重新播种，所以这一步
+                // 同时也是“预览跟上”的前提。
+                if (levelEvent.eventType == LevelEventType.BackgroundSettings)
                 {
                     SetBackgroundSafe();
                 }
@@ -4512,6 +4873,36 @@ namespace ADOFAIEditorStudio
             {
                 return fallback;
             }
+
+            // **谱面里没这个键时，用属性元数据里的默认值。**
+            //
+            // 正常属性都有 `value_default`，但读法是「事件里没有就回落调用方
+            // 给的 fallback」。高级滤镜展开出来的那批 `filter_*` 不一样：
+            // 它们不在 `propertiesInfo` 里，值只存在于事件数据中 ——
+            // 换滤镜之后新字段一个值都没有，于是控件全显示空白，
+            // 看起来就是「参数丢了」。
+            //
+            // 先试着从事件数据取；取不到（键不存在，不是值等于 fallback）
+            // 再退回 `value_default`。
+            Dictionary<string, object> data = levelEvent.GetData();
+            bool hasKey = data != null && data.ContainsKey(info.name);
+            if (!hasKey && info.value_default != null)
+            {
+                if (info.value_default is T)
+                {
+                    return (T)info.value_default;
+                }
+                try
+                {
+                    return (T)Convert.ChangeType(info.value_default, typeof(T),
+                        System.Globalization.CultureInfo.InvariantCulture);
+                }
+                catch (Exception)
+                {
+                    // 转不过去就算了，落回常规读取。
+                }
+            }
+
             try
             {
                 return levelEvent.Get<T>(info.name, fallback);
@@ -4544,6 +4935,20 @@ namespace ADOFAIEditorStudio
             {
                 return Color.white;
             }
+
+            // 同 `SafeGet`：高级滤镜展开出来的颜色字段在换了滤镜之后
+            // 事件里没有这个键 —— 那时用滤镜类的默认色，而不是白色。
+            Dictionary<string, object> data = levelEvent.GetData();
+            if (data != null && !data.ContainsKey(info.name))
+            {
+                string defaultHex = info.value_default as string;
+                Color parsed;
+                if (!string.IsNullOrEmpty(defaultHex) && TryParseHex(defaultHex, out parsed))
+                {
+                    return parsed;
+                }
+            }
+
             try
             {
                 return levelEvent.GetColor(info.name);

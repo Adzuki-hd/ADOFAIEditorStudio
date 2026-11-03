@@ -144,6 +144,13 @@ namespace ADOFAIEditorStudio.Preview.Domains
         /// </summary>
         private bool legacyRelativeTo;
 
+        /// <summary>
+        /// 会话开始前相机的跟随模式。`WriteCamera` 每帧会把它强制设成 true，
+        /// `EndSession` 里要还回去 —— 否则关掉工作台之后原生播放也会跟着球走。
+        /// null 表示还没记过。
+        /// </summary>
+        private bool? followModeBeforeSession;
+
         // 镜像事件链的工作值，纯粹是为了让 LogCameraCompare 能报出来。
         // 它们是 EvaluateChannels 里的局部变量；LastPosition 事件是针对
         // 被携带的目标解析的，所以相机落到世界原点时，看一眼这些值就能
@@ -261,6 +268,18 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // 新会话从没有平移的状态开始，所以视图打开时就在谱面说的位置。
             userPan = Vector2.zero;
             lastWrittenLocalValid = false;
+
+            // 记下会话开始前的跟随模式。`WriteCamera` 每帧会强制设成 true，
+            // 结束时要还回去（见 `followModeBeforeSession` 的说明）。
+            // 只记第一次 —— 会话重入时不能把"已经是我们改过的 true"当成原始值。
+            if (!followModeBeforeSession.HasValue)
+            {
+                scrCamera probeCamera = scrCamera.instance;
+                if (probeCamera != null)
+                {
+                    followModeBeforeSession = probeCamera.followMode;
+                }
+            }
 
             LevelData levelData = scnGame.instance == null ? null : scnGame.instance.levelData;
             defaultMode = levelData == null ? CamMovementType.Player : levelData.camRelativeTo;
@@ -888,6 +907,25 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
         public void EndSession()
         {
+            // **把跟随模式还回去。**
+            //
+            // `WriteCamera` 里每帧无条件 `camera.followMode = true`（预览自己
+            // 驱动镜头时不需要游戏的跟随逻辑）。但那是**游戏活对象上的全局
+            // 状态**，不还原的话，关掉工作台回到原生编辑器播放，相机就一路
+            // 跟着球走 —— 谱面里明明写的是 `relativeTo: Tile`。
+            //
+            // 实测反馈：「原版 + AES 都不正常」，而单独开原版时是对的。
+            // 根子就在这里：AES 把 followMode 改成了 true 再没还。
+            if (followModeBeforeSession.HasValue)
+            {
+                scrCamera camera = scrCamera.instance;
+                if (camera != null)
+                {
+                    camera.followMode = followModeBeforeSession.Value;
+                }
+                followModeBeforeSession = null;
+            }
+
             keyframes.Clear();
             userPan = Vector2.zero;
             lastWrittenLocalValid = false;

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using ADOFAI;
 using ADOFAIEditorStudio.Ui;
 using TMPro;
 using UnityEngine;
@@ -515,10 +516,10 @@ namespace ADOFAIEditorStudio
                 width, Mathf.Max(32f, height - ListTop), out decoViewport, out decoContent);
         }
 
+
         private void CreateBatchButton(string name, float x, float w, string label,
             out TextMeshProUGUI text, Action action)
-        {
-            RectTransform rect = CreateRect(name, decoPage, x, BatchTop, w, BatchHeight);
+        {            RectTransform rect = CreateRect(name, decoPage, x, BatchTop, w, BatchHeight);
 
             Image hover = CreateImage("Hover", rect, 0f, 0f, 0f, 0f, Color.clear);
             hover.raycastTarget = true;

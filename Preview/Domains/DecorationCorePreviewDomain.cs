@@ -1468,7 +1468,21 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 // 缓存的内容是「这件装饰物可能被哪些遮罩裁」，只随 tag / 遮罩类型
                 // 变化，不随遮罩每帧移动而变（OBB 在渲染时另算）。所以只在
                 // masking / maskingTarget 改变（含首次）时刷新一次即可。
-                state.Settled = !anyActive;
+                // **行星相对的装饰物永远不定型。**
+                //
+                // 「定型」的前提是「这件装饰物在下一事件之前不会有任何属性变化」。
+                // 但 relativeTo 是 Red/Blue/GreenPlanet 的那一类，位置是
+                // `自己的坐标 + 球的世界坐标`，而球每帧都在动 —— 它们永不定型。
+                //
+                // 不排除的话：本谱的 planet 装饰物在第 272 格变可见、第 403 格
+                // 变不可见，两条都是 `positionOffset: [null,null]` 的纯透明度事件。
+                // 于是 272 一过，`NextEventStart` 指向 403，整段 130 格被判定
+                // "没有活动事件" → 整件 continue → 位置不再跟随球 →
+                // 玩家看到的就是「两个白色小球卡在原地不动」。
+                bool followsPlanet = placement == DecPlacementType.RedPlanet
+                    || placement == DecPlacementType.BluePlanet
+                    || placement == DecPlacementType.GreenPlanet;
+                state.Settled = !anyActive && !followsPlanet;
                 state.SettledAt = frame.Time;
                 state.NextEventStart = nextEventStart;
 
@@ -1507,19 +1521,41 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
                 // 探针：确认行星相对的装饰物真的贴在球上（位置 ≈ 行星位置）。
                 // 挂在 VerboseDiagnostics 后面，默认一条都不输出。
-                if (followPlanet != null
+                //
+                // **只打行星相关的**。整个谱面上千件装饰物，逐件打根本读不过来；
+                // 要查的就是「relativeTo 是球、位置却没跟着球走」这一类。
+                // 判据用 placement（事件的 relativeTo）而不是 followPlanet ——
+                // 恰恰是「placement 是行星、followPlanet 却是 null」这种
+                // 关联断掉的情况最需要看见。
+                //
+                // 这一行当初是为了查「两个白球替代行星却卡在原地」加的
+                // （根因是定型跳过，见 state.Settled 那段）。留着不删：
+                // 同类问题（换一张谱、换个 tag）还会再来，有它就不用重新搭探针。
+                bool planetRelative = placement == DecPlacementType.RedPlanet
+                    || placement == DecPlacementType.BluePlanet
+                    || placement == DecPlacementType.GreenPlanet
+                    || followPlanet != null;
+                if (planetRelative
                     && Main.Settings != null
                     && Main.Settings.VerboseDiagnostics
                     && Time.frameCount - lastPlanetFollowProbeFrame >= 60)
                 {
                     lastPlanetFollowProbeFrame = Time.frameCount;
+                    scrController probeController = ADOBase.controller;
                     Main.Logger.Log("[DecorationCore/PlanetFollow] " + decoration.name
                         + " placement=" + placement
-                        + " planet=" + (followPlanet.name ?? "?")
-                        + " planetPos=" + ((Vector2)followPlanet.transform.position).ToString("0.00")
+                        + " followPlanet=" + (followPlanet == null ? "null" : "有")
+                        + " planet=" + (followPlanet == null ? "-" : (followPlanet.name ?? "?"))
+                        + " planetPos=" + (followPlanet == null
+                            ? "-" : ((Vector2)followPlanet.transform.position).ToString("0.00"))
                         + " decoPos=" + ((Vector2)decoration.transform.position).ToString("0.00")
                         + " anchored=" + anchored.ToString("0.00")
                         + " paused=" + suppressPlanetFollow
+                        + " controller=" + (probeController == null ? "null" : "有")
+                        + " red=" + (probeController == null || probeController.planetRed == null
+                            ? "-" : ((Vector2)probeController.planetRed.transform.position).ToString("0.00"))
+                        + " blue=" + (probeController == null || probeController.planetBlue == null
+                            ? "-" : ((Vector2)probeController.planetBlue.transform.position).ToString("0.00"))
                         + " opacity=" + opacity.ToString("0.00")
                         + " visible=" + visible + ".");
                 }
