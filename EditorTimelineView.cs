@@ -4870,6 +4870,9 @@ private static float MinimumPixelsPerSecond
         /// **只在铅笔这里细分**，块拖动 / 模块拖动的吸附不受影响 ——
         /// 那些是"把东西放在格子上"，本来就该整数；这里是"画一个框"，
         /// 边界位置没有必须落在格线上的理由。
+        ///
+        /// 吸附之后再走 `ConstrainPencilPoint` 做正交约束：吸附决定"落在哪条格线"，
+        /// 约束决定"这条边横着走还是竖着走"。两步分开，各自职责清楚。
         /// </summary>
         private Vector2 SnapPencilPoint(Vector2 modulePoint)
         {
@@ -4936,6 +4939,62 @@ private static float MinimumPixelsPerSecond
         }
 
         /// <summary>
+        /// 铅笔的**正交约束**：模块只能由横平竖直的边围起来，不许出现斜线。
+        ///
+        /// 给定「上一个节点」和「这次想落的位置」，把候选点压到与上一个节点
+        /// 同一条横线或同一条竖线上 —— 哪边像素距离大就归哪边。这样手一歪
+        /// 也不会画出斜边，而连着点两下仍然能拐出阶梯。
+        ///
+        /// **比较的是像素距离，不是秒和行的数值。** 两边的单位根本不同
+        /// （X 是秒、Y 是行号），直接比数值等于拿厘米比公斤。`ModulePointToLocal`
+        /// 换到同一个屏幕坐标系里再比，结果才和眼睛看到的一致。
+        ///
+        /// 传进来的点**必须已经吸过格**：约束只是把其中一个坐标替换成锚点的
+        /// 坐标，而锚点本身就在格线上，所以约束之后仍然落在格线上。
+        /// </summary>
+        private Vector2 ConstrainPencilPoint(Vector2 anchor, Vector2 point)
+        {
+            Vector2 anchorLocal = ModulePointToLocal(anchor);
+            Vector2 pointLocal = ModulePointToLocal(point);
+            if (Mathf.Abs(pointLocal.x - anchorLocal.x)
+                >= Mathf.Abs(pointLocal.y - anchorLocal.y))
+            {
+                // 横向为主：只改 X，Y 拉回锚点那一行。
+                return new Vector2(point.x, anchor.y);
+            }
+            // 竖直为主：只改 Y，X 拉回锚点那一列。
+            return new Vector2(anchor.x, point.y);
+        }
+
+        /// <summary>
+        /// 多边形闭合时，最后一条边（最后一点 → 第一点）也必须是横平竖直的。
+        ///
+        /// 用户逐点落下去时，每条边在落点那一刻就被约束过了，但**收口这条边
+        /// 没有经历过任何一次约束** —— 它天然最容易是斜的。这里补一个拐点
+        /// `(第一点.x, 最后一点.y)`：于是「最后一点 → 拐点」是横的、
+        /// 「拐点 → 第一点」是竖的，两边都正交。
+        ///
+        /// 只在两个坐标都不相等时才补，避免多出一个和现有节点重合的点。
+        /// </summary>
+        private void ClosePencilOrthogonally()
+        {
+            if (pencilPoints.Count < 3)
+            {
+                return;
+            }
+            Vector2 first = pencilPoints[0];
+            Vector2 last = pencilPoints[pencilPoints.Count - 1];
+            const float tolerance = 1e-4f;
+            if (Mathf.Abs(first.x - last.x) <= tolerance
+                || Mathf.Abs(first.y - last.y) <= tolerance)
+            {
+                // 已经在同一条横线/竖线上，直接收口就是正交的。
+                return;
+            }
+            pencilPoints.Add(new Vector2(first.x, last.y));
+        }
+
+        /// <summary>
         /// 铅笔模式下按下左键：拿到已有节点上就拖它，否则落一个新节点；
         /// 落在第一个节点附近则视为闭合、生成模块。
         /// </summary>
@@ -4963,8 +5022,14 @@ private static float MinimumPixelsPerSecond
                 return;
             }
 
-            // 空处：落一个新节点（吸到格上）。
-            pencilPoints.Add(SnapPencilPoint(LocalToModulePoint(local)));
+            // 空处：落一个新节点（先吸格，再按上一个节点做正交约束）。
+            Vector2 candidate = SnapPencilPoint(LocalToModulePoint(local));
+            if (pencilPoints.Count > 0)
+            {
+                candidate = ConstrainPencilPoint(
+                    pencilPoints[pencilPoints.Count - 1], candidate);
+            }
+            pencilPoints.Add(candidate);
             RebuildPencilNodes();
             RedrawPencilDraft();
         }
@@ -4975,7 +5040,17 @@ private static float MinimumPixelsPerSecond
             if (pencilDragIndex >= 0 && pencilDragIndex < pencilPoints.Count)
             {
                 // 拖节点也吸格 —— 用户要的是"逐格步进"，不是"能拖到任意位置"。
-                pencilPoints[pencilDragIndex] = SnapPencilPoint(LocalToModulePoint(local));
+                // 而且**拖哪条边就约束哪条边**：节点 i 有两个邻居（i-1 与 i+1），
+                // 但正在改的是它和前一个节点之间那条边，所以锚点取 i-1。
+                // 第 0 个节点没有前驱，原样跟随鼠标（它只影响收口那条边，
+                // 而收口由 `ClosePencilOrthogonally` 补拐点）。
+                Vector2 dragged = SnapPencilPoint(LocalToModulePoint(local));
+                if (pencilDragIndex > 0)
+                {
+                    dragged = ConstrainPencilPoint(
+                        pencilPoints[pencilDragIndex - 1], dragged);
+                }
+                pencilPoints[pencilDragIndex] = dragged;
                 RebuildPencilNodes();
             }
             RedrawPencilDraft(local);
@@ -5018,11 +5093,14 @@ private static float MinimumPixelsPerSecond
                 pencilGraphic.AddShape(moduleScratch, fill, stroke, 2f);
             }
 
-            // 橡皮筋：从最后一个节点到鼠标（也吸格，让人看见下一步会落在哪）。
+            // 橡皮筋：从最后一个节点到鼠标（也吸格，再正交约束 ——
+            // 让人看见下一步真的会落在哪条横线/竖线上，而不是一条斜线）。
             if (cursorLocal.HasValue && pencilPoints.Count > 0)
             {
                 Vector2 from = ModulePointToLocal(pencilPoints[pencilPoints.Count - 1]);
                 Vector2 snapped = SnapPencilPoint(LocalToModulePoint(cursorLocal.Value));
+                snapped = ConstrainPencilPoint(
+                    pencilPoints[pencilPoints.Count - 1], snapped);
                 Vector2 to = ModulePointToLocal(snapped);
                 if ((to - from).sqrMagnitude > 4f)
                 {
@@ -5094,6 +5172,10 @@ private static float MinimumPixelsPerSecond
         /// </summary>
         private void FinishModulePolygon()
         {
+            // **先把收口那条边也变正交**（补一个拐点），再判够不够三个点 ——
+            // 有些"两个点 + 收口"的圈补完拐点就够数了。
+            ClosePencilOrthogonally();
+
             if (pencilPoints.Count < 3)
             {
                 ClearPencilDraft();
