@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    EditorProjectFile 的读写保真测试。
+
+    **不进主工程**：主工程默认把整个目录都编进去，tests 目录已由
+    ADOFAIEditorStudio.csproj 的 `<Compile Remove="tests\\**" />` 排除；
+    这里用 `Compile Include` 把被测文件单独拉进来。
+
+    为什么是 net48 控制台而不是 xunit：
+      · 机器上不一定装了测试运行器；
+      · 这个类不依赖 Unity、不依赖游戏，只是一进一出的文本读写 ——
+        一个自检程序就够，还能直接拿去当回归脚本跑。
+  -->
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>ProjectFileTests</AssemblyName>
+    <RootNamespace>ADOFAIEditorStudio.Tests</RootNamespace>
+    <Nullable>disable</Nullable>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 被测文件。只这一个 —— EditorProjectFile 不碰 Unity，也不碰游戏类型。 -->
+    <Compile Include="..\\..\\EditorProjectFile.cs" Link="EditorProjectFile.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      **用 NuGet 的 Newtonsoft.Json，不拷游戏那份。**
+      游戏自带那份是强命名的，测试 exe 没签名 —— 运行时直接
+      `FileLoadException: 强名称验证失败`。NuGet 包同样是 13.x，
+      API 完全一致（`JsonConvert.DeserializeObject` / `SerializeObject`），
+      序列化行为也一样（被测类没有用任何自定义 converter / 特性）。
+    -->
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+</Project>

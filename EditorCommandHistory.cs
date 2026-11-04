@@ -611,6 +611,117 @@ namespace ADOFAIEditorStudio
             }
         }
 
+        // ------------------------------------------------- 时间轴模块（分组框）
+
+        /// <summary>
+        /// 一个模块在某一刻的完整状态。撤销 / 重做就是整表换回去。
+        ///
+        /// **为什么记整表快照而不是增量：** 模块之间会互相抢成员（后画的赢），
+        /// 所以一个模块变了，别的模块的成员表也可能跟着变。拆成增量记，
+        /// 迟早漏一条。模块数量本来就不多（一张谱顶天几十个），整表最省心。
+        /// </summary>
+        internal sealed class ModuleSnapshot
+        {
+            internal string Name;
+            internal bool Collapsed;
+            internal List<Vector2> Points;
+            internal List<string> Members;
+        }
+
+        /// <summary>
+        /// 记一次"模块表变了"。**调用方要先把改动做完** —— 这里只入栈。
+        ///
+        /// 前后一样就什么都不记，免得点一下模块也留下一条撤销记录。
+        /// </summary>
+        internal static void RecordModuleChange(EditorTimelineView view, string label,
+            List<ModuleSnapshot> before, List<ModuleSnapshot> after)
+        {
+            if (view == null || before == null || after == null)
+            {
+                return;
+            }
+            if (SameModuleSnapshot(before, after))
+            {
+                return;
+            }
+            Record(new ModuleChangeCommand
+            {
+                View = view,
+                Label = string.IsNullOrEmpty(label) ? "模块改动" : label,
+                Before = before,
+                After = after
+            });
+        }
+
+        private sealed class ModuleChangeCommand : ICommand
+        {
+            internal EditorTimelineView View;
+            internal string Label;
+            internal List<ModuleSnapshot> Before;
+            internal List<ModuleSnapshot> After;
+
+            public string Description
+            {
+                get { return Label; }
+            }
+
+            public bool Undo()
+            {
+                return View != null && View.RestoreModuleSnapshot(Before);
+            }
+
+            public bool Redo()
+            {
+                return View != null && View.RestoreModuleSnapshot(After);
+            }
+        }
+
+        /// <summary>两份快照是不是一模一样（多边形按数值比，成员按顺序比）。</summary>
+        private static bool SameModuleSnapshot(List<ModuleSnapshot> a, List<ModuleSnapshot> b)
+        {
+            if (a.Count != b.Count)
+            {
+                return false;
+            }
+            for (int i = 0; i < a.Count; i++)
+            {
+                ModuleSnapshot x = a[i];
+                ModuleSnapshot y = b[i];
+                if (x == null || y == null)
+                {
+                    if (!ReferenceEquals(x, y))
+                    {
+                        return false;
+                    }
+                    continue;
+                }
+                if (!string.Equals(x.Name, y.Name, StringComparison.Ordinal)
+                    || x.Collapsed != y.Collapsed)
+                {
+                    return false;
+                }
+                if (x.Points.Count != y.Points.Count || x.Members.Count != y.Members.Count)
+                {
+                    return false;
+                }
+                for (int p = 0; p < x.Points.Count; p++)
+                {
+                    if ((x.Points[p] - y.Points[p]).sqrMagnitude > 1e-8f)
+                    {
+                        return false;
+                    }
+                }
+                for (int m = 0; m < x.Members.Count; m++)
+                {
+                    if (!string.Equals(x.Members[m], y.Members[m], StringComparison.Ordinal))
+                    {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
         /// <summary>
         /// 记一次"事件的生效 / 停用"。
         ///

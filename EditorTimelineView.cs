@@ -246,6 +246,38 @@ namespace ADOFAIEditorStudio
                     return;
                 }
 
+                // **拖一个属于模块的块 = 拖整个模块。**
+                //
+                // 用户要的语义：分组之后"左键拖动不再拖动事件块，而是拖整个模块"。
+                // 块身上挂着 Button 和这个拖动组件，从块上按下时事件被它们吃掉，
+                // 视图那条 OnPointerDown 根本收不到 —— 所以必须在**这里**转交，
+                // 否则在块上拖就还是只拖那一个块。
+                //
+                // 例外有两条：
+                //   · **按住 Shift 拖** = 把这一块单独拖出来，不动整个模块
+                //     （用户要的："shift+左键拖就能拖出来"）；
+                //   · 双击拎出来之后（`detachedEvent`），拖它也只拖它自己。
+                //
+                // **为什么不用 Ctrl：** 时间轴上的 Ctrl 已经被框选、加选占着，
+                // 而且 Ctrl+拖在别的编辑器里通常也是"复制" —— 撞得太多。
+                bool shiftDown = Input.GetKey(KeyCode.LeftShift)
+                    || Input.GetKey(KeyCode.RightShift);
+                if (view != null && !shiftDown
+                    && !ReferenceEquals(item.Event, view.DetachedEvent))
+                {
+                    TimelineModule owner = view.ModuleOfBlock(item);
+                    if (owner != null)
+                    {
+                        Vector2 local;
+                        if (view.TryGetViewportPoint(eventData.pressPosition, out local))
+                        {
+                            view.BeginModuleDragFromBlock(owner, local);
+                            eventData.eligibleForClick = false;
+                            return;
+                        }
+                    }
+                }
+
                 // **只读：块不能拖。** 拖动改的是事件的时间和时长，都是写谱面。
                 // 拦在这里而不是 Drag 里：一旦进入拖动状态，光标、预览位置、
                 // 松手提交都要走完整条链，中途拦反而容易留下半截状态。
@@ -292,6 +324,19 @@ namespace ADOFAIEditorStudio
 
             public void OnDrag(PointerEventData eventData)
             {
+                // **从块上起步的模块拖动，后续拖动事件也转交给视图。**
+                //
+                // `OnBeginDrag` 里已经把按下转成了 `BeginModuleDragFromBlock`，
+                // 但拖动 / 松手事件仍然发给**这个组件**（指针是在块上按下的），
+                // 视图那套 `OnDrag` / `OnPointerUp` 根本收不到 —— 不在这里转交，
+                // 模块拖动就只走完"按下"那一下：框不动、松手也不提交。
+                // 实测症状就是"在模块里的块上拖，拖不动"。
+                if (view != null && view.ModuleDragActive)
+                {
+                    view.OnDrag(eventData);
+                    return;
+                }
+
                 // **框选优先，而且用 `MarqueeActive` 判、不用 Ctrl 键。**
                 //
                 // 框是在 OnBeginDrag 里开起来的（那时按着 Ctrl），但拖到一半
@@ -393,6 +438,15 @@ namespace ADOFAIEditorStudio
 
             public void OnEndDrag(PointerEventData eventData)
             {
+                // **模块拖动在块上起步时，松手也转交。**
+                // 视图的 `OnPointerUp` 里才调 `EndModuleDrag`，而指针按在块上，
+                // 视图收不到 —— 不转交的话松手不提交，框和块都停在半路。
+                if (view != null && view.ModuleDragActive)
+                {
+                    view.OnPointerUp(eventData);
+                    return;
+                }
+
                 // 诊断：这一条最要紧 —— 松手那一刻 dragging 与 marqueeActive
                 // 是不是同时为真。若同时为真，下面第一条分支会直接 return，
                 // EndBlockDrag 永远走不到，blockDragActive 就永久卡住。
@@ -808,6 +862,11 @@ private static float MinimumPixelsPerSecond
         /// </summary>
         /// <summary>事件块那一层（在标尺下、播放头上）。</summary>
         private RectTransform blockLayer;
+        /// <summary>块层的交互闸：铅笔模式下关掉块的射线，让点击落到视图上。</summary>
+        private CanvasGroup blockLayerGroup;
+        /// <summary>模块多边形的绘制层。垫在事件块下面、格线上面。</summary>
+        private RectTransform moduleLayer;
+        private ModulePolygonGraphic moduleGraphic;
         /// <summary>格线层（在块下面）。</summary>
         private RectTransform gridLayer;
         private EditorStudioOverlay owner;
@@ -1040,6 +1099,13 @@ private static float MinimumPixelsPerSecond
         private bool pendingZoomToMaximum;
         private float viewStartTime;
         private float totalDuration;
+
+        /// <summary>
+        /// 块内容的最右端（最后一个块的起点 + 2 秒余量）。`CollectBlocks` 每次
+        /// 真跑时重算 —— 横向范围取它和播放位置的较大值，不再跟谱面总时长走
+        /// （谱面末尾可能挂着两百万秒的空档，见 `CollectBlocks` 那段的说明）。
+        /// </summary>
+        private float blockContentEnd;
         private float navigationDuration;
         private float nextDataRefresh;
         private float nextSelectionRefresh;
@@ -1199,7 +1265,15 @@ private static float MinimumPixelsPerSecond
         /// </summary>
         internal void ClearSelection()
         {
-            if (selectedEvent == null && multiSelection.Count == 0)
+            // **模块也算选中。**
+            //
+            // 这里原来只清事件和多选 —— 展开的模块框仍然算选中（描边亮着，
+            // 按 Del 会去删它），而 Shift+C 的用途就是"什么都不选"。
+            bool hadModule = selectedModule != null;
+            selectedModule = null;
+            selectedModules.Clear();
+
+            if (selectedEvent == null && multiSelection.Count == 0 && !hadModule)
             {
                 return;
             }
@@ -1207,6 +1281,7 @@ private static float MinimumPixelsPerSecond
             selectedEvent = null;
             multiSelection.Clear();
             visualsDirty = true;
+            MarkBlocksDirty();
         }
 
         /// <summary>
@@ -1231,7 +1306,18 @@ private static float MinimumPixelsPerSecond
                 hadDecorations = true;
             }
 
-            if (selectedEvent == null && multiSelection.Count == 0 && !hadDecorations)
+            // **模块也算选中，一起清。**
+            //
+            // 原来这里只清事件和装饰物 —— 于是点空白处之后，模块**仍然算选中**：
+            // 折叠条上的选中描边一直亮着，而且按 Del 会去删那个模块，
+            // 而用户以为自己只是点了一下空白。实测报的就是
+            // 「点别处取消选中 → 描边没消失」。
+            bool hadModule = selectedModule != null;
+            selectedModule = null;
+            selectedModules.Clear();
+
+            if (selectedEvent == null && multiSelection.Count == 0
+                && !hadDecorations && !hadModule)
             {
                 return;
             }
@@ -1912,6 +1998,98 @@ private static float MinimumPixelsPerSecond
             MarkBlocksDirty();
 
             status = "已粘贴 " + created.Count + " 个事件到第 " + seq + " 格";
+
+            // **滚到粘出来的块那儿。**
+            //
+            // 新块的行号会被 `RebindBlockPlacements` 的防重叠兜底顶到很下面
+            // （它会一路 `++maxRow` 找到空行）—— 数据是对的，但早就滚出视口，
+            // 用户看到的就是"粘贴没生效"。滚过去才看得见。
+            //
+            // 行号要等重绑之后才有，而重绑在下一帧的 `EnsureBlockPlacements`，
+            // 所以这里只记一个待办，由 `Update` 收尾。
+            pendingRevealEvent = created[0];
+
+            // **落的行：留到重绑时现算**（那时其他块已经定好位）。
+            // 见 `pendingPasteEvents` 的说明。
+            for (int i = 0; i < created.Count; i++)
+            {
+                pendingPasteEvents.Add(created[i]);
+            }
+            return true;
+        }
+
+        /// <summary>粘贴之后要滚过去看的那一个事件。null = 没有待办。</summary>
+        private LevelEvent pendingRevealEvent;
+
+        /// <summary>为了滚到那个块已经重试了几次（新事件要等求值器重建才进清单）。</summary>
+        private int revealAttempts;
+
+        /// <summary>
+        /// 这一块该落在第几行：**同一时间位置上最底那块的下方一格**。
+        ///
+        /// 判「同一时间位置」用画出来的宽度（和重叠判定同一套），所以零时长块
+        /// 也按它实际占的横向空间算。时间上完全不重叠的那些块不算 ——
+        /// 它们本来就在别的时段，把粘贴块塞到它们下面没有意义。
+        ///
+        /// **必须在重绑途中调用**：那时 `blockPlacements` 里已经定好位的就是
+        /// "这一段时间现有的块"，算出来的才是真正的下方。
+        ///
+        /// 一个都找不到（这段时间本来就没块）就落第 0 行。
+        /// </summary>
+        private int BottomRowNear(TimelineItem item)
+        {
+            if (item == null)
+            {
+                return 0;
+            }
+            float speed = Mathf.Max(1f, pixelsPerSecond);
+            float selfLeft = item.StartTime * speed;
+            float selfRight = selfLeft + Mathf.Max(BlockMinWidth,
+                item.Duration * speed - BlockGap);
+
+            int bottom = -1;
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                BlockPlacement other = blockPlacements[i];
+                if (other == null || other.Item == null)
+                {
+                    continue;
+                }
+                float otherLeft = other.Time * speed;
+                float otherRight = otherLeft + Mathf.Max(BlockMinWidth,
+                    other.Item.Duration * speed - BlockGap);
+                if (selfLeft >= otherRight || otherLeft >= selfRight)
+                {
+                    continue;
+                }
+                if (other.Row > bottom)
+                {
+                    bottom = other.Row;
+                }
+            }
+            return bottom + 1;
+        }
+
+        /// <summary>把视图滚动到某个事件块那儿（横向 + 纵向）。找不到块就返回 false。</summary>
+        internal bool RevealEvent(LevelEvent target)
+        {
+            if (target == null)
+            {
+                return false;
+            }
+            EnsureBlockPlacements();
+            BlockPlacement placement = FindPlacementForEvent(target);
+            if (placement == null)
+            {
+                return false;
+            }
+            ScrollVerticallyToRow(placement.Row);
+            // 横向：把它放到视口左侧三分之一处，前后都留得出东西看。
+            float visible = bodyWidth / Mathf.Max(1f, pixelsPerSecond);
+            viewStartTime = placement.Time - visible * 0.33f;
+            ClampViewStart();
+            visualsDirty = true;
+            MarkBlocksDirty();
             return true;
         }
 
@@ -2110,6 +2288,42 @@ private static float MinimumPixelsPerSecond
             PreviewDiagnostics.RecordPart("Timeline.UpdateBlocks",
                 (System.Diagnostics.Stopwatch.GetTimestamp() - __updateBlocksWatch)
                 * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+            // 模块画在块下面，所以必须在块之后刷（顺序上先画块再盖上会挡住块）。
+            // 实际生效的是节点顺序（moduleLayer 在 blockLayer 之前建的），
+            // 这里只是刷新几何。
+            // 铅笔预览：橡皮筋要跟着鼠标走，所以每帧刷一次。
+            if (modulePencilActive)
+            {
+                TickPencilCursor();
+            }
+
+            // 右键菜单：Esc 收起（点别处由 OnPointerDown 处理）。
+            TickModuleContextMenu();
+
+            // **布局脏了就定时自动存。**
+            //
+            // 部署脚本是 `taskkill` 硬杀游戏，优雅退出的自动保存根本不会跑 ——
+            // 只要模块没手动 Ctrl+S，一次重启就全丢（实测：连画几轮之后
+            // 工程文件里 `0 个模块`，用户以为右键菜单坏了，其实是模块没了）。
+            TickAutoSaveLayout(now);
+
+            // 粘贴之后滚过去看那个块。**要重试** —— 新事件要等求值器重建
+            // （0.5 秒一轮）才会出现在 `ordered` 里，下一帧就找是找不到的。
+            if (pendingRevealEvent != null)
+            {
+                revealAttempts++;
+                if (RevealEvent(pendingRevealEvent) || revealAttempts > 120)
+                {
+                    pendingRevealEvent = null;
+                    revealAttempts = 0;
+                }
+            }
+
+            long __modulesWatch = System.Diagnostics.Stopwatch.GetTimestamp();
+            UpdateModules();
+            PreviewDiagnostics.RecordPart("Timeline.Modules",
+                (System.Diagnostics.Stopwatch.GetTimestamp() - __modulesWatch)
+                * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
             long __rulerWatch = System.Diagnostics.Stopwatch.GetTimestamp();
             UpdateRuler();
             PreviewDiagnostics.RecordPart("Timeline.Ruler",
@@ -2163,7 +2377,18 @@ private static float MinimumPixelsPerSecond
             EditorPlaybackSnapshot snapshot = EditorPlaybackBridge.ReadSnapshot();
             totalDuration = Mathf.Max(totalDuration, snapshot.Duration);
             float visibleDuration = bodyWidth / Mathf.Max(1f, pixelsPerSecond);
-            navigationDuration = Mathf.Max(navigationDuration, totalDuration, snapshot.CurrentTime);
+            // **每帧重算，不累积。**
+            //
+            // 横向范围取「块内容到哪儿」和「播放头在哪儿」的较大值。
+            // 不并 `totalDuration`：谱面末尾可能挂着两百万秒的空档，
+            // 并进来右边就是一片滚不到头的空白（见 `CollectBlocks` 那一段）。
+            //
+            // **必须是重算**：原来用 `Mathf.Max(navigationDuration, ...)` 只增不减，
+            // 一旦被撑大就再也缩不回来。而刷新时那两处把它清零的写法更糟 ——
+            // 清零之后只要 `CollectBlocks` 早退一次（静止帧就会早退），
+            // `ClampViewStart` 当场把 `viewStartTime` 夹到 0，**时间轴跳回开头**。
+            // 实测：拖完模块松手就跳回开头，就是这么来的。
+            navigationDuration = Mathf.Max(blockContentEnd, snapshot.CurrentTime);
             if (snapshot.State == EditorPlaybackState.Playing)
             {
                 navigationDuration = Mathf.Max(navigationDuration, snapshot.CurrentTime + visibleDuration);
@@ -2328,6 +2553,21 @@ private static float MinimumPixelsPerSecond
         /// 不该顺手把谱面的时间也改了。
         /// </summary>
         /// <summary>uGUI 那条路正在拖块吗（探针用）。</summary>
+        /// <summary>这一帧的 Delete 已经被"删模块"用掉了。</summary>
+        private int moduleDeleteHandledFrame = -1;
+
+        /// <summary>
+        /// 这一帧的 Delete 是不是已经被"删模块"处理过了。
+        ///
+        /// `EditorPlaybackBridge` 在它自己那条 Delete 分支开头问一次 —— 那里
+        /// 看到 `multiSelection` 非空就会再删一遍，而删模块刚把成员塞进去
+        /// （"释放并保持选中"），于是「删模块」变成「连里面的一起删」。
+        /// </summary>
+        internal bool ModuleDeleteHandledThisFrame
+        {
+            get { return moduleDeleteHandledFrame == Time.frameCount; }
+        }
+
         /// <summary>当前能不能改谱面（只读模式返回 false，并弹统一提示）。</summary>
         internal bool CanEditChart()
         {
@@ -2552,6 +2792,31 @@ private static float MinimumPixelsPerSecond
 
         public void OnPointerDown(PointerEventData eventData)
         {
+            // **右键点模块 = 弹出操作菜单。**
+            //
+            // 原来右键直接进重命名。现在模块能做的事多了（复制 / 剪切 / 粘贴 /
+            // 删除 / 展开 / 重命名），塞不进一个手势，改成一颗悬浮列表，
+            // 重命名也收进列表里。放在最前面（不受铅笔/框选影响），
+            // 也不参与下面的任何左键逻辑。
+            if (eventData.button == PointerEventData.InputButton.Right && !modulePencilActive)
+            {
+                ResetModuleRightClickWatch();
+                float rx;
+                float ry;
+                bool gotPoint = TryGetViewportPoint(eventData.position, out rx, out ry);
+                if (gotPoint)
+                {
+                    // **任何地方都弹**：模块 / 事件块 / 空白，各有各的菜单。
+                    ShowTimelineContextMenu(eventData.position, new Vector2(rx, ry));
+                }
+                else
+                {
+                    CloseModuleContextMenu();
+                }
+                eventData.Use();
+                return;
+            }
+
             if ((eventData.button != PointerEventData.InputButton.Left
                     && eventData.button != PointerEventData.InputButton.Middle)
                 || scrubbing)
@@ -2573,6 +2838,18 @@ private static float MinimumPixelsPerSecond
                 return;
             }
 
+            // **铅笔模式优先于一切。**
+            //
+            // 开着铅笔时，时间轴上的左键只做两件事：落节点、或者拖动已有节点。
+            // 绝不能落到下面的"框选/拖播放头/清选中"任何一支上 —— 那样边画边
+            // 触发别的操作，画出来的东西根本不可控。
+            if (modulePencilActive)
+            {
+                HandlePencilPointerDown(new Vector2(x, y));
+                eventData.Use();
+                return;
+            }
+
             // **Ctrl + 左键 = 框选。** 放在标尺/播放头判断之前：按住 Ctrl 时
             // 整块区域都归框选用。
             //
@@ -2583,6 +2860,69 @@ private static float MinimumPixelsPerSecond
             if (MarqueeModifierHeld)
             {
                 BeginMarquee(new Vector2(x, y));
+                eventData.Use();
+                return;
+            }
+
+            // **点模块 = 选中它并开始拖整组。**
+            //
+            // 放在标尺/播放头判断之前：模块区域里的点击一律归模块，
+            // 不然在模块上拖会变成拖播放头。
+            TimelineModule hitModule = ModuleAtLocal(new Vector2(x, y));
+            if (hitModule != null)
+            {
+                // **Ctrl / Shift + 点模块 = 加选（只允许相邻的）。**
+                //
+                // 用户要的语义：相邻的几个模块能一起选中，接着右键合并；
+                // 不相邻的不让加选 —— 合并到一半发现隔着老远，那个操作没有意义。
+                bool additive = Input.GetKey(KeyCode.LeftControl)
+                    || Input.GetKey(KeyCode.RightControl)
+                    || Input.GetKey(KeyCode.LeftShift)
+                    || Input.GetKey(KeyCode.RightShift);
+                if (additive)
+                {
+                    if (IsModuleSelected(hitModule))
+                    {
+                        // 已经选着：再点一次就摘掉（反选）。
+                        selectedModules.Remove(hitModule);
+                        selectedModule = selectedModules.Count > 0
+                            ? selectedModules[selectedModules.Count - 1]
+                            : null;
+                    }
+                    else if (CanAddToModuleSelection(hitModule))
+                    {
+                        SetSelectedModule(hitModule, true);
+                    }
+                    else
+                    {
+                        SetTransientStatus("只能加选相邻的模块", 2f);
+                    }
+                    visualsDirty = true;
+                    eventData.Use();
+                    return;
+                }
+
+                // 双击模块 = 折叠 / 展开。
+                //
+                // uGUI 没有内建双击，自己按下两次点击的时间差判（0.35 秒内、
+                // 同一个模块）。放在拖动之前：否则双击的第一下就已经把
+                // 模块拖起来了（虽然没位移不会提交，但状态会乱）。
+                float now = Time.unscaledTime;
+                bool doubleClick = ReferenceEquals(hitModule, lastModuleClickTarget)
+                    && now - lastModuleClickTime <= 0.35f;
+                lastModuleClickTarget = hitModule;
+                lastModuleClickTime = now;
+
+                if (doubleClick)
+                {
+                    ToggleModuleCollapsed(hitModule);
+                    SetSelectedModule(hitModule, false);
+                    eventData.Use();
+                    return;
+                }
+
+                SetSelectedModule(hitModule, false);
+                BeginModuleDrag(hitModule, new Vector2(x, y));
                 eventData.Use();
                 return;
             }
@@ -2624,6 +2964,26 @@ private static float MinimumPixelsPerSecond
             if (eventData.button != PointerEventData.InputButton.Left
                 && eventData.button != PointerEventData.InputButton.Middle)
             {
+                return;
+            }
+
+            // 铅笔模式：松手只是结束节点拖动，不做任何选中/播放头操作。
+            if (modulePencilActive && eventData.button == PointerEventData.InputButton.Left)
+            {
+                HandlePencilPointerUp();
+                blockingPointerDrag = false;
+                anyPointerCapture = false;
+                eventData.Use();
+                return;
+            }
+
+            // 模块拖动收尾：提交并重算成员。
+            if (draggingModule != null && eventData.button == PointerEventData.InputButton.Left)
+            {
+                EndModuleDrag();
+                blockingPointerDrag = false;
+                anyPointerCapture = false;
+                eventData.Use();
                 return;
             }
 
@@ -2701,6 +3061,32 @@ private static float MinimumPixelsPerSecond
 
         public void OnDrag(PointerEventData eventData)
         {
+            // 铅笔模式：拖动只用来挪节点、以及更新那条橡皮筋。
+            if (modulePencilActive && eventData.button == PointerEventData.InputButton.Left)
+            {
+                Vector2 pencilPoint;
+                if (TryGetViewportPoint(eventData.position, out pencilPoint))
+                {
+                    HandlePencilPointerDrag(pencilPoint);
+                }
+                eventData.Use();
+                return;
+            }
+
+            // 模块拖动：只挪整组，不参与播放头/平移。
+            if (draggingModule != null && eventData.button == PointerEventData.InputButton.Left)
+            {
+                Main.Logger.Log("[ModuleDrag] OnDrag 进入 draggingModule="
+                    + DisplayNameOf(draggingModule));
+                Vector2 modulePoint;
+                if (TryGetViewportPoint(eventData.position, out modulePoint))
+                {
+                    DragModule(modulePoint);
+                }
+                eventData.Use();
+                return;
+            }
+
             // 框选优先：拉框中时其它拖动都不参与。
             if (marqueeActive && eventData.button == PointerEventData.InputButton.Left)
             {
@@ -2790,6 +3176,63 @@ private static float MinimumPixelsPerSecond
 
         private void HandleKeyboardShortcuts()
         {
+            // **铅笔模式的两个键先处理，而且不受鼠标是否在时间轴上限制。**
+            //
+            // 画到一半把鼠标挪出去（比如去点一下参数栏）再按 Esc，也应该取消 ——
+            // 否则只能把鼠标挪回来才退得掉，很难受。
+            if (modulePencilActive)
+            {
+                if (Input.GetKeyDown(KeyCode.Escape))
+                {
+                    // Esc = 整次绘制作废，并退出铅笔模式。
+                    SetModulePencilActive(false);
+                    return;
+                }
+                if (Input.GetKeyDown(KeyCode.Return) || Input.GetKeyDown(KeyCode.KeypadEnter))
+                {
+                    // 回车 = 闭合（至少三个点才围得出区域）。
+                    if (pencilPoints.Count >= 3)
+                    {
+                        FinishModulePolygon();
+                    }
+                    return;
+                }
+                if (Input.GetKeyDown(KeyCode.Backspace))
+                {
+                    // 退格 = 撤掉最后一个点，方便一边画一边修。
+                    if (pencilPoints.Count > 0)
+                    {
+                        pencilPoints.RemoveAt(pencilPoints.Count - 1);
+                        RebuildPencilNodes();
+                        RedrawPencilDraft();
+                    }
+                    return;
+                }
+            }
+
+            // **选中模块时，Delete 先删模块（不删里面的块）。**
+            //
+            // 用户要的语义：删掉的是"这层分组"，块本身留着，而且**保持选中** ——
+            // 这样紧接着还能对它们做别的操作（比如一起拖走）。
+            //
+            // 这一条必须挡在 `EditorPlaybackBridge` 那条 Delete 之前，
+            // 否则删的就是块了。所以放在本函数最前面（不受鼠标位置限制）。
+            if (selectedModule != null && !modulePencilActive
+                && (Input.GetKeyDown(KeyCode.Delete)
+                    || (Input.GetKeyDown(KeyCode.Backspace)
+                        && owner != null && !owner.IsTextInputFocused())))
+            {
+                DeleteSelectedModule();
+                // **告诉外面这一下已经用掉了。**
+                //
+                // 删模块会把成员塞进 `multiSelection`（"释放并保持选中"），
+                // 而 `EditorPlaybackBridge` 的 Delete 分支看到多选非空就会
+                // **再删一遍** —— 表现就是「删模块连里面的一起删了」。
+                // 记一个帧号，让那边认出来跳过。
+                moduleDeleteHandledFrame = Time.frameCount;
+                return;
+            }
+
             if (!ContainsScreenPoint(Input.mousePosition)
                 || owner == null || owner.IsTextInputFocused())
             {
@@ -3245,6 +3688,827 @@ private static float MinimumPixelsPerSecond
         private Dictionary<string, int> projectRows;
 
         /// <summary>
+        /// 时间轴模块（分组）。
+        ///
+        /// 每个模块用一圈多边形定义归属：圈里的块归它。多边形顶点用**时间轴
+        /// 内容坐标**（X = 秒，Y = 行空间像素）—— 和框选同一套坐标约定，
+        /// 滚动和缩放之后形状还能对得上块。
+        ///
+        /// 成员用**事件身份**存（和 `projectRows` 同一种键），不存块下标 ——
+        /// 下标会随删除/排序变化。块被别的途径删掉之后，下次刷新时对不上的
+        /// 会被自动清掉（见 `PruneModuleMembers`）。
+        /// </summary>
+        private readonly List<TimelineModule> modules = new List<TimelineModule>();
+
+        /// <summary>
+        /// 当前选中的模块们（点模块条/圈选中）。空 = 没有选中模块。
+        ///
+        /// **为什么是集合而不是单个：** 用户要能同时选中几个**相邻**的模块
+        /// 再合并成一个。`selectedModule` 保留成"主选中"（拖动、改名、
+        /// 删除这些单模块操作用的），这里存的是完整的选择集。
+        /// </summary>
+        private readonly List<TimelineModule> selectedModules = new List<TimelineModule>();
+
+        /// <summary>
+        /// 主选中的模块 —— **只在单模块操作里用**（拖动、重命名、Del 删模块）。
+        ///
+        /// 多选时的约定：它是 `selectedModules` 里最后点中的那个。
+        /// 老代码全在读它，所以没改成"到处遍历集合" —— 那是几十处改动，
+        /// 收益却只在多选的时候体现。多选只影响两件事：**画描边**和**右键菜单**。
+        /// </summary>
+        private TimelineModule selectedModule;
+
+        /// <summary>每帧重算出的模块多边形（局部坐标），供绘制与命中测试共用。</summary>
+        private readonly List<Vector2> moduleScratch = new List<Vector2>();
+
+        /// <summary>把某个模块并进模块选择集（或换掉整个选择集）。</summary>
+        private void SetSelectedModule(TimelineModule module, bool additive)
+        {
+            if (!additive)
+            {
+                selectedModules.Clear();
+            }
+            selectedModule = module;
+            if (module == null)
+            {
+                return;
+            }
+            if (!selectedModules.Contains(module))
+            {
+                selectedModules.Add(module);
+            }
+        }
+
+        /// <summary>这个模块在不在当前选择集里。</summary>
+        private bool IsModuleSelected(TimelineModule module)
+        {
+            return module != null && selectedModules.Contains(module);
+        }
+
+        /// <summary>
+        /// 两个模块**相邻**吗：包围盒在**行**上相接或重叠，而且在时间上
+        /// 中间没有别的模块把间隔填满。
+        ///
+        /// 判据取「行范围 + 时间范围」的矩形相交（或紧邻一行的容差）——
+        /// 这正是用户能看出来的"挨在一起"。时间上隔得老远、行也不挨的
+        /// 两个模块不叫相邻。
+        /// </summary>
+        private static bool ModulesAdjacent(TimelineModule a, TimelineModule b)
+        {
+            if (a == null || b == null || a.Points.Count < 3 || b.Points.Count < 3)
+            {
+                return false;
+            }
+            GetModuleBounds(a, out float aMinX, out float aMaxX,
+                out float aMinY, out float aMaxY);
+            GetModuleBounds(b, out float bMinX, out float bMaxX,
+                out float bMinY, out float bMaxY);
+
+            // 行方向：允许差一格（贴着的两条也算挨着）。
+            bool rowTouch = aMinY <= bMaxY + 1f && bMinY <= aMaxY + 1f;
+            // 时间方向：允许差一格（含折叠条的宽度，别太苛刻）。
+            bool timeTouch = aMinX <= bMaxX + 1f && bMinX <= aMaxX + 1f;
+            return rowTouch && timeTouch;
+        }
+
+        /// <summary>模块多边形的包围盒（内容坐标）。</summary>
+        private static void GetModuleBounds(TimelineModule module,
+            out float minX, out float maxX, out float minY, out float maxY)
+        {
+            minX = float.MaxValue;
+            maxX = float.MinValue;
+            minY = float.MaxValue;
+            maxY = float.MinValue;
+            for (int i = 0; i < module.Points.Count; i++)
+            {
+                Vector2 point = module.Points[i];
+                minX = Mathf.Min(minX, point.x);
+                maxX = Mathf.Max(maxX, point.x);
+                minY = Mathf.Min(minY, point.y);
+                maxY = Mathf.Max(maxY, point.y);
+            }
+            if (minX == float.MaxValue)
+            {
+                minX = maxX = minY = maxY = 0f;
+            }
+        }
+
+        /// <summary>
+        /// 这个模块能不能并进当前选择集：**要么集合是空的，要么和集合里
+        /// 至少一个模块相邻**。不相邻的不让选 —— 用户要的就是"相邻的能多选，
+        /// 不相邻的不行"，那是为了接下来合并（合并只对连成一片的有意义）。
+        /// </summary>
+        private bool CanAddToModuleSelection(TimelineModule module)
+        {
+            if (module == null || selectedModules.Count == 0)
+            {
+                return true;
+            }
+            if (selectedModules.Contains(module))
+            {
+                return true;
+            }
+            for (int i = 0; i < selectedModules.Count; i++)
+            {
+                if (ModulesAdjacent(selectedModules[i], module))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // ------------------------------------------------------------ 铅笔绘制
+
+        /// <summary>铅笔模式开着没有。</summary>
+        private bool modulePencilActive;
+
+        /// <summary>铅笔按钮（标题行那颗）。</summary>
+        private Button moduleButton;
+
+        /// <summary>正在落点的多边形（模块坐标）。空 = 还没开始画。</summary>
+        private readonly List<Vector2> pencilPoints = new List<Vector2>();
+
+        /// <summary>正在拖的那个节点下标。-1 = 没在拖节点。</summary>
+        private int pencilDragIndex = -1;
+
+        /// <summary>铅笔预览层的绘制组件（和正式模块分开，画半透明虚线感）。</summary>
+        private ModulePolygonGraphic pencilGraphic;
+
+        /// <summary>铅笔预览层。</summary>
+        private RectTransform pencilLayer;
+
+        /// <summary>节点小圆点，画在预览层最上面。</summary>
+        private readonly List<GameObject> pencilNodes = new List<GameObject>();
+
+        /// <summary>判定「点回第一个节点、构成闭合」的吸附半径（像素）。</summary>
+        private const float PencilCloseRadius = 14f;
+
+        /// <summary>判定「点在已有节点上、要拖它」的吸附半径（像素）。</summary>
+        private const float PencilNodeGrabRadius = 10f;
+
+        // ------------------------------------------------------------ 右键菜单
+        //
+        // **时间轴上右键 = 上下文菜单**，目标有三种：
+        //   · 点中模块（多边形/折叠条里）→ 模块操作（复制整组 / 删除模块 / 折叠 / 改名）
+        //   · 点中事件块 → 单块操作（复制 / 剪切 / 删除这个块）
+        //   · 点在空白处 → 时间轴操作（粘贴 / 全选之类）
+        //
+        // 菜单浮在**浮层画布**上（排序 32000），下面垫一层全屏透明挡板：
+        // 鼠标左键点任何地方先被挡板接住，收起菜单、不穿透到下面的块。
+
+        /// <summary>右键菜单的根节点。null = 当前没开。</summary>
+        private RectTransform moduleMenuRoot;
+
+        /// <summary>菜单下面那层全屏挡板（点它 = 关菜单）。</summary>
+        private RectTransform contextMenuBlocker;
+
+        /// <summary>菜单当前作用的模块（点中模块或点中块所属的模块时才有）。</summary>
+        private TimelineModule moduleMenuTarget;
+
+        /// <summary>菜单当前作用的事件块（点中块时才有）。</summary>
+        private LevelEvent contextMenuEvent;
+
+        private const float ModuleMenuRowHeight = 26f;
+        private const float ModuleMenuPadding = 6f;
+        private const float ModuleMenuWidth = 168f;
+
+        /// <summary>
+        /// 把模块整组的成员并进多选集。
+        ///
+        /// 菜单里的复制 / 剪切都靠它 —— 那两个函数读的是 `CollectSelection()`，
+        /// 而右键模块那一刻选中集可能还是空的（或者还是上一次点中的块）。
+        /// </summary>
+        private void SelectModuleMembers(TimelineModule module)
+        {
+            multiSelection.Clear();
+            selectedEvent = null;
+            if (module == null)
+            {
+                return;
+            }
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                BlockPlacement placement = blockPlacements[i];
+                if (placement == null || placement.Item == null
+                    || placement.Item.Event == null)
+                {
+                    continue;
+                }
+                if (!IsModuleMember(module, placement))
+                {
+                    continue;
+                }
+                multiSelection.Add(placement.Item.Event);
+            }
+            // 主选中给第一个，参数栏和单块操作都能立刻有落点。
+            foreach (LevelEvent levelEvent in multiSelection)
+            {
+                selectedEvent = levelEvent;
+                break;
+            }
+            MarkBlocksDirty();
+            visualsDirty = true;
+        }
+
+        /// <summary>
+        /// 时间轴上右键：按点中的东西弹不同的菜单。
+        ///
+        /// 判定顺序和点击一致：**先模块、再块、最后空白** ——
+        /// 模块的框通常比块大，先问它才不会出现"点在块上却弹了模块菜单"。
+        /// </summary>
+        private void ShowTimelineContextMenu(Vector2 screenPosition,
+            Vector2 localPoint)
+        {
+            TimelineModule module = ModuleAtLocal(localPoint);
+            LevelEvent blockEvent = FindBlockEventAtLocal(localPoint);
+
+            // **点中的模块在已选集合里 → 菜单针对整个选择集。**
+            //
+            // 用户的操作流：Ctrl 加选出几个相邻的，然后在其中任意一个上
+            // 右键，期望看到的是"对这几个一起做什么"。不在集合里就按单模块。
+            if (module != null && IsModuleSelected(module) && selectedModules.Count > 1)
+            {
+                ShowContextMenuFor(null, null, screenPosition, /*multiModules*/ true);
+                return;
+            }
+
+            if (module == null && blockEvent == null)
+            {
+                // 空白处也弹菜单 —— 至少要有粘贴。
+                ShowContextMenuFor(null, null, screenPosition);
+                return;
+            }
+            ShowContextMenuFor(module, blockEvent, screenPosition);
+        }
+
+        /// <summary>
+        /// 时间轴局部坐标下，最上面那一块的 LevelEvent。没有则 null。
+        ///
+        /// 宏观看的是 `blockViews`：它和绘制用的是同一份几何（时间 + 行号 + 最小宽度），
+        /// 所以"看得见就点得中"。
+        /// </summary>
+        private LevelEvent FindBlockEventAtLocal(Vector2 local)
+        {
+            float speed = Mathf.Max(1f, pixelsPerSecond);
+            float contentTop = RulerHeight - verticalScrollOffset;
+            float stride = BlockStridePixels;
+            float blockHeight = BlockHeightPixels;
+
+            LevelEvent found = null;
+            // 后画的在上，所以从后往前找第一个命中的。
+            for (int i = blockViews.Count - 1; i >= 0; i--)
+            {
+                BlockView block = blockViews[i];
+                float left = (block.Time - viewStartTime) * speed;
+                float width = Mathf.Max(BlockMinWidth,
+                    block.Duration * speed - BlockGap);
+                float top = contentTop + block.Row * stride;
+                if (local.x < left || local.x > left + width)
+                {
+                    continue;
+                }
+                if (local.y < top || local.y > top + blockHeight)
+                {
+                    continue;
+                }
+                found = block.Event;
+                break;
+            }
+            return found;
+        }
+
+        /// <summary>
+        /// 按目标种类建菜单。`module` 和 `evt` 都可以为 null（空白处）。
+        /// </summary>
+        /// <param name="multiModules">
+        /// true = 针对**整个模块选择集**建菜单（右键点在已选中的模块上时）。
+        /// 这时 `module` / `evt` 都传 null，菜单项从 `selectedModules` 取。
+        /// </param>
+        private void ShowContextMenuFor(TimelineModule module, LevelEvent evt,
+            Vector2 screenPosition, bool multiModules = false)
+        {
+            CloseModuleContextMenu();
+            moduleMenuTarget = module;
+            contextMenuEvent = evt;
+
+            EditorStudioOverlay overlay = Main.Overlay;
+            RectTransform layer = overlay == null ? null : overlay.PopupLayer;
+            if (layer == null)
+            {
+                return;
+            }
+
+            // **全屏挡板先建。** 它盖住整个浮层画布，左键点它就关菜单 ——
+            // 用户要的"右键后左键点任何地方都能取消"就是它。
+            contextMenuBlocker = CreateRect("ContextMenuBlocker", layer,
+                0f, 0f, layer.rect.width, layer.rect.height);
+            Image blockerImage = contextMenuBlocker.gameObject.AddComponent<Image>();
+            blockerImage.color = new Color(0f, 0f, 0f, 0f);
+            blockerImage.raycastTarget = true;
+            Button blockerButton = contextMenuBlocker.gameObject.AddComponent<Button>();
+            blockerButton.transition = Selectable.Transition.None;
+            blockerButton.onClick.AddListener(delegate { CloseModuleContextMenu(); });
+            // 中键在挡板上也要能收菜单。Button 只响应左键，所以补一个
+            // 中键的按下处理 —— 否则挡板会把中键吞掉（菜单不关、平移也不动）。
+            UiBlockerMiddleClick middleClick =
+                contextMenuBlocker.gameObject.AddComponent<UiBlockerMiddleClick>();
+            middleClick.OnPressed = delegate { CloseModuleContextMenu(); };
+            contextMenuBlocker.SetAsLastSibling();
+
+            moduleMenuRoot = CreateRect("ContextMenu", layer, 0f, 0f,
+                ModuleMenuWidth, 10f);
+            Image background = moduleMenuRoot.gameObject.AddComponent<Image>();
+            background.color = Palette.Panel;
+            background.raycastTarget = true;
+            if (roundedSprite != null)
+            {
+                background.sprite = roundedSprite;
+                background.type = Image.Type.Sliced;
+            }
+
+            float y = ModuleMenuPadding;
+            // **目标从闭包捕获** —— 菜单一关字段就清空了，而动作在关菜单之后跑。
+            TimelineModule targetModule = module;
+            LevelEvent targetEvent = evt;
+            // 多选时的快照 —— 动作执行前选择集可能已经被菜单关闭清掉。
+            List<TimelineModule> targetModules =
+                multiModules ? new List<TimelineModule>(selectedModules) : null;
+
+            if (multiModules && targetModules != null && targetModules.Count > 1)
+            {
+                // **多选模块的菜单：合并 / 复制整组 / 删除。**
+                int count = targetModules.Count;
+                AddModuleMenuRow("合并为 1 个模块（" + count + " 个）", ref y, false,
+                    delegate { MergeModules(targetModules); });
+                AddModuleMenuRow("复制这些模块的事件", ref y, false,
+                    delegate { DoModulesCopy(targetModules); });
+                AddModuleMenuRow("粘贴", ref y, false,
+                    delegate { DoModulePaste(); });
+                AddModuleMenuRow(string.Empty, ref y, true, null);
+                AddModuleMenuRow("删除这 " + count + " 个模块", ref y, true,
+                    delegate { DoModulesDelete(targetModules); });
+                AddModuleMenuRow(string.Empty, ref y, true, null);
+            }
+
+            if (targetModule != null)
+            {
+                AddModuleMenuRow("复制模块", ref y, false,
+                    delegate { DoModuleCopy(targetModule); });
+                AddModuleMenuRow("剪切模块", ref y, false,
+                    delegate { DoModuleCut(targetModule); });
+                AddModuleMenuRow("粘贴", ref y, false,
+                    delegate { DoModulePaste(); });
+                AddModuleMenuRow(string.Empty, ref y, true, null);
+                AddModuleMenuRow(targetModule.Collapsed ? "展开" : "折叠", ref y, false,
+                    delegate { ToggleModuleCollapsed(targetModule); });
+                AddModuleMenuRow("重命名", ref y, false,
+                    delegate { BeginModuleRename(targetModule); });
+                AddModuleMenuRow("删除模块", ref y, true,
+                    delegate
+                    {
+                        selectedModule = targetModule;
+                        DeleteSelectedModule();
+                    });
+                AddModuleMenuRow(string.Empty, ref y, true, null);
+            }
+
+            if (targetEvent != null)
+            {
+                AddModuleMenuRow("复制此事件", ref y, false,
+                    delegate { DoEventCopy(targetEvent); });
+                AddModuleMenuRow("剪切此事件", ref y, false,
+                    delegate { DoEventCut(targetEvent); });
+                if (targetModule == null)
+                {
+                    AddModuleMenuRow("粘贴", ref y, false,
+                        delegate { DoModulePaste(); });
+                }
+                AddModuleMenuRow("删除此事件", ref y, true,
+                    delegate { DoEventDelete(targetEvent); });
+            }
+            else if (targetModule == null)
+            {
+                // 空白处：至少要能粘贴。
+                AddModuleMenuRow("粘贴到播放头", ref y, false,
+                    delegate { DoModulePaste(); });
+                AddModuleMenuRow("全选事件块", ref y, false,
+                    delegate { SelectAllBlocks(); });
+            }
+
+            moduleMenuRoot.sizeDelta = new Vector2(ModuleMenuWidth,
+                y + ModuleMenuPadding);
+
+            // 位置：跟着鼠标，别出屏幕。
+            Vector2 local;
+            if (!RectTransformUtility.ScreenPointToLocalPointInRectangle(
+                layer, screenPosition, null, out local))
+            {
+                local = Vector2.zero;
+            }
+            Rect layerRect = layer.rect;
+            float x = local.x - layerRect.xMin;
+            float top = layerRect.yMax - local.y;
+            float width = ModuleMenuWidth;
+            float height = moduleMenuRoot.sizeDelta.y;
+            if (x + width > layerRect.width - 6f)
+            {
+                x = Mathf.Max(6f, layerRect.width - 6f - width);
+            }
+            if (x < 6f)
+            {
+                x = 6f;
+            }
+            if (top + height > layerRect.height - 6f)
+            {
+                top = Mathf.Max(6f, layerRect.height - 6f - height);
+            }
+            SetTopLeft(moduleMenuRoot, x, top, width, height);
+            moduleMenuRoot.SetAsLastSibling();
+        }
+
+        /// <summary>全选当前时间轴上所有可见车道的块。</summary>
+        private void SelectAllBlocks()
+        {
+            multiSelection.Clear();
+            selectedEvent = null;
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                BlockPlacement placement = blockPlacements[i];
+                if (placement != null && placement.Item != null
+                    && placement.Item.Event != null)
+                {
+                    multiSelection.Add(placement.Item.Event);
+                }
+            }
+            foreach (LevelEvent levelEvent in multiSelection)
+            {
+                selectedEvent = levelEvent;
+                break;
+            }
+            SetTransientStatus("已选中 " + multiSelection.Count + " 个事件", 3f);
+            MarkBlocksDirty();
+            visualsDirty = true;
+        }
+
+        private void DoEventCopy(LevelEvent target)
+        {
+            if (target == null)
+            {
+                return;
+            }
+            multiSelection.Clear();
+            multiSelection.Add(target);
+            selectedEvent = target;
+            MarkBlocksDirty();
+            int copied = CopySelection();
+            SetTransientStatus(copied <= 0
+                ? (owner != null && !owner.AllowEdit()
+                    ? EditorStudioOverlay.ReadOnlyEditMessage
+                    : "复制失败")
+                : "已复制 1 个事件", 3f);
+        }
+
+        private void DoEventCut(LevelEvent target)
+        {
+            if (target == null)
+            {
+                return;
+            }
+            multiSelection.Clear();
+            multiSelection.Add(target);
+            selectedEvent = target;
+            MarkBlocksDirty();
+            string status;
+            if (!CutSelection(out status))
+            {
+                SetTransientStatus(status == null ? "剪切失败" : status, 3f);
+                return;
+            }
+            SetTransientStatus(status, 3f);
+        }
+
+        private void DoEventDelete(LevelEvent target)
+        {
+            if (target == null)
+            {
+                return;
+            }
+            multiSelection.Clear();
+            multiSelection.Add(target);
+            selectedEvent = target;
+            string status;
+            if (!DeleteSelection(out status))
+            {
+                SetTransientStatus(status == null ? "删除失败" : status, 3f);
+                return;
+            }
+            SetTransientStatus(status, 3f);
+        }
+
+        /// <summary>右键模块时弹出的操作菜单（保留：给旧调用点用）。</summary>
+        private void ShowModuleContextMenu(TimelineModule module, Vector2 screenPosition)
+        {
+            if (module == null)
+            {
+                return;
+            }
+            ShowContextMenuFor(module, null, screenPosition);
+        }
+
+        /// <summary>往菜单里加一行。`danger` 用危险色，空标题 = 一条分割线。</summary>
+        private void AddModuleMenuRow(string label, ref float y,
+            bool danger, Action action)
+        {
+            if (string.IsNullOrEmpty(label))
+            {
+                CreateImage("ModuleMenuSep", moduleMenuRoot, 8f,
+                    y + 4f, ModuleMenuWidth - 16f, 1f, Palette.PanelRule);
+                y += 9f;
+                return;
+            }
+
+            Button row = CreateButton("ModuleMenu_" + label, moduleMenuRoot, 4f, y,
+                ModuleMenuWidth - 8f, ModuleMenuRowHeight, label,
+                delegate
+                {
+                    // **先关菜单，再执行动作。** 反过来的话菜单一直挡在屏幕上，
+                    // 而重命名要往同一位置盖输入框、删除要改选择集 —— 都会互相打架。
+                    CloseModuleContextMenu();
+                    if (action != null)
+                    {
+                        action();
+                    }
+                });
+            TextMeshProUGUI text = row.GetComponentInChildren<TextMeshProUGUI>();
+            if (text != null)
+            {
+                text.fontSize = 12.5f;
+                text.alignment = TextAlignmentOptions.MidlineLeft;
+                text.color = danger ? UiTheme.Current.FeedbackDanger : Palette.TextPrimary;
+            }
+            y += ModuleMenuRowHeight;
+        }
+
+        private void CloseModuleContextMenu()
+        {
+            if (moduleMenuRoot != null)
+            {
+                Destroy(moduleMenuRoot.gameObject);
+                moduleMenuRoot = null;
+            }
+            if (contextMenuBlocker != null)
+            {
+                Destroy(contextMenuBlocker.gameObject);
+                contextMenuBlocker = null;
+            }
+            moduleMenuTarget = null;
+            contextMenuEvent = null;
+        }
+
+        /// <summary>菜单开着的时候点别处 / 按 Esc 就收起。</summary>
+        private void TickModuleContextMenu()
+        {
+            // **右键兜底：`OnPointerDown` 收不到右键时的第二条路。**
+            //
+            // 块身上挂着 Button，它自己实现了 IPointerDownHandler，
+            // 从块上按下右键时事件被它吃掉 —— 视图那条 `OnPointerDown`
+            // 可能压根不跑（左键能到是另一回事，右键不一定）。
+            // 这里用 `Input.GetMouseButtonDown(1)` 兜一层：谁接住都行，
+            // 用 `moduleRightClickHandledFrame` 防同一次按下被处理两遍。
+            if (Input.GetMouseButtonDown(1)
+                && Time.frameCount != moduleRightClickHandledFrame
+                && !modulePencilActive
+                && viewport != null
+                && RectTransformUtility.RectangleContainsScreenPoint(
+                    viewport, Input.mousePosition, null))
+            {
+                float rx;
+                float ry;
+                if (TryGetViewportPoint(Input.mousePosition, out rx, out ry))
+                {
+                    moduleRightClickHandledFrame = Time.frameCount;
+                    ShowTimelineContextMenu(Input.mousePosition, new Vector2(rx, ry));
+                }
+            }
+
+            // **左键 / 中键点任何地方都关菜单，但点在菜单自己身上要放行。**
+            //
+            // 这里踩过一次坑：原来无条件关，结果 `Update` 比 `EventSystem` 早跑，
+            // 鼠标一按下菜单就被销毁 —— 而 `Button.onClick` 是在**松手**时才触发的，
+            // 到那时按钮已经不存在了，所以**菜单项一次都点不中**
+            // （症状就是「右键无法复制，状态栏啥都没打」）。
+            //
+            // 现在先判"点在不在菜单矩形里"：在就交给 Button 自己处理；
+            // 不在才关。
+            if (moduleMenuRoot != null
+                && (Input.GetMouseButtonDown(0) || Input.GetMouseButtonDown(2)))
+            {
+                bool overMenu = RectTransformUtility.RectangleContainsScreenPoint(
+                    moduleMenuRoot, Input.mousePosition, null);
+                if (!overMenu)
+                {
+                    CloseModuleContextMenu();
+                }
+            }
+
+            if (moduleMenuRoot == null)
+            {
+                return;
+            }
+            if (Input.GetKeyDown(KeyCode.Escape))
+            {
+                CloseModuleContextMenu();
+            }
+        }
+
+        /// <summary>这一帧的右键已经由 `OnPointerDown` 处理过了，兜底那条别再跑。</summary>
+        private int moduleRightClickHandledFrame = -1;
+
+        private void ResetModuleRightClickWatch()
+        {
+            moduleRightClickHandledFrame = Time.frameCount;
+        }
+
+        // ------------------------------------------------- 菜单动作
+        //
+        // **模块目标一律从参数传进来**，不从字段读 —— 菜单一关就会清字段，
+        // 而这些动作都是在关菜单之后才跑的。
+
+        private void DoModuleCopy(TimelineModule module)
+        {
+            if (module == null)
+            {
+                return;
+            }
+            SelectModuleMembers(module);
+            int copied = CopySelection();
+            SetTransientStatus(copied <= 0
+                ? "模块里没有可复制的事件"
+                : "已复制 " + copied + " 个事件", 3f);
+        }
+
+        private void DoModuleCut(TimelineModule module)
+        {
+            if (module == null)
+            {
+                return;
+            }
+            SelectModuleMembers(module);
+            string status;
+            if (!CutSelection(out status))
+            {
+                SetTransientStatus(status == null ? "剪切失败" : status, 3f);
+                return;
+            }
+            SetTransientStatus(status, 3f);
+        }
+
+        private void DoModulePaste()
+        {
+            string status;
+            if (!PasteAtPlayhead(out status))
+            {
+                SetTransientStatus(status == null ? "剪贴板是空的" : status, 3f);
+                return;
+            }
+            SetTransientStatus(status, 3f);
+        }
+
+        /// <summary>状态条提示（走面板那份，和时间轴其它提示同一个位置）。</summary>
+        private void SetTransientStatus(string status, float seconds)
+        {
+            if (owner != null && !string.IsNullOrEmpty(status))
+            {
+                owner.SetTransientStatus(status, seconds);
+            }
+        }
+
+        // ------------------------------------------------------------ 模块拖动
+
+        /// <summary>正在拖的模块。</summary>
+        private TimelineModule draggingModule;
+
+        /// <summary>拖动起点（局部坐标）。</summary>
+        private Vector2 moduleDragStart;
+
+        /// <summary>拖动开始时每个成员的原始状态（走现有的 DragOrigin，撤销靠它）。</summary>
+        private readonly List<DragOrigin> moduleDragOrigins = new List<DragOrigin>();
+
+        /// <summary>拖动起点处模块所有多边形顶点的副本（模块坐标）。</summary>
+        private readonly List<Vector2> moduleDragPolygonOrigin = new List<Vector2>();
+
+        /// <summary>
+        /// 按下时整张模块表的快照。松手时和当前状态一起入撤销栈 ——
+        /// 块的位移本身已经有记录，但**框的位移没有**，所以整表快照补上这一块。
+        /// </summary>
+        private List<EditorCommandHistory.ModuleSnapshot> moduleDragSnapshotBefore;
+
+        /// <summary>拖出这个像素数才算拖动，避免点击时手抖被判成拖动。</summary>
+        private const float ModuleDragThreshold = 3f;
+
+        private bool moduleDragMoved;
+
+
+        /// <summary>上一次点中的模块与时刻 —— 用来判双击（折叠/展开）。</summary>
+        private TimelineModule lastModuleClickTarget;
+        private float lastModuleClickTime = float.NegativeInfinity;
+
+        /// <summary>
+        /// 被「双击拎出来」的那个事件 —— 拖它时只拖它自己，不拖整个模块。
+        ///
+        /// 模块里的块默认是"拖一个 = 拖整组"，那样永远没法单独微调某一个。
+        /// 双击某个块就把这一个从组拖里摘出来，直到下一次选中变化。
+        /// </summary>
+        private LevelEvent detachedEvent;
+
+        /// <summary>上一次点中的块与时刻 —— 用来判双击（把块从模块里拎出来）。</summary>
+        private LevelEvent lastBlockClickEvent;
+        private float lastBlockClickTime = float.NegativeInfinity;
+
+        internal LevelEvent DetachedEvent
+        {
+            get { return detachedEvent; }
+        }
+
+        /// <summary>从块上按下时转交给模块拖动（见 TimelineBlockDrag.OnBeginDrag）。</summary>
+        internal void BeginModuleDragFromBlock(TimelineModule module, Vector2 local)
+        {
+            BeginModuleDrag(module, local);
+        }
+
+        /// <summary>
+        /// 正在拖模块。块上的 `TimelineBlockDrag` 靠它判断要不要把后续的
+        /// `OnDrag` / `OnEndDrag` 转交给视图 —— 指针按在块上时，事件不会
+        /// 自动跑去视图那边。
+        /// </summary>
+        internal bool ModuleDragActive
+        {
+            get { return draggingModule != null; }
+        }
+
+
+        /// <summary>一个模块的运行时状态。</summary>
+        internal sealed class TimelineModule
+        {
+            internal string Name = "";
+
+            /// <summary>多边形顶点，时间轴内容坐标。X = 秒，Y = 行空间像素。</summary>
+            internal readonly List<Vector2> Points = new List<Vector2>();
+
+            internal bool Collapsed;
+
+            /// <summary>
+            /// 成员的事件身份。**这是纯缓存，不是真相。**
+            ///
+            /// 真相是几何：`多边形 + 块矩形`，由 `EnsureModuleMembersRebuilt`
+            /// 在脏帧整表重建。这里存身份只是为了别的地方能 O(1) 查
+            /// 「这块属于谁」，以及在折叠时快速判断"这块要不要画"。
+            ///
+            /// **绝对不要往这里写业务逻辑** —— 身份键里带着起点时间和参数哈希，
+            /// 拖动 / 改参数 / 粘贴都会让它过期。以前每个用到它的地方各写一套
+            /// "查不到就按几何兜底"，兜底之间互不知情，bug 一个接一个。
+            /// 现在只有 `EnsureModuleMembersRebuilt` 一处写它。
+            /// </summary>
+            internal readonly HashSet<string> Members = new HashSet<string>();
+
+            /// <summary>
+            /// 画布上的可见框（屏幕/视口坐标），每帧由多边形重新算。
+            ///
+            /// 折叠时用它画那条「一行高」的横条，展开时用来判断点击/悬停落没落在
+            /// 模块里。为空表示这一帧还没算（不可见）。
+            /// </summary>
+            internal Rect ScreenBounds;
+            internal bool ScreenBoundsValid;
+
+            /// <summary>折叠后那条横条的名字文本，指向模块自己。</summary>
+            internal GameObject CollapsedLabel;
+            internal TextMeshProUGUI CollapsedText;
+
+            /// <summary>
+            /// 折叠后那块**实心圆角矩形**。展开时收掉。
+            ///
+            /// 单独一个 `Image` 而不是走 `moduleGraphic` 的多边形：那个组件只能
+            /// 填多边形 + 描边，画不出圆角。折叠条本来就是个矩形，用 Image
+            /// 还能直接吃 `roundedSprite` 的九宫格，圆角不会随宽度拉伸变形。
+            /// </summary>
+            internal RectTransform CollapsedBar;
+            internal Image CollapsedBarImage;
+
+            /// <summary>折叠条常驻的那圈描边（饱和橙）。</summary>
+            internal Image CollapsedBarEdge;
+
+            /// <summary>折叠条选中时那圈亮边（子节点，叠在上面）。</summary>
+            internal Image CollapsedBarOutline;
+        }
+
+        /// <summary>
+        /// 模块是否已经加载过。`false` = 这张谱还没有模块表，别拿空表去覆盖。
+        /// 和 `projectRows` 的 null 语义同源，但这里是「已经读过、可能为空」。
+        /// </summary>
+        private bool modulesLoaded;
+
+        /// <summary>
         /// 上一次认的谱面路径。用来判断「换谱面了没有」—— 见 `EnsureBlockPlacements`。
         /// </summary>
         private string projectChartPath;
@@ -3303,6 +4567,17 @@ private static float MinimumPixelsPerSecond
             // 行号一路涨到几百。表现就是**换谱之后事件全没了**（全排到下面去了）。
             placementsChart = null;
 
+            // **换谱面必须先把模块清掉。**
+            //
+            // 上一张谱的模块是按它的块身份建的，挂到新谱上只会对不上。
+            // 这一句要放在两个 early return **之前** —— 放在载入成功那条路上
+            // 的话，换到一张没有工程的谱时旧模块会原样留着。
+            ClearModuleViews();
+            modules.Clear();
+            modulesLoaded = false;
+            selectedModule = null;
+            selectedModules.Clear();
+
             if (string.IsNullOrEmpty(chartPath))
             {
                 return;
@@ -3326,7 +4601,2656 @@ private static float MinimumPixelsPerSecond
                 return;
             }
             projectRows = project.Rows;
-            Main.Logger.Log("[工程] 载入 " + project.Rows.Count + " 条位置记录：" + path);
+            LoadModulesFrom(project);
+            Main.Logger.Log("[工程] 载入 " + project.Rows.Count + " 条位置记录、"
+                + modules.Count + " 个模块：" + path);
+        }
+
+        /// <summary>
+        /// 从工程对象里把模块搬进运行时状态。
+        ///
+        /// 换谱面时必须先清空 —— 否则上一张谱的模块会挂到新谱的块上。
+        /// </summary>
+        private void LoadModulesFrom(EditorProjectFile.Project project)
+        {
+            ClearModuleViews();
+            modules.Clear();
+            modulesLoaded = true;
+
+            if (project == null || project.Modules == null)
+            {
+                moduleMembersDirty = true;
+                return;
+            }
+
+            for (int i = 0; i < project.Modules.Count; i++)
+            {
+                EditorProjectFile.ProjectModule source = project.Modules[i];
+                if (source == null || source.PointsX == null || source.PointsY == null)
+                {
+                    continue;
+                }
+                int count = Mathf.Min(source.PointsX.Count, source.PointsY.Count);
+                if (count < 3)
+                {
+                    // 少于三点围不成区域（`TryLoad` 已经筛过一遍，
+                    // 这里再挡一道，防止运行时手动构造出来的坏数据）。
+                    continue;
+                }
+
+                TimelineModule module = new TimelineModule
+                {
+                    Name = source.Name ?? string.Empty,
+                    Collapsed = source.Collapsed
+                };
+                for (int p = 0; p < count; p++)
+                {
+                    module.Points.Add(new Vector2(source.PointsX[p], source.PointsY[p]));
+                }
+                // **不读旧文件里的成员表** —— 归属由几何决定（见
+                // `TimelineModule.Members` 的说明）。
+                modules.Add(module);
+            }
+            // 模块表换了：下一帧按几何重建一遍成员。
+            moduleMembersDirty = true;
+        }
+
+        /// <summary>把运行时模块塞进工程对象，准备写盘。</summary>
+        private void WriteModulesTo(EditorProjectFile.Project project)
+        {
+            if (project == null)
+            {
+                return;
+            }
+            project.Modules = new List<EditorProjectFile.ProjectModule>(modules.Count);
+            for (int i = 0; i < modules.Count; i++)
+            {
+                TimelineModule module = modules[i];
+                if (module == null || module.Points.Count < 3)
+                {
+                    continue;
+                }
+                EditorProjectFile.ProjectModule target = new EditorProjectFile.ProjectModule
+                {
+                    Name = module.Name ?? string.Empty,
+                    Collapsed = module.Collapsed
+                };
+                for (int p = 0; p < module.Points.Count; p++)
+                {
+                    target.PointsX.Add(module.Points[p].x);
+                    target.PointsY.Add(module.Points[p].y);
+                }
+                // **成员表不写盘** —— 归属由几何决定，存下来也没人读，
+                // 反而会和实际位置打架（见 `ProjectModule.Members` 的说明）。
+                project.Modules.Add(target);
+            }
+        }
+
+        // ------------------------------------------------------------ 铅笔工具
+
+        /// <summary>
+        /// 开关铅笔模式。
+        ///
+        /// 切换时把半成品清掉 —— 画到一半切走再切回来，留着几个孤零零的节点
+        /// 只会让人困惑（"这些点哪来的"）。
+        /// </summary>
+        /// <summary>
+        /// 铅笔开着就退出，返回 true 表示这一下 Esc 已经被吃掉了。
+        ///
+        /// 给 `EditorStudioOverlay` 的 Esc 链最前面用 —— 那个链的最后一支是
+        /// 「关工作台」，铅笔不先吃掉的话，画到一半按 Esc 会连工作台一起关掉。
+        /// </summary>
+        internal bool CancelModulePencilIfActive()
+        {
+            if (!modulePencilActive)
+            {
+                return false;
+            }
+            SetModulePencilActive(false);
+            return true;
+        }
+
+        private void ToggleModulePencil()
+        {
+            // 模块要存进 `.aesprj`，而工程只在编辑模式下才有 —— 只读时
+            // 画出来的分组没地方落盘，等于白画。拦在这里并说一声。
+            if (!modulePencilActive && !CanEditChart())
+            {
+                return;
+            }
+            SetModulePencilActive(!modulePencilActive);
+        }
+
+        private void SetModulePencilActive(bool active)
+        {
+            if (modulePencilActive == active)
+            {
+                return;
+            }
+            modulePencilActive = active;
+            ClearPencilDraft();
+            ApplyModulePencilIcon();
+
+            // 块层让路：铅笔模式下的点击必须落到视图自己身上（见 blockLayerGroup）。
+            if (blockLayerGroup != null)
+            {
+                blockLayerGroup.blocksRaycasts = !active;
+            }
+
+            if (active)
+            {
+                // 进铅笔就先把普通选中清掉：那时候左键已经不选块了，
+                // 留着旧选中只会让参数栏显示一批"动不了"的东西。
+                ClearAllSelection();
+                selectedModule = null;
+                selectedModules.Clear();
+            }
+        }
+
+        /// <summary>
+        /// 铅笔按钮：底色跟着开/关变，图标是运行时按矢量路径生成的那支笔。
+        ///
+        /// 图标以**白色**生成，这里只改 `Image.color` 上色 —— 换调色板时
+        /// 不用重新生成贴图。
+        /// </summary>
+        private void ApplyModulePencilIcon()
+        {
+            if (moduleButton == null)
+            {
+                return;
+            }
+            Image background = moduleButton.targetGraphic as Image;
+            if (background != null)
+            {
+                background.color = modulePencilActive ? Selected : ButtonNormal;
+            }
+
+            if (modulePencilImage == null)
+            {
+                // 第一次进来时把图标挂上去：居中、按比例缩放、不接射线。
+                RectTransform host = moduleButton.GetComponent<RectTransform>();
+                Image icon = CreateImage("ModulePencilIcon", host, 6f, 6f,
+                    Mathf.Max(8f, host.sizeDelta.x - 12f),
+                    Mathf.Max(8f, host.sizeDelta.y - 12f), Palette.TextSecondary);
+                icon.preserveAspect = true;
+                icon.raycastTarget = false;
+                icon.sprite = UiTimelineModuleIcon.Get();
+                modulePencilImage = icon;
+            }
+
+            modulePencilImage.color = modulePencilActive
+                ? Palette.TextPrimary
+                : Palette.TextSecondary;
+            // 关着时压一点，开的时候满亮 —— 和旁边几颗模式按钮同一套明暗关系。
+            modulePencilImage.color = modulePencilActive
+                ? Palette.TextPrimary
+                : new Color(Palette.TextSecondary.r, Palette.TextSecondary.g,
+                    Palette.TextSecondary.b, 0.85f);
+        }
+
+        /// <summary>铅笔图标的那张 Image（生成一次就复用）。</summary>
+        private Image modulePencilImage;
+
+        /// <summary>
+        /// 每帧让铅笔预览跟上鼠标：橡皮筋从最后一个节点连到光标。
+        ///
+        /// 没在时间轴上就不画橡皮筋（不传光标），但已落的点和折线照旧 ——
+        /// 用户抬头看别处时不该整圈消失。
+        /// </summary>
+        private void TickPencilCursor()
+        {
+            EnsurePencilLayer();
+            if (pencilLayer == null)
+            {
+                return;
+            }
+            // 视图层级要跟上：面板变宽变高之后，预览层还按旧尺寸建的。
+            if (pencilLayer.sizeDelta.x < bodyWidth - 0.5f
+                || pencilLayer.sizeDelta.y < bodyHeight - 0.5f)
+            {
+                pencilLayer.sizeDelta = new Vector2(
+                    Mathf.Max(pencilLayer.sizeDelta.x, bodyWidth),
+                    Mathf.Max(pencilLayer.sizeDelta.y, bodyHeight));
+            }
+
+            Vector2 cursor;
+            bool valid = TryGetViewportPoint(Input.mousePosition, out cursor)
+                && cursor.x >= 0f && cursor.y >= RulerHeight
+                && cursor.x <= bodyWidth;
+            RedrawPencilDraft(valid ? (Vector2?)cursor : null);
+
+            if (pencilPoints.Count > 0)
+            {
+                RebuildPencilNodes();
+            }
+        }
+
+        /// <summary>丢掉正在进行的那一圈点。</summary>
+        private void ClearPencilDraft()
+        {
+            pencilPoints.Clear();
+            pencilDragIndex = -1;
+            ClearPencilNodes();
+            if (pencilGraphic != null)
+            {
+                pencilGraphic.BeginShapes();
+                pencilGraphic.SubmitShapes();
+            }
+        }
+
+        private void ClearPencilNodes()
+        {
+            for (int i = 0; i < pencilNodes.Count; i++)
+            {
+                if (pencilNodes[i] != null)
+                {
+                    Destroy(pencilNodes[i]);
+                }
+            }
+            pencilNodes.Clear();
+        }
+
+        /// <summary>
+        /// 把一个自由坐标**吸到格子上**。
+        ///
+        /// 用户反馈：自由落点画出来常常尖尖的、歪歪扭扭，很难看。改成逐格步进 ——
+        /// X 吸到最近的格边界（走现成的 `SnapBlockTime`），Y 吸到最近的整行。
+        /// 于是不管手怎么抖，落下来的点永远在格线上。
+        /// </summary>
+        /// <summary>
+        /// 铅笔落点吸附：**横向按四分之一格、纵向按四分之一行**。
+        ///
+        /// 原来横向吸到整格边界（`SnapBlockTime`），画出来的框只能贴着格线走 ——
+        /// 想框住半格里的东西就得把框画得特别大。用户要"一格能分四格步进"，
+        /// 所以这里在相邻两格之间再插三个点。
+        ///
+        /// 纵向同理：行号是浮点，原来 `Round` 成整数，只能落在行边界上；
+        /// 现在按 1/4 行取整。
+        ///
+        /// **只在铅笔这里细分**，块拖动 / 模块拖动的吸附不受影响 ——
+        /// 那些是"把东西放在格子上"，本来就该整数；这里是"画一个框"，
+        /// 边界位置没有必须落在格线上的理由。
+        /// </summary>
+        private Vector2 SnapPencilPoint(Vector2 modulePoint)
+        {
+            float snappedTime = SnapPencilTime(modulePoint.x);
+            float snappedRow = Mathf.Round(modulePoint.y * PencilRowSteps) / PencilRowSteps;
+            return new Vector2(snappedTime, snappedRow);
+        }
+
+        /// <summary>格子细分度：一格分四格。</summary>
+        private const int PencilCellSteps = 4;
+
+        /// <summary>行的细分度：一行分四格。</summary>
+        private const float PencilRowSteps = 4f;
+
+        /// <summary>
+        /// 把一个时间吸到**四分之一格**的边界上。
+        ///
+        /// 找前后相邻两格，在它们之间按 1/4 等分，取最近的那个分界点。
+        /// 关掉吸附（`SnapDragEnabled == false`）时原样返回。
+        /// </summary>
+        private float SnapPencilTime(float time)
+        {
+            if (!SnapDragEnabled)
+            {
+                return Mathf.Max(0f, time);
+            }
+
+            scnEditor editor = scnEditor.instance;
+            if (editor == null || editor.floors == null || editor.floors.Count == 0)
+            {
+                return Mathf.Max(0f, time);
+            }
+
+            List<scrFloor> floors = editor.floors;
+            int index = LowerBoundFloors(floors, time);
+            if (index <= 0)
+            {
+                return 0f;
+            }
+            if (index >= floors.Count)
+            {
+                return Convert.ToSingle(floors[floors.Count - 1].entryTime);
+            }
+
+            float before = Convert.ToSingle(floors[index - 1].entryTime);
+            float after = Convert.ToSingle(floors[index].entryTime);
+            float span = after - before;
+            if (span <= 1e-5f)
+            {
+                return before;
+            }
+            // 在这两格之间按 1/4 等分，取最接近的那一条。
+            float ratio = (time - before) / span;
+            int step = Mathf.RoundToInt(ratio * PencilCellSteps);
+            if (step < 0)
+            {
+                step = 0;
+            }
+            if (step > PencilCellSteps)
+            {
+                step = PencilCellSteps;
+            }
+            return before + span * step / PencilCellSteps;
+        }
+
+        /// <summary>
+        /// 铅笔模式下按下左键：拿到已有节点上就拖它，否则落一个新节点；
+        /// 落在第一个节点附近则视为闭合、生成模块。
+        /// </summary>
+        private void HandlePencilPointerDown(Vector2 local)
+        {
+            // 先看有没有踩到已落的节点上（含第一个 —— 那是"闭合"）。
+            for (int i = 0; i < pencilPoints.Count; i++)
+            {
+                Vector2 nodeLocal = ModulePointToLocal(pencilPoints[i]);
+                if ((nodeLocal - local).sqrMagnitude
+                    > PencilNodeGrabRadius * PencilNodeGrabRadius)
+                {
+                    continue;
+                }
+
+                if (i == 0 && pencilPoints.Count >= 3)
+                {
+                    // 点回第一个节点 = 闭合。至少三个点才围得出区域。
+                    FinishModulePolygon();
+                    return;
+                }
+
+                // 其它节点：开始拖它。
+                pencilDragIndex = i;
+                return;
+            }
+
+            // 空处：落一个新节点（吸到格上）。
+            pencilPoints.Add(SnapPencilPoint(LocalToModulePoint(local)));
+            RebuildPencilNodes();
+            RedrawPencilDraft();
+        }
+
+        /// <summary>铅笔模式下拖动：正在拖节点就改它的位置，否则只更新预览线。</summary>
+        private void HandlePencilPointerDrag(Vector2 local)
+        {
+            if (pencilDragIndex >= 0 && pencilDragIndex < pencilPoints.Count)
+            {
+                // 拖节点也吸格 —— 用户要的是"逐格步进"，不是"能拖到任意位置"。
+                pencilPoints[pencilDragIndex] = SnapPencilPoint(LocalToModulePoint(local));
+                RebuildPencilNodes();
+            }
+            RedrawPencilDraft(local);
+        }
+
+        /// <summary>铅笔模式下松手：结束节点拖动。</summary>
+        private void HandlePencilPointerUp()
+        {
+            pencilDragIndex = -1;
+            RedrawPencilDraft();
+        }
+
+        /// <summary>
+        /// 重画铅笔预览：已落的点连成折线，再加一条从最后一点到鼠标的橡皮筋。
+        /// </summary>
+        private void RedrawPencilDraft()
+        {
+            RedrawPencilDraft(null);
+        }
+
+        private void RedrawPencilDraft(Vector2? cursorLocal)
+        {
+            if (pencilGraphic == null || pencilLayer == null)
+            {
+                return;
+            }
+
+            pencilGraphic.BeginShapes();
+            if (pencilPoints.Count >= 2)
+            {
+                moduleScratch.Clear();
+                for (int i = 0; i < pencilPoints.Count; i++)
+                {
+                    moduleScratch.Add(ModulePointToLocal(pencilPoints[i]));
+                }
+                Color accent = Palette.Accent;
+                Color stroke = new Color(accent.r, accent.g, accent.b, 0.9f);
+                // 用"描边宽、填充近乎没有"来表达"这还不是模块"。
+                Color fill = new Color(accent.r, accent.g, accent.b, 0.04f);
+                pencilGraphic.AddShape(moduleScratch, fill, stroke, 2f);
+            }
+
+            // 橡皮筋：从最后一个节点到鼠标（也吸格，让人看见下一步会落在哪）。
+            if (cursorLocal.HasValue && pencilPoints.Count > 0)
+            {
+                Vector2 from = ModulePointToLocal(pencilPoints[pencilPoints.Count - 1]);
+                Vector2 snapped = SnapPencilPoint(LocalToModulePoint(cursorLocal.Value));
+                Vector2 to = ModulePointToLocal(snapped);
+                if ((to - from).sqrMagnitude > 4f)
+                {
+                    moduleScratch.Clear();
+                    // 一条细长四边形（宽 2）—— 复用同一个 Graphic，不再建 Image。
+                    Vector2 delta = to - from;
+                    float length = delta.magnitude;
+                    Vector2 normal = new Vector2(-delta.y, delta.x) / length * 1f;
+                    moduleScratch.Add(from - normal);
+                    moduleScratch.Add(from + normal);
+                    moduleScratch.Add(to + normal);
+                    moduleScratch.Add(to - normal);
+                    Color accent = Palette.Accent;
+                    Color dashed = new Color(accent.r, accent.g, accent.b, 0.4f);
+                    pencilGraphic.AddShape(moduleScratch, dashed, dashed, 1f);
+                }
+            }
+
+            pencilGraphic.SubmitShapes();
+        }
+
+        /// <summary>每个节点画一个小圆点，好让人看清落点在哪。</summary>
+        private void RebuildPencilNodes()
+        {
+            EnsurePencilLayer();
+            while (pencilNodes.Count < pencilPoints.Count)
+            {
+                RectTransform dot = CreateRect("PencilNode" + pencilNodes.Count,
+                    pencilLayer, 0f, 0f, 10f, 10f);
+                Image image = dot.gameObject.AddComponent<Image>();
+                image.color = Palette.Accent;
+                image.raycastTarget = false;
+                pencilNodes.Add(dot.gameObject);
+            }
+            while (pencilNodes.Count > pencilPoints.Count)
+            {
+                int last = pencilNodes.Count - 1;
+                if (pencilNodes[last] != null)
+                {
+                    Destroy(pencilNodes[last]);
+                }
+                pencilNodes.RemoveAt(last);
+            }
+
+            for (int i = 0; i < pencilPoints.Count; i++)
+            {
+                Vector2 local = ModulePointToLocal(pencilPoints[i]);
+                SetTopLeft(pencilNodes[i].GetComponent<RectTransform>(),
+                    local.x - 5f, local.y - 5f, 10f, 10f);
+            }
+        }
+
+        private void EnsurePencilLayer()
+        {
+            if (pencilLayer != null || viewport == null)
+            {
+                return;
+            }
+            pencilLayer = CreateRect("PencilLayer", viewport, 0f, 0f, bodyWidth, bodyHeight);
+            pencilGraphic = pencilLayer.gameObject.AddComponent<ModulePolygonGraphic>();
+            pencilGraphic.raycastTarget = false;
+            pencilLayer.SetAsLastSibling();
+        }
+
+        /// <summary>
+        /// 闭合了：把这一圈点变成一个模块。
+        ///
+        /// 生成之后按新几何重算成员 —— 判据是「块中心在圈内」。
+        /// </summary>
+        private void FinishModulePolygon()
+        {
+            if (pencilPoints.Count < 3)
+            {
+                ClearPencilDraft();
+                return;
+            }
+
+            // 画之前的模块表 —— 这次操作要能整条撤回去。
+            List<EditorCommandHistory.ModuleSnapshot> moduleSnapshotBefore =
+                CaptureModuleSnapshot();
+
+            // **原样保留多边形**（和 PS 钢笔一样），只是每个点都已经吸到格上 ——
+            // 所以边框该直的直、该拐的拐，只是不会再有歪歪扭扭的小尖角。
+            TimelineModule module = new TimelineModule
+            {
+                Name = string.Empty,
+                Collapsed = false
+            };
+            for (int i = 0; i < pencilPoints.Count; i++)
+            {
+                module.Points.Add(pencilPoints[i]);
+            }
+
+            // **压扁到零面积就没法用了，撑开一点。**
+            //
+            // 点都吸到整行之后，横向画一圈（或者只在一行里点）会让全部顶点的
+            // Y 变成同一个整数 —— 多边形退化成一条线，`PointInPolygon` 判不进
+            // 任何块，模块就是空的（表现：拖不动，因为没成员可拖）。
+            // 这里给纵向兜一个最小值：至少一行高。
+            ExpandDegenerateModule(module);
+
+            modules.Add(module);
+
+            ClearPencilDraft();
+            // 置脏就行 —— 下一次用到成员的地方会整表重建（见 `EnsureModuleMembersRebuilt`）。
+            moduleMembersDirty = true;
+            selectedModule = module;
+
+            // 画完自动退回选择模式 —— 用户要的是"画一个"，不是"一直画"。
+            SetModulePencilActive(false);
+
+            // **画圈本身要能撤销。** 成员表也跟着一起记 —— 撤销之后
+            // 再重做，圈和它认下的块必须是同一份状态。
+            EditorCommandHistory.RecordModuleChange(this, "新建模块",
+                moduleSnapshotBefore, CaptureModuleSnapshot());
+        }
+
+        // ------------------------------------------------------------ 模块交互
+
+        /// <summary>
+        /// 画布局部坐标落在哪个模块上。后画的优先（和成员判定的「后画的赢」一致）。
+        ///
+        /// 折叠的模块用矩形判（它就是一条横条），展开的用多边形判。
+        /// </summary>
+        private TimelineModule ModuleAtLocal(Vector2 local)
+        {
+            for (int i = modules.Count - 1; i >= 0; i--)
+            {
+                TimelineModule module = modules[i];
+                if (module == null || module.Points.Count < 3)
+                {
+                    continue;
+                }
+
+                if (module.Collapsed)
+                {
+                    if (!module.ScreenBoundsValid)
+                    {
+                        continue;
+                    }
+                    if (module.ScreenBounds.Contains(local))
+                    {
+                        return module;
+                    }
+                    continue;
+                }
+
+                // 展开：把局部点换回模块坐标再问多边形。
+                //
+                // **用严格版。** `PointInPolygon` 的边界容差是 0.5，而这里的
+                // 坐标单位是「秒」和「行」—— 0.5 秒是半个大格子、0.5 行是半行。
+                // 拿它判"点没点在框里"，点在框外半秒的地方也算命中，
+                // 用户看到的就是「点模块外围附近居然能选中模块」。
+                //
+                // `PointStrictlyInPolygon` 的容差是 1e-4，只把"正好压在边上"
+                // 算在内（沿边画框时确实会点在线上）。
+                Vector2 modulePoint = LocalToModulePoint(local);
+                if (PointStrictlyInPolygon(module.Points, modulePoint))
+                {
+                    return module;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 按成员表把每个成员块的原值收进 `moduleDragOrigins`。
+        ///
+        /// 成员表必须先是最新的 —— 调用方负责调 `EnsureModuleMembersRebuilt`。
+        /// </summary>
+        private void CollectModuleDragOrigins(TimelineModule module)
+        {
+            moduleDragOrigins.Clear();
+            if (module == null)
+            {
+                return;
+            }
+            EnsureModuleMembersRebuilt();
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                BlockPlacement placement = blockPlacements[i];
+                if (placement == null || placement.Item == null
+                    || string.IsNullOrEmpty(placement.Item.Key))
+                {
+                    continue;
+                }
+                if (!module.Members.Contains(placement.Item.Key))
+                {
+                    continue;
+                }
+                moduleDragOrigins.Add(CaptureDragOrigin(placement.Item));
+            }
+        }
+
+        /// <summary>开始拖一个模块：记下每个成员的原始状态，以及多边形的原样。</summary>
+        private void BeginModuleDrag(TimelineModule module, Vector2 local)
+        {
+            draggingModule = module;
+            selectedModule = module;
+            moduleDragStart = local;
+            moduleDragMoved = false;
+
+            moduleDragOrigins.Clear();
+            moduleDragPolygonOrigin.Clear();
+            for (int i = 0; i < module.Points.Count; i++)
+            {
+                moduleDragPolygonOrigin.Add(module.Points[i]);
+            }
+            moduleDragSnapshotBefore = CaptureModuleSnapshot();
+
+            // 成员的原值走现成的 `CaptureDragOrigin` —— 撤销记录要用它。
+            EnsureBlockPlacements();
+
+            // **先让成员表是最新的，再照它收原值。**
+            //
+            // 以前这里有两级兜底（表空就补算、一个都收不到再补算），因为
+            // 成员表可能是"半对半错"的。现在成员表只有一个写入点
+            // （`EnsureModuleMembersRebuilt`），脏了整表重建，不会再有半对半错。
+            moduleMembersDirty = true;
+            EnsureModuleMembersRebuilt();
+            CollectModuleDragOrigins(module);
+
+            // **描边和重叠判定按这份名单认人。**
+            //
+            // 和单块拖动共用 `dragMembers` —— 块绘制那边只认这一个集合，
+            // 不填的话拖模块时一块红边都不显示，松手作废也没有任何提示。
+            dragMembers.Clear();
+            for (int i = 0; i < moduleDragOrigins.Count; i++)
+            {
+                TimelineItem member = moduleDragOrigins[i].Item;
+                if (member != null && member.Event != null)
+                {
+                    dragMembers.Add(member.Event);
+                }
+            }
+
+            // 选中这一组，参数栏就能像多选一样统一改。
+            ApplyModuleSelection(module);
+
+            // 拖不动时先看这一行：成员为 0 就说明是"圈里没块"，
+            // 而不是拖动逻辑坏了。
+            if (Main.Settings != null && Main.Settings.VerboseDiagnostics)
+            {
+                Main.Logger.Log("[ModuleDrag] begin 模块=" + DisplayNameOf(module)
+                    + " 成员=" + module.Members.Count
+                    + " 抓到原值=" + moduleDragOrigins.Count
+                    + " 顶点=" + module.Points.Count
+                    + " local=" + local.ToString("0.0"));
+            }
+        }
+
+        /// <summary>拖动中：按位移改成员的时间/行号和模块多边形。</summary>
+        private void DragModule(Vector2 local)
+        {
+            if (draggingModule == null)
+            {
+                return;
+            }
+
+            Vector2 delta = local - moduleDragStart;
+            if (!moduleDragMoved
+                && delta.sqrMagnitude <= ModuleDragThreshold * ModuleDragThreshold)
+            {
+                return;
+            }
+            moduleDragMoved = true;
+
+            float speed = Mathf.Max(1f, pixelsPerSecond);
+
+            // **横向吸附格子。**
+            //
+            // 参考点取模块多边形的**左边界**：拖到哪儿，左边界就吸到最近的那条
+            // 格线。`SnapBlockTime` 找的正是格边界（和块拖动的吸附是同一套），
+            // 所以框对齐之后，一眼就能看出它压住了哪几格。
+            //
+            // 行号那边本来就用 `RoundToInt`，天然是整行。
+            float rawTimeDelta = delta.x / speed;
+            float timeDelta = rawTimeDelta;
+            float moduleMinX = float.MaxValue;
+            for (int i = 0; i < moduleDragPolygonOrigin.Count; i++)
+            {
+                moduleMinX = Mathf.Min(moduleMinX, moduleDragPolygonOrigin[i].x);
+            }
+            if (moduleMinX != float.MaxValue)
+            {
+                timeDelta = SnapBlockTime(moduleMinX + rawTimeDelta) - moduleMinX;
+            }
+
+            int rowDelta = Mathf.RoundToInt(delta.y / Mathf.Max(1f, BlockStridePixels));
+
+            // **多边形跟着一起挪** —— 不然框走了块还留在原地，
+            // 松手重新判定成员时又全散了。
+            for (int i = 0; i < draggingModule.Points.Count; i++)
+            {
+                draggingModule.Points[i] = moduleDragPolygonOrigin[i]
+                    + new Vector2(timeDelta, rowDelta);
+            }
+
+            // 成员块：时间按位移、行号按取整后的行差。只改预览值，
+            // 真正的提交在松手时一次做完（那样才是一条撤销记录）。
+            for (int i = 0; i < moduleDragOrigins.Count; i++)
+            {
+                DragOrigin origin = moduleDragOrigins[i];
+                if (origin.Item == null)
+                {
+                    continue;
+                }
+                BlockPlacement placement = FindPlacementForEvent(origin.Item.Event);
+                if (placement == null)
+                {
+                    continue;
+                }
+                placement.Time = origin.Start + timeDelta;
+                placement.Row = Mathf.Max(0, origin.Row + rowDelta);
+                origin.Item.StartTime = placement.Time;
+                origin.Item.DisplayRow = placement.Row;
+            }
+
+            // **块要真的跟手。**
+            //
+            // 上面改的是 `placement.Time / Row`，而绘制的两条早退
+            // （`CollectBlocks` 的指纹、`UpdateBlocks` 的视图快照）看的都不是
+            // 这两个字段 —— 不置脏的话拖框时块纹丝不动，松手才跳到新位置。
+            MarkBlocksDirty();
+            visualsDirty = true;
+        }
+
+        /// <summary>
+        /// 松手：把成员的新位置**提交进谱面**，整批记成一条撤销记录。
+        ///
+        /// 没拖动过（只是点了一下）就什么都不提交 —— 点选不该产生撤销记录。
+        /// </summary>
+        private void EndModuleDrag()
+        {
+            TimelineModule module = draggingModule;
+            draggingModule = null;
+
+            if (module == null)
+            {
+                moduleDragOrigins.Clear();
+                moduleDragPolygonOrigin.Clear();
+                moduleDragSnapshotBefore = null;
+                return;
+            }
+
+            // **空模块也要能拖。**
+            //
+            // 框本身是个能摆放的物件 —— 里面一个块都没有，也不该被钉死在原地。
+            // 拖完可能正好框住了别的块，那就按几何认一次（认到了就顺手变成成员）。
+            if (moduleDragOrigins.Count == 0)
+            {
+                bool polygonMoved = moduleDragMoved;
+                moduleDragOrigins.Clear();
+                moduleDragPolygonOrigin.Clear();
+                if (polygonMoved)
+                {
+                    // 框挪过了，归属可能变了 —— 置脏，下次用到时整表重建。
+                    moduleMembersDirty = true;
+                    projectDirty = true;
+                    visualsDirty = true;
+                    // 空框这次只挪了框本身 —— 撤销就是把它放回去。
+                    EditorCommandHistory.RecordModuleChange(this, "拖动模块",
+                        moduleDragSnapshotBefore, CaptureModuleSnapshot());
+                }
+                moduleDragSnapshotBefore = null;
+                dragMembers.Clear();
+                return;
+            }
+
+            if (!moduleDragMoved)
+            {
+                moduleDragOrigins.Clear();
+                moduleDragPolygonOrigin.Clear();
+                moduleDragSnapshotBefore = null;
+                dragMembers.Clear();
+                return;
+            }
+
+            // **松手前查重叠，和多选拖动同一套规则。**
+            //
+            // 只要有一块和别的块在像素上叠了，整批作废 —— 不然松手之后
+            // 两块挤在同一行，谁也看不清谁压着谁，撤销还会像"跳错地方"。
+            // 拖动过程中那些块会描红边（见 `UpdateBlocks` 里的 `dragMember`），
+            // 红边就是"松手会作废"的提示。
+            if (RevertDragIfOverlapping(moduleDragOrigins))
+            {
+                // 框也要退回原位：块已经退回去了，框留在新位置就对不上。
+                for (int i = 0; i < module.Points.Count
+                    && i < moduleDragPolygonOrigin.Count; i++)
+                {
+                    module.Points[i] = moduleDragPolygonOrigin[i];
+                }
+                moduleDragPolygonOrigin.Clear();
+                moduleDragSnapshotBefore = null;
+                dragMembers.Clear();
+                projectDirty = true;
+                visualsDirty = true;
+                return;
+            }
+
+            scnEditor editor = scnEditor.instance;
+            if (editor != null && editor.floors != null && editor.floors.Count > 0)
+            {
+                // 先把每个成员**最终**的时间抓下来，再把 item 还原成原值 ——
+                // `CommitBlockDrag` 要用真实的 old 值判断有没有真的改动。
+                List<float> finalStarts = new List<float>(moduleDragOrigins.Count);
+                for (int i = 0; i < moduleDragOrigins.Count; i++)
+                {
+                    TimelineItem target = moduleDragOrigins[i].Item;
+                    finalStarts.Add(target == null ? 0f : target.StartTime);
+                }
+                List<float> restoreStarts = new List<float>(moduleDragOrigins.Count);
+                for (int i = 0; i < moduleDragOrigins.Count; i++)
+                {
+                    restoreStarts.Add(moduleDragOrigins[i].Item == null
+                        ? 0f : moduleDragOrigins[i].Item.StartTime);
+                }
+                for (int i = 0; i < moduleDragOrigins.Count; i++)
+                {
+                    TimelineItem target = moduleDragOrigins[i].Item;
+                    if (target != null)
+                    {
+                        target.StartTime = moduleDragOrigins[i].Start;
+                        target.Duration = moduleDragOrigins[i].StartDuration;
+                    }
+                }
+
+                // 整批一条撤销记录。
+                EditorCommandHistory.BeginBatch(
+                    "拖动模块 " + Mathf.Max(1, moduleDragOrigins.Count) + " 个事件");
+                try
+                {
+                    for (int i = 0; i < moduleDragOrigins.Count; i++)
+                    {
+                        DragOrigin origin = moduleDragOrigins[i];
+                        TimelineItem item = origin.Item;
+                        if (item == null || item.Event == null)
+                        {
+                            continue;
+                        }
+                        float deltaSeconds = finalStarts[i] - origin.Start;
+                        // **时间只改 angleOffset、不动 floor。**
+                        //
+                        // 模块拖动是"整组平移"，不是"拖到某一格上"。改 floor 会
+                        // 让同一个模块里的块各自吸附到不同格，相对关系就散了。
+                        // 跟随者那条路（CommitFollowerDrag）本来就是干这个的。
+                        if (Mathf.Abs(deltaSeconds) > 0.0001f)
+                        {
+                            CommitFollowerDrag(editor, origin, deltaSeconds);
+                        }
+                    }
+
+                    // 行号也记进同一批：一次 Ctrl+Z 把横竖一起退回。
+                    RecordModuleRowMove(editor);
+
+                    // **框的位移也进同一批。** 块那边有 `CommitFollowerDrag` /
+                    // `RecordModuleRowMove` 记着，但模块多边形是工作台自己的数据，
+                    // 不记的话撤销只把块退回去、框还留在新位置 —— 用户报的
+                    // "能撤回事件块，框撤不回来"就是这个。
+                    EditorCommandHistory.RecordModuleChange(this, "拖动模块",
+                        moduleDragSnapshotBefore, CaptureModuleSnapshot());
+                }
+                finally
+                {
+                    EditorCommandHistory.EndBatch();
+                }
+            }
+
+            moduleDragOrigins.Clear();
+            moduleDragPolygonOrigin.Clear();
+            moduleDragSnapshotBefore = null;
+            dragMembers.Clear();
+
+            // **不要在这里重算成员。**
+            //
+            // 拖模块时多边形和块是**同一个位移**，成员集合本来就不该变。
+            // 而在松手这一帧重算很危险：`RecordModuleRowMove` 只记撤销、
+            // 不落盘，下一次 `EnsureBlockPlacements` 有可能把行号复位；
+            // 只要块的纵坐标差一点点落在圈外，重算就会把成员**清空** ——
+            // 于是第二次拖动时 `moduleDragOrigins` 是空的、整个拖动直接失效。
+            // 实测就是这个现象："第一次能拖，第二次拖不动"。
+            //
+            // 成员只在**画圈**（新增）和**显式重算**时变，拖动不动它。
+            projectDirty = true;
+            visualsDirty = true;
+
+            // 提交之后块的起点时间变了 —— 归属可能变（块整体平移，几何关系
+            // 没变，所以通常是同一批；但防重叠兜底可能把某块挪到别的行）。
+            // 置脏即可，下次用到成员时整表重建。
+            moduleMembersDirty = true;
+        }
+
+        /// <summary>把模块各成员的新行号记进撤销栈（和拖行号同一条路）。</summary>
+        private void RecordModuleRowMove(scnEditor editor)
+        {
+            if (editor == null || moduleDragOrigins.Count == 0)
+            {
+                return;
+            }
+            List<LevelEvent> targets = new List<LevelEvent>(moduleDragOrigins.Count);
+            List<int> oldRows = new List<int>(moduleDragOrigins.Count);
+            List<int> newRows = new List<int>(moduleDragOrigins.Count);
+            for (int i = 0; i < moduleDragOrigins.Count; i++)
+            {
+                DragOrigin origin = moduleDragOrigins[i];
+                if (origin.Item == null || origin.Item.Event == null)
+                {
+                    continue;
+                }
+                BlockPlacement placement = FindPlacementForEvent(origin.Item.Event);
+                if (placement == null || placement.Row == origin.Row)
+                {
+                    continue;
+                }
+                targets.Add(origin.Item.Event);
+                oldRows.Add(origin.Row);
+                newRows.Add(placement.Row);
+            }
+            if (targets.Count == 0)
+            {
+                return;
+            }
+            EditorCommandHistory.RecordBlockRows(this, targets.ToArray(),
+                oldRows.ToArray(), newRows.ToArray());
+        }
+
+        /// <summary>把某个模块的成员并进多选集，参数栏就能统一改。</summary>
+        private void ApplyModuleSelection(TimelineModule module)
+        {
+            multiSelection.Clear();
+            if (module == null)
+            {
+                return;
+            }
+            EnsureModuleMembersRebuilt();
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                BlockPlacement placement = blockPlacements[i];
+                if (placement == null || placement.Item == null
+                    || placement.Item.Event == null
+                    || string.IsNullOrEmpty(placement.Item.Key))
+                {
+                    continue;
+                }
+                if (module.Members.Contains(placement.Item.Key))
+                {
+                    multiSelection.Add(placement.Item.Event);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 删掉选中的模块 —— **只删分组，不动里面的块**。
+        ///
+        /// 删完之后那些块**保持选中**：用户要的是"把这一层框去掉，
+        /// 但这批事件我还想接着操作"，所以选中集必须留着。
+        /// </summary>
+        private void DeleteSelectedModule()
+        {
+            TimelineModule module = selectedModule;
+            if (module == null)
+            {
+                return;
+            }
+
+            // 删之前的模块表 —— 这一步要能撤回去。
+            List<EditorCommandHistory.ModuleSnapshot> moduleSnapshotBefore =
+                CaptureModuleSnapshot();
+
+            // 先按身份把成员对应的 LevelEvent 收进多选集 —— 删模块之前收，
+            // 因为删完 Members 就没了。
+            EnsureModuleMembersRebuilt();
+            multiSelection.Clear();
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                BlockPlacement placement = blockPlacements[i];
+                if (placement == null || placement.Item == null
+                    || placement.Item.Event == null
+                    || string.IsNullOrEmpty(placement.Item.Key))
+                {
+                    continue;
+                }
+                if (module.Members.Contains(placement.Item.Key))
+                {
+                    multiSelection.Add(placement.Item.Event);
+                }
+            }
+
+            if (module.CollapsedLabel != null)
+            {
+                Destroy(module.CollapsedLabel);
+                module.CollapsedLabel = null;
+                module.CollapsedText = null;
+            }
+            modules.Remove(module);
+            selectedModule = null;
+            selectedModules.Clear();
+
+            projectDirty = true;
+            visualsDirty = true;
+            layoutDirty = true;
+            // 模块没了，它原来藏起来的块要重新画出来（同 `ToggleModuleCollapsed`）。
+            MarkBlocksDirty();
+
+            EditorCommandHistory.RecordModuleChange(this, "删除模块",
+                moduleSnapshotBefore, CaptureModuleSnapshot());
+        }
+
+        /// <summary>模块重命名用的内联输入框。null = 没在改。</summary>
+        private TMP_InputField moduleRenameField;
+        private TimelineModule moduleRenameTarget;
+
+        /// <summary>
+        /// 就地改名：在模块条/多边形上盖一个输入框。
+        ///
+        /// 回车提交、Esc 取消、点别处也算提交（和搜索框同一种手感）。
+        /// 位置取模块的屏幕包围盒，所以展开和折叠两种形态都能用。
+        /// </summary>
+        private void BeginModuleRename(TimelineModule module)
+        {
+            if (module == null)
+            {
+                return;
+            }
+            EndModuleRename(true);
+
+            if (!module.ScreenBoundsValid)
+            {
+                return;
+            }
+
+            moduleRenameTarget = module;
+
+            Rect bounds = module.ScreenBounds;
+            float width = Mathf.Clamp(bounds.width, 120f, 320f);
+            float height = Mathf.Max(24f, Mathf.Min(BlockStridePixels, 30f));
+            float x = bounds.xMin;
+            float y = bounds.yMin;
+
+            RectTransform host = CreateRect("ModuleRename", viewport, x, y, width, height);
+            Image background = host.gameObject.AddComponent<Image>();
+            background.color = Palette.FieldWell;
+            background.raycastTarget = true;
+
+            TextMeshProUGUI text = CreateStretchedInputText("Text", host, 8f,
+                DisplayNameOf(module), 12.5f, Palette.TextPrimary);
+            TextMeshProUGUI placeholder = CreateStretchedInputText("Placeholder", host, 8f,
+                "模块名", 12.5f, Palette.TextMuted);
+
+            TMP_InputField field = host.gameObject.AddComponent<TMP_InputField>();
+            field.targetGraphic = background;
+            field.lineType = TMP_InputField.LineType.SingleLine;
+            field.contentType = TMP_InputField.ContentType.Standard;
+            field.characterLimit = 40;
+            field.navigation = new Navigation { mode = Navigation.Mode.None };
+            field.richText = false;
+            field.customCaretColor = true;
+            field.caretColor = new Color(0.96f, 0.96f, 0.96f, 1f);
+            field.caretWidth = 2;
+            field.caretBlinkRate = 0.85f;
+            field.textViewport = host;
+            field.textComponent = text;
+            field.placeholder = placeholder;
+            field.restoreOriginalTextOnEscape = false;
+            field.text = DisplayNameOf(module);
+            field.onSubmit.AddListener(delegate(string value) { EndModuleRename(true); });
+            field.onEndEdit.AddListener(delegate(string value) { EndModuleRename(true); });
+
+            // 点别处提交：输入框自己会触发 onEndEdit，这里不用额外挂。
+            field.ActivateInputField();
+            field.Select();
+            moduleRenameField = field;
+        }
+
+        /// <summary>结束改名。`commit` 为假表示放弃（Esc）。</summary>
+        private void EndModuleRename(bool commit)
+        {
+            TMP_InputField field = moduleRenameField;
+            TimelineModule module = moduleRenameTarget;
+            moduleRenameField = null;
+            moduleRenameTarget = null;
+
+            if (field == null)
+            {
+                return;
+            }
+
+            string value = field.text == null ? string.Empty : field.text.Trim();
+            if (field.gameObject != null)
+            {
+                Destroy(field.gameObject);
+            }
+
+            if (commit && module != null)
+            {
+                // 名字和默认的「模块 N」一样就当没自定义，保持默认更省心。
+                if (string.Equals(value, "模块 " + (modules.IndexOf(module) + 1),
+                        StringComparison.Ordinal))
+                {
+                    value = string.Empty;
+                }
+                List<EditorCommandHistory.ModuleSnapshot> moduleSnapshotBefore =
+                    CaptureModuleSnapshot();
+                RenameModule(module, value);
+                EditorCommandHistory.RecordModuleChange(this, "重命名模块",
+                    moduleSnapshotBefore, CaptureModuleSnapshot());
+            }
+        }
+
+        /// <summary>折叠 / 展开一个模块。</summary>
+        private void ToggleModuleCollapsed(TimelineModule module)
+        {
+            if (module == null)
+            {
+                return;
+            }
+            List<EditorCommandHistory.ModuleSnapshot> moduleSnapshotBefore =
+                CaptureModuleSnapshot();
+
+            bool expanding = module.Collapsed;
+            module.Collapsed = !module.Collapsed;
+            if (!module.Collapsed)
+            {
+                if (module.CollapsedLabel != null)
+                {
+                    Destroy(module.CollapsedLabel);
+                    module.CollapsedLabel = null;
+                    module.CollapsedText = null;
+                }
+                HideCollapsedBar(module);
+            }
+            projectDirty = true;
+            visualsDirty = true;
+            layoutDirty = true;
+            // **折叠 / 展开改的是"哪些块画不画"，必须让块重新收集一遍。**
+            //
+            // `CollectBlocks` 只在数据指纹 / 脏版本变化时才真跑；不置脏的话，
+            // 折叠时藏起来的块在展开后仍然不画 —— 用户看到的就是
+            // 「展开后下面的事件不见了」。
+            MarkBlocksDirty();
+
+            EditorCommandHistory.BeginBatch(expanding ? "展开模块" : "折叠模块");
+            try
+            {
+                // **展开之后，模块框盖住的那些"外人"块要让路。**
+                //
+                // 模块展开会占住一整片区域；本来在那片区域里的、不属于这个模块的
+                // 事件块就压在框底下了 —— 既看不清，也不好点。用户要的是
+                // 「展开时只要有事件被遮挡，就把它们挪到下面合适的格子」。
+                if (expanding)
+                {
+                    PushOutOverlappingBlocks(module);
+                }
+
+                EditorCommandHistory.RecordModuleChange(this,
+                    expanding ? "展开模块" : "折叠模块",
+                    moduleSnapshotBefore, CaptureModuleSnapshot());
+            }
+            finally
+            {
+                EditorCommandHistory.EndBatch();
+            }
+        }
+
+        /// <summary>
+        /// 把模块框范围里、**不属于这个模块**的事件块挪到模块下方去。
+        ///
+        /// 触发时机：展开模块时（折叠时看不见内容，不需要让路）。
+        ///
+        /// 挪的依据是**行**：块和模块框在行方向上有交叠、在时间上也有交叠，
+        /// 就算"被遮挡"。目标行从模块底行下面开始，往下找**第一个放得下**的行
+        /// （那一行在这个时间区间上没有别的块）。
+        ///
+        /// 移动会记进撤销栈，和"展开模块"合成一步。
+        /// </summary>
+        private void PushOutOverlappingBlocks(TimelineModule module)
+        {
+            if (module == null || module.Points.Count < 3)
+            {
+                return;
+            }
+            EnsureBlockPlacements();
+
+            // **先把成员表刷成最新的** —— 下面靠它分"自己人 / 外人"。
+            moduleMembersDirty = true;
+            EnsureModuleMembersRebuilt();
+
+            float minRow = float.MaxValue, maxRow = float.MinValue;
+            float minTime = float.MaxValue, maxTime = float.MinValue;
+            for (int i = 0; i < module.Points.Count; i++)
+            {
+                Vector2 point = module.Points[i];
+                minRow = Mathf.Min(minRow, point.y);
+                maxRow = Mathf.Max(maxRow, point.y);
+                minTime = Mathf.Min(minTime, point.x);
+                maxTime = Mathf.Max(maxTime, point.x);
+            }
+            if (minRow == float.MaxValue)
+            {
+                return;
+            }
+
+            int firstRow = Mathf.FloorToInt(minRow);
+            int lastRow = Mathf.CeilToInt(maxRow) - 1;
+            if (lastRow < firstRow)
+            {
+                lastRow = firstRow;
+            }
+
+
+            List<LevelEvent> targets = new List<LevelEvent>();
+            List<int> oldRows = new List<int>();
+            List<int> newRows = new List<int>();
+
+            // **候选 = 框里的所有块，成员也算。**
+            //
+            // 原来把成员整个跳过 —— 那是按"成员本来就在框里，不用管"想的。
+            // 实测不成立：同一格上的几个事件（同类型、同时刻）会被排到**同一行**，
+            // 画出来完全重合，谁后画谁在上面。用户看到的就是
+            // 「模块里最下面那个块被另一个块替换了」。
+            //
+            // 所以遮挡要在全体之间解决，不分成員/外人。
+            // 「画出来的宽度」参与判定：零时长块也占 `BlockMinWidth`，
+            // 用原始时长比会把紧贴框沿的重叠漏掉。
+            float minVisibleSeconds = BlockMinWidth / Mathf.Max(1f, pixelsPerSecond);
+            List<BlockPlacement> candidates = new List<BlockPlacement>();
+            HashSet<BlockPlacement> movable = new HashSet<BlockPlacement>();
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                BlockPlacement placement = blockPlacements[i];
+                if (placement == null || placement.Item == null
+                    || placement.Item.Event == null)
+                {
+                    continue;
+                }
+                if (placement.Row < firstRow || placement.Row > lastRow)
+                {
+                    continue;
+                }
+                float left = placement.Time;
+                float right = placement.Time + Mathf.Max(minVisibleSeconds,
+                    Mathf.Max(0f, placement.Item.Duration));
+                if (right < minTime || left > maxTime)
+                {
+                    continue;
+                }
+                candidates.Add(placement);
+                movable.Add(placement);
+            }
+
+            // **成员优先。** 它们本来就该待在框里，让外人给它们让路；
+            // 成员之间撞了，才按行号/时间决定谁往下挪。
+            candidates.Sort(delegate(BlockPlacement a, BlockPlacement b)
+            {
+                bool aMember = IsModuleMember(module, a);
+                bool bMember = IsModuleMember(module, b);
+                if (aMember != bMember)
+                {
+                    return aMember ? -1 : 1;
+                }
+                if (a.Row != b.Row)
+                {
+                    return a.Row.CompareTo(b.Row);
+                }
+                return a.Time.CompareTo(b.Time);
+            });
+
+            HashSet<BlockPlacement> settled = new HashSet<BlockPlacement>();
+            for (int i = 0; i < candidates.Count; i++)
+            {
+                BlockPlacement placement = candidates[i];
+
+                if (!RowHasConflict(placement, placement.Row, movable, settled))
+                {
+                    settled.Add(placement);
+                    continue;
+                }
+
+                int targetRow = FindFreeRowFor(placement, lastRow + 1, movable, settled);
+                if (targetRow == placement.Row)
+                {
+                    settled.Add(placement);
+                    continue;
+                }
+                targets.Add(placement.Item.Event);
+                oldRows.Add(placement.Row);
+                newRows.Add(targetRow);
+                placement.Row = targetRow;
+                // 行号有两条载体（位置表 + item），两边一起写 ——
+                // 只改一边的话下一次重绑会被 `DisplayRow` 拽回去。
+                placement.Item.DisplayRow = targetRow;
+                settled.Add(placement);
+            }
+
+
+            if (targets.Count == 0)
+            {
+                return;
+            }
+
+            EditorCommandHistory.RecordBlockRows(this, targets.ToArray(),
+                oldRows.ToArray(), newRows.ToArray());
+            blocksDirtyVersion++;
+            visualsDirty = true;
+        }
+
+        /// <summary>
+        /// 这一块是不是这个模块的成员。
+        ///
+        /// **缓存优先，几何兜底。** 正常情况下成员表已经由
+        /// `EnsureModuleMembersRebuilt` 刷好了，查表 O(1)；万一这一帧刚好脏了
+        /// 还没重建，几何判定也能给出正确答案（不会像以前那样"过期就错"）。
+        ///
+        /// 后画的模块优先 —— 一个块被两个框包住时算后面那个的。
+        /// </summary>
+        private bool IsModuleMember(TimelineModule module, BlockPlacement placement)
+        {
+            if (module == null || placement == null || placement.Item == null)
+            {
+                return false;
+            }
+            EnsureModuleMembersRebuilt();
+            if (!BlockFullyInModule(placement, module))
+            {
+                return false;
+            }
+            // 被后面的模块抢走了，就不算自己的。
+            for (int i = modules.Count - 1; i >= 0; i--)
+            {
+                TimelineModule later = modules[i];
+                if (ReferenceEquals(later, module))
+                {
+                    return true;
+                }
+                if (later != null && BlockFullyInModule(placement, later))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 这一块待在 `row` 上会不会和**已经安顿好的**块画出重叠。
+        ///
+        /// 只看 `settled`：还没轮到的不算 —— 它们自己会往下让。
+        /// 候选之外的块（框外的）也算占位，否则会把块挪到别人头上。
+        /// </summary>
+        private bool RowHasConflict(BlockPlacement self, int row,
+            HashSet<BlockPlacement> movable, HashSet<BlockPlacement> settled)
+        {
+            if (self == null || self.Item == null)
+            {
+                return false;
+            }
+            float speed = Mathf.Max(1f, pixelsPerSecond);
+            float selfLeft = self.Time * speed;
+            float selfRight = selfLeft + Mathf.Max(BlockMinWidth,
+                self.Item.Duration * speed - BlockGap);
+
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                BlockPlacement other = blockPlacements[i];
+                if (other == null || other == self || other.Item == null
+                    || other.Row != row)
+                {
+                    continue;
+                }
+                // 折叠模块里看不见的块不算占位（同 `BlockOverlapsOthers`）。
+                if (IsBlockHiddenByCollapsedModule(other.Item))
+                {
+                    continue;
+                }
+                // 还没安顿的候选先不管 —— 它们会让开。
+                if (movable.Contains(other) && !settled.Contains(other))
+                {
+                    continue;
+                }
+                float otherLeft = other.Time * speed;
+                float otherRight = otherLeft + Mathf.Max(BlockMinWidth,
+                    other.Item.Duration * speed - BlockGap);
+                if (selfLeft < otherRight && otherLeft < selfRight)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 从 `fromRow` 开始往下找第一个能放下这一块的行。
+        ///
+        /// 「放下」= 这一行上与它在**像素**上不重叠（块有最小宽度，
+        /// 所以按画出来的宽度比，和 `BlockOverlapsOthers` 同一套）。
+        /// </summary>
+        private int FindFreeRowFor(BlockPlacement self, int fromRow,
+            HashSet<BlockPlacement> movable, HashSet<BlockPlacement> settled)
+        {
+            if (self == null || self.Item == null)
+            {
+                return fromRow;
+            }
+
+            int row = Mathf.Max(0, fromRow);
+            // 兜底上限：一张谱的行数再多也就几百，跑飞了说明数据坏了，别死循环。
+            int guard = blockPlacements.Count + 256;
+            while (guard-- > 0)
+            {
+                if (!RowHasConflict(self, row, movable, settled))
+                {
+                    return row;
+                }
+                row++;
+            }
+            return row;
+        }
+
+        /// <summary>重命名模块。空串 = 回到默认的「模块 N」。</summary>
+        internal void RenameModule(TimelineModule module, string name)
+        {
+            if (module == null)
+            {
+                return;
+            }
+            module.Name = name ?? string.Empty;
+            if (module.CollapsedText != null)
+            {
+                module.CollapsedText.text = DisplayNameOf(module);
+            }
+            projectDirty = true;
+            visualsDirty = true;
+        }
+
+        // ------------------------------------------------------------ 模块绘制
+
+        /// <summary>
+        /// 每帧把模块画出来。填充半透明、描边用强调色；选中的加粗。
+        ///
+        /// 折叠的模块画成一条一行高的横条（宽度 = 多边形在时间轴上的跨度），
+        /// 名字写在上面 —— 用户选的形态就是这样：折叠后看不见里面的块，
+        /// 只留一条纯色的模块条。
+        /// </summary>
+        private void UpdateModules()
+        {
+            if (moduleGraphic == null || moduleLayer == null)
+            {
+                return;
+            }
+
+            moduleGraphic.BeginShapes();
+
+            for (int i = 0; i < modules.Count; i++)
+            {
+                TimelineModule module = modules[i];
+                if (module == null || module.Points.Count < 3)
+                {
+                    continue;
+                }
+
+                bool selected = IsModuleSelected(module);
+
+                if (module.Collapsed)
+                {
+                    DrawCollapsedModule(module, selected);
+                    continue;
+                }
+
+                // 展开：按多边形原样画。
+                moduleScratch.Clear();
+                Vector2 min = new Vector2(float.MaxValue, float.MaxValue);
+                Vector2 max = new Vector2(float.MinValue, float.MinValue);
+                for (int p = 0; p < module.Points.Count; p++)
+                {
+                    Vector2 local = ModulePointToLocal(module.Points[p]);
+                    moduleScratch.Add(local);
+                    min = Vector2.Min(min, local);
+                    max = Vector2.Max(max, local);
+                }
+                module.ScreenBounds = Rect.MinMaxRect(min.x, min.y, max.x, max.y);
+                module.ScreenBoundsValid = true;
+
+                Color fill = ModuleFillColor(selected);
+                Color stroke = ModuleStrokeColor(selected);
+                moduleGraphic.AddShape(moduleScratch, fill, stroke, selected ? 2.5f : 1.5f);
+
+                EnsureCollapsedLabel(module, false);
+                // 展开形态不画折叠条 —— 收掉（展开那一刻 `ToggleModuleCollapsed`
+                // 已经收过一次，这里兜住"先折叠后展开、但状态被撤销改回去"那种）。
+                HideCollapsedBar(module);
+            }
+
+            moduleGraphic.SubmitShapes();
+        }
+
+        /// <summary>折叠模块：画一条从多边形左沿到右沿的横条，上面写名字。</summary>
+        private void DrawCollapsedModule(TimelineModule module, bool selected)
+        {
+            Vector2 min = new Vector2(float.MaxValue, float.MaxValue);
+            Vector2 max = new Vector2(float.MinValue, float.MinValue);
+            for (int p = 0; p < module.Points.Count; p++)
+            {
+                Vector2 local = ModulePointToLocal(module.Points[p]);
+                min = Vector2.Min(min, local);
+                max = Vector2.Max(max, local);
+            }
+
+            // **折叠条占两行高。**
+            //
+            // 一行太窄：模块名读起来挤，而且和大号事件块视觉上不成比例。
+            // 用户要的就是两格（"默认 2 个 Y 的高度"）。
+            float height = BlockStridePixels * 2f;
+            float top = min.y;
+            Rect bounds = Rect.MinMaxRect(min.x, top, max.x, top + height);
+            module.ScreenBounds = bounds;
+            module.ScreenBoundsValid = true;
+
+            // **折叠条：圆角 + 半透明填充 + 描边。**
+            //
+            // 用独立的 `Image` 而不是 `moduleGraphic` 的多边形：那个组件只会
+            // 填多边形和描边，画不了圆角。折叠条本来就是个矩形，换成 Image
+            // 还能直接复用 `roundedSprite`（九宫格缩放，圆角不随宽度变形）。
+            //
+            // **填充是半透明的**（和展开态的多边形一个观感）—— 折叠只是
+            // "把里面的块藏起来、收成一条"，不是"盖一块实心板在时间轴上"。
+            // 实心那条压在格线上太抢眼，整条时间轴的层次就乱了。
+            RectTransform bar = EnsureCollapsedBar(module);
+            if (bar != null)
+            {
+                SetTopLeft(bar, bounds.xMin, bounds.yMin, bounds.width, bounds.height);
+                // 两层描边都是条的子节点，尺寸跟着条走（九宫格缩放圆角不变形）。
+                float edgeWidth = bounds.width + 2f;
+                float edgeHeight = bounds.height + 2f;
+                if (module.CollapsedBarEdge != null)
+                {
+                    SetTopLeft(module.CollapsedBarEdge.rectTransform,
+                        -1f, -1f, edgeWidth, edgeHeight);
+                }
+                if (module.CollapsedBarOutline != null)
+                {
+                    SetTopLeft(module.CollapsedBarOutline.rectTransform,
+                        -1f, -1f, edgeWidth, edgeHeight);
+                }
+            }
+
+            // 名字：贴左，高度按行高夹一下别超出条外。
+            TextMeshProUGUI label = EnsureCollapsedLabel(module, true);
+            if (label != null)
+            {
+                RectTransform rect = label.rectTransform;
+                SetTopLeft(rect, bounds.xMin + 8f, bounds.yMin, Mathf.Max(40f, bounds.width - 16f), height);
+                label.text = DisplayNameOf(module);
+            }
+        }
+
+        /// <summary>
+        /// 折叠条那块圆角矩形。按需创建，展开时由 `HideCollapsedBar` 收掉。
+        ///
+        /// **填充走 `ModuleFillColor`（半透明），描边走 `ModuleStrokeColor`** ——
+        /// 和展开态的多边形是同一套观感。选中时描边加粗、填充加深一档
+        /// （`ModuleFillColor/ModuleStrokeColor` 里已经按 selected 分了档），
+        /// 另外再叠一圈 `outlineSprite` 的亮边 —— 那个是"选中"的强信号，
+        /// 事件块选中用的也是同一张。
+        /// </summary>
+        private RectTransform EnsureCollapsedBar(TimelineModule module)
+        {
+            if (module == null)
+            {
+                return null;
+            }
+            if (module.CollapsedBar == null)
+            {
+                RectTransform rect = CreateRect("ModuleBar", moduleLayer, 0f, 0f, 100f,
+                    BlockStridePixels * 2f);
+                Image image = rect.gameObject.AddComponent<Image>();
+                image.raycastTarget = false;
+                if (roundedSprite != null)
+                {
+                    image.sprite = roundedSprite;
+                    // 九宫格：圆角固定 7 像素，不随条宽变形。
+                    image.type = Image.Type.Sliced;
+                }
+                module.CollapsedBar = rect;
+                module.CollapsedBarImage = image;
+
+                // **常驻描边** —— 折叠条要有边框，不然半透明填充在深色底上
+                // 就是一团糊。用 `outlineSprite` 那张圆角描边贴图，九宫格缩放。
+                RectTransform edge = CreateRect("ModuleBarEdge", rect,
+                    -1f, -1f, 102f, BlockStridePixels * 2f + 2f);
+                Image edgeImage = edge.gameObject.AddComponent<Image>();
+                edgeImage.raycastTarget = false;
+                if (outlineSprite != null)
+                {
+                    edgeImage.sprite = outlineSprite;
+                    edgeImage.type = Image.Type.Sliced;
+                }
+                edgeImage.color = ModuleCollapsedStrokeColor;
+                module.CollapsedBarEdge = edgeImage;
+
+                // 选中时再叠一圈更亮的（白色），压在常驻描边上面。
+                RectTransform outline = CreateRect("ModuleBarOutline", module.CollapsedBar,
+                    -1f, -1f, 102f, BlockStridePixels * 2f + 2f);
+                Image outlineImage = outline.gameObject.AddComponent<Image>();
+                outlineImage.raycastTarget = false;
+                if (outlineSprite != null)
+                {
+                    outlineImage.sprite = outlineSprite;
+                    outlineImage.type = Image.Type.Sliced;
+                }
+                outlineImage.color = Color.white;
+                module.CollapsedBarOutline = outlineImage;
+                outline.gameObject.SetActive(false);
+            }
+
+            bool selected = IsModuleSelected(module);
+            // 饱和橙 + 半透明 —— 折叠条要在时间轴上一眼认出来，格线还要能透出来。
+            module.CollapsedBarImage.color = ModuleCollapsedFillColor;
+            if (module.CollapsedBarEdge != null)
+            {
+                module.CollapsedBarEdge.color = ModuleCollapsedStrokeColor;
+            }
+            if (module.CollapsedBarOutline != null)
+            {
+                if (module.CollapsedBarOutline.gameObject.activeSelf != selected)
+                {
+                    module.CollapsedBarOutline.gameObject.SetActive(selected);
+                }
+            }
+            module.CollapsedBar.gameObject.SetActive(true);
+            return module.CollapsedBar;
+        }
+
+        /// <summary>把折叠条收掉（展开 / 删模块时调）。</summary>
+        private void HideCollapsedBar(TimelineModule module)
+        {
+            if (module == null || module.CollapsedBar == null)
+            {
+                return;
+            }
+            Destroy(module.CollapsedBar.gameObject);
+            module.CollapsedBar = null;
+            module.CollapsedBarImage = null;
+            module.CollapsedBarEdge = null;
+            module.CollapsedBarOutline = null;
+        }
+
+        /// <summary>折叠模块的名字文本。按需创建/销毁。</summary>
+        private TextMeshProUGUI EnsureCollapsedLabel(TimelineModule module, bool wanted)
+        {
+            if (!wanted)
+            {
+                if (module.CollapsedLabel != null)
+                {
+                    Destroy(module.CollapsedLabel);
+                    module.CollapsedLabel = null;
+                    module.CollapsedText = null;
+                }
+                return null;
+            }
+
+            if (module.CollapsedLabel == null)
+            {
+                // 高度和 `DrawCollapsedModule` 里的折叠条一致（两行），
+                // 免得建出来的第一帧是一条细缝。
+                RectTransform rect = CreateRect("ModuleLabel", moduleLayer, 0f, 0f, 100f,
+                    BlockStridePixels * 2f);
+                TextMeshProUGUI text = CreateText("Text", rect, 0f, 0f, 100f,
+                    BlockStridePixels * 2f, string.Empty, 11f, Palette.TextPrimary,
+                    TextAlignmentOptions.MidlineLeft, false);
+                text.overflowMode = TextOverflowModes.Ellipsis;
+                text.raycastTarget = false;
+                module.CollapsedLabel = rect.gameObject;
+                module.CollapsedText = text;
+            }
+            return module.CollapsedText;
+        }
+
+        /// <summary>
+        /// 模块的强调色：**橙**。
+        ///
+        /// 不跟 `Palette.Accent` 走 —— 那个是整套界面的主色（绿/蓝），
+        /// 事件块也是那一套。模块是"框住一批块"的另一层语义，用同一族颜色
+        /// 会让人以为它也是某种事件块。橙色在这儿没有别的东西用，一眼能分开。
+        /// </summary>
+        private static readonly Color ModuleAccentColor = new Color(1f, 0.55f, 0.12f, 1f);
+
+        /// <summary>
+        /// 折叠条的强调色：**比展开态更艳一档**。
+        ///
+        /// 折叠之后这一条是"整组东西"的唯一标识，要在时间轴上一眼认出来 ——
+        /// 用展开态那种淡橙（alpha 0.12）根本看不见。这里换成饱和橙，
+        /// 靠 alpha 保持在半透明（格线还能透出来），不靠发灰降存在感。
+        /// </summary>
+        private static readonly Color ModuleCollapsedFillColor =
+            new Color(1f, 0.62f, 0.18f, 0.62f);
+
+        /// <summary>折叠条的描边色：饱和橙，比填充更实。</summary>
+        private static readonly Color ModuleCollapsedStrokeColor =
+            new Color(1f, 0.70f, 0.30f, 1f);
+
+        private Color ModuleFillColor(bool selected)
+        {
+            return new Color(ModuleAccentColor.r, ModuleAccentColor.g,
+                ModuleAccentColor.b, selected ? 0.22f : 0.12f);
+        }
+
+        private Color ModuleStrokeColor(bool selected)
+        {
+            return new Color(ModuleAccentColor.r, ModuleAccentColor.g,
+                ModuleAccentColor.b, selected ? 0.95f : 0.60f);
+        }
+
+        /// <summary>
+        /// 把当前模块表整份拷下来（深拷贝）。撤销记录用。
+        /// 空槽位原样保留成 null，这样下标和 `modules` 一一对应。
+        /// </summary>
+        internal List<EditorCommandHistory.ModuleSnapshot> CaptureModuleSnapshot()
+        {
+            List<EditorCommandHistory.ModuleSnapshot> snapshot =
+                new List<EditorCommandHistory.ModuleSnapshot>(modules.Count);
+            for (int i = 0; i < modules.Count; i++)
+            {
+                TimelineModule module = modules[i];
+                if (module == null)
+                {
+                    snapshot.Add(null);
+                    continue;
+                }
+                snapshot.Add(new EditorCommandHistory.ModuleSnapshot
+                {
+                    Name = module.Name,
+                    Collapsed = module.Collapsed,
+                    Points = new List<Vector2>(module.Points),
+                    Members = new List<string>(module.Members)
+                });
+            }
+            return snapshot;
+        }
+
+        /// <summary>
+        /// 把模块表整份换回快照里的样子。撤销 / 重做都走这里。
+        ///
+        /// **模块对象是重建的，不是原地改字段** —— 旧对象上挂着折叠标签之类的
+        /// UI 引用，原地改容易留下孤儿。重建前先把可见对象收掉。
+        /// </summary>
+        internal bool RestoreModuleSnapshot(List<EditorCommandHistory.ModuleSnapshot> snapshot)
+        {
+            if (snapshot == null)
+            {
+                return false;
+            }
+            ClearModuleViews();
+            modules.Clear();
+            selectedModule = null;
+            selectedModules.Clear();
+            draggingModule = null;
+            for (int i = 0; i < snapshot.Count; i++)
+            {
+                EditorCommandHistory.ModuleSnapshot source = snapshot[i];
+                if (source == null)
+                {
+                    continue;
+                }
+                TimelineModule module = new TimelineModule
+                {
+                    Name = source.Name ?? string.Empty,
+                    Collapsed = source.Collapsed
+                };
+                if (source.Points != null)
+                {
+                    module.Points.AddRange(source.Points);
+                }
+                if (source.Members != null)
+                {
+                    for (int m = 0; m < source.Members.Count; m++)
+                    {
+                        module.Members.Add(source.Members[m]);
+                    }
+                }
+                modules.Add(module);
+            }
+            projectDirty = true;
+            visualsDirty = true;
+            layoutDirty = true;
+            // 折叠状态可能变了 —— 块该不该画要重新判一次。
+            MarkBlocksDirty();
+            return true;
+        }
+
+        /// <summary>清掉模块的可见对象（折叠横条 / 高亮框 / 顶点）。模块数据本身不动。</summary>
+        private void ClearModuleViews()
+        {
+            for (int i = 0; i < modules.Count; i++)
+            {
+                TimelineModule module = modules[i];
+                if (module == null)
+                {
+                    continue;
+                }
+                if (module.CollapsedLabel != null)
+                {
+                    Destroy(module.CollapsedLabel);
+                    module.CollapsedLabel = null;
+                    module.CollapsedText = null;
+                }
+                HideCollapsedBar(module);
+            }
+        }
+
+        /// <summary>
+        /// 点是否落在多边形内（射线法，奇偶规则）。
+        ///
+        /// 用的是**时间轴内容坐标** —— 调用方先把屏幕点换算过来再问。
+        /// 换算是必要的：多边形是按内容坐标存的，滚动/缩放之后同一个屏幕点
+        /// 对应的内容坐标是变的。
+        ///
+        /// 边界上的点按「在内部」算 —— 用户很难精确点在线上，
+        /// 而"差一点点没选中"比"多选了一块"更让人困惑。
+        /// </summary>
+        internal static bool PointInPolygon(List<Vector2> points, Vector2 test)
+        {
+            if (points == null || points.Count < 3)
+            {
+                return false;
+            }
+
+            bool inside = false;
+            int count = points.Count;
+            for (int i = 0, j = count - 1; i < count; j = i++)
+            {
+                Vector2 a = points[i];
+                Vector2 b = points[j];
+
+                // 先判是不是正好压在边上。
+                if (PointOnSegment(a, b, test))
+                {
+                    return true;
+                }
+
+                bool crosses = (a.y > test.y) != (b.y > test.y);
+                if (!crosses)
+                {
+                    continue;
+                }
+                float denominator = b.y - a.y;
+                if (Mathf.Abs(denominator) < 1e-6f)
+                {
+                    continue;
+                }
+                float intersectX = a.x + (test.y - a.y) * (b.x - a.x) / denominator;
+                if (test.x < intersectX)
+                {
+                    inside = !inside;
+                }
+            }
+            return inside;
+        }
+
+        /// <summary>
+        /// 严格版「点在多边形内」：**不带任何吸附容差**。
+        ///
+        /// 为什么要单独一个：`PointInPolygon` 走的是 `PointOnSegment`，那里的容差
+        /// 是 **0.5**。这对"用户点到边界附近"是好事，但在模块的内容坐标里
+        /// X 的单位是**秒** —— 0.5 秒是半个大格子，足以把框外一大截的块
+        /// 判成"压在边框上"。实测：框右边界 25.955，块右端 26.292（超了 0.337 秒）
+        /// 照样算成员，拖模块时跟着跑。
+        ///
+        /// 这里只判射线交点，容差 1e-4（边界重合时算在内）。
+        /// </summary>
+        private static bool PointStrictlyInPolygon(List<Vector2> points, Vector2 test)
+        {
+            if (points == null || points.Count < 3)
+            {
+                return false;
+            }
+            bool inside = false;
+            int count = points.Count;
+            // **边界上的点算在内**，但容差只有 1e-4 秒。
+            //
+            // 这一步不能省：块的左上角经常正好压在框的左上角上（用户画框时
+            // 就是沿着块边画的），射线法对"点恰好在顶点上"的结果是不确定的
+            // —— 实测会判成在外，于是框里的块一个都不算成员。
+            const float edgeTolerance = 1e-4f;
+
+            for (int i = 0, j = count - 1; i < count; j = i++)
+            {
+                Vector2 a = points[i];
+                Vector2 b = points[j];
+                if (PointOnSegment(a, b, test, edgeTolerance))
+                {
+                    return true;
+                }
+                bool crosses = (a.y > test.y) != (b.y > test.y);
+                if (!crosses)
+                {
+                    continue;
+                }
+                float denominator = b.y - a.y;
+                if (Mathf.Abs(denominator) < 1e-6f)
+                {
+                    continue;
+                }
+                float intersectX = a.x + (test.y - a.y) * (b.x - a.x) / denominator;
+                if (test.x <= intersectX + edgeTolerance)
+                {
+                    inside = !inside;
+                }
+            }
+            return inside;
+        }
+
+        /// <summary>
+        /// 点是否落在线段上。
+        ///
+        /// `tolerance` 默认 0.5（给"鼠标点到边界附近"用）；模块的严格判定会传
+        /// 一个极小值 —— 那里的坐标单位是秒，0.5 就是半秒。
+        /// </summary>
+        private static bool PointOnSegment(Vector2 a, Vector2 b, Vector2 test,
+            float tolerance = 0.5f)
+        {
+            Vector2 ab = b - a;
+            Vector2 at = test - a;
+            float lengthSquared = ab.sqrMagnitude;
+            if (lengthSquared < 1e-6f)
+            {
+                return (test - a).sqrMagnitude <= tolerance * tolerance;
+            }
+            float t = Vector2.Dot(at, ab) / lengthSquared;
+            if (t < 0f || t > 1f)
+            {
+                return false;
+            }
+            Vector2 projection = a + ab * t;
+            return (test - projection).sqrMagnitude <= tolerance * tolerance;
+        }
+
+        /// <summary>
+        /// 一个块是否**完整地**落在模块里。
+        ///
+        /// **判据是「整块包含」，不是「块中心在里面」。** 用户明确要的是这个：
+        /// 原来按中心判，一个块只要中心压在圈里就算成员 —— 于是紧贴框外、
+        /// 只探进来一个角的块也会被算进去，拖模块时跟着一起动，看着莫名其妙。
+        ///
+        /// 做法：取块在内容坐标里的矩形（X = 起点~起点+时长，Y = 行~行+1），
+        /// 四个角都在多边形内才算命中。凹多边形下四角在内理论上还不能保证
+        /// 全包含，但模块框基本是凸的矩形/多边形，够用了。
+        /// </summary>
+        private bool BlockFullyInModule(BlockPlacement placement, TimelineModule module)
+        {
+            if (placement == null || module == null || module.Points.Count < 3
+                || placement.Item == null)
+            {
+                return false;
+            }
+
+            float duration = placement.Item.Duration;
+            if (!float.IsNaN(placement.PreviewDuration))
+            {
+                duration = placement.PreviewDuration;
+            }
+            if (duration < 0f)
+            {
+                duration = 0f;
+            }
+
+            // **按「画出来的宽度」判，不是按数据时长判。**
+            //
+            // 零时长事件（SetFilter / MoveTrack 这一类）数据上就是一个点，
+            // 但时间轴上照样画成 `BlockMinWidth` 那么宽。只按数据判的话，
+            // 视觉上明明探到框外、贴着右沿的块，矩形退化成一个点、稳稳在框里，
+            // 于是被判成成员 —— 用户看到的就是"右边有几个事件贴着框，却被
+            // 算进模块、跟着一起拖了"。
+            //
+            // 这里换算成「当前缩放下那一块最少占多少秒」，和肉眼看到的一致。
+            float minVisibleSeconds = BlockMinWidth / Mathf.Max(1f, pixelsPerSecond);
+            if (duration < minVisibleSeconds)
+            {
+                duration = minVisibleSeconds;
+            }
+
+            float left = placement.Time;
+            float right = placement.Time + duration;
+            float top = placement.Row;
+            float bottom = placement.Row + 1f;
+
+            // **必须用严格版。** `PointInPolygon` 的边界容差是 0.5，在这里
+            // 等于"半秒"，框外半秒以内的块全会被当成压在边框上。
+            return PointStrictlyInPolygon(module.Points, new Vector2(left, top))
+                && PointStrictlyInPolygon(module.Points, new Vector2(right, top))
+                && PointStrictlyInPolygon(module.Points, new Vector2(right, bottom))
+                && PointStrictlyInPolygon(module.Points, new Vector2(left, bottom));
+        }
+
+        /// <summary>
+        /// 块中心在**内容坐标**里的位置（X = 秒，Y = 行空间像素）。
+        ///
+        /// 和 `TryGetBlockRect` 那套屏幕换算同源，只是这里要的是内容坐标 ——
+        /// 模块的多边形按内容坐标存，两者必须用同一个空间比。
+        /// </summary>
+        private bool TryGetBlockCenterInContentSpace(BlockPlacement placement, out Vector2 center)
+        {
+            center = Vector2.zero;
+            if (placement == null || placement.Item == null)
+            {
+                return false;
+            }
+            float start = placement.Time;
+            float duration = placement.Item.Duration;
+            if (!float.IsNaN(placement.PreviewDuration))
+            {
+                duration = placement.PreviewDuration;
+            }
+            float timeMid = start + duration * 0.5f;
+            // **模块坐标空间：X = 秒，Y = 行号浮点。**
+            //
+            // 为什么不存像素：行高（`BlockStridePixels`）是可以调的，缩放也是。
+            // 存像素的话用户一改行高或者一缩放，多边形就和块错位了 —— 而且
+            // 是不可逆的错位，得重画。存「秒 + 行号」则永远对得上。
+            float rowMid = placement.Row + 0.5f;
+            center = new Vector2(timeMid, rowMid);
+            return true;
+        }
+
+        /// <summary>模块坐标 → 画布局部坐标（相对 viewport 左上角）。</summary>
+        private Vector2 ModulePointToLocal(Vector2 modulePoint)
+        {
+            float x = (modulePoint.x - viewStartTime) * Mathf.Max(1f, pixelsPerSecond);
+            float y = RulerHeight + modulePoint.y * BlockStridePixels - verticalScrollOffset;
+            return new Vector2(x, y);
+        }
+
+        /// <summary>画布局部坐标 → 模块坐标。`ModulePointToLocal` 的反向。</summary>
+        private Vector2 LocalToModulePoint(Vector2 local)
+        {
+            float x = viewStartTime + local.x / Mathf.Max(1f, pixelsPerSecond);
+            float y = (local.y - RulerHeight + verticalScrollOffset)
+                / Mathf.Max(1f, BlockStridePixels);
+            return new Vector2(x, y);
+        }
+
+
+        /// <summary>
+        /// 拖完模块后，等身份键重算好了再按几何重建一次成员表。
+        ///
+        /// 身份键里带着**起点时间**和**参数哈希**，拖模块改的正是时间 ——
+        /// 提交之后整批键都会变，而成员表里留的还是旧键。这个时间点（位置表
+        /// 刚重绑完、清单已经换成新对象、键也重算过了）几何关系仍然是对的，
+        /// 所以按几何重建一定能把同一批块找回来。
+        ///
+        /// 只在 `moduleMembersNeedGeometry` 被置起来的那一帧做一次。
+        /// </summary>
+        /// <summary>
+        /// 成员表需要按几何重建。
+        ///
+        /// **这是唯一的失效点。** 任何会让归属变化的事情（画圈、拖模块、
+        /// 拖块、改行号、粘贴、删除、撤销、读工程……）都只把这一位置起来，
+        /// 由 `EnsureModuleMembersRebuilt` 在下次要用之前统一重建一遍。
+        ///
+        /// 以前的做法是每个调用点自己去"补算"，兜底条件各写各的、互相不知道
+        /// 对方存在 —— 那正是这一串 bug 的来源（第二次拖不动、拖出拖回丢成员、
+        /// 拖一个模块别的模块块全冒出来……）。
+        /// </summary>
+        private bool moduleMembersDirty = true;
+
+        /// <summary>
+        /// 正在重建成员表。**防重入，不能省。**
+        ///
+        /// 重建前要调 `EnsureBlockPlacements` 把位置表弄新，而那条路会反过来
+        /// 把 `moduleMembersDirty` 重新置起来 —— 没有这个闸的话，
+        /// `CollectBlocks` 每问一个块就重建一次整表，1156 个块就是 1156 次
+        /// O(模块数 × 块数)。实测 1525ms 一帧，整个工作台卡死。
+        /// </summary>
+        private bool rebuildingModuleMembers;
+
+        /// <summary>
+        /// 脏了就整表重建一次。**每帧每个用到成员的地方都先调它**。
+        ///
+        /// 重建的判据只有一条：**块矩形四角都在多边形内**（`BlockFullyInModule`），
+        /// 后画的模块优先。不查身份键 —— 键会过期，几何不会。
+        ///
+        /// 开销：模块数 × 块数。块数上千时靠包围盒先筛掉大半，而且只在
+        /// 脏的那一帧跑；静止帧这里是直接 return。
+        /// </summary>
+        private void EnsureModuleMembersRebuilt()
+        {
+            if (!moduleMembersDirty || rebuildingModuleMembers)
+            {
+                return;
+            }
+
+            // **先确保位置表是最新的。** 成员是拿块的当前矩形算的，
+            // 位置表还是上一帧的话算出来的是旧归属。
+            //
+            // 这一步可能**反过来把脏标记重新置起来**（`EnsureBlockPlacements`
+            // 里有好几处置脏），所以要先清标记、再调它、最后再清一次 ——
+            // 而不是"清完标记再调，出来就以为干净了"。
+            moduleMembersDirty = false;
+            rebuildingModuleMembers = true;
+            try
+            {
+                EnsureBlockPlacements();
+                moduleMembersDirty = false;
+
+                for (int m = 0; m < modules.Count; m++)
+                {
+                    TimelineModule module = modules[m];
+                    if (module != null)
+                    {
+                        module.Members.Clear();
+                    }
+                }
+                if (modules.Count == 0 || blockPlacements.Count == 0)
+                {
+                    return;
+                }
+
+                BuildModuleMembers();
+            }
+            finally
+            {
+                rebuildingModuleMembers = false;
+            }
+        }
+
+        /// <summary>
+        /// 真正做「按几何认领」的那一段。从后往前扫（后画的模块优先）。
+        ///
+        /// 单独拆出来是为了让 `EnsureModuleMembersRebuilt` 的 try/finally
+        /// 包得干净 —— 中途抛出去也必须把 `rebuildingModuleMembers` 放回去，
+        /// 否则之后永远不再重建（成员表就冻在坏状态上）。
+        /// </summary>
+        private void BuildModuleMembers()
+        {
+            for (int m = modules.Count - 1; m >= 0; m--)
+            {
+                TimelineModule module = modules[m];
+                if (module == null || module.Points.Count < 3)
+                {
+                    continue;
+                }
+                for (int i = 0; i < blockPlacements.Count; i++)
+                {
+                    BlockPlacement placement = blockPlacements[i];
+                    if (placement == null || placement.Item == null
+                        || string.IsNullOrEmpty(placement.Item.Key))
+                    {
+                        continue;
+                    }
+                    if (module.Members.Contains(placement.Item.Key))
+                    {
+                        continue;
+                    }
+                    if (!BlockFullyInModule(placement, module))
+                    {
+                        continue;
+                    }
+                    module.Members.Add(placement.Item.Key);
+                }
+            }
+        }
+
+
+        /// <summary>
+        /// 多边形压成零面积时把它撑成矩形。
+        ///
+        /// 触发条件很常见：横向画一圈、只在一行里点、或者 Y 吸附之后全部顶点
+        /// 落到同一行。这时多边形退化成一条线，`PointInPolygon` 圈不进任何块 ——
+        /// 用户看到的是"画了个框，但拖不动"（其实是一个成员都没有）。
+        ///
+        /// **只在退化时才动形状**：正常的多边形原样保留（用户要的钢笔感觉）。
+        /// 退化的话没别的选择 —— 一条线本来就没法定义区域，撑成细条反而能用。
+        /// </summary>
+        private void ExpandDegenerateModule(TimelineModule module)
+        {
+            if (module == null || module.Points.Count < 3)
+            {
+                return;
+            }
+
+            float minX = float.MaxValue, maxX = float.MinValue;
+            float minY = float.MaxValue, maxY = float.MinValue;
+            for (int i = 0; i < module.Points.Count; i++)
+            {
+                Vector2 p = module.Points[i];
+                minX = Mathf.Min(minX, p.x);
+                maxX = Mathf.Max(maxX, p.x);
+                minY = Mathf.Min(minY, p.y);
+                maxY = Mathf.Max(maxY, p.y);
+            }
+
+            // 一格宽。
+            float needX = 0.1f;
+            scnEditor editor = scnEditor.instance;
+            if (editor != null && editor.floors != null && editor.floors.Count >= 2)
+            {
+                float first = Convert.ToSingle(editor.floors[0].entryTime);
+                float second = Convert.ToSingle(editor.floors[1].entryTime);
+                float delta = Mathf.Abs(second - first);
+                if (delta > 0.0001f)
+                {
+                    needX = delta;
+                }
+            }
+            // 一行高。
+            const float needY = 1f;
+
+            // **判据只有一条：真的塌成零。**
+            //
+            // 原来拿「一格时长」当 X 的阈值 —— 那等于说"窄于一格的框算退化"，
+            // 于是谱面 BPM 低的时候（实测一格 2.696 秒）用户画一个两秒宽的框
+            // 就被判成退化、硬撑到一格宽，**右边凭空多出一截**。
+            // 实测：四个顶点 x=6.404..8.427（宽 2.02 秒），闭合后变成 6.40..9.10。
+            //
+            // 真正的退化是"所有顶点共线"（吸附之后横向画一条线、Y 全相同）。
+            // 那种情况差值是 0，所以判 0 就够。
+            bool flatY = maxY - minY <= 0.0001f;
+            bool flatX = maxX - minX <= 0.0001f;
+            if (!flatY && !flatX)
+            {
+                // 形状本来就撑得开，一个字都不改。
+                return;
+            }
+
+            if (flatY)
+            {
+                maxY = minY + needY;
+            }
+            if (flatX)
+            {
+                maxX = minX + needX;
+            }
+
+            module.Points.Clear();
+            module.Points.Add(new Vector2(minX, minY));
+            module.Points.Add(new Vector2(maxX, minY));
+            module.Points.Add(new Vector2(maxX, maxY));
+            module.Points.Add(new Vector2(minX, maxY));
+        }
+
+        /// <summary>
+        /// 这一块属于哪个模块 —— **按身份键先找，找不到再按几何兜底**。
+        ///
+        /// 单靠身份键不够稳：键里带着起点时间和参数哈希，一次拖动 / 改参数之后
+        /// 整批键都会变，而成员表要等下一次重算才追上。这中间的空档里
+        /// `ModuleOf` 会返回 null —— 用户看到的就是"在模块里的块上拖，
+        /// 有时拖整组、有时只拖一个"。
+        ///
+        /// 几何兜底用的是**完全包裹**那条判据，和成员判定同一套。
+        /// </summary>
+        private TimelineModule ModuleOfBlock(TimelineItem item)
+        {
+            if (item == null || item.Event == null)
+            {
+                return null;
+            }
+            EnsureModuleMembersRebuilt();
+            BlockPlacement placement = FindPlacementForEvent(item.Event);
+            if (placement == null)
+            {
+                return null;
+            }
+            // 后画的赢 —— 和 `EnsureModuleMembersRebuilt` 的认领顺序一致。
+            for (int i = modules.Count - 1; i >= 0; i--)
+            {
+                TimelineModule module = modules[i];
+                if (module != null && BlockFullyInModule(placement, module))
+                {
+                    return module;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>这个块属于哪个模块。不属于任何模块时返回 null。</summary>
+        internal TimelineModule ModuleOf(string eventKey)
+        {
+            if (string.IsNullOrEmpty(eventKey))
+            {
+                return null;
+            }
+            EnsureModuleMembersRebuilt();
+            for (int i = 0; i < modules.Count; i++)
+            {
+                TimelineModule module = modules[i];
+                if (module != null && module.Members.Contains(eventKey))
+                {
+                    return module;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// 这个块是不是被「已折叠」的模块藏起来了。
+        ///
+        /// 折叠 = 整块不画，只留模块那一条横条。
+        ///
+        /// **这里是热路径**（每帧每块都问一次），所以只查成员表、不做几何运算；
+        /// 表本身由 `EnsureModuleMembersRebuilt` 在脏帧整表刷好。
+        /// </summary>
+        private bool IsBlockHiddenByCollapsedModule(TimelineItem item)
+        {
+            if (item == null || string.IsNullOrEmpty(item.Key) || modules.Count == 0)
+            {
+                return false;
+            }
+            bool anyCollapsed = false;
+            for (int i = 0; i < modules.Count; i++)
+            {
+                TimelineModule module = modules[i];
+                if (module != null && module.Collapsed)
+                {
+                    anyCollapsed = true;
+                    break;
+                }
+            }
+            if (!anyCollapsed)
+            {
+                return false;
+            }
+            EnsureModuleMembersRebuilt();
+            for (int i = 0; i < modules.Count; i++)
+            {
+                TimelineModule module = modules[i];
+                if (module != null && module.Collapsed && module.Members.Contains(item.Key))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 把选中的几个模块合并成一个。
+        ///
+        /// **做法是"并成一个更大的多边形"** —— 取所有顶点的凸包。
+        ///
+        /// 为什么不是"保留第一个、把别人删掉"：那样只有第一个的框还在，
+        /// 其余几块区域就成了"不属于任何模块"的空地，视觉上和预期不符
+        /// （用户想的是"这几个合起来算一块"）。
+        ///
+        /// 为什么是凸包而不是并集轮廓：并集轮廓要处理凹凸边、自相交、
+        /// 顶点合并，代码量是凸包的十倍，而这个场景（几个相邻的矩形框）
+        /// 用凸包包出来就是对的形状。凸包在凹多边形组合下的代价是
+        /// **会多圈进一点空白区域**，但那片区域本来就在相邻模块之间，
+        /// 视觉效果可以接受。
+        /// </summary>
+        private void MergeModules(List<TimelineModule> targets)
+        {
+            if (targets == null || targets.Count < 2)
+            {
+                return;
+            }
+
+            // 只留下还活着的（撤销 / 换谱面都可能让列表里的引用失效）。
+            List<TimelineModule> live = new List<TimelineModule>();
+            for (int i = 0; i < targets.Count; i++)
+            {
+                TimelineModule module = targets[i];
+                if (module != null && module.Points.Count >= 3
+                    && modules.Contains(module))
+                {
+                    live.Add(module);
+                }
+            }
+            if (live.Count < 2)
+            {
+                SetTransientStatus("没有可合并的模块", 2f);
+                return;
+            }
+
+            List<EditorCommandHistory.ModuleSnapshot> snapshotBefore =
+                CaptureModuleSnapshot();
+
+            // 1) 收集全部顶点，求凸包。
+            List<Vector2> all = new List<Vector2>();
+            bool anyCollapsed = false;
+            for (int i = 0; i < live.Count; i++)
+            {
+                all.AddRange(live[i].Points);
+                anyCollapsed |= live[i].Collapsed;
+            }
+            List<Vector2> hull = ConvexHull(all);
+            if (hull.Count < 3)
+            {
+                SetTransientStatus("合并失败：顶点共线，围不出区域", 3f);
+                return;
+            }
+
+            // 2) 新模块：名字沿用第一个的（有自定义名就保留，没有就空着走默认）。
+            TimelineModule merged = new TimelineModule
+            {
+                Name = live[0].Name ?? string.Empty,
+                // 合并后的形态：**展开**。折叠起来看不见里面合并了什么，
+                // 而且用户刚做完合并动作，接着要看的就是结果。
+                Collapsed = false
+            };
+            merged.Points.AddRange(hull);
+            _ = anyCollapsed;
+
+            // 3) 位置：在原列表中第一个模块的位置插入（保持"后画的赢"的次序）。
+            int insertIndex = modules.IndexOf(live[0]);
+            if (insertIndex < 0)
+            {
+                insertIndex = modules.Count;
+            }
+
+            // 4) 移除被合并的，插入新的。
+            for (int i = 0; i < live.Count; i++)
+            {
+                if (live[i].CollapsedLabel != null)
+                {
+                    Destroy(live[i].CollapsedLabel);
+                    live[i].CollapsedLabel = null;
+                    live[i].CollapsedText = null;
+                }
+                HideCollapsedBar(live[i]);
+                modules.Remove(live[i]);
+            }
+            if (insertIndex > modules.Count)
+            {
+                insertIndex = modules.Count;
+            }
+            modules.Insert(insertIndex, merged);
+
+            selectedModules.Clear();
+            SetSelectedModule(merged, true);
+            moduleMembersDirty = true;
+            projectDirty = true;
+            visualsDirty = true;
+            layoutDirty = true;
+            MarkBlocksDirty();
+
+            EditorCommandHistory.RecordModuleChange(this, "合并模块",
+                snapshotBefore, CaptureModuleSnapshot());
+            SetTransientStatus("已合并 " + live.Count + " 个模块", 3f);
+        }
+
+        /// <summary>
+        /// 求一组点的**凸包**（Andrew 单调链）。返回逆时针排列的顶点。
+        ///
+        /// 用于合并模块：把几个相邻模块的多边形顶点拢在一起求凸包，
+        /// 得到一个把它们都包住的框。
+        /// </summary>
+        private static List<Vector2> ConvexHull(List<Vector2> points)
+        {
+            List<Vector2> result = new List<Vector2>();
+            if (points == null || points.Count < 3)
+            {
+                return result;
+            }
+
+            List<Vector2> sorted = new List<Vector2>(points);
+            sorted.Sort(delegate(Vector2 a, Vector2 b)
+            {
+                if (!Mathf.Approximately(a.x, b.x))
+                {
+                    return a.x.CompareTo(b.x);
+                }
+                return a.y.CompareTo(b.y);
+            });
+
+            // 去掉完全重合的点 —— 否则叉积恒为 0，单调链会退化成一条线。
+            List<Vector2> unique = new List<Vector2>(sorted.Count);
+            for (int i = 0; i < sorted.Count; i++)
+            {
+                if (unique.Count == 0
+                    || (unique[unique.Count - 1] - sorted[i]).sqrMagnitude > 1e-8f)
+                {
+                    unique.Add(sorted[i]);
+                }
+            }
+            if (unique.Count < 3)
+            {
+                return result;
+            }
+
+            List<Vector2> lower = new List<Vector2>();
+            for (int i = 0; i < unique.Count; i++)
+            {
+                while (lower.Count >= 2
+                    && Cross(lower[lower.Count - 2], lower[lower.Count - 1], unique[i]) <= 0f)
+                {
+                    lower.RemoveAt(lower.Count - 1);
+                }
+                lower.Add(unique[i]);
+            }
+
+            List<Vector2> upper = new List<Vector2>();
+            for (int i = unique.Count - 1; i >= 0; i--)
+            {
+                while (upper.Count >= 2
+                    && Cross(upper[upper.Count - 2], upper[upper.Count - 1], unique[i]) <= 0f)
+                {
+                    upper.RemoveAt(upper.Count - 1);
+                }
+                upper.Add(unique[i]);
+            }
+
+            // 两条链首尾各有一个重复点，去掉。
+            lower.RemoveAt(lower.Count - 1);
+            upper.RemoveAt(upper.Count - 1);
+            result.AddRange(lower);
+            result.AddRange(upper);
+            return result;
+        }
+
+        /// <summary>三点叉积（正 = 逆时针）。</summary>
+        private static float Cross(Vector2 origin, Vector2 a, Vector2 b)
+        {
+            return (a.x - origin.x) * (b.y - origin.y)
+                - (a.y - origin.y) * (b.x - origin.x);
+        }
+
+        /// <summary>把几个模块的成员事件一起复制。</summary>
+        private void DoModulesCopy(List<TimelineModule> targets)
+        {
+            multiSelection.Clear();
+            selectedEvent = null;
+            if (targets == null)
+            {
+                return;
+            }
+            for (int m = 0; m < targets.Count; m++)
+            {
+                TimelineModule module = targets[m];
+                if (module == null || !modules.Contains(module))
+                {
+                    continue;
+                }
+                for (int i = 0; i < blockPlacements.Count; i++)
+                {
+                    BlockPlacement placement = blockPlacements[i];
+                    if (placement == null || placement.Item == null
+                        || placement.Item.Event == null)
+                    {
+                        continue;
+                    }
+                    if (IsModuleMember(module, placement))
+                    {
+                        multiSelection.Add(placement.Item.Event);
+                    }
+                }
+            }
+            int copied = CopySelection();
+            SetTransientStatus(copied <= 0
+                ? "这些模块里没有可复制的事件"
+                : "已复制 " + copied + " 个事件", 3f);
+        }
+
+        /// <summary>把几个模块一起删掉（**只删框，块留着并选中**）。</summary>
+        private void DoModulesDelete(List<TimelineModule> targets)
+        {
+            if (targets == null || targets.Count == 0)
+            {
+                return;
+            }
+            EnsureModuleMembersRebuilt();
+
+            List<EditorCommandHistory.ModuleSnapshot> snapshotBefore =
+                CaptureModuleSnapshot();
+
+            // 先把成员收进多选 —— 和单模块删除同一个语义。
+            multiSelection.Clear();
+            for (int m = 0; m < targets.Count; m++)
+            {
+                TimelineModule module = targets[m];
+                if (module == null || !modules.Contains(module))
+                {
+                    continue;
+                }
+                for (int i = 0; i < blockPlacements.Count; i++)
+                {
+                    BlockPlacement placement = blockPlacements[i];
+                    if (placement == null || placement.Item == null
+                        || placement.Item.Event == null)
+                    {
+                        continue;
+                    }
+                    if (IsModuleMember(module, placement))
+                    {
+                        multiSelection.Add(placement.Item.Event);
+                    }
+                }
+                if (module.CollapsedLabel != null)
+                {
+                    Destroy(module.CollapsedLabel);
+                    module.CollapsedLabel = null;
+                    module.CollapsedText = null;
+                }
+                HideCollapsedBar(module);
+                modules.Remove(module);
+            }
+
+            selectedModules.Clear();
+            selectedModule = null;
+            selectedModules.Clear();
+            foreach (LevelEvent levelEvent in multiSelection)
+            {
+                selectedEvent = levelEvent;
+                break;
+            }
+
+            projectDirty = true;
+            visualsDirty = true;
+            layoutDirty = true;
+            MarkBlocksDirty();
+            moduleMembersDirty = true;
+
+            EditorCommandHistory.RecordModuleChange(this, "删除模块",
+                snapshotBefore, CaptureModuleSnapshot());
+            SetTransientStatus("已删除 " + targets.Count + " 个模块（事件保留）", 3f);
+            // 让外面那条 Delete 别再删一遍（同单模块删除）。
+            moduleDeleteHandledFrame = Time.frameCount;
+        }
+
+        /// <summary>某个模块的显示名：没自定义就用「模块 N」。</summary>
+        internal string DisplayNameOf(TimelineModule module)
+        {
+            if (module == null)
+            {
+                return string.Empty;
+            }
+            if (!string.IsNullOrEmpty(module.Name))
+            {
+                return module.Name;
+            }
+            int index = modules.IndexOf(module);
+            return "模块 " + (index < 0 ? 1 : index + 1);
         }
 
         /// <summary>
@@ -3364,6 +7288,12 @@ private static float MinimumPixelsPerSecond
                 }
                 project.Rows[placement.Item.Key] = placement.Row;
             }
+            // **模块必须一起写。**
+            //
+            // 这里原来是只填 Rows 就落盘 —— 因为那时候还没有模块。加了模块之后
+            // 忘了这一句的话，每存一次排版就把所有模块抹掉，而用户完全察觉不到
+            // （界面上模块还好好的，重开谱面才没）。
+            WriteModulesTo(project);
             string error = EditorProjectFile.Save(projectPath, project);
             if (string.IsNullOrEmpty(error))
             {
@@ -3373,6 +7303,63 @@ private static float MinimumPixelsPerSecond
             }
             return error;
         }
+
+        /// <summary>上一次自动保存的时刻（`Time.unscaledTime`）。</summary>
+        private float lastAutoSaveTime;
+
+        /// <summary>
+        /// 工程脏了之后，安静一会儿就自动写盘。
+        ///
+        /// **为什么需要它：** 部署脚本是 `taskkill` 硬杀游戏，`SaveProjectBeforeQuit`
+        /// 那条优雅退出的自动保存永远不会触发。模块只在内存里，一次重启全丢 ——
+        /// 实测连画几轮之后工程文件里 `0 个模块`，用户看着像"右键菜单坏了"，
+        /// 其实是模块根本没存下来。
+        ///
+        /// **为什么是"安静一会儿"而不是每帧：** 拖动时 `projectDirty` 一直是 true，
+        /// 每帧写盘会卡。等 2 秒没新改动再写，既跟得上又不打断操作。
+        ///
+        /// 只在**已经有工程文件**时写：这张谱还没有工程就什么都不做 ——
+        /// 自动建工程目录超出了"自动保存"该做的事。
+        /// </summary>
+        private void TickAutoSaveLayout(float now)
+        {
+            if (!projectDirty)
+            {
+                lastAutoSaveTime = now;
+                return;
+            }
+            if (now - lastAutoSaveTime < AutoSaveIdleSeconds)
+            {
+                return;
+            }
+            lastAutoSaveTime = now;
+
+            string chartPath = EditorProjectSession.GetCurrentLevelPath();
+            if (string.IsNullOrEmpty(chartPath))
+            {
+                return;
+            }
+            if (EditorProjectFile.FindProjectFile(chartPath) == null)
+            {
+                // 没有工程文件：不自动建。用户得先切到编辑模式建一个。
+                return;
+            }
+            string directory = EditorProjectFile.GetProjectDirectory(chartPath);
+            string fileName = System.IO.Path.GetFileNameWithoutExtension(chartPath)
+                + EditorProjectFile.FileExtension;
+            string error = SaveProjectRows(
+                System.IO.Path.Combine(directory, fileName),
+                System.IO.Path.GetFileName(chartPath));
+            if (!string.IsNullOrEmpty(error))
+            {
+                Main.Logger.Warning("[工程] 自动保存失败：" + error);
+                return;
+            }
+            Main.Logger.Log("[工程] 自动保存 " + modules.Count + " 个模块");
+        }
+
+        /// <summary>布局改动停手多久之后自动存盘（秒）。</summary>
+        private const float AutoSaveIdleSeconds = 2f;
 
         /// <summary>
         /// 保存工程（开发期挂在 `Ctrl+Shift+S` 上）。
@@ -3620,7 +7607,16 @@ private static float MinimumPixelsPerSecond
 
             if (!forcePlacementRebuild && sameChart && blockPlacements.Count > 0)
             {
-                RebindBlockPlacements(ordered);
+                // **只有真重绑了才需要重算归属。**
+                //
+                // `RebindBlockPlacements` 在"顺序没变"时自己就早退了（那是
+                // 绝大多数帧），无条件置脏等于**每帧重建整个成员表** ——
+                // 1156 块 × 模块数，实测 1525ms 一帧，工作台卡死。
+                // 让它返回"到底动没动"。
+                if (RebindBlockPlacements(ordered))
+                {
+                    moduleMembersDirty = true;
+                }
                 return;
             }
             // 强制重排是一次性的：这次用掉就清掉，别让它一直生效
@@ -3662,6 +7658,9 @@ private static float MinimumPixelsPerSecond
                 UpdateZoomText();
                 visualsDirty = true;
             }
+
+            // 块刚全部重新装箱，归属要跟着重算。
+            moduleMembersDirty = true;
         }
 
         /// <summary>
@@ -3772,7 +7771,26 @@ private static float MinimumPixelsPerSecond
         /// 清单顺序仍然按 `SourceOrder` 排 —— 这样和"一块一行"的初始排列一致，
         /// 索引也就稳定，拖动中的 Id 不会指到别的块上。
         /// </summary>
-        private void RebindBlockPlacements(List<TimelineItem> ordered)
+        /// <summary>
+        /// 粘贴出来、还没定行的那些事件。
+        ///
+        /// **为什么不能记行号、也不能用"下一次重绑用"的单值字段：**
+        /// 粘贴之后要过几帧新事件才进 `ordered`（求值器重建是异步的），
+        /// 中间任何一次重绑都会把单值消耗掉 —— 等新事件真到了它已经是 0。
+        /// 实测症状：粘一次还行，**粘几次就全堆到最下面**。
+        ///
+        /// 而**行号也不能在粘贴那一刻算**：那时新块还不在 `blockPlacements` 里，
+        /// 拿它自己的时间去问「这一段时间最底是第几行」根本问不到（上一版就是
+        /// 这样算错的，落到了全谱末尾）。
+        ///
+        /// 所以这里只记"哪些事件是粘贴出来的"，**行号留到重绑时现算** ——
+        /// 那一刻其他块都已经定好位，算出来的才是真·这一段的下方。
+        /// </summary>
+        private readonly HashSet<LevelEvent> pendingPasteEvents =
+            new HashSet<LevelEvent>(ReferenceComparer<LevelEvent>.Instance);
+
+        /// <returns>true = 位置表真的动过（调用方要据此重算模块归属）。</returns>
+        private bool RebindBlockPlacements(List<TimelineItem> ordered)
         {
             // **一模一样就一个字都别动。**
             //
@@ -3786,7 +7804,7 @@ private static float MinimumPixelsPerSecond
             // 没变就早退，这两个问题一起消失。
             if (SamePlacementOrder(ordered))
             {
-                return;
+                return false;
             }
 
             // **按事件身份（`Key`）搬位置，不是按 `LevelEvent` 对象。**
@@ -3899,6 +7917,20 @@ private static float MinimumPixelsPerSecond
                         {
                             time = savedTime;
                         }
+
+                        // **前缀领到的行号可能已经被别人占了 —— 那就不能用。**
+                        //
+                        // 前缀是 `类型:格:时间`，而**粘贴出来的新事件前三段和原事件
+                        // 一模一样**。原事件在第 1 步已经按对象认回了自己的行号，
+                        // 而前缀队列是**独立的一份**、不会因为它被领走而消耗 ——
+                        // 于是这里把同一个行号又发给新块，两块当场叠在一起。
+                        //
+                        // 上面那段注释里「第二个自然去补 → 不会再叠」的推理只在
+                        // 「新块是旧块的替代」时成立；粘贴是**净增**，前提不成立。
+                        if (RowIsOccupied(item, row))
+                        {
+                            row = -1;
+                        }
                     }
                 }
 
@@ -3919,6 +7951,28 @@ private static float MinimumPixelsPerSecond
                         {
                             maxRow = row;
                         }
+                    }
+                }
+
+                if (row < 0 && item.Event != null
+                    && pendingPasteEvents.Remove(item.Event))
+                {
+                    // **粘贴出来的块：行号在这里现算。**
+                    //
+                    // 粘贴那一刻还算不了 —— 那时它自己都还没进 `blockPlacements`，
+                    // 拿它自己的时间去问"这一段最底是第几行"问不到（上一版就是
+                    // 这样算错的，落到了全谱末尾）。
+                    // 现在这个位置表里前面那些块**已经定好位**了，算出来才准。
+                    int pasteRow = BottomRowNear(item);
+                    int guard = blockPlacements.Count + 64;
+                    while (RowIsOccupied(item, pasteRow) && guard-- > 0)
+                    {
+                        pasteRow++;
+                    }
+                    row = pasteRow;
+                    if (row > maxRow)
+                    {
+                        maxRow = row;
                     }
                 }
 
@@ -3955,11 +8009,49 @@ private static float MinimumPixelsPerSecond
             {
                 RememberRemovedRow(leftover.Key, leftover.Value);
             }
+            return true;
+        }
+
+        /// <summary>
+        /// 这一块如果坐在 `row` 上，会不会和**已经定好位**的块在画面上叠着。
+        ///
+        /// 用「画出来的宽度」比（零时长块也占 `BlockMinWidth`），
+        /// 和 `BlockOverlapsOthers` 同一套判据 —— 就是肉眼看得到的那种叠。
+        ///
+        /// `blockPlacements` 在重绑过程中是**边建边填**的，已经加进去的就是
+        /// "已经定好位"的那批，正好拿它比。
+        /// </summary>
+        private bool RowIsOccupied(TimelineItem item, int row)
+        {
+            if (item == null || row < 0)
+            {
+                return false;
+            }
+            float speed = Mathf.Max(1f, pixelsPerSecond);
+            float selfLeft = item.StartTime * speed;
+            float selfRight = selfLeft + Mathf.Max(BlockMinWidth,
+                item.Duration * speed - BlockGap);
+
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                BlockPlacement other = blockPlacements[i];
+                if (other == null || other.Item == null || other.Row != row)
+                {
+                    continue;
+                }
+                float otherLeft = other.Time * speed;
+                float otherRight = otherLeft + Mathf.Max(BlockMinWidth,
+                    other.Item.Duration * speed - BlockGap);
+                if (selfLeft < otherRight && otherLeft < selfRight)
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         /// <summary>记下"这个事件消失前待在第几行"。见 <see cref="removedRows"/>。</summary>
-        private void RememberRemovedRow(LevelEvent levelEvent, int row)
-        {
+        private void RememberRemovedRow(LevelEvent levelEvent, int row)        {
             if (levelEvent == null)
             {
                 return;
@@ -4099,7 +8191,7 @@ private static float MinimumPixelsPerSecond
         /// </summary>
         private bool CollectBlocksUnchanged()
         {
-            if (!collectBoundOnce || blockDragActive || imBlockDrag)
+            if (!collectBoundOnce || blockDragActive || imBlockDrag || draggingModule != null)
             {
                 return false;
             }
@@ -4174,10 +8266,14 @@ private static float MinimumPixelsPerSecond
             // 而它在一帧里不会变 —— 4237 个块就是白查 4237 次。`imBlockDrag` 同理
             // （循环里没有改它的地方）。
             scnEditor chartEditor = scnEditor.instance;
-            // 两条拖动路径都要算「正在拖」：`imBlockDrag` 是 ImGui 时代那条，
-            // `blockDragActive` 是现在 uGUI 标记块走的这条。少判一个，拖动期间
-            // 位置表就会被谱面（还没提交的旧值）覆盖回去，块不跟手。
-            bool liveTimeBase = !imBlockDrag && !blockDragActive && chartEditor != null
+            // 三条拖动路径都要算「正在拖」：`imBlockDrag` 是 ImGui 时代那条，
+            // `blockDragActive` 是现在 uGUI 标记块走的这条，`draggingModule` 是
+            // 拖整个模块那条。少判一个，拖动期间位置表就会被谱面（还没提交的
+            // 旧值）覆盖回去，块不跟手 —— 拖模块时就是这么全军覆没的：
+            // `DragModule` 刚写好的 `placement.Time`，下一句就被这里的
+            // `GetEventStartTime` 按旧谱面算回去了，块纹丝不动。
+            bool liveTimeBase = !imBlockDrag && !blockDragActive
+                && draggingModule == null && chartEditor != null
                 && chartEditor.floors != null && chartEditor.floors.Count > 0;
             for (int i = 0; i < blockPlacements.Count; i++)
             {
@@ -4187,6 +8283,15 @@ private static float MinimumPixelsPerSecond
                 // **车道被关掉的块只是不画，位置表里原样留着。**
                 // 滤在这里而不是滤在清单里，切换车道才不会再动玩家的摆放。
                 if (item != null && !LaneIsVisible(item.Lane))
+                {
+                    continue;
+                }
+
+                // **折叠的模块里，那些块整块不画。**
+                //
+                // 用户选的形态：折叠后看不见时间块，只留一行纯色的模块条。
+                // 这里只是不画 —— 位置表、选中集、撤销全都照旧，展开就回来。
+                if (IsBlockHiddenByCollapsedModule(item))
                 {
                     continue;
                 }
@@ -4254,6 +8359,15 @@ private static float MinimumPixelsPerSecond
             // 超出谱面时长"（长事件、末尾的装饰物事件等）就会被算小 —— 于是
             // 横向滚动在某个位置被卡住，后面的块**永远滚不到**，看起来就是
             // "第 N 格之后的事件块全消失了"。
+            //
+            // **只按「起点时间」算，不按「起点 + 时长」。**
+            //
+            // 谱面里有种常见写法：给 `MoveDecorations` 写一个巨大的 duration
+            // （实测量到 5000000 拍），让装饰物"永久"停在场上。按右边算的话
+            // 时间轴的横向长度会被顶到两百多万秒（实测 navDur=2247330），
+            // 滚到最右边整整一大片空白 —— 用户报的"右边面积多了很多"就是这个。
+            //
+            // 导航要看的是"这个块在哪儿"，起点就够；块右端长得没意义，该裁就裁。
             float latestBlockTime = 0f;
             for (int i = 0; i < blockPlacements.Count; i++)
             {
@@ -4262,16 +8376,15 @@ private static float MinimumPixelsPerSecond
                 {
                     continue;
                 }
-                float end = placement.Time + Mathf.Max(0f, placement.Item.Duration);
-                if (end > latestBlockTime)
+                if (placement.Time > latestBlockTime)
                 {
-                    latestBlockTime = end;
+                    latestBlockTime = placement.Time;
                 }
             }
-            if (latestBlockTime > 0f)
-            {
-                navigationDuration = Mathf.Max(navigationDuration, latestBlockTime + 2f);
-            }
+            // 只记「块内容到哪儿」。横向范围在 `Update` 里和播放位置一起算 ——
+            // 那里能拿到 `snapshot.CurrentTime`，而且每次**重算**而不是累积
+            // （累积的话内容变短之后永远缩不回来，右边会留一片空白）。
+            blockContentEnd = latestBlockTime > 0f ? latestBlockTime + 2f : 0f;
             // **这里原来要把 blockViews 按（行号, Id）排一遍，去掉了。**
             //
             // 排序唯一的用途，是让绘制那边能「画到屏幕底下就 break」提前收工。
@@ -5009,6 +9122,25 @@ private static float MinimumPixelsPerSecond
             ApplyViewLockIcon();
             UiHoverTip.Attach(viewLockButton, "视图锁：锁住预览的相机位置和缩放");
 
+            // **铅笔：时间轴分组。**
+            //
+            // 像 PS 的钢笔工具：点一下落一个节点，节点之间自动连成多边形；
+            // 已落的节点可以拖。按 Esc 取消整次绘制。
+            // 闭合（点回第一个节点附近）才生成模块，没闭合就什么都不生成。
+            moduleButton = CreateButton(
+                "ModulePencil",
+                root,
+                358f + ContentShift,
+                7f,
+                32f,
+                29f,
+                string.Empty,
+                delegate { ToggleModulePencil(); }
+            );
+            ApplyModulePencilIcon();
+            UiHoverTip.Attach(moduleButton,
+                "分组：点出包围圈，闭合后生成模块（Esc 取消）");
+
             // 这个设置会持久化，所以启动时必须告知求值器——
             // 否则会出现一开始实际未锁、按钮却已显示为锁定状态的情况。
             if (Main.Settings != null)
@@ -5025,8 +9157,8 @@ private static float MinimumPixelsPerSecond
                 TextAlignmentOptions.Center, false);
 
             // 摘要放到读数左边那段空档里，右对齐贴住读数。
-            // 起点让开视图锁（322 + 32）那一格。
-            float summaryLeft = 364f + ContentShift;
+            // 起点让开分组铅笔（358 + 32）那一格，再留 8 的缝。
+            float summaryLeft = 398f + ContentShift;
             summaryText = CreateText("Summary", root, summaryLeft, 8f,
                 Mathf.Max(60f, timeX - 12f - summaryLeft), 28f, string.Empty, 11f,
                 TextMuted, TextAlignmentOptions.MidlineRight, false);
@@ -5066,12 +9198,29 @@ private static float MinimumPixelsPerSecond
             viewport.gameObject.AddComponent<RectMask2D>();
             // 格线要压在块**下面**，所以单独一层、先建。
             gridLayer = CreateRect("GridLayer", viewport, 0f, 0f, bodyWidth, bodyHeight);
+            // **模块层要垫在块下面。**
+            //
+            // 模块是半透明的色块，压在事件块上面会糊掉文字；垫在下面则像
+            // 一条带颜色的底板，块照常可读。它又在格线之上 —— 不然格线会
+            // 从半透明填充里透出来，看起来像脏点。
+            moduleLayer = CreateRect("ModuleLayer", viewport, 0f, 0f, bodyWidth, bodyHeight);
+            moduleGraphic = moduleLayer.gameObject.AddComponent<ModulePolygonGraphic>();
+            moduleGraphic.raycastTarget = false;
             // 事件块层：夹在标尺上沿与视口之间，播放头在它上面。
             //
             // **不要再给它加 RectMask2D。** 视口自己已经有遮罩了；这一层
             // 建的时候按当时的 bodyHeight 定尺寸，面板拉高之后它不跟着变 ——
             // 多出来那一段就被它自己裁掉（用户看到「下面又被剪了」）。
             blockLayer = CreateRect("BlockLayer", viewport, 0f, 0f, bodyWidth, bodyHeight);
+            // **铅笔模式要能压过块。**
+            //
+            // 每个块身上挂着 Button 和 TimelineBlockDrag，它们自己实现
+            // IPointerDownHandler —— 从块上按下时事件被块吃掉，视图这条
+            // OnPointerDown 根本不跑。画圈时手一定会划过块，那样就画不成。
+            //
+            // 挂个 CanvasGroup，开着铅笔时把 `blocksRaycasts` 关掉，
+            // 事件就会穿过块层落到视图上（视图组件在 panel 根节点上）。
+            blockLayerGroup = blockLayer.gameObject.AddComponent<CanvasGroup>();
             markerLayer = CreateRect("MarkerLayer", viewport, 0f, 0f, bodyWidth, bodyHeight);
             // 这些层必须在填充各自的池之前就存在，否则
             // 表头会被挂到场景根节点而不是画布下，导致
@@ -5601,7 +9750,10 @@ private static float MinimumPixelsPerSecond
             verticalScrollOffset = 0f;
 
             totalDuration = 0f;
-            navigationDuration = 0f;
+            // **这里不清 `navigationDuration`。**
+            // 清了之后只要 `CollectBlocks` 早退一帧（静止帧就会早退），
+            // `ClampViewStart` 会把视图夹到 0 —— 时间轴当场跳回开头。
+            // 它现在由 `Update` 每帧按 `blockContentEnd` 重算，不需要在这里重置。
             if (editor == null || editor.floors == null || editor.floors.Count == 0)
             {
                 // 空谱面也把滚动位置装回去，否则退出到这里时它会
@@ -5629,7 +9781,13 @@ private static float MinimumPixelsPerSecond
             }
 
             totalDuration = Mathf.Max(totalDuration, Convert.ToSingle(editor.floors[editor.floors.Count - 1].entryTime));
-            navigationDuration = totalDuration;
+            // **横向范围不取 `totalDuration`。**
+            //
+            // 它跟的是"最后一格"，而谱面末尾完全可能挂着一大段没有事件的空档
+            // （那种两百万秒级的时长就这么来的）。拿它当滚动上限，右边就是一整片
+            // 空白。范围交给 `CollectBlocks` 按最后一个块的**起点**去定 ——
+            // **这里不要清 `navigationDuration`**，清了而 `CollectBlocks`
+            // 又早退的话，`ClampViewStart` 会把视图夹回 0（时间轴跳回开头）。
             if (selectedEvent != null && !ContainsEventReference(selectedEvent))
             {
                 selectedEvent = null;
@@ -5653,6 +9811,16 @@ private static float MinimumPixelsPerSecond
             UpdateSummary();
             layoutDirty = true;
             visualsDirty = true;
+
+            // **事件清单变了，模块归属要跟着重算。**
+            //
+            // 块被别的途径删掉（原生面板、撤销、联机远端）之后，它还挂在
+            // 成员表里 —— 不重算的话成员计数和"选中整组"都会带上一个
+            // 不存在的块。用户选的语义是"自动从模块里移除，不弹提示"。
+            //
+            // 现在只需要置脏：归属完全由几何决定，下次用到时整表重建，
+            // 已经不在清单里的块自然不会被算进去（见 `EnsureModuleMembersRebuilt`）。
+            moduleMembersDirty = true;
 
             // 车道图标是在预览面板建按钮时取的，而那时谱面数据可能还没进来。
             // 数据一刷新就让那边再取一次：GetLaneIcon 的回退分支依赖事件已就绪。
@@ -7090,6 +11258,15 @@ private static float MinimumPixelsPerSecond
                 {
                     continue;
                 }
+                // **折叠模块里那些"不画"的块不算占位。**
+                //
+                // 它们在数据上还占着一行，但屏幕上根本看不见 —— 拿它们判重叠，
+                // 用户会把块拖到一片看着空空的区域里，红框一路亮着、松手就作废
+                // （用户说的"幽灵格导致红框拖不了"）。看不见的东西不该挡路。
+                if (IsBlockHiddenByCollapsedModule(other.Item))
+                {
+                    continue;
+                }
                 float otherLeft = other.Time * speed;
                 float otherWidth = Mathf.Max(BlockMinWidth,
                     other.Item.Duration * speed - BlockGap);
@@ -7112,10 +11289,23 @@ private static float MinimumPixelsPerSecond
         /// </summary>
         internal bool RevertDragIfOverlapping()
         {
-            bool overlapping = false;
-            for (int i = 0; i < dragOrigins.Count; i++)
+            return RevertDragIfOverlapping(dragOrigins);
+        }
+
+        /// <summary>
+        /// 同上，但按传进来的名单判 —— **拖模块要用这个**：那一批块存在
+        /// `moduleDragOrigins` 里，不是 `dragOrigins`。
+        /// </summary>
+        private bool RevertDragIfOverlapping(List<DragOrigin> origins)
+        {
+            if (origins == null)
             {
-                DragOrigin origin = dragOrigins[i];
+                return false;
+            }
+            bool overlapping = false;
+            for (int i = 0; i < origins.Count; i++)
+            {
+                DragOrigin origin = origins[i];
                 if (origin.Item == null || origin.Item.Event == null)
                 {
                     continue;
@@ -7131,9 +11321,9 @@ private static float MinimumPixelsPerSecond
                 return false;
             }
 
-            for (int i = 0; i < dragOrigins.Count; i++)
+            for (int i = 0; i < origins.Count; i++)
             {
-                DragOrigin origin = dragOrigins[i];
+                DragOrigin origin = origins[i];
                 if (origin.Item == null || origin.Item.Event == null)
                 {
                     continue;
@@ -7152,7 +11342,7 @@ private static float MinimumPixelsPerSecond
             }
 
             // 起点表清掉：横纵都不再提交。
-            dragOrigins.Clear();
+            origins.Clear();
             // 行号已退回原值，得让 `CollectBlocks` 重跑（它不看 visualsDirty）。
             blocksDirtyVersion++;
             visualsDirty = true;
@@ -8582,6 +12772,25 @@ private static float MinimumPixelsPerSecond
                 ToggleSelectionOf(item);
                 return;
             }
+
+            // **双击块 = 把它从模块里「拎出来」。**
+            //
+            // 模块内的块默认拖一个就拖整组，双击之后拖它只拖自己 ——
+            // 这样才能单独微调某一个。下一次选中变化时自动失效。
+            float now = Time.unscaledTime;
+            if (ReferenceEquals(item.Event, lastBlockClickEvent)
+                && now - lastBlockClickTime <= 0.35f)
+            {
+                detachedEvent = item.Event;
+                // 双击同时也把选中收敛到这一个（用户说的"选单个"）。
+                multiSelection.Clear();
+            }
+            else
+            {
+                detachedEvent = null;
+            }
+            lastBlockClickEvent = item.Event;
+            lastBlockClickTime = now;
 
             // 普通点击 = **替换**选择，所以先把多选清掉。
             //
@@ -10825,7 +15034,12 @@ private static float MinimumPixelsPerSecond
         /// </summary>
         private bool BlocksViewUnchanged()
         {
-            if (!blocksBoundOnce || blockDragActive || imBlockDrag)
+            // **模块拖动也算「拖动中」。**
+            //
+            // 拖模块改的是 `blockPlacements[i].Time / Row`（和多选拖动同一条路），
+            // 视图几何、数据指纹、选中指纹全都不变 —— 只靠快照会把块冻在原地，
+            // 拖框的时候块不跟手，松手后才"啪"地跳过去。
+            if (!blocksBoundOnce || blockDragActive || imBlockDrag || draggingModule != null)
             {
                 return false;
             }
@@ -10942,8 +15156,10 @@ private static float MinimumPixelsPerSecond
                     // 长事件往右铺得很远，拖动时只看这一块根本看不出后面撞没撞
                     // —— 这个红边就是那个提示（没有它，用户只能靠"撤回之后位置
                     // 怎么不对"来反推）。只查被拖着的那几块，每帧 O(块数)。
-                    bool dragMember = blockDragActive && block.Event != null
-                        && dragMembers.Contains(block.Event);
+                    // **拖模块也算「这次拖动涉及的块」** —— 否则拖整组时
+                    // 一块红边都不亮，松手整批作废，用户只看到"东西自己弹回去了"。
+                    bool dragMember = (blockDragActive || draggingModule != null)
+                        && block.Event != null && dragMembers.Contains(block.Event);
                     bool showOutline = block.Selected || dragMember;
                     if (marker.Outline.gameObject.activeSelf != showOutline)
                     {
@@ -11555,6 +15771,302 @@ private static float MinimumPixelsPerSecond
                 vh.AddTriangle(start, start + 1, start + 2);
                 vh.AddTriangle(start + 2, start + 3, start);
             }
+        }
+    }
+
+    /// <summary>
+    /// 画时间轴模块的多边形：半透明填充 + 一圈描边。
+    ///
+    /// 为什么自己写 Graphic 而不是拼 Image：
+    /// 模块是任意多边形（用户点几个点围出来），uGUI 的 Image 只会画矩形。
+    /// 而 `MaskableGraphic` 一个组件就能把全部模块画进同一张网格 ——
+    /// 十个模块也只是多几十个顶点，不会多出十几个 GameObject。
+    ///
+    /// **坐标约定和 `VerticalLineStripGraphic` 一致**：父节点左上角是原点，
+    /// x 向右、y 向下。填充用扇形三角化（以第一个顶点为中心），对凸多边形
+    /// 正确、对凹多边形在某些形状下会露出缺口 —— 用户画的基本都是凸的，
+    /// 这里按够用来做，不引入完整的耳切法三角化。
+    /// </summary>
+    internal sealed class ModulePolygonGraphic : MaskableGraphic
+    {
+        /// <summary>一个要画的多边形。顶点已换算成「相对本组件原点」的局部坐标。</summary>
+        internal sealed class Shape
+        {
+            internal readonly List<Vector2> Points = new List<Vector2>();
+            internal Color Fill = Color.white;
+            internal Color Stroke = Color.white;
+            internal float StrokeWidth = 2f;
+        }
+
+        private readonly List<Shape> pending = new List<Shape>();
+        private readonly List<Shape> submitted = new List<Shape>();
+        private bool forceDirty = true;
+
+        internal void BeginShapes()
+        {
+            pending.Clear();
+        }
+
+        /// <summary>加一个形状。`points` 会被拷进来，调用方可以复用列表。</summary>
+        internal void AddShape(List<Vector2> points, Color fill, Color stroke, float strokeWidth)
+        {
+            if (points == null || points.Count < 3)
+            {
+                return;
+            }
+            Shape shape = new Shape
+            {
+                Fill = fill,
+                Stroke = stroke,
+                StrokeWidth = Mathf.Max(1f, strokeWidth)
+            };
+            for (int i = 0; i < points.Count; i++)
+            {
+                shape.Points.Add(points[i]);
+            }
+            pending.Add(shape);
+        }
+
+        internal void SubmitShapes()
+        {
+            if (!forceDirty && SameAsSubmitted())
+            {
+                return;
+            }
+            forceDirty = false;
+
+            submitted.Clear();
+            // 这里不做复用池 —— 模块数量是个位数，每帧新建几个 Shape 可以接受；
+            // 真要优化时再上池子，现在上只会让代码更难读。
+            for (int i = 0; i < pending.Count; i++)
+            {
+                submitted.Add(pending[i]);
+            }
+            SetVerticesDirty();
+        }
+
+        /// <summary>强制下一帧重画（颜色/形状之外的状态变了时用，比如选中态切换）。</summary>
+        internal void MarkDirty()
+        {
+            forceDirty = true;
+        }
+
+        private bool SameAsSubmitted()
+        {
+            if (submitted.Count != pending.Count)
+            {
+                return false;
+            }
+            for (int i = 0; i < pending.Count; i++)
+            {
+                Shape a = submitted[i];
+                Shape b = pending[i];
+                if (!SameColor(a.Fill, b.Fill) || !SameColor(a.Stroke, b.Stroke)
+                    || !Mathf.Approximately(a.StrokeWidth, b.StrokeWidth)
+                    || a.Points.Count != b.Points.Count)
+                {
+                    return false;
+                }
+                for (int p = 0; p < a.Points.Count; p++)
+                {
+                    // 0.05 像素的容差：滚动偏移是浮点累加，逐帧有微小抖动，
+                    // 严格相等会让它每帧都判定"变了"、每帧重建网格。
+                    if ((a.Points[p] - b.Points[p]).sqrMagnitude > 0.0025f)
+                    {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        private static bool SameColor(Color a, Color b)
+        {
+            return Mathf.Abs(a.r - b.r) <= 0.004f
+                && Mathf.Abs(a.g - b.g) <= 0.004f
+                && Mathf.Abs(a.b - b.b) <= 0.004f
+                && Mathf.Abs(a.a - b.a) <= 0.004f;
+        }
+
+        /// <summary>多边形的有向面积。正 = 逆时针，负 = 顺时针。</summary>
+        private static float SignedArea(List<Vector2> points)
+        {
+            float sum = 0f;
+            for (int i = 0, j = points.Count - 1; i < points.Count; j = i++)
+            {
+                sum += (points[j].x * points[i].y) - (points[i].x * points[j].y);
+            }
+            return sum * 0.5f;
+        }
+
+        /// <summary>
+        /// 这三个连续顶点能不能切下来当"耳朵"。
+        ///
+        /// 条件：prev→cur→next 是凸的（叉积为正，前提是逆时针），
+        /// 且这个三角形里不含多边形其它顶点。少了后一条，凹多边形会切错。
+        /// </summary>
+        private static bool IsEar(List<Vector2> points, int prev, int cur, int next)
+        {
+            Vector2 a = points[prev];
+            Vector2 b = points[cur];
+            Vector2 c = points[next];
+
+            // 叉积判凸：逆时针多边形里，凸顶点的叉积为正。
+            float cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+            if (cross <= 0f)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < points.Count; i++)
+            {
+                if (i == prev || i == cur || i == next)
+                {
+                    continue;
+                }
+                if (PointInTriangle(points[i], a, b, c))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /// <summary>点是否在三角形内（含边界）。</summary>
+        private static bool PointInTriangle(Vector2 p, Vector2 a, Vector2 b, Vector2 c)
+        {
+            float d1 = (p.x - b.x) * (a.y - b.y) - (a.x - b.x) * (p.y - b.y);
+            float d2 = (p.x - c.x) * (b.y - c.y) - (b.x - c.x) * (p.y - c.y);
+            float d3 = (p.x - a.x) * (c.y - a.y) - (c.x - a.x) * (p.y - a.y);
+            bool hasNeg = d1 < 0f || d2 < 0f || d3 < 0f;
+            bool hasPos = d1 > 0f || d2 > 0f || d3 > 0f;
+            return !(hasNeg && hasPos);
+        }
+
+        /// <summary>往网格里加一个三角形（y 取负，和这个组件其它地方的换算一致）。</summary>
+        private static void AddTriangle(VertexHelper vh, Vector2 a, Vector2 b, Vector2 c,
+            Color32 color)
+        {
+            int start = vh.currentVertCount;
+            vh.AddVert(new Vector3(a.x, -a.y, 0f), color, Vector2.zero);
+            vh.AddVert(new Vector3(b.x, -b.y, 0f), color, Vector2.zero);
+            vh.AddVert(new Vector3(c.x, -c.y, 0f), color, Vector2.zero);
+            vh.AddTriangle(start, start + 1, start + 2);
+        }
+
+        protected override void OnPopulateMesh(VertexHelper vh)
+        {
+            vh.Clear();
+            for (int s = 0; s < submitted.Count; s++)
+            {
+                Shape shape = submitted[s];
+                List<Vector2> points = shape.Points;
+                if (points.Count < 3)
+                {
+                    continue;
+                }
+
+                // 局部 y 向下为正 → 顶点 y 取负（和 VerticalLineStripGraphic 同一换算）。
+                Color32 fill = shape.Fill;
+                Color32 stroke = shape.Stroke;
+
+                // ── 填充：耳切法三角形化 ──
+                //
+                // **不能用扇形（fan）三角化**：那只对凸多边形成立。用户画的是
+                // 任意多边形，凹进去的地方会被填到外面去 —— 实测就是"画了个
+                // 方框，结果多出一块三角形，看起来像梯形"。
+                //
+                // 耳切法对任意简单多边形都正确：每次找一个"耳朵"（凸顶点，
+                // 且它和相邻两点构成的三角形里不含其它顶点）切掉，直到只剩一个三角形。
+                List<Vector2> work = new List<Vector2>(points);
+                // 先统一成逆时针，凸凹判据才有一致的符号。
+                if (SignedArea(work) < 0f)
+                {
+                    work.Reverse();
+                }
+                int guard = work.Count * work.Count + 8;
+                while (work.Count >= 3 && guard-- > 0)
+                {
+                    bool clipped = false;
+                    for (int i = 0; i < work.Count; i++)
+                    {
+                        int prev = (i + work.Count - 1) % work.Count;
+                        int next = (i + 1) % work.Count;
+                        if (!IsEar(work, prev, i, next))
+                        {
+                            continue;
+                        }
+                        AddTriangle(vh, work[prev], work[i], work[next], fill);
+                        work.RemoveAt(i);
+                        clipped = true;
+                        break;
+                    }
+                    if (!clipped)
+                    {
+                        // 退化/自相交的数据：切不动了就停，剩下的不画。
+                        // 宁可少填一块，也不要往界外糊一大片。
+                        break;
+                    }
+                }
+                if (work.Count == 3)
+                {
+                    AddTriangle(vh, work[0], work[1], work[2], fill);
+                }
+
+                // ── 描边：每段两条线拼一个矩形 ──
+                float half = shape.StrokeWidth * 0.5f;
+                for (int i = 0; i < points.Count; i++)
+                {
+                    Vector2 from = points[i];
+                    Vector2 to = points[(i + 1) % points.Count];
+                    Vector2 delta = to - from;
+                    float length = delta.magnitude;
+                    if (length < 0.001f)
+                    {
+                        continue;
+                    }
+                    // 法线：垂直于这一段，长度是半个线宽。
+                    Vector2 normal = new Vector2(-delta.y, delta.x) / length * half;
+                    Vector2 p0 = from - normal;
+                    Vector2 p1 = from + normal;
+                    Vector2 p2 = to + normal;
+                    Vector2 p3 = to - normal;
+
+                    int start = vh.currentVertCount;
+                    vh.AddVert(new Vector3(p0.x, -p0.y, 0f), stroke, Vector2.zero);
+                    vh.AddVert(new Vector3(p1.x, -p1.y, 0f), stroke, Vector2.zero);
+                    vh.AddVert(new Vector3(p2.x, -p2.y, 0f), stroke, Vector2.zero);
+                    vh.AddVert(new Vector3(p3.x, -p3.y, 0f), stroke, Vector2.zero);
+                    vh.AddTriangle(start, start + 1, start + 2);
+                    vh.AddTriangle(start + 2, start + 3, start);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 浮层挡板上的「中键按下」回调。
+    ///
+    /// uGUI 的 `Button` 只吃左键，中键按在挡板上没人接 —— 菜单不关，
+    /// 而中键平移也被挡板吞掉，表现就是"点了中键什么都没发生"。
+    /// 这里补一个最小的处理器，按下就调 `OnPressed`（顺带把事件收掉，
+    /// 不让它漏到下面去）。
+    /// </summary>
+    internal sealed class UiBlockerMiddleClick : MonoBehaviour, IPointerDownHandler
+    {
+        internal Action OnPressed;
+
+        public void OnPointerDown(PointerEventData eventData)
+        {
+            if (eventData.button != PointerEventData.InputButton.Middle)
+            {
+                return;
+            }
+            if (OnPressed != null)
+            {
+                OnPressed();
+            }
+            eventData.Use();
         }
     }
 }

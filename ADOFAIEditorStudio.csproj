@@ -118,8 +118,11 @@
     <Compile Remove="Backups\\**" />
     <!-- tools 下面是自己用的离线工具（比如布局预览），不是模组的一部分。 -->
     <Compile Remove="tools\\**" />
+    <!-- tests 下面是独立的测试工程（各自有自己的 csproj），绝不能被编进 mod 程序集。 -->
+    <Compile Remove="tests\\**" />
     <None Remove="FrameCacheSpike\\**" />
     <None Remove="Backups\\**" />
     <None Remove="tools\\**" />
+    <None Remove="tests\\**" />
   </ItemGroup>
 </Project>

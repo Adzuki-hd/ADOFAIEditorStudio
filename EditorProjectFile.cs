@@ -26,13 +26,55 @@ namespace ADOFAIEditorStudio
     internal static class EditorProjectFile
     {
         /// <summary>文件格式版本。将来改结构时用它做兼容分支。</summary>
-        internal const int CurrentFormatVersion = 1;
+        internal const int CurrentFormatVersion = 2;
 
         /// <summary>工程文件的扩展名。</summary>
         internal const string FileExtension = ".aesprj";
 
         /// <summary>工程目录名的后缀：`<谱面名>_AES`。</summary>
         private const string DirectorySuffix = "_AES";
+
+        /// <summary>
+        /// 一个时间轴模块（分组）。
+        ///
+        /// 用户用钢笔工具在时间轴上点出一圈多边形，落在圈里的块就归到这个模块。
+        /// 圈本身**只是用来定义归属**：一旦生成，成员表就是准的；多边形的顶点
+        /// 还能继续拖动改形状，那时会按新形状重新算一次成员。
+        ///
+        /// 坐标是**时间轴内容坐标**（时间和行空间像素），不是屏幕坐标 ——
+        /// 存屏幕坐标的话，滚动或缩放之后形状就和块对不上了。这一条和框选
+        /// 那边踩过的坑一样（见框选锚点那段注释）。
+        /// </summary>
+        internal sealed class ProjectModule
+        {
+            /// <summary>模块名。空表示没自定义，界面上显示「模块 N」。</summary>
+            public string Name = "";
+
+            /// <summary>
+            /// 多边形顶点，按**时间轴内容坐标**存：X = 时间（秒），Y = 行空间像素。
+            /// 至少三个点才构成一个区域。
+            /// </summary>
+            public List<float> PointsX = new List<float>();
+            public List<float> PointsY = new List<float>();
+
+            /// <summary>折叠后只留一行名字，里面的块不画。</summary>
+            public bool Collapsed;
+
+            /// <summary>
+            /// **旧格式遗留字段，不再写入。**
+            ///
+            /// 以前成员是用「事件身份」存的，而身份里带着起点时间和参数哈希 ——
+            /// 拖一下、改个参数，整批键就失效，成员表和实际几何开始漂移。
+            /// 为此在十几个调用点各写了一套"查不到就按几何兜底"，
+            /// 兜底之间互不知情，bug 一个接一个（第二次拖不动、拖出拖回丢成员、
+            /// 拖一个模块别的模块块全冒出来……）。
+            ///
+            /// 现在**几何是唯一真相**：模块的归属完全由「多边形 + 块矩形」决定，
+            /// 每帧按需重算（`EnsureModuleMembersRebuilt`）。这个字段只为能读
+            /// 旧文件而保留，读出来会被忽略。
+            /// </summary>
+            public List<string> Members = new List<string>();
+        }
 
         /// <summary>工程文件的内容。</summary>
         internal sealed class Project
@@ -48,6 +90,12 @@ namespace ADOFAIEditorStudio
 
             /// <summary>事件身份 → 时间轴行号。</summary>
             public Dictionary<string, int> Rows = new Dictionary<string, int>();
+
+            /// <summary>
+            /// 时间轴模块。老工程文件里没有这个字段，读出来是 null ——
+            /// 下面 TryLoad 里补成空表，和「一个模块都没有」等价。
+            /// </summary>
+            public List<ProjectModule> Modules = new List<ProjectModule>();
         }
 
         /// <summary>
@@ -58,6 +106,18 @@ namespace ADOFAIEditorStudio
         /// </summary>
         internal static string GetProjectDirectory(string chartPath)
         {
+            // **空路径要先挡掉。**
+            //
+            // `Path.GetDirectoryName("")` 在 .NET Framework 4.8 上会抛
+            // `ArgumentException`（不是返回 null）—— 而"谱面路径为空"是
+            // **正常情况**：场景切换的中间态、还没打开谱面的时候都会拿到空串
+            // （见 `EnsureBlockPlacements` 里那段关于 null 路径的说明）。
+            // 由测试 `TestGetProjectDirectory` 抓到的。
+            if (string.IsNullOrEmpty(chartPath))
+            {
+                return Path.Combine(".", "level" + DirectorySuffix);
+            }
+
             string directory = Path.GetDirectoryName(chartPath);
             string name = Path.GetFileNameWithoutExtension(chartPath);
             if (string.IsNullOrEmpty(directory))
@@ -118,6 +178,36 @@ namespace ADOFAIEditorStudio
                 if (loaded.Rows == null)
                 {
                     loaded.Rows = new Dictionary<string, int>();
+                }
+                if (loaded.Modules == null)
+                {
+                    // 老工程文件没有这个字段 —— 当成「没有模块」，不要当成读取失败。
+                    loaded.Modules = new List<ProjectModule>();
+                }
+                // 逐个剔掉形态不对的模块（顶点少于三个、成员表是 null），
+                // 免得界面上画一个空壳出来。
+                for (int i = loaded.Modules.Count - 1; i >= 0; i--)
+                {
+                    ProjectModule module = loaded.Modules[i];
+                    if (module == null
+                        || module.PointsX == null || module.PointsY == null
+                        || module.PointsX.Count < 3
+                        || module.PointsX.Count != module.PointsY.Count)
+                    {
+                        loaded.Modules.RemoveAt(i);
+                        continue;
+                    }
+                    if (module.Members == null)
+                    {
+                        module.Members = new List<string>();
+                    }
+                    // **旧文件里的成员表直接丢掉。** 现在是几何说了算，
+                    // 留着它只会和实际位置打架（见 `ProjectModule.Members` 的说明）。
+                    module.Members.Clear();
+                    if (module.Name == null)
+                    {
+                        module.Name = "";
+                    }
                 }
                 project = loaded;
                 return true;

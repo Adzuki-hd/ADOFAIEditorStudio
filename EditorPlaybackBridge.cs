@@ -7838,6 +7838,16 @@ namespace ADOFAIEditorStudio
 
                 if (selectionTimeline != null)
                 {
+                    // **这一帧的 Delete 可能已经被"删模块"用掉了。**
+                    //
+                    // 删模块是"只去分组、块留着"，它会顺手把成员塞进多选集
+                    // （用户要的"释放并保持选中"）。而这里看到多选非空就会
+                    // 再删一遍 —— 表现就是「删模块连里面的一起删了」。
+                    if (deleteSelection && selectionTimeline.ModuleDeleteHandledThisFrame)
+                    {
+                        return false;
+                    }
+
                     if (deleteSelection)
                     {
                         handled = selectionTimeline.DeleteSelection(out selectionStatus);

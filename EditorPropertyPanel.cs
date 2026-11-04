@@ -230,6 +230,12 @@ namespace ADOFAIEditorStudio
         /// <summary>批量模式下**每个选中事件都有**的属性键 —— 只有这些能上参数栏。</summary>
         private readonly HashSet<string> batchKeys = new HashSet<string>();
 
+        /// <summary>
+        /// 批量行的**显示顺序**。`batchKeys` 是 HashSet，遍历顺序不稳定，
+        /// 直接拿它建行会让参数栏每次刷新都换一次排法。
+        /// </summary>
+        private readonly List<string> batchKeyOrder = new List<string>();
+
         /// <summary>批量模式下**取值还全等**的键。不在里面的画成「多个值」。</summary>
         private readonly HashSet<string> batchUniformKeys = new HashSet<string>();
 
@@ -1513,9 +1519,18 @@ namespace ADOFAIEditorStudio
             try
             {
                 int rowIndex = 0;
-                foreach (KeyValuePair<string, ADOFAI.PropertyInfo> pair in live[0].info.propertiesInfo)
+                // **按并集顺序建行**（`batchKeyOrder`，不是 `live[0]` 的枚举）——
+                // 这样别的选中事件独有的参数也能上得来。
+                for (int keyIndex = 0; keyIndex < batchKeyOrder.Count; keyIndex++)
                 {
-                    ADOFAI.PropertyInfo info = pair.Value;
+                    string key = batchKeyOrder[keyIndex];
+                    ADOFAI.PropertyInfo info = FindInfo(live[0], key);
+                    // `live[0]` 没有这一项：从别的事件上拿它的元数据（名字、类型、
+                    // 控件形态都一样，只是这个事件没存值）。
+                    for (int e = 1; e < live.Count && info == null; e++)
+                    {
+                        info = FindInfo(live[e], key);
+                    }
                     if (info == null || string.IsNullOrEmpty(info.name))
                     {
                         continue;
@@ -1524,16 +1539,11 @@ namespace ADOFAIEditorStudio
                     {
                         continue;
                     }
-                    // 只有每个选中事件都有的属性才上得来。
-                    if (!batchKeys.Contains(pair.Key))
-                    {
-                        continue;
-                    }
 
                     Row row = ObtainRow(rowIndex, rowWidth);
                     float rowHeight = RowHeightFor(info, rowWidth);
-                    row.Key = pair.Key;
-                    bool mixed = !batchUniformKeys.Contains(pair.Key);
+                    row.Key = key;
+                    bool mixed = !batchUniformKeys.Contains(key);
                     // 值一律取第一个选中事件的：控件总得有个东西可画，
                     // 而且它同时就是作者要改的那个抓手。不一致这件事
                     // 由 FinishBatchRow 在右边那块标签表达。
@@ -1560,6 +1570,7 @@ namespace ADOFAIEditorStudio
             batchEvents = null;
             batchKeys.Clear();
             batchUniformKeys.Clear();
+            batchKeyOrder.Clear();
         }
 
         /// <summary>这一批里还活着的有几个。「够不够两个」是算不算批量的门槛。</summary>
@@ -1629,56 +1640,79 @@ namespace ADOFAIEditorStudio
         {
             batchKeys.Clear();
             batchUniformKeys.Clear();
+            batchKeyOrder.Clear();
             if (batchEvents == null || batchEvents.Count == 0)
             {
                 return;
             }
 
-            foreach (KeyValuePair<string, ADOFAI.PropertyInfo> pair in batchEvents[0].info.propertiesInfo)
+            // **取并集，不是交集。**
+            //
+            // 原来是「每个选中事件都有这一项才显示」—— 模块里混着不同类型的事件时
+            // （或者同一类型里隐藏/可见的项不同），一大批参数就被筛掉了。
+            // 用户要的是「模块里所有事件的参数都能看见」。
+            //
+            // 没有这一项的事件在写入时跳过（见 `CommitBatch`），所以并集不会
+            // 往不认识它的地方乱写。
+            HashSet<string> seen = new HashSet<string>(StringComparer.Ordinal);
+            for (int e = 0; e < batchEvents.Count; e++)
             {
-                ADOFAI.PropertyInfo info = pair.Value;
-                if (info == null || string.IsNullOrEmpty(info.name))
-                {
-                    continue;
-                }
-                if (info.invisible || info.controlType == ControlType.Hidden)
-                {
-                    continue;
-                }
-
-                bool presentEverywhere = true;
-                bool uniform = true;
-                string firstValue = null;
-
-                for (int i = 0; i < batchEvents.Count; i++)
-                {
-                    ADOFAI.PropertyInfo other = FindInfo(batchEvents[i], pair.Key);
-                    if (other == null || other.invisible || other.controlType == ControlType.Hidden)
-                    {
-                        presentEverywhere = false;
-                        break;
-                    }
-
-                    string value = BatchValueKey(batchEvents[i], other);
-                    if (i == 0)
-                    {
-                        firstValue = value;
-                    }
-                    else if (value != firstValue)
-                    {
-                        uniform = false;
-                    }
-                }
-
-                if (!presentEverywhere)
+                LevelEvent levelEvent = batchEvents[e];
+                if (levelEvent == null || levelEvent.info == null
+                    || levelEvent.info.propertiesInfo == null)
                 {
                     continue;
                 }
 
-                batchKeys.Add(pair.Key);
-                if (uniform)
+                foreach (KeyValuePair<string, ADOFAI.PropertyInfo> pair
+                    in levelEvent.info.propertiesInfo)
                 {
-                    batchUniformKeys.Add(pair.Key);
+                    ADOFAI.PropertyInfo info = pair.Value;
+                    if (info == null || string.IsNullOrEmpty(info.name))
+                    {
+                        continue;
+                    }
+                    if (info.invisible || info.controlType == ControlType.Hidden)
+                    {
+                        continue;
+                    }
+                    if (!seen.Add(pair.Key))
+                    {
+                        continue;
+                    }
+
+                    batchKeys.Add(pair.Key);
+                    batchKeyOrder.Add(pair.Key);
+
+                    // **一致性只看「有这一项」的那些事件。**
+                    // 缺这一项的事件不参与比较 —— 否则只要有一个事件没有它，
+                    // 这一行就永远显示「多个值」，看着像数据坏了。
+                    bool uniform = true;
+                    string firstValue = null;
+                    bool haveFirst = false;
+                    for (int i = 0; i < batchEvents.Count; i++)
+                    {
+                        ADOFAI.PropertyInfo other = FindInfo(batchEvents[i], pair.Key);
+                        if (other == null || other.invisible
+                            || other.controlType == ControlType.Hidden)
+                        {
+                            continue;
+                        }
+                        string value = BatchValueKey(batchEvents[i], other);
+                        if (!haveFirst)
+                        {
+                            firstValue = value;
+                            haveFirst = true;
+                        }
+                        else if (value != firstValue)
+                        {
+                            uniform = false;
+                        }
+                    }
+                    if (uniform)
+                    {
+                        batchUniformKeys.Add(pair.Key);
+                    }
                 }
             }
         }
@@ -4500,6 +4534,15 @@ namespace ADOFAIEditorStudio
                 {
                     LevelEvent target = batchEvents[i];
                     if (target == null || !IsLive(target))
+                    {
+                        continue;
+                    }
+                    // **没有这一项的事件跳过。**
+                    //
+                    // 批量的参数行现在是所有事件的**并集** —— 某个事件根本没有
+                    // 这个属性是正常的（不同类型混选、或者隐藏项不同）。
+                    // 不跳过的话会往它的存档字典里塞一个它不认识的键。
+                    if (FindInfo(target, key) == null)
                     {
                         continue;
                     }
