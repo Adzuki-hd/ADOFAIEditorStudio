@@ -143,6 +143,55 @@ namespace ADOFAIEditorStudio.Ui
     }
 
     /// <summary>
+    /// 圆角半径刻度。
+    ///
+    /// **按控件尺寸分档**，不是全场一个值。原来所有圆角都写死 7px，
+    /// 于是大面板的角显得钝、小按钮的角又显得圆——视觉上没有节奏。
+    /// 分档之后，越大的面用越大的角，比例上才协调。
+    ///
+    /// 数值取 4 的倍数附近，和 `UiSpacing` 同一套节奏。
+    ///
+    /// **2026-11-05 整体上调一档**：最初那版偏保守（事件块 24~48px 高
+    /// 只拿到 3~6px 半径），看起来还是接近直角。用户要求「圆角的 R 大点」。
+    /// </summary>
+    internal static class UiRadius
+    {
+        /// <summary>4 — 极小件：色块、指示点、徽标</summary>
+        internal const float Xs = 4f;
+        /// <summary>6 — 小件：输入框、小按钮、标签</summary>
+        internal const float Sm = 6f;
+        /// <summary>8 — 中件：按钮、卡片、下拉</summary>
+        internal const float Md = 8f;
+        /// <summary>12 — 大件：面板、弹层、对话框</summary>
+        internal const float Lg = 12f;
+        /// <summary>16 — 特大件：整屏容器、大弹窗</summary>
+        internal const float Xl = 16f;
+
+        /// <summary>
+        /// 按控件短边自动挑一档。短边越长圆角越大，上限 <see cref="Lg"/>。
+        ///
+        /// 给「不想逐个指定」的地方一个合理默认值 —— 面板和按钮各自的大小
+        /// 本来就不同，让半径跟着走比统一写死更自然。
+        /// </summary>
+        internal static float ForSize(float shortSide)
+        {
+            if (shortSide <= 20f)
+            {
+                return Xs;
+            }
+            if (shortSide <= 32f)
+            {
+                return Sm;
+            }
+            if (shortSide <= 64f)
+            {
+                return Md;
+            }
+            return Lg;
+        }
+    }
+
+    /// <summary>
     /// 字号刻度，Major Third（1.25）梯度。
     ///
     /// 原来有 10 档（9 / 9.5 / 10 / 10.5 / 11 / 12 / 13 / 15 / 17 / 20），

@@ -60,6 +60,20 @@ namespace ADOFAIEditorStudio
         private float width;
         private float height;
 
+        /// <summary>
+        /// 内容区过渡：切换事件时淡入 + 轻微放大。
+        ///
+        /// **挂在 `viewport` 上而不是 `content` 上。** `content` 的位置归
+        /// `ScrollRect` 管，过渡组件会写 `anchoredPosition`，两者打架 ——
+        /// 滚动条会被动画拽回去。`viewport` 是拉伸节点（锚点铺满父级、
+        /// 偏移全 0），pivot 在 (0.5,0.5)，缩放补偿量算出来正好是 0，
+        /// 于是只剩透明度 + 中心缩放，完全不碰位置。
+        /// </summary>
+        private UiTransition contentTransition;
+
+        /// <summary>下一次 `Rebuild` 要不要播过渡。只有"换了选中事件"才置真。</summary>
+        private bool animateNextRebuild;
+
         /// <summary>设置页正文顶上的页名（右栏由面板标题负责，这里是空的）。</summary>
         private TextMeshProUGUI pageTitle;
 
@@ -71,6 +85,15 @@ namespace ADOFAIEditorStudio
         private float lastBuiltWidth = -1f;
         private int lastBatchCount = -1;
         private string lastPage;
+
+        /// <summary>
+        /// 固定显示哪一页设置。`None` = 跟着 overlay 的当前选中走（老行为）。
+        ///
+        /// **传送带式左栏用这个**：6 个设置页各建一个实例、各自钉死一页，
+        /// 整体横向平移。不钉死的话，6 个实例都会去读
+        /// `overlay.SelectedSettingsEvent`、全都显示同一页。
+        /// </summary>
+        private LevelEventType pinnedSettingsPage = LevelEventType.None;
 
         // 弹层（枚举 / 调色盘）共用一块 32000 画布
         private RectTransform popupLayer;
@@ -106,8 +129,21 @@ namespace ADOFAIEditorStudio
         // ── 对外 ─────────────────────────────────────────────────────────
 
         /// <summary>设置页模式：只看一页设置，不跟时间轴选中、不画预览与生效开关。</summary>
-        internal void SetSettingsMode(bool value)
+        /// <summary>
+        /// 把这一实例钉死在某一页设置上。传送带式左栏用。
+        ///
+        /// 钉死之后内容不再跟着 overlay 的选中走 —— 6 个实例各显示各的，
+        /// 才能并排铺开。
+        /// </summary>
+        internal void PinSettingsPage(LevelEventType page)
         {
+            pinnedSettingsPage = page;
+            lastPage = null;
+            target = null;
+            Rebuild();
+        }
+
+        internal void SetSettingsMode(bool value)        {
             if (!value && panel != null)
             {
                 // 离开设置页要**清掉那个标记**：留着的话，右栏以后打开装饰物
@@ -206,6 +242,9 @@ namespace ADOFAIEditorStudio
             scroll.viewport = viewport;
             scroll.content = content;
 
+            // 内容区过渡挂在 viewport 上 —— 理由见 `contentTransition` 的注释。
+            contentTransition = UiTransition.Attach(viewportObject);
+
             emptyLabel = CreateText("Empty", viewport, CardPad, 8f,
                 Mathf.Max(40f, width - CardPad * 2f), 24f, string.Empty,
                 12f, TextMuted, TextAlignmentOptions.MidlineLeft);
@@ -287,7 +326,20 @@ namespace ADOFAIEditorStudio
 
             if (settingsMode)
             {
-                string page = overlay.SelectedSettingsTitle;
+                string page;
+                LevelEvent settingsTarget;
+                if (pinnedSettingsPage != LevelEventType.None)
+                {
+                    // **钉死了一页**：内容不跟着 overlay 的选中走，
+                    // 这样传送带里 6 个实例才能各显示各的。
+                    page = overlay.SettingsTitleOf(pinnedSettingsPage);
+                    settingsTarget = overlay.FindSettingsPageOf(pinnedSettingsPage);
+                }
+                else
+                {
+                    page = overlay.SelectedSettingsTitle;
+                    settingsTarget = overlay.SelectedSettingsEvent;
+                }
                 if (!string.Equals(page, lastPage, StringComparison.Ordinal))
                 {
                     lastPage = page;
@@ -296,10 +348,11 @@ namespace ADOFAIEditorStudio
                         pageTitle.text = page;
                     }
                 }
-                LevelEvent settingsTarget = overlay.SelectedSettingsEvent;
                 if (!ReferenceEquals(settingsTarget, target))
                 {
                     target = settingsTarget;
+                    // 换了页才播过渡；同一页的刷新不播，否则每 0.12 秒闪一次。
+                    animateNextRebuild = true;
                     Rebuild();
                 }
                 return;
@@ -322,6 +375,9 @@ namespace ADOFAIEditorStudio
             int batchCount = panel.InBatch ? panel.BatchEvents.Count : 0;
             if (!ReferenceEquals(anchor, target) || batchCount != lastBatchCount)
             {
+                // 只有"选中对象换了"才播过渡。批量人数变化（多加/少选一个）
+                // 内容大同小异，跟着闪反而吵。
+                animateNextRebuild = !ReferenceEquals(anchor, target);
                 target = anchor;
                 lastBatchCount = batchCount;
                 Rebuild();
@@ -612,6 +668,7 @@ namespace ADOFAIEditorStudio
             if (!hasTarget)
             {
                 content.sizeDelta = new Vector2(0f, Mathf.Max(height, 40f));
+                PlayContentTransition();
                 return;
             }
 
@@ -637,6 +694,27 @@ namespace ADOFAIEditorStudio
                 y += rowHeight + CardGap;
             }
             content.sizeDelta = new Vector2(0f, Mathf.Max(height, y + CardPad));
+            PlayContentTransition();
+        }
+
+        /// <summary>
+        /// 切换事件时播一次淡入。**只在 `animateNextRebuild` 置真时播** ——
+        /// 宽度变化、评分数变化、批量人数变化都会重建，那些跟着闪会吵。
+        ///
+        /// 时长用 `UiMotion.Fast`（0.12s）：参数栏是高频操作的面板，
+        /// 拖选取框扫过一串事件时每换一个都要播，慢了会拖手感。
+        /// </summary>
+        private void PlayContentTransition()
+        {
+            if (!animateNextRebuild)
+            {
+                return;
+            }
+            animateNextRebuild = false;
+            if (contentTransition != null)
+            {
+                contentTransition.PlayShow(UiMotion.Fast);
+            }
         }
 
         /// <summary>

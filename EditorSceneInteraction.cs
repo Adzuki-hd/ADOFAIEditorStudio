@@ -680,6 +680,21 @@ namespace ADOFAIEditorStudio
                 return;
             }
 
+            // **有模态弹窗盖着时，指针一概不归预览。**
+            //
+            // 这里直读 `Input.GetMouseButtonDown`，绕开了 uGUI 的事件系统 ——
+            // 窗口遮罩虽然吃 uGUI 射线，却拦不住这条路径。于是开着设置窗口
+            // 点预览区域会选中最底下的装饰物（用户报的"点穿"）。
+            //
+            // 判据放在最前面、并且**顺手 Reset**：弹窗是这一帧才开的，
+            // 上一帧可能已经按下去了（`pendingKind` 有值），不 Reset 的话
+            // 松手时还会走完那一次选中。
+            if (Main.Overlay != null && Main.Overlay.IsModalWindowOpen)
+            {
+                Reset();
+                return;
+            }
+
             TickMediaDrop(viewport);
 
             // 媒体拖放活着时独占指针；否则下面那段场景拖动

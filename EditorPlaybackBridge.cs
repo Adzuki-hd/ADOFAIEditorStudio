@@ -1804,8 +1804,32 @@ namespace ADOFAIEditorStudio
             Cursor.visible = true;
         }
 
+        /// <summary>
+        /// 正在拆掉并重建整个工作台 UI（换分辨率、切主题）。
+        ///
+        /// **重建期间不能取消拖动会话。** 重建会 `Destroy(uiRoot)`，连带销毁
+        /// `EditorTimelineView`，而它的 `OnDisable` / `OnDestroy` 会调
+        /// `CancelTimelineScrub` —— 那个方法看到求值器会话活着就把它整个关掉。
+        /// 会话一关，预览求值器就不再出帧，画面冻在最后一帧；而
+        /// `previewRequested` 还是 true，`TickPreview` 也就不会重建会话。
+        ///
+        /// 表现就是「切主题 / 改分辨率之后预览卡住」。
+        /// 置位期间 `CancelTimelineScrub` 直接返回；重建结束后由调用方清掉。
+        /// </summary>
+        internal static bool SuppressScrubCancel
+        {
+            get { return suppressScrubCancel; }
+            set { suppressScrubCancel = value; }
+        }
+
+        private static bool suppressScrubCancel;
+
         internal static void CancelTimelineScrub()
         {
+            if (suppressScrubCancel)
+            {
+                return;
+            }
             lastTimelineScrubFloor = -1;
             lastTimelineScrubEditorId = 0;
             lastTimelineScrubTime = float.NaN;

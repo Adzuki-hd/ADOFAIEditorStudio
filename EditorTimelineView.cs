@@ -78,7 +78,11 @@ namespace ADOFAIEditorStudio
         {
             internal GameObject GameObject;
             internal RectTransform Rect;
-            internal Image Background;
+            /// <summary>
+            /// 块底色。用 `Graphic` 而不是 `Image` —— 现在是矢量圆角组件
+            /// （`UiShapeGraphic`），尺寸变了要按新宽高重画圆角。
+            /// </summary>
+            internal Graphic Background;
             internal EaseCurveImage Curve;
             /// <summary>上一次绑的曲线数组。同一个数组不重复 SetCurve。</summary>
             internal float[] CurveValues;
@@ -875,8 +879,6 @@ private static float MinimumPixelsPerSecond
 
         /// <summary>下一次重建时要不要重排（载入 / 换谱 / 固定排版）。</summary>
         private bool repackOnNextRebuild = true;
-        /// <summary>防抖：到这个时刻执行一次重排（0 = 不排）。</summary>
-        private float repackDueTime;
         private readonly HashSet<int> activeBlockIds = new HashSet<int>();
         private readonly List<TimelineSection> layoutSections = new List<TimelineSection>();
         private readonly List<int> layoutRowSection = new List<int>();
@@ -914,7 +916,7 @@ private static float MinimumPixelsPerSecond
         // 线看上去永远停在最初那个偏矮的高度上（表现就是"被切了一半"）。
         private Image playheadGlow;
         private Image playheadCore;
-        private Image playheadHandle;
+        private Graphic playheadHandle;
         private TextMeshProUGUI summaryText;
         private TextMeshProUGUI timeText;
         private TextMeshProUGUI zoomText;
@@ -970,30 +972,152 @@ private static float MinimumPixelsPerSecond
         /// <summary>
         /// 固定播放头下 Shift+滚轮 = 扫时间。
         ///
-        /// 和自由模式的滚动用**同一套"欠账 + 指数逼近"**（`ScrollSmoothSpeed`），
-        /// 所以手感、滑停时长完全一致 —— 之前这里固定按 5 秒/秒 追，明显比
-        /// 自由模式慢一大截。
+        /// **和自由模式的滚动用同一套速度模型**：每格往 `centeredScrubVelocity`
+        /// 上累加，每帧按指数衰减，位移 = 速度 × dt（单位是秒/秒）。
+        ///
+        /// 早先这里是"欠账式"，和自由模式对不齐 —— 用户连续滚时两种模式
+        /// 手感不一样，固定播放头下明显更顿。现在两边同源。
         /// </summary>
-        private float centeredScrubPending;
+        private float centeredScrubVelocity;
         private bool centeredScrubActive;
 
         /// <summary>「定位到播放头」的滑动目标与开关（滑过去而不是瞬移）。</summary>
         private float viewGlideTarget;
         private bool viewGliding;
 
+        /// <summary>纵向滚动速度（像素/秒）。滚轮往上叠，每帧自己衰减。</summary>
+        private float verticalScrollVelocity;
+
+        /// <summary>横向滚动速度（像素/秒）。</summary>
+        private float horizontalScrollVelocity;
         /// <summary>
-        /// 滚轮平滑：**只追赶，不留惯性**。
-        ///
-        /// 滚轮把"还没走完的距离"记进 `*ScrollPending`，每帧按指数逼近把它花掉
-        /// （`1 - e^(-22·dt)`），花完就停。
-        ///
-        /// 早先那套是"给一个初速度再衰减"，在触控板上会出事：系统自己会连发
-        /// 一串动量事件，每个都再加一次速度，叠起来松手后能滑好几秒。
-        /// 改成"欠账式"之后，输入停 → 欠账有限 → 0.2 秒内停稳，不会有残余。
+        /// 滚轮一格给速度加多少。**手感主旋钮**：一格约 150px 的距离感，
+        /// 乘 12 得到 1800 px/s 的初速度，配合下面的衰减大约滑 150~200px，
+        /// 和原来"一格 150px"的观感对得上。
         /// </summary>
-        private const float ScrollSmoothSpeed = 22f;
-        private float verticalScrollPending;
-        private float horizontalScrollPending;
+        private const float WheelVelocityGain = 12f;
+
+        /// <summary>
+        /// 纵向速度衰减率（每秒）。`e^(-6·dt)` 对应时间常数 0.17 秒，
+        /// 松手后约 0.5 秒停稳 —— 有惯性但不拖沓。
+        /// </summary>
+        private const float VerticalScrollDecay = 6f;
+
+        /// <summary>
+        /// 横向衰减更慢（`e^(-3.2·dt)`，时间常数 0.31 秒），惯性更长。
+        /// 用户明确要求横滚"惯性再久点"。
+        /// </summary>
+        private const float HorizontalScrollDecay = 3.2f;
+
+        /// <summary>
+        /// 缩放欠账，单位是**倍率的自然对数**。
+        ///
+        /// 倍率是乘性的：连滚一次"放大 1.25"、一次"缩小 0.8"应该回到原处。
+        /// 直接累加倍率会算成 1.25 + 0.8（错得离谱）；记对数之后
+        /// `ln(1.25) + ln(0.8) = 0`，线性累加正好抵消。
+        /// </summary>
+        private float zoomPendingLog;
+
+        /// <summary>缩放欠账的逼近速度。比滚动的 22 慢，缩放才有一段"推近"的过程。</summary>
+        private const float ZoomSmoothSpeed = 14f;
+
+        /// <summary>
+        /// 行高欠账（像素）。Alt+滚轮一格记 `RowHeightStep`，由
+        /// `ApplyRowHeightSmoothing` 每帧花掉一点 —— 于是"调行高"是一段连续的
+        /// 变高/变矮，而不是一格一跳。
+        /// </summary>
+        private float rowHeightPending;
+
+        /// <summary>行高欠账的逼近速度。和缩放同档，两个手势观感一致。</summary>
+        private const float RowHeightSmoothSpeed = 14f;
+
+        /// <summary>平滑行高期间攒下的持久化待办 —— 花完才写一次设置文件。</summary>
+        private bool rowHeightPersistPending;
+
+        /// <summary>
+        /// 滚轮去抖：当前认定的滚动方向（+1 正向、-1 反向、0 未定）。
+        ///
+        /// **滚轮硬件会抖。** 用户一直往一个方向滚时，机械编码器偶尔会吐一两个
+        /// 反向刻度（用户实测「一直正向滚动也有一瞬反向」）。在平滑滚动里这特别
+        /// 明显：欠账是慢慢花掉的，一个反向刻度会把正在推进的位移往回拽一截。
+        /// </summary>
+        private float wheelDirection;
+
+        /// <summary>上一次有效滚轮刻度的时刻（`Time.unscaledTime`）。</summary>
+        private float wheelDirectionTime;
+
+        /// <summary>
+        /// 反向刻度的容忍窗口（秒）。超过这个时间没再收到同向刻度，
+        /// 说明用户停手了，下一个刻度无论哪个方向都当新的一段。
+        /// </summary>
+        private const float WheelReversalWindow = 0.12f;
+
+        /// <summary>
+        /// 窗口内反向刻度的权重。**只阻尼，不丢弃、也不翻倍。**
+        ///
+        /// 这里踩过一次坑：上一版是"反向刻度先丢掉，连续 2 个才认并翻倍补上"，
+        /// 结果正是用户报的「有时突然减慢有时突然加快」——
+        /// 丢掉的时候慢了一格，确认换向的时候又一次性补两格，速度忽快忽慢。
+        ///
+        /// 现在的做法：反向刻度照单全收，只是在窗口内打个折（0.2 倍）。
+        /// 于是抖动只留下一个几乎看不见的小回弹，而**每一个刻度的总量守恒**
+        /// —— 不会凭空少一格或多一格，速度就匀了。
+        ///
+        /// 真要换方向时：停手超过窗口后第一下就是全权重，之后同向也都是全权重，
+        /// 所以换向照样跟手。
+        /// </summary>
+        private const float WheelReversalDamping = 0.2f;
+
+        /// <summary>
+        /// 滚轮去抖：反向刻度在窗口内打折，其余原样返回。
+        ///
+        /// **不做任何计数和补偿** —— 这是关键。任何"攒够了再补"的做法都会让
+        /// 单位时间内的滚动量忽多忽少，而用户滚轮的手感正是靠"每格走一样远"。
+        /// </summary>
+        private float FilterWheelDelta(float raw)
+        {
+            if (Mathf.Approximately(raw, 0f))
+            {
+                return 0f;
+            }
+            float direction = raw > 0f ? 1f : -1f;
+            float now = Time.unscaledTime;
+
+            // 没有方向、或者上一刻度已经过去很久 —— 这是一段新的滚动，直接认。
+            if (wheelDirection == 0f || now - wheelDirectionTime > WheelReversalWindow)
+            {
+                wheelDirection = direction;
+                wheelDirectionTime = now;
+                return raw;
+            }
+
+            if (direction == wheelDirection)
+            {
+                wheelDirectionTime = now;
+                return raw;
+            }
+
+            // 反向：打折收下，但**不改方向**，也不更新时间戳 ——
+            // 时间戳不动，窗口会自然过期，一次抖动不会把方向锁死。
+            return raw * WheelReversalDamping;
+        }
+
+        /// <summary>
+        /// 这一轮平滑缩放围绕哪个横坐标缩放（视口坐标，像素）。
+        ///
+        /// **必须记住**：欠账是分几十帧花掉的，每帧都拿"当前鼠标位置"当锚点的话，
+        /// 手一抖锚点就变，画面会跟着左右漂。锚点在滚轮那一刻定死，整段用完为止。
+        /// </summary>
+        private float zoomAnchorX;
+
+        /// <summary>
+        /// 平滑缩放期间**推迟**重排的到期时刻（0 = 没有待办）。
+        ///
+        /// `ZoomAt` 在固定排版下每次都要 `RepackRowsByTypePriority`（全量装箱，
+        /// 单次几毫秒）。原来一次滚轮只调一次还能接受；改成平滑之后是每帧一次，
+        /// 60 次/秒的全量装箱会把主线程拖垮。所以连续缩放期间只标记，等停手后再排。
+        /// </summary>
+        private float repackDueTime;
 
         /// <summary>切换「自由 / 固定播放头」。</summary>
         internal void ToggleFollowMode()
@@ -1347,7 +1471,18 @@ private static float MinimumPixelsPerSecond
         private readonly HashSet<LevelEvent> multiSelection = new HashSet<LevelEvent>();
 
         private bool marqueeActive;
-        private Vector2 marqueeStart;
+        /// <summary>
+        /// 框选的**起点，存内容坐标**（X = 秒，Y = 行）。
+        ///
+        /// 原来存的是视口像素坐标 —— 于是拖框的过程中滚一下时间轴，
+        /// 起点钉在屏幕上不动，框就跟着视口走，永远选不到"滚过去"的那些块。
+        /// 用户原话：「有时想滚动时间轴一起选上后面的都选不了」。
+        ///
+        /// 存内容坐标之后，滚动 / 缩放时起点跟着谱面走，框自然越拉越长。
+        /// 这正是本文件那条硬规矩：跨帧保留的几何一律存内容坐标。
+        /// </summary>
+        private Vector2 marqueeStartContent;
+        /// <summary>框的另一角（鼠标位置）。**这个存视口坐标是对的** —— 鼠标不随滚动移动。</summary>
         private Vector2 marqueeCurrent;
         private RectTransform marqueeBand;
 
@@ -1491,7 +1626,7 @@ private static float MinimumPixelsPerSecond
                 Main.Logger.Log("[TimelineDrag] BeginMarquee from=" + from);
             }
             marqueeActive = true;
-            marqueeStart = point;
+            marqueeStartContent = ViewportPointToContent(point);
             marqueeCurrent = point;
             EnsureMarqueeBand();
             UpdateMarqueeBand();
@@ -1550,8 +1685,9 @@ private static float MinimumPixelsPerSecond
                 return;
             }
 
-            Vector2 min = Vector2.Min(marqueeStart, marqueeCurrent);
-            Vector2 max = Vector2.Max(marqueeStart, marqueeCurrent);
+            Vector2 start = ContentToViewportPoint(marqueeStartContent);
+            Vector2 min = Vector2.Min(start, marqueeCurrent);
+            Vector2 max = Vector2.Max(start, marqueeCurrent);
             SetTopLeft(marqueeBand, min.x, min.y, max.x - min.x, max.y - min.y);
             if (!marqueeBand.gameObject.activeSelf)
             {
@@ -1563,9 +1699,32 @@ private static float MinimumPixelsPerSecond
 
         private Rect MarqueeViewportRect()
         {
-            Vector2 min = Vector2.Min(marqueeStart, marqueeCurrent);
-            Vector2 max = Vector2.Max(marqueeStart, marqueeCurrent);
+            Vector2 start = ContentToViewportPoint(marqueeStartContent);
+            Vector2 min = Vector2.Min(start, marqueeCurrent);
+            Vector2 max = Vector2.Max(start, marqueeCurrent);
             return Rect.MinMaxRect(min.x, min.y, max.x, max.y);
+        }
+
+        /// <summary>
+        /// 视口坐标（左上原点、y 向下）→ **内容坐标**（X = 秒，Y = 行）。
+        ///
+        /// 和 `LocalToModulePoint` 同一套换算 —— 行高和 `RulerHeight` 都算进去，
+        /// 所以改行高、滚视口之后起点仍然贴在谱面的同一处。
+        /// </summary>
+        private Vector2 ViewportPointToContent(Vector2 point)
+        {
+            return new Vector2(
+                viewStartTime + point.x / Mathf.Max(1f, pixelsPerSecond),
+                (point.y - RulerHeight + verticalScrollOffset)
+                    / Mathf.Max(1f, BlockStridePixels));
+        }
+
+        /// <summary>内容坐标 → 视口坐标。`ViewportPointToContent` 的反向。</summary>
+        private Vector2 ContentToViewportPoint(Vector2 content)
+        {
+            return new Vector2(
+                (content.x - viewStartTime) * Mathf.Max(1f, pixelsPerSecond),
+                RulerHeight + content.y * BlockStridePixels - verticalScrollOffset);
         }
 
         private void FinishMarquee(
@@ -1590,7 +1749,8 @@ private static float MinimumPixelsPerSecond
             // 拉出的框太小 = 只是按了一下，不是框选 —— 交给"点一下切换"那条路。
             if (band.width < 4f && band.height < 4f)
             {
-                ToggleSelectionAt(marqueeStart);
+                // 起点存的是内容坐标，点选要用视口坐标 —— 换算回去。
+                ToggleSelectionAt(ContentToViewportPoint(marqueeStartContent));
                 return;
             }
 
@@ -1902,6 +2062,10 @@ private static float MinimumPixelsPerSecond
                 return false;
             }
 
+            // **删之前先炸一遍粒子** —— 删完块就从 `blockViews` 里消失了，
+            // 那时再找位置和颜色已经来不及。
+            BurstDeletedBlocks(targets, decorations);
+
             int removed;
             if (!EditorCommandHistory.RemoveSelection(editor, targets, decorations, out removed))
             {
@@ -1916,14 +2080,153 @@ private static float MinimumPixelsPerSecond
             }
             multiSelection.Clear();
             selectedEvent = null;
+
+            // **立刻把这些块从视图里摘掉，别等下一次重新分析谱面。**
+            //
+            // 原来只置 `visualsDirty`，而块真正消失要等 `RefreshData`
+            // （0.5 秒一轮）。表现就是「粒子先炸、块还在原地愣一下才消失」——
+            // 用户看到的延迟感就是这个。
+            //
+            // **光从 `blockViews` 里剔除不够**：`CollectBlocks` 重建时
+            // 用的是缓存的 `cachedOrdered`（按 `dataFingerprint` 判失效），
+            // 而指纹要等 `RefreshData` 才更新 —— 剔掉的块下一帧又回来了。
+            // 所以必须强制刷新一次数据源。
+            RemoveBlocksFromView(targets, decorations);
+            RefreshData(true);
             visualsDirty = true;
             status = "已删除 " + removed + " 项";
             return true;
         }
 
-        internal int CopySelection()
+        /// <summary>
+        /// 把一批事件对应的块从 `blockViews` 里摘掉，并让下一帧强制重绑。
+        ///
+        /// 删完立刻生效，不等 `RefreshData` —— 那个要 0.5 秒一轮，
+        /// 期间块还画在屏幕上，和已经炸掉的粒子对不上。
+        /// </summary>
+        private void RemoveBlocksFromView(List<LevelEvent> targets,
+            List<LevelEvent> decorations)
         {
-            return EditorTimelineClipboard.Copy(CollectSelection());
+            if (blockViews.Count == 0)
+            {
+                return;
+            }
+            for (int i = blockViews.Count - 1; i >= 0; i--)
+            {
+                BlockView block = blockViews[i];
+                if (block.Event == null)
+                {
+                    continue;
+                }
+                if (targets.Contains(block.Event) || decorations.Contains(block.Event))
+                {
+                    blockViews.RemoveAt(i);
+                }
+            }
+            // 强制下一帧重绑：`BlocksViewUnchanged` 会看这个版本号。
+            blocksDirtyVersion++;
+        }
+
+        /// <summary>
+        /// 被删的块炸成粒子。**必须在真正删除之前调** —— 删完
+        /// `blockViews` 里就没有这些块了，位置和颜色都找不回来。
+        ///
+        /// 粒子颜色取自**块自己的底色**，所以不同车道的事件炸出来是不同颜色，
+        /// 一眼能看出刚才删的是什么。
+        /// </summary>
+        private void BurstDeletedBlocks(List<LevelEvent> targets,
+            List<LevelEvent> decorations)
+        {
+            if (particleLayer == null)
+            {
+                EnsureParticleLayer();
+            }
+            if (particleLayer == null || particleBurst == null)
+            {
+                return;
+            }
+
+            // 用块当前在画布上的矩形和颜色。`blockViews` 是绘制用的那一份，
+            // 和肉眼看到的位置一致。
+            float speed = Mathf.Max(1f, pixelsPerSecond);
+            float contentTop = RulerHeight - verticalScrollOffset;
+            float stride = BlockStridePixels;
+            float blockHeight = BlockHeightPixels;
+            int burstCount = 0;
+
+            for (int i = 0; i < blockViews.Count; i++)
+            {
+                BlockView block = blockViews[i];
+                if (block.Event == null)
+                {
+                    continue;
+                }
+                if (!targets.Contains(block.Event) && !decorations.Contains(block.Event))
+                {
+                    continue;
+                }
+                float left = (block.Time - viewStartTime) * speed;
+                float width = Mathf.Max(BlockMinWidth, block.Duration * speed - BlockGap);
+                float top = contentTop + block.Row * stride;
+
+                Color color = block.BlockColor;
+                color.a = 1f;
+                particleBurst.Burst(
+                    new Rect(left, top, width, blockHeight),
+                    color, ParticlePerBlock);
+                burstCount++;
+                // 一次删太多块时别把粒子堆爆 —— 前 40 块有粒子就够了。
+                if (burstCount >= MaxBurstBlocks)
+                {
+                    break;
+                }
+            }
+
+            if (burstCount > 0)
+            {
+                particleBurstActive = true;
+            }
+        }
+
+        /// <summary>每个块炸几颗粒子。用户选的「少」那一档。</summary>
+        private const int ParticlePerBlock = 10;
+
+        /// <summary>一次最多给多少块炸粒子（防批量删除时卡顿）。</summary>
+        private const int MaxBurstBlocks = 40;
+
+        /// <summary>
+        /// 建粒子层。挂在视口下面，**在块层之上** —— 粒子要盖住正在消失的块。
+        /// </summary>
+        private void EnsureParticleLayer()
+        {
+            if (particleLayer != null || viewport == null)
+            {
+                return;
+            }
+            particleLayer = CreateRect("ParticleLayer", viewport,
+                0f, 0f, bodyWidth, bodyHeight);
+            particleBurst = particleLayer.gameObject.AddComponent<UiParticleBurst>();
+            particleBurst.raycastTarget = false;
+            particleLayer.SetAsLastSibling();
+        }
+
+        /// <summary>每帧推进粒子。没有活粒子时把层收起来，不占绘制。</summary>
+        private void TickParticles()
+        {
+            if (!particleBurstActive || particleBurst == null)
+            {
+                return;
+            }
+            if (particleBurst.Step(Time.unscaledDeltaTime))
+            {
+                return;
+            }
+            // 全死光了：停掉，别每帧再问一次。
+            particleBurstActive = false;
+        }
+
+        internal int CopySelection()
+        {            return EditorTimelineClipboard.Copy(CollectSelection());
         }
 
         /// <summary>剪切 = 复制 + 删除。复制没成功就不删 —— 否则东西没了还没得粘。</summary>
@@ -2321,6 +2624,7 @@ private static float MinimumPixelsPerSecond
 
             long __modulesWatch = System.Diagnostics.Stopwatch.GetTimestamp();
             UpdateModules();
+            TickParticles();
             PreviewDiagnostics.RecordPart("Timeline.Modules",
                 (System.Diagnostics.Stopwatch.GetTimestamp() - __modulesWatch)
                 * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
@@ -2394,28 +2698,29 @@ private static float MinimumPixelsPerSecond
                 navigationDuration = Mathf.Max(navigationDuration, snapshot.CurrentTime + visibleDuration);
             }
 
-            // 固定播放头下的 Shift+滚轮：**和自由模式同一套欠账式平滑**
-            // （同样的 `ScrollSmoothSpeed`），所以速度和滑停时长一致。
+            // 固定播放头下的 Shift+滚轮：**和自由模式同一套速度模型**，
+            // 位移 = 速度 × dt（速度单位是秒/秒），速度按指数衰减。
             if (centeredScrubActive)
             {
-                if (Mathf.Abs(centeredScrubPending) > 0.0002f)
+                if (Mathf.Abs(centeredScrubVelocity) > 0.0002f)
                 {
-                    float k = 1f - Mathf.Exp(-Time.unscaledDeltaTime * ScrollSmoothSpeed);
-                    float move = centeredScrubPending * k;
                     float scrubNow = snapshot.CurrentTime;
-                    float scrubNext = Mathf.Clamp(scrubNow + move, 0f,
-                        Mathf.Max(0f, navigationDuration));
-                    if (Mathf.Abs(scrubNext - (scrubNow + move)) > 0.00001f)
+                    float scrubNext = Mathf.Clamp(
+                        scrubNow + centeredScrubVelocity * Time.unscaledDeltaTime,
+                        0f, Mathf.Max(0f, navigationDuration));
+                    if (Mathf.Abs(scrubNext
+                            - (scrubNow + centeredScrubVelocity * Time.unscaledDeltaTime)) > 0.00001f)
                     {
-                        // 撞到谱面头/尾：欠账作废，别继续"想"走。
-                        centeredScrubPending = 0f;
+                        // 撞到谱面头/尾：速度作废，别继续"想"走。
+                        centeredScrubVelocity = 0f;
                     }
                     else
                     {
-                        centeredScrubPending -= move;
-                        if (Mathf.Abs(centeredScrubPending) < 0.0002f)
+                        centeredScrubVelocity *=
+                            Mathf.Exp(-Time.unscaledDeltaTime * HorizontalScrollDecay);
+                        if (Mathf.Abs(centeredScrubVelocity) < 0.0002f)
                         {
-                            centeredScrubPending = 0f;
+                            centeredScrubVelocity = 0f;
                         }
                     }
                     pendingScrubTime = scrubNext;
@@ -2465,8 +2770,8 @@ private static float MinimumPixelsPerSecond
                     ClampCenteredViewStart();
                     visualsDirty = true;
                 }
-                // 固定播放头自己不产生横向欠账：位置由上面每帧算死。
-                horizontalScrollPending = 0f;
+                // 固定播放头自己不产生横向速度：位置由上面每帧算死。
+                horizontalScrollVelocity = 0f;
             }
 
             // 「定位到播放头」的滑动（自由模式用；固定模式由上面的缓动代劳）。
@@ -2485,8 +2790,37 @@ private static float MinimumPixelsPerSecond
             }
 
             long __segWatch2 = System.Diagnostics.Stopwatch.GetTimestamp();
+            ApplyZoomSmoothing();
+            ApplyRowHeightSmoothing();
             ApplyScrollSmoothing();
+            // 平滑缩放收尾的那一帧补排一次 —— `ZoomAt` 在平滑期间只记账，
+            // 不排的话松手后行号还停在旧间距上。
+            if (repackDueTime < 0f && Mathf.Abs(zoomPendingLog) < 1e-5f)
+            {
+                repackDueTime = 0f;
+                if (FixedTimelineLayout)
+                {
+                    RepackRowsByTypePriority();
+                }
+                // 缩放期间攒下的那次装箱在这里补上。
+                layoutDirty = true;
+                visualsDirty = true;
+            }
             PreviewDiagnostics.RecordPart("T.Scroll", Since(__segWatch2));
+
+            // **拉框中每帧重画一次框。**
+            //
+            // 起点存的是内容坐标（秒 + 行），视图一滚它就该换算成新的屏幕位置。
+            // 但 `UpdateMarqueeBand` 原来只在**鼠标移动**时被调（OnDrag /
+            // MarqueeFromMarkerDrag）—— 于是 Shift+滚轮或滚轮滚视图时框不动，
+            // 看起来就是"锚点又钉在屏幕上了"，一松 Shift 才恢复。
+            //
+            // 放在滚动之后：换算用的是这一帧最新的 `viewStartTime` 和
+            // `verticalScrollOffset`，框和块才不会差一帧。
+            if (marqueeActive)
+            {
+                UpdateMarqueeBand();
+            }
 
             __segWatch2 = System.Diagnostics.Stopwatch.GetTimestamp();
             if (visualsDirty)
@@ -2645,6 +2979,15 @@ private static float MinimumPixelsPerSecond
                 return;
             }
 
+            // **先去抖。** 滚轮编码器会吐反向刻度，平滑之后特别明显
+            // （见 `FilterWheelDelta` 的说明）。所有分支共用同一个方向判定，
+            // 因为用户一次滚轮动作里的修饰键不会变。
+            wheelDelta = FilterWheelDelta(wheelDelta);
+            if (Mathf.Approximately(wheelDelta, 0f))
+            {
+                return;
+            }
+
             // **拖动中只放开纵向滚动。**
             //
             // 长事件往右铺得远，拖的时候本来就要上下找行，一律禁掉太难用。
@@ -2664,11 +3007,17 @@ private static float MinimumPixelsPerSecond
 
             if (control)
             {
-                ZoomAt(wheelDelta > 0f ? 1.25f : 0.8f, bodyWidth * 0.5f);
+                // **Ctrl+滚轮走平滑缩放**：只记欠账（倍率的对数），
+                // 由 `ApplyZoomSmoothing` 每帧花掉，手感才不顿。
+                AddZoomDelta(wheelDelta > 0f ? 1.25f : 0.8f, bodyWidth * 0.5f);
             }
             else if (alt)
             {
-                AdjustRowHeight(wheelDelta > 0f ? 1f : -1f);
+                // **Alt+滚轮走平滑行高**：只记欠账，由 `ApplyRowHeightSmoothing`
+                // 每帧花掉，行高才是一段连续变化而不是一格一跳。
+                rowHeightPending += wheelDelta > 0f ? RowHeightStep : -RowHeightStep;
+                rowHeightPersistPending = true;
+                visualsDirty = true;
             }
             else if (shift)
             {
@@ -2678,16 +3027,20 @@ private static float MinimumPixelsPerSecond
                 if (followMode == TimelineFollowMode.CenteredPlayhead)
                 {
                     // **固定播放头下横滚 = 挪时间**，视图不挪 —— 播放头始终钉在正中。
-                    // 只把"还要走多少秒"记进欠账，推进交给 Update 里的指数逼近，
-                    // 参数和自由模式的滚动同一个 `ScrollSmoothSpeed`。
+                    // 往 `centeredScrubVelocity` 上叠速度（单位是秒/秒），
+                    // 和自由模式同一套速度模型。
                     if (!centeredScrubActive)
                     {
-                        centeredScrubPending = 0f;
+                        centeredScrubVelocity = 0f;
                         centeredScrubActive = true;
                         string scrubStatus;
                         EditorPlaybackBridge.TryBeginTimelineScrub(out scrubStatus);
                     }
-                    centeredScrubPending -= pixels / Mathf.Max(1f, pixelsPerSecond);
+                    // 和 `AddHorizontalScrollDelta` 同一条换算（含方向）：
+                    // 自由模式是 `AddHorizontalScrollDelta(-pixels)`，
+                    // 所以这里也要取负，两个模式滚同一个方向时间走同一个方向。
+                    centeredScrubVelocity += -pixels * WheelVelocityGain
+                        / Mathf.Max(1f, pixelsPerSecond);
                     MarkManualNavigation();
                 }
                 else
@@ -2716,26 +3069,106 @@ private static float MinimumPixelsPerSecond
         /// 花掉；花完即停。这样既不顿（不是一格一跳），也不会像惯性那样松手
         /// 之后还滑几秒（触控板会连发动量事件，速度叠起来停不下来）。
         /// </summary>
-        private void AddVerticalScrollDelta(float pixels)
+        /// <summary>
+        /// 记一笔缩放欠账（Ctrl+滚轮走这里）。**不直接改 `pixelsPerSecond`** ——
+        /// 真正的改动交给 `ApplyZoomSmoothing` 每帧按指数逼近花掉。
+        ///
+        /// `anchorX` 是这一整段缩放固定的锚点。第一次记账时定下，
+        /// 之后连续滚轮都沿用（除非换了锚点位置超过一小段，见下）。
+        /// </summary>
+        private void AddZoomDelta(float factor, float anchorX)
         {
-            verticalScrollPending += pixels;
+            if (Mathf.Approximately(factor, 1f))
+            {
+                return;
+            }
+            if (Mathf.Abs(zoomPendingLog) < 1e-5f)
+            {
+                // 欠账已经花完（或本来就没有）：这是新一段缩放，锚点按这次定。
+                zoomAnchorX = anchorX;
+            }
+            else if (Mathf.Abs(anchorX - zoomAnchorX) > 4f)
+            {
+                // 上一段还没滑完，但鼠标已经挪到别处 —— 用户显然在重新瞄准。
+                // 直接接受新锚点，否则画面会绕着旧位置扭。
+                zoomAnchorX = anchorX;
+            }
+            zoomPendingLog += Mathf.Log(factor);
             visualsDirty = true;
         }
 
-        /// <summary>横向滚轮：同上，单位是像素，落到 `viewStartTime` 时再换成秒。</summary>
+        /// <summary>
+        /// 每帧把缩放欠账花掉一点：`step = pending · (1 − e^(−k·dt))`。
+        ///
+        /// 真正应用的是 `Mathf.Exp(step)` 这个倍率 —— 所以是"按比例逼近"，
+        /// 不论当前缩放到哪一档，观感都是匀速推近/推远。
+        /// </summary>
+        private void ApplyZoomSmoothing()
+        {
+            if (Mathf.Abs(zoomPendingLog) < 1e-5f)
+            {
+                if (zoomPendingLog != 0f)
+                {
+                    zoomPendingLog = 0f;
+                }
+                return;
+            }
+            float delta = Time.unscaledDeltaTime;
+            if (delta <= 0f)
+            {
+                return;
+            }
+            float k = 1f - Mathf.Exp(-delta * ZoomSmoothSpeed);
+            float step = zoomPendingLog * k;
+            // 夹一下，免得单帧一步跨过整个缩放范围（低帧率时 k 会很大）。
+            step = Mathf.Clamp(step, -0.6f, 0.6f);
+            float factor = Mathf.Exp(step);
+            float before = pixelsPerSecond;
+            ZoomAt(factor, zoomAnchorX);
+            // `ZoomAt` 撞到上下限时倍率会被夹住，此时欠账必须清掉，
+            // 否则它一直"想"缩，用户反方向滚一下要先抵消掉这段欠账。
+            if (Mathf.Approximately(before, pixelsPerSecond))
+            {
+                zoomPendingLog = 0f;
+                return;
+            }
+            zoomPendingLog -= step;
+            if (Mathf.Abs(zoomPendingLog) < 1e-5f)
+            {
+                zoomPendingLog = 0f;
+            }
+            visualsDirty = true;
+        }
+
+        /// <summary>
+        /// 滚轮一格：**往速度上叠**，不是往欠账里加距离。
+        ///
+        /// 这是手感的关键区别 —— 连续滚时速度一路累加，读起来是"越滚越快"
+        /// 而不是"一格一冲"。
+        /// </summary>
+        private void AddVerticalScrollDelta(float pixels)
+        {
+            verticalScrollVelocity += pixels * WheelVelocityGain;
+            visualsDirty = true;
+        }
+
+        /// <summary>横向滚轮：同上，叠到横向速度上。</summary>
         private void AddHorizontalScrollDelta(float pixels)
         {
             viewGliding = false;
-            horizontalScrollPending += pixels;
+            horizontalScrollVelocity += pixels * WheelVelocityGain;
             MarkManualNavigation();
             visualsDirty = true;
         }
 
         /// <summary>
-        /// 每帧把"欠账"按指数逼近花掉：`move = pending · (1 − e^(−22·dt))`。
+        /// 每帧推进滚动：**位移 = 速度 × dt**，速度按 `e^(-decay·dt)` 衰减。
         ///
-        /// 到点即停（剩余不足 0.01 直接抹零），所以**松手就是停**，
-        /// 不会像惯性那样还往前滑。撞到边界也立刻清零，免得贴着边抖。
+        /// 连续滚轮时速度是累加的，所以越滚越快；停手后速度自然衰减到零，
+        /// 惯性有但有限。
+        ///
+        /// **撞到边界要立刻把速度清零** —— 否则会贴着边一直"想"滚，
+        /// 用户往反方向滚时第一下先被这段残余抵消掉。
         /// </summary>
         private void ApplyScrollSmoothing()
         {
@@ -2744,44 +3177,57 @@ private static float MinimumPixelsPerSecond
             {
                 return;
             }
-            float k = 1f - Mathf.Exp(-delta * ScrollSmoothSpeed);
             bool dirty = false;
 
-            if (Mathf.Abs(verticalScrollPending) > 0.01f)
+            if (Mathf.Abs(verticalScrollVelocity) > 0.5f)
             {
-                float move = verticalScrollPending * k;
                 float before = verticalScrollOffset;
-                verticalScrollOffset += move;
+                verticalScrollOffset += verticalScrollVelocity * delta;
                 ClampVerticalScroll();
-                verticalScrollPending -= move;
-                if (Mathf.Abs(before - verticalScrollOffset) < 0.001f)
+                if (Mathf.Abs(before - verticalScrollOffset) < 0.0001f)
                 {
-                    // 顶到边界：欠账作废，别让它一直"想"滚。
-                    verticalScrollPending = 0f;
+                    // 顶到边界：速度作废。
+                    verticalScrollVelocity = 0f;
                 }
-                if (Mathf.Abs(verticalScrollPending) < 0.01f)
+                else
                 {
-                    verticalScrollPending = 0f;
+                    verticalScrollVelocity *= Mathf.Exp(-delta * VerticalScrollDecay);
+                    if (Mathf.Abs(verticalScrollVelocity) < 0.5f)
+                    {
+                        verticalScrollVelocity = 0f;
+                    }
                 }
                 dirty = true;
             }
-
-            if (Mathf.Abs(horizontalScrollPending) > 0.01f)
+            else if (verticalScrollVelocity != 0f)
             {
-                float move = horizontalScrollPending * k;
+                verticalScrollVelocity = 0f;
+            }
+
+            if (Mathf.Abs(horizontalScrollVelocity) > 0.05f)
+            {
+                // 横向衰减更慢（`HorizontalScrollDecay`），惯性更长。
                 float before = viewStartTime;
-                viewStartTime += move / Mathf.Max(1f, pixelsPerSecond);
+                viewStartTime += horizontalScrollVelocity * delta
+                    / Mathf.Max(1f, pixelsPerSecond);
                 ClampViewStart();
-                horizontalScrollPending -= move;
-                if (Mathf.Abs(before - viewStartTime) < 0.000001f)
+                if (Mathf.Abs(before - viewStartTime) < 0.0000001f)
                 {
-                    horizontalScrollPending = 0f;
+                    horizontalScrollVelocity = 0f;
                 }
-                if (Mathf.Abs(horizontalScrollPending) < 0.01f)
+                else
                 {
-                    horizontalScrollPending = 0f;
+                    horizontalScrollVelocity *= Mathf.Exp(-delta * HorizontalScrollDecay);
+                    if (Mathf.Abs(horizontalScrollVelocity) < 0.05f)
+                    {
+                        horizontalScrollVelocity = 0f;
+                    }
                 }
                 dirty = true;
+            }
+            else if (horizontalScrollVelocity != 0f)
+            {
+                horizontalScrollVelocity = 0f;
             }
 
             if (dirty)
@@ -3286,17 +3732,66 @@ private static float MinimumPixelsPerSecond
             SetRowHeight(rowHeight + direction * RowHeightStep, true);
         }
 
+        /// <summary>
+        /// 每帧把行高欠账花掉一点，走的是和 `ApplyScrollSmoothing` 同一套
+        /// 指数逼近 —— 所以"调行高"是一段连续变化，松手后还会滑一小截。
+        ///
+        /// **这里不能加"步子太小就先攒着"的门槛。** 行高只有 24~48 像素，
+        /// 滚一格才 3px，按 14 的速度每帧步长只有 0.6px —— 门槛一旦设成
+        /// "攒到 1px 才动"，欠账在门槛里不递减就永远够不到，单格滚轮完全
+        /// 不动、滚几格才突然跳一下（用户报的"卡、有延迟"）。
+        ///
+        /// 卡顿的根源不在这个频率，而在 `SetRowHeight` 里那次全量重排 ——
+        /// 已经改成行高不再触发重排了，所以每帧照实花是安全的。
+        /// </summary>
+        private void ApplyRowHeightSmoothing()
+        {
+            if (Mathf.Abs(rowHeightPending) < 0.005f)
+            {
+                if (rowHeightPending != 0f)
+                {
+                    rowHeightPending = 0f;
+                    // 收尾：最后那点零头补齐，并落一次设置文件。
+                    if (rowHeightPersistPending)
+                    {
+                        rowHeightPersistPending = false;
+                        if (Main.Settings != null)
+                        {
+                            Main.Settings.TimelineRowHeight = rowHeight;
+                        }
+                        Main.SaveSettings();
+                    }
+                }
+                return;
+            }
+            float delta = Time.unscaledDeltaTime;
+            if (delta <= 0f)
+            {
+                return;
+            }
+            float k = 1f - Mathf.Exp(-delta * RowHeightSmoothSpeed);
+            float step = rowHeightPending * k;
+            float before = rowHeight;
+            SetRowHeight(rowHeight + step, false);
+            float applied = rowHeight - before;
+            rowHeightPending -= applied;
+            if (Mathf.Abs(rowHeightPending) < 0.01f)
+            {
+                rowHeightPending = 0f;
+            }
+            // 撞到上下限时行高没变，欠账作废 —— 否则反方向滚要先抵消这段。
+            if (Mathf.Approximately(applied, 0f))
+            {
+                rowHeightPending = 0f;
+            }
+        }
+
         private void SetRowHeight(float value, bool persist)
         {
             float requested = Mathf.Clamp(value, MinimumRowHeight, MaximumRowHeight);
             bool changed = false;
             if (!Mathf.Approximately(requested, rowHeight))
             {
-                // 行位置存在行表里，而行表是按行高
-                // 构建的，所以放大行必须重跑布局。只把
-                // 视觉标脏，会用旧间距画更高的块，
-                // 让每个分类框都压到下面那个身上。
-                //
                 // **比例的分母要用"现在的内容高度"。** 原来用的是
                 // `layoutTotalHeight` —— 那是旧排版模型的字段，重建那一段删掉之后
                 // 就再也没被赋过值、恒为 0，于是比例恒为 0、每按一次 Alt+滚轮
@@ -3307,16 +3802,25 @@ private static float MinimumPixelsPerSecond
                     : Mathf.Clamp01(verticalScrollOffset / contentBefore);
                 rowHeight = requested;
                 changed = true;
-                layoutDirty = true;
+                // **改行高不需要重排。**
+                //
+                // `RebuildDynamicRows` 只拿 `pixelsPerSecond` 算装箱，
+                // 从头到尾没读过 `rowHeight` —— 块的纵向位置是每帧现算的
+                // （`blockTop = RulerHeight + Row * BlockStridePixels`）。
+                // 原来这里置 `layoutDirty` 是纯浪费：一次全量装箱要几毫秒，
+                // 而平滑行高是每帧都在改，60 次/秒直接把主线程拖死
+                // （用户报的"Alt+滚轮卡"）。
                 visualsDirty = true;
-                // 行高压根就是块绑定的几何输入（行距/块高），必须置脏。
+                // 行高是块绑定的几何输入（行距/块高），必须置脏。
                 MarkBlocksDirty();
 
                 // 让光标下始终是谱面的同一处，而不是保持同一个
                 // 行号——行号已经不再对应固定位置了。
                 verticalScrollOffset = scrollRatio * BlockContentHeight;
-            // 改行高时位置是重算出来的，把滚轮的欠账清掉，否则两边抢。
-            verticalScrollPending = 0f;
+                // 内容高度变了，滚动上界跟着变，得夹一次否则会滚出底。
+                ClampVerticalScroll();
+                // 改行高时位置是重算出来的，把滚动速度清掉，否则两边抢。
+                verticalScrollVelocity = 0f;
                 if (Main.Settings != null)
                 {
                     Main.Settings.TimelineRowHeight = rowHeight;
@@ -3571,6 +4075,33 @@ private static float MinimumPixelsPerSecond
 
         private readonly List<BlockPlacement> blockPlacements = new List<BlockPlacement>();
         private readonly List<BlockView> blockViews = new List<BlockView>();
+
+        /// <summary>删除块的爆炸粒子层。按需创建，挂在视口下、块层之上。</summary>
+        private RectTransform particleLayer;
+        /// <summary>粒子绘制组件（和 `particleLayer` 同生共死）。</summary>
+        private UiParticleBurst particleBurst;
+        /// <summary>还有活粒子吗。全死光就停掉推进，别每帧空跑。</summary>
+        private bool particleBurstActive;
+
+        /// <summary>
+        /// 拖动中的块**画在哪儿**（屏幕坐标）。键是块的 Id。
+        ///
+        /// **只影响绘制，不影响数据。** 块的真实时间/行号照常即时更新，
+        /// 这里只是让屏幕上的位置慢一拍追上去 —— 看起来有"重量"。
+        /// 松手时不提交这个值，提交的是真实位置。
+        ///
+        /// 拖动结束就把对应的项删掉，下次拖动从实际位置重新开始。
+        /// </summary>
+        private readonly Dictionary<int, Vector2> dragTrailPositions =
+            new Dictionary<int, Vector2>();
+
+        /// <summary>
+        /// 拖尾的追赶速度（每秒收敛比例）。越小越"黏"。
+        ///
+        /// 0.35 对应大约 60ms 的滞后：肉眼看得出块"跟得有点慢"，
+        /// 但不会慢到影响精确落点判断。
+        /// </summary>
+        private const float DragTrailFollowRate = 0.35f;
 
         /// <summary>
         /// `EnsureBlockPlacements` 每帧要的「按 SourceOrder 排序的全量事件清单」缓存。
@@ -4018,14 +4549,17 @@ private static float MinimumPixelsPerSecond
 
             moduleMenuRoot = CreateRect("ContextMenu", layer, 0f, 0f,
                 ModuleMenuWidth, 10f);
-            Image background = moduleMenuRoot.gameObject.AddComponent<Image>();
-            background.color = Palette.Panel;
-            background.raycastTarget = true;
-            if (roundedSprite != null)
-            {
-                background.sprite = roundedSprite;
-                background.type = Image.Type.Sliced;
-            }
+            // 弹层背景用矢量圆角：菜单会随内容长高，贴图拉伸在高度变化时
+            // 边缘会跟着糊。
+            UiShapeGraphic menuBackground =
+                moduleMenuRoot.gameObject.AddComponent<UiShapeGraphic>();
+            menuBackground.color = Palette.Panel;
+            menuBackground.raycastTarget = true;
+            menuBackground.BeginShapes();
+            menuBackground.AddRoundedRect(
+                new Rect(0f, 0f, ModuleMenuWidth, 10f),
+                UiRadius.Md, Color.white, Color.clear, 0f);
+            menuBackground.SubmitShapes();
 
             float y = ModuleMenuPadding;
             // **目标从闭包捕获** —— 菜单一关字段就清空了，而动作在关菜单之后跑。
@@ -4099,6 +4633,17 @@ private static float MinimumPixelsPerSecond
             moduleMenuRoot.sizeDelta = new Vector2(ModuleMenuWidth,
                 y + ModuleMenuPadding);
 
+            // 高度定下来了，圆角形状跟着重画一次 —— 创建时还不知道最终多高。
+            UiShapeGraphic menuShape = moduleMenuRoot.GetComponent<UiShapeGraphic>();
+            if (menuShape != null)
+            {
+                menuShape.BeginShapes();
+                menuShape.AddRoundedRect(
+                    new Rect(0f, 0f, ModuleMenuWidth, y + ModuleMenuPadding),
+                    UiRadius.Md, Color.white, Color.clear, 0f);
+                menuShape.SubmitShapes();
+            }
+
             // 位置：跟着鼠标，别出屏幕。
             Vector2 local;
             if (!RectTransformUtility.ScreenPointToLocalPointInRectangle(
@@ -4125,6 +4670,14 @@ private static float MinimumPixelsPerSecond
             }
             SetTopLeft(moduleMenuRoot, x, top, width, height);
             moduleMenuRoot.SetAsLastSibling();
+
+            // 弹出过渡：淡入 + 轻微放大。菜单是"从鼠标位置长出来"的东西，
+            // 直接出现太生硬。
+            UiTransition menuTransition = UiTransition.Attach(moduleMenuRoot.gameObject);
+            if (menuTransition != null)
+            {
+                menuTransition.PlayShow(UiMotion.Fast);
+            }
         }
 
         /// <summary>全选当前时间轴上所有可见车道的块。</summary>
@@ -7985,6 +8538,34 @@ private static float MinimumPixelsPerSecond
                     }
                 }
 
+                if (row < 0 && item.Event != null)
+                {
+                    // **刚才被删掉、现在又回来了的事件。**
+                    //
+                    // 撤销插回的就是当初删掉的那个对象（见 `RemoveEvents`），
+                    // 所以能按引用认出来，把它原来的行号还给它。
+                    //
+                    // **必须排在前缀兜底之前。** 这里是按**对象引用**查的，
+                    // 精确到"就是这一个事件"；而前缀是 `类型:格:时间`，
+                    // 同一格同一时刻的一批同类事件（比如叠着的几个 SetFilter）
+                    // 前缀完全一样，队列里排的是**别人的行号**。
+                    //
+                    // 实测（多选删除 → 撤销）：记住 4 个行号，只领回 2 个 ——
+                    // 另外两个被前缀队列抢先领走了别人的行，真正的主人排在
+                    // 后面时 `RowIsOccupied` 还查不到它（那块还没摆），于是
+                    // 主人被挤到最下面。用户看到的就是「撤回了一部分、位置乱飞」。
+                    int restoredRow;
+                    if (removedRows.TryGetValue(item.Event, out restoredRow))
+                    {
+                        row = restoredRow;
+                        removedRows.Remove(item.Event);
+                        if (row > maxRow)
+                        {
+                            maxRow = row;
+                        }
+                    }
+                }
+
                 if (row < 0 && !string.IsNullOrEmpty(item.Key))
                 {
                     Queue<int> queue;
@@ -8012,26 +8593,6 @@ private static float MinimumPixelsPerSecond
                         if (RowIsOccupied(item, row))
                         {
                             row = -1;
-                        }
-                    }
-                }
-
-                if (row < 0 && item.Event != null)
-                {
-                    // **刚才被删掉、现在又回来了的事件。**
-                    //
-                    // 撤销插回的就是当初删掉的那个对象（见 `RemoveEvents`），
-                    // 所以能按引用认出来，把它原来的行号还给它。
-                    // 放在前缀兜底之后 —— 前缀更准（它要求身份一致），
-                    // 只有前缀也查不到才轮到这里。
-                    int restoredRow;
-                    if (removedRows.TryGetValue(item.Event, out restoredRow))
-                    {
-                        row = restoredRow;
-                        removedRows.Remove(item.Event);
-                        if (row > maxRow)
-                        {
-                            maxRow = row;
                         }
                     }
                 }
@@ -8687,6 +9248,8 @@ private static float MinimumPixelsPerSecond
                 return;
             }
             imBlockDrag = false;
+            // 拖动结束：拖尾状态作废 —— 松手后块要落在真实位置，不能再追。
+            dragTrailPositions.Clear();
             // 拖动结束：块要落回提交/还原后的位置，立即重绑。
             MarkBlocksDirty();
 
@@ -9060,7 +9623,7 @@ private static float MinimumPixelsPerSecond
                 Palette.AccentSecondary);
             CreateText("Heading", root,
                 barX + EditorStudioOverlay.HeadingBarWidth + EditorStudioOverlay.HeadingBarGap + ContentShift,
-                7f - EditorStudioOverlay.HeadingTextLift, 78f, 30f, "时间轴", UiType.Title, Palette.AccentSecondary,
+                7f - EditorStudioOverlay.HeadingTextLift, 78f, 30f, "时间轴", UiType.Title, UiTheme.Current.HeadingColor,
                 TextAlignmentOptions.MidlineLeft, true);
 
             // 车道筛选按钮原来在这里，是一排文字按钮（全部/镜头/视效/…）。
@@ -9114,7 +9677,7 @@ private static float MinimumPixelsPerSecond
             HideButtonLabel(locatePlayheadButton);
             locatePlayheadIcon = CreateImage("PlayheadIcon",
                 locatePlayheadButton.GetComponent<RectTransform>(),
-                5f, 6f, 18f, 16f, TextPrimary);
+                5f, 6f, 18f, 16f, TextSecondary);
             locatePlayheadIcon.raycastTarget = false;
 
             // **排版模式那颗按钮已搬进「设置窗口 → 常规设置」。**
@@ -9176,7 +9739,7 @@ private static float MinimumPixelsPerSecond
 
                 Sprite icon = GetLaneIcon(lane);
                 Image iconImage = CreateImage("Icon", host, 4f, 6f, 18f, 16f,
-                    IsLaneVisible(lane) ? TextPrimary : TextMuted);
+                    IsLaneVisible(lane) ? Palette.Accent : TextSecondary);
                 iconImage.sprite = icon;
                 iconImage.preserveAspect = true;
                 iconImage.raycastTarget = false;
@@ -9219,9 +9782,11 @@ private static float MinimumPixelsPerSecond
                 string.Empty,
                 delegate { ToggleModulePencil(); }
             );
+            // **暂时不开放**（2026-11-06 用户要求）：按钮建出来但立刻隐藏。
+            // 不直接删掉，是因为功能本身是好的、只是还没打磨到能用的程度；
+            // 保留代码 + 隐藏入口，之后重新开放只要去掉下面那一行。
+            moduleButton.gameObject.SetActive(false);
             ApplyModulePencilIcon();
-            UiHoverTip.Attach(moduleButton,
-                "分组：点出包围圈，闭合后生成模块（Esc 取消）");
 
             // 这个设置会持久化，所以启动时必须告知求值器——
             // 否则会出现一开始实际未锁、按钮却已显示为锁定状态的情况。
@@ -9269,14 +9834,18 @@ private static float MinimumPixelsPerSecond
             //
             // 它的尺寸已经通过 Relayout 跟随面板高度，所以缩放手柄
             // 这里不需要额外处理。
-            Image viewportImage = CreateImage("Viewport", root, GutterWidth + ContentShift, headerHeight, bodyWidth, bodyHeight, TimelineCard);
-            viewportImage.raycastTarget = true;
-            if (roundedSprite != null)
-            {
-                viewportImage.sprite = roundedSprite;
-                viewportImage.type = Image.Type.Sliced;
-            }
-            viewport = viewportImage.rectTransform;
+            // **主视图用矢量圆角。** 这是界面上面积最大的一块圆角，
+            // 贴图拉伸在这里最容易看出糊边 —— 换成现算几何之后边缘是干净的。
+            RectTransform viewportRect = CreateRect("Viewport", root,
+                GutterWidth + ContentShift, headerHeight, bodyWidth, bodyHeight);
+            UiShapeGraphic viewportShape = viewportRect.gameObject.AddComponent<UiShapeGraphic>();
+            viewportShape.color = TimelineCard;
+            viewportShape.raycastTarget = true;
+            viewportShape.BeginShapes();
+            viewportShape.AddRoundedRect(new Rect(0f, 0f, bodyWidth, bodyHeight),
+                UiRadius.Lg, Color.white, Color.clear, 0f);
+            viewportShape.SubmitShapes();
+            viewport = viewportRect;
             viewport.gameObject.AddComponent<RectMask2D>();
             // 格线要压在块**下面**，所以单独一层、先建。
             gridLayer = CreateRect("GridLayer", viewport, 0f, 0f, bodyWidth, bodyHeight);
@@ -9360,6 +9929,8 @@ private static float MinimumPixelsPerSecond
                 PlayheadHandleWidth, 9f, PlayheadColor);
             playheadHandle.raycastTarget = false;
 
+            // **整条顶边都能拖高度。** 原来只有中间 48 像素一小段有抓握感，
+            // 用户得瞄着找；现在整条都是热区，光标一进来就换成上下箭头。
             Image resizeHandleImage = CreateImage(
                 "ResizeHandle",
                 root,
@@ -9369,14 +9940,19 @@ private static float MinimumPixelsPerSecond
                 ResizeHandleHeight,
                 new Color(0f, 0f, 0f, 0.001f)
             );
-            CreateRoundedImage(
-                "Grip",
+            // **一条细细的淡灰线**：告诉用户「这里能拖」。
+            //
+            // 原来中间有一段 48×3 的短横杠当抓握提示 —— 那读起来像
+            // "只有这一段能拖"。改成整条贯通的 1 像素发丝线，
+            // 既标出热区的上沿，又不会像一段控件。
+            CreateImage(
+                "GripLine",
                 resizeHandleImage.rectTransform,
-                rootWidth * 0.5f - 24f,
-                2f,
-                48f,
-                3f,
-                UiTheme.Current.BorderStrong
+                0f,
+                0f,
+                rootWidth,
+                1f,
+                UiTheme.Current.BorderHairline
             ).raycastTarget = false;
             TimelineResizeHandle resizeHandle = resizeHandleImage.gameObject.AddComponent<TimelineResizeHandle>();
             resizeHandle.Initialize(owner, root);
@@ -11444,7 +12020,7 @@ private static float MinimumPixelsPerSecond
                 return;
             }
             centeredScrubActive = false;
-            centeredScrubPending = 0f;
+            centeredScrubVelocity = 0f;
             SubmitPendingScrub(true);
             EditorPlaybackBridge.EndTimelineScrub();
             ParticleWatch.ResumeAll();
@@ -12442,11 +13018,12 @@ private static float MinimumPixelsPerSecond
         private static Texture2D resizeCursorTexture;
 
         /// <summary>
-        /// 左右箭头指针。Unity 没有内置的 resize 指针，
-        /// 而 Cursor.SetCursor 只吃自定义 Texture2D，所以自己画一张。
+        /// 「上下双向箭头」指针 —— 时间轴顶边可拖高度时用。
         ///
-        /// 画成左右两个三角 + 中间一根横杠，边缘做一像素羽化——
-        /// 硬边的斜线在大屏上锯齿很明显。
+        /// Unity 没有内置的 resize 指针，`Cursor.SetCursor` 只吃自定义
+        /// `Texture2D`，所以按用户给的 SVG 描出来（1024 视框，上下两个箭头
+        /// 夹一根横杠）。和项目里其它自绘图标同一套做法：把路径展平成多边形，
+        /// 再用扫描线填充成贴图。
         /// </summary>
         internal static Texture2D GetResizeCursorTexture()
         {
@@ -12455,46 +13032,77 @@ private static float MinimumPixelsPerSecond
                 return resizeCursorTexture;
             }
 
-            const int size = 24;
-            const float halfStroke = 1.6f;
-            var pixels = new Color32[size * size];
-            var clear = new Color32(0, 0, 0, 0);
+            const int size = 32;
+            const float viewBox = 1024f;
+            float scale = size / viewBox;
+            const int superSample = 4;
 
-            float mid = size * 0.5f;
+            // 三块：上箭头、下箭头、中间横杠。**分开填再累加** ——
+            // 它们互不相交，取并集即可。
+            float[][] polygons = BuildResizeCursorPolygons();
+            var coverage = new float[size * size];
+
             for (int y = 0; y < size; y++)
             {
-                for (int x = 0; x < size; x++)
+                for (int sub = 0; sub < superSample; sub++)
                 {
-                    float px = x + 0.5f;
-                    float py = y + 0.5f;
+                    float sampleY = (y + (sub + 0.5f) / superSample) / scale;
+                    float svgY = viewBox - sampleY;
 
-                    // 中间那根横杠。
-                    float bar = Mathf.Max(
-                        Mathf.Abs(py - mid) - 1.1f,
-                        Mathf.Abs(px - mid) - (size * 0.22f));
-                    float barAlpha = Mathf.Clamp01(0.5f - bar);
-
-                    // 左右两个箭头（三角形），用「点到三段线段的距离」描边，
-                    // 这样和项目里其它自绘图标是同一套画法。
-                    float left = DistanceToSegment(px, py, 2.5f, mid, 8f, mid - 5.5f);
-                    left = Mathf.Min(left, DistanceToSegment(px, py, 2.5f, mid, 8f, mid + 5.5f));
-                    left = Mathf.Min(left, DistanceToSegment(px, py, 2.5f, mid, 8f, mid));
-
-                    float right = DistanceToSegment(px, py, size - 2.5f, mid, size - 8f, mid - 5.5f);
-                    right = Mathf.Min(right, DistanceToSegment(px, py, size - 2.5f, mid, size - 8f, mid + 5.5f));
-                    right = Mathf.Min(right, DistanceToSegment(px, py, size - 2.5f, mid, size - 8f, mid));
-
-                    float alpha = Mathf.Max(barAlpha, Mathf.Clamp01(halfStroke - Mathf.Min(left, right) + 0.5f));
-                    if (alpha <= 0f)
+                    for (int poly = 0; poly < polygons.Length; poly++)
                     {
-                        pixels[y * size + x] = clear;
-                        continue;
+                        float[] flat = polygons[poly];
+                        int count = flat.Length / 2;
+                        var crossings = new List<float>(8);
+                        for (int i = 0, j = count - 1; i < count; j = i++)
+                        {
+                            float ax = flat[i * 2];
+                            float ay = flat[i * 2 + 1];
+                            float bx = flat[j * 2];
+                            float by = flat[j * 2 + 1];
+                            if ((ay > svgY) == (by > svgY))
+                            {
+                                continue;
+                            }
+                            float t = (svgY - ay) / (by - ay);
+                            crossings.Add(ax + t * (bx - ax));
+                        }
+                        if (crossings.Count < 2)
+                        {
+                            continue;
+                        }
+                        crossings.Sort();
+                        for (int c = 0; c + 1 < crossings.Count; c += 2)
+                        {
+                            float x0 = crossings[c] * scale;
+                            float x1 = crossings[c + 1] * scale;
+                            if (x1 <= x0)
+                            {
+                                continue;
+                            }
+                            int from = Mathf.Max(0, Mathf.FloorToInt(x0));
+                            int to = Mathf.Min(size - 1, Mathf.CeilToInt(x1) - 1);
+                            for (int px = from; px <= to; px++)
+                            {
+                                float left = Mathf.Max(x0, px);
+                                float right = Mathf.Min(x1, px + 1f);
+                                float overlap = right - left;
+                                if (overlap > 0f)
+                                {
+                                    coverage[y * size + px] += overlap;
+                                }
+                            }
+                        }
                     }
-
-                    // 深色描边 + 白色主体：指针会落在浅色的事件块上，
-                    // 纯白的箭头在白块上会看不见。
-                    pixels[y * size + x] = new Color32(255, 255, 255, (byte)Mathf.RoundToInt(alpha * 255f));
                 }
+            }
+
+            var pixels = new Color32[size * size];
+            float perSample = 1f / superSample;
+            for (int i = 0; i < coverage.Length; i++)
+            {
+                float alpha = Mathf.Clamp01(coverage[i] * perSample);
+                pixels[i] = new Color32(255, 255, 255, (byte)Mathf.RoundToInt(alpha * 255f));
             }
 
             resizeCursorTexture = new Texture2D(size, size, TextureFormat.RGBA32, false)
@@ -12511,6 +13119,49 @@ private static float MinimumPixelsPerSecond
             // 表现就是「鼠标贴到边缘光标不变」。
             resizeCursorTexture.Apply(false, false);
             return resizeCursorTexture;
+        }
+
+        /// <summary>
+        /// 用户给的 SVG 展平后的三段多边形（每段是 `[x0,y0, x1,y1, …]`）。
+        ///
+        /// 原路径（1024×1024 视框，圆弧按 6 段采样）：
+        /// `M545.184 416h-64V229.92H314.08l175.296-175.296a32 32 0 0 1 45.248 0
+        /// l175.296 175.296h-164.736V416z m0 192v177.312h173.504l-184.064 184.064
+        /// a32 32 0 0 1-45.248 0L305.28 785.28h175.872V608h64z M96.064 544
+        /// a32 32 0 0 1 0-64h827.296a32 32 0 0 1 0 64H96.064z`
+        /// </summary>
+        private static float[][] BuildResizeCursorPolygons()
+        {
+            return new[]
+            {
+                // 上箭头
+                new[]
+                {
+                    545.1840f, 416.0000f, 481.1840f, 416.0000f, 481.1840f, 229.9200f,
+                    314.0800f, 229.9200f, 489.3760f, 54.6240f, 496.0028f, 49.5404f,
+                    503.7193f, 46.3448f, 512.0000f, 45.2548f, 520.2807f, 46.3448f,
+                    527.9972f, 49.5404f, 534.6240f, 54.6240f, 709.9200f, 229.9200f,
+                    545.1840f, 229.9200f
+                },
+                // 下箭头
+                new[]
+                {
+                    545.1840f, 608.0000f, 545.1840f, 785.3120f, 718.6880f, 785.3120f,
+                    534.6240f, 969.3760f, 527.9972f, 974.4596f, 520.2807f, 977.6552f,
+                    512.0000f, 978.7452f, 503.7193f, 977.6552f, 496.0028f, 974.4596f,
+                    489.3760f, 969.3760f, 305.2800f, 785.2800f, 481.1520f, 785.2800f,
+                    481.1520f, 608.0000f
+                },
+                // 中间横杠
+                new[]
+                {
+                    96.0640f, 544.0000f, 80.0640f, 539.7128f, 68.3512f, 528.0000f,
+                    64.0640f, 512.0000f, 68.3512f, 496.0000f, 80.0640f, 484.2872f,
+                    96.0640f, 480.0000f, 923.3600f, 480.0000f, 939.3600f, 484.2872f,
+                    951.0728f, 496.0000f, 955.3600f, 512.0000f, 951.0728f, 528.0000f,
+                    939.3600f, 539.7128f, 923.3600f, 544.0000f
+                }
+            };
         }
 
         private bool cursorIsResize;
@@ -13001,11 +13652,36 @@ private static float MinimumPixelsPerSecond
             //
             // 块有最小像素宽度，缩小时"名义不重叠"的两个块在屏幕上照样会叠在
             // 一起。固定排版下重排一次，让间距按新的像素尺度重新分配。
+            //
+            // **平滑缩放期间两条重排都必须推迟。**
+            //
+            // 原来只挡住了 `RepackRowsByTypePriority`，但下一句
+            // `layoutDirty = true` 会让 `RefreshGeometry` 去跑
+            // `RebuildDynamicRows` —— 那也是全量装箱（3400 块要几毫秒）。
+            // 平滑之后每帧都在调，于是每帧一次几毫秒的装箱，60 次/秒的
+            // 主线程抖动就是用户说的"一直正向滚动也细碎地卡"。
+            //
+            // 两者都攒到欠账花完（停手）那一次再排。
+            bool zooming = Mathf.Abs(zoomPendingLog) > 1e-5f;
             if (FixedTimelineLayout)
             {
-                RepackRowsByTypePriority();
+                if (zooming)
+                {
+                    repackDueTime = -1f;
+                }
+                else
+                {
+                    RepackRowsByTypePriority();
+                    repackDueTime = 0f;
+                }
             }
-            layoutDirty = true;
+            // 装箱只依赖 `pixelsPerSecond`（块最小像素宽、块间距），
+            // 所以缩放期间攒着、停手后补一次即可 —— 中途那一帧用旧行号
+            // 画出来只是"块还没重新贴紧"，肉眼看不出来。
+            if (!zooming)
+            {
+                layoutDirty = true;
+            }
             MarkManualNavigation();
             UpdateZoomText();
             visualsDirty = true;
@@ -13668,12 +14344,30 @@ private static float MinimumPixelsPerSecond
             return image;
         }
 
-        private Image CreateRoundedImage(string name, RectTransform parent, float x, float y, float width, float height, Color color)
+        /// <summary>
+        /// 圆角矩形。**用矢量绘制，不再拿贴图九宫格拉伸。**
+        ///
+        /// 原来这里挂一张 32×32 的 `roundedSprite` 做 Sliced 拉伸，半径写死
+        /// 7 像素 —— 大面板的角显得钝、小控件的角显得圆，而且贴图在非整数
+        /// 像素位置会糊边。这些正是界面「有像素感」的来源。
+        ///
+        /// 现在交给 `UiShapeGraphic`：按实际宽高现算圆角几何，半径按控件
+        /// 短边自动分档（见 `UiRadius.ForSize`）。返回类型放宽成 `Graphic`
+        /// 就够了 —— 调用方只用 `color` / `raycastTarget` / `targetGraphic`，
+        /// 全是基类成员。
+        /// </summary>
+        private Graphic CreateRoundedImage(string name, RectTransform parent,
+            float x, float y, float width, float height, Color color)
         {
-            Image image = CreateImage(name, parent, x, y, width, height, color);
-            image.sprite = roundedSprite;
-            image.type = Image.Type.Sliced;
-            return image;
+            RectTransform rect = CreateRect(name, parent, x, y, width, height);
+            UiShapeGraphic shape = rect.gameObject.AddComponent<UiShapeGraphic>();
+            shape.color = color;
+            shape.BeginShapes();
+            shape.AddRoundedRect(new Rect(0f, 0f, width, height),
+                UiRadius.ForSize(Mathf.Min(width, height)),
+                Color.white, Color.clear, 0f);
+            shape.SubmitShapes();
+            return shape;
         }
 
         private readonly Dictionary<long, Texture2D> chevronTextures = new Dictionary<long, Texture2D>();
@@ -14129,7 +14823,7 @@ private static float MinimumPixelsPerSecond
                 {
                     continue;
                 }
-                Color wanted = IsLaneVisible(i) ? TextPrimary : TextMuted;
+                Color wanted = IsLaneVisible(i) ? Palette.Accent : TextSecondary;
                 if (icon.color != wanted)
                 {
                     icon.color = wanted;
@@ -14275,10 +14969,12 @@ private static float MinimumPixelsPerSecond
                 {
                     locatePlayheadIcon.sprite = locatePlayheadSprite;
                 }
-                // 一次性动作，没有开/关状态 —— 恒为主文字色。
-                if (locatePlayheadIcon.color != TextPrimary)
+                // 一次性动作，没有开/关状态 —— 恒为次要文字色（中性灰）。
+                // **不能用 TextPrimary**：那是正文的暖橙，图标用它会显得"已激活"，
+                // 和旁边那些真正有开关状态的按钮混成一片。
+                if (locatePlayheadIcon.color != TextSecondary)
                 {
-                    locatePlayheadIcon.color = TextPrimary;
+                    locatePlayheadIcon.color = TextSecondary;
                 }
             }
         }
@@ -14529,7 +15225,7 @@ private static float MinimumPixelsPerSecond
             bool on = Main.Settings != null && Main.Settings.FollowSelectionOnClick;
             selectionFollowSprite = CreateEventFollowSprite(on);
             Image icon = CreateImage("SelectionFollowIcon", selectionFollowButton.GetComponent<RectTransform>(),
-                5f, 6f, 18f, 16f, TextPrimary);
+                5f, 6f, 18f, 16f, TextSecondary);
             icon.sprite = selectionFollowSprite;
             icon.raycastTarget = false;
         }
@@ -14981,14 +15677,18 @@ private static float MinimumPixelsPerSecond
                 int index = markerPool.Count;
                 RectTransform rect = CreateRect("Block" + index, blockLayer,
                     0f, 0f, 100f, DefaultRowHeight);
-                Image background = rect.gameObject.AddComponent<Image>();
+                // **事件块用矢量圆角，不用贴图九宫格。**
+                //
+                // 原来挂的是 32×32 的 `roundedSprite`、九宫格边距 8 ——
+                // 而块宽经常只有 64px 左右，左右各吃掉 8px 就只剩中间 48px，
+                // 圆角被压缩变形，看着就是「圆角上有像素点」。
+                // 块高也只有 24~48px，固定 7px 的半径占比太大。
+                //
+                // 改成现算几何之后，半径按块的实际短边挑档，窄块自然不会
+                // 出现被挤压的圆角。
+                UiShapeGraphic background =
+                    rect.gameObject.AddComponent<UiShapeGraphic>();
                 background.raycastTarget = true;
-                // 块允许圆角：用和面板同一个九宫格圆角图，拉伸时四角不糊。
-                if (roundedSprite != null)
-                {
-                    background.sprite = roundedSprite;
-                    background.type = Image.Type.Sliced;
-                }
 
                 TimelineMarker marker = new TimelineMarker();
                 marker.GameObject = rect.gameObject;
@@ -15185,6 +15885,37 @@ private static float MinimumPixelsPerSecond
                     block.Duration * pixelsPerSecond - BlockGap);
                 float top = contentTop + block.Row * stride;
 
+                // **拖尾：拖动中的块，屏幕位置慢一拍追上去。**
+                //
+                // 只改画在哪儿，不改数据 —— 块的 `Time` / `Row` 照常即时更新，
+                // 松手提交的也是真实值。所以这个滞后纯粹是观感，不会让落点
+                // 变得不准（用户要求"不影响落下"）。
+                if ((blockDragActive || imBlockDrag) && dragMembers.Contains(block.Event))
+                {
+                    Vector2 target = new Vector2(left, top);
+                    Vector2 current;
+                    if (dragTrailPositions.TryGetValue(block.Id, out current))
+                    {
+                        // 指数收敛：每帧走剩余距离的一部分，越快越跟手。
+                        float t = 1f - Mathf.Exp(-DragTrailFollowRate * 60f
+                            * Time.unscaledDeltaTime);
+                        current = Vector2.Lerp(current, target, Mathf.Clamp01(t));
+                    }
+                    else
+                    {
+                        // 第一帧直接对齐，否则块会从屏幕左上角飞过来。
+                        current = target;
+                    }
+                    dragTrailPositions[block.Id] = current;
+                    left = current.x;
+                    top = current.y;
+                }
+                else if (dragTrailPositions.Count > 0)
+                {
+                    // 不是拖动中的块：清掉残留，免得下次拖动从旧位置开始。
+                    dragTrailPositions.Remove(block.Id);
+                }
+
                 if (left + width <= 0f || left >= viewWidth
                     || top + blockHeight <= RulerHeight || top >= viewHeight)
                 {
@@ -15225,6 +15956,22 @@ private static float MinimumPixelsPerSecond
                     marker.GameObject.SetActive(true);
                 }
                 SetTopLeft(marker.Rect, left, top, width, blockHeight);
+
+                // **块的形状每帧按新尺寸重画。**
+                //
+                // 块的宽度跟着事件时长走、高度跟着行高走，两者都会变；
+                // 矢量圆角是按尺寸现算的，不重画就会停在上一帧的形状上。
+                // `SubmitShapes` 内部会比较内容，尺寸没变时不会真的重建网格，
+                // 所以每帧调一次的代价只有一次字段比较。
+                UiShapeGraphic blockShape = marker.Background as UiShapeGraphic;
+                if (blockShape != null)
+                {
+                    blockShape.BeginShapes();
+                    blockShape.AddRoundedRect(new Rect(0f, 0f, width, blockHeight),
+                        UiRadius.ForSize(Mathf.Min(width, blockHeight)),
+                        Color.white, Color.clear, 0f);
+                    blockShape.SubmitShapes();
+                }
 
                 // 选中不再改底色 —— 用描边表达（见下）。
                 Color fill = block.BlockColor;
@@ -15570,7 +16317,10 @@ private static float MinimumPixelsPerSecond
                 5f,
                 18f,
                 18f,
-                locked ? TextPrimary : TextMuted
+                // 开 = 主色（和旁边那些开关按钮同一套语义），关 = 次要文字色。
+                // **不能用 TextPrimary**：那是正文的暖橙，锁定态会跟着变橙，
+                // 和"已激活"的强调色混成一片。
+                locked ? Palette.Accent : TextSecondary
             );
             icon.sprite = viewLockSprite;
             icon.raycastTarget = false;
@@ -15692,7 +16442,7 @@ private static float MinimumPixelsPerSecond
             string label,
             Action action)
         {
-            Image image = CreateRoundedImage(name, parent, x, y, width, height, ButtonNormal);
+            Graphic image = CreateRoundedImage(name, parent, x, y, width, height, ButtonNormal);
             Button button = image.gameObject.AddComponent<Button>();
             button.targetGraphic = image;
             button.onClick.AddListener(delegate { action(); });

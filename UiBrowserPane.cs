@@ -87,6 +87,33 @@ namespace ADOFAIEditorStudio
         private RectTransform root;
         private RectTransform tabHost;
         private RectTransform tabContent;
+
+        /// <summary>
+        /// 传送带容器：**所有页面横向并排放在它里面**，整条按页号平移。
+        ///
+        /// 原来每页各自 `SetActive` 切换，切换时两页叠在同一位置 ——
+        /// 用户要的是"像传送带一样滑过去"，那必须让它们真的并排。
+        ///
+        /// 它自己挂 `RectMask2D`，只露出当前这一页的宽度。
+        /// </summary>
+        private RectTransform pageStrip;
+
+        /// <summary>
+        /// 传送带的裁剪框（固定不动，挂 `RectMask2D`）。
+        ///
+        /// **必须和 `pageStrip` 分开。** 遮罩挂在被平移的节点上会跟着一起移，
+        /// 等于没遮 —— 整条内容会被裁到屏幕外，表现就是"后面的页全是空白"。
+        /// </summary>
+        private RectTransform pageViewport;
+        /// <summary>条带上每一页的容器，下标 = 标签序号。</summary>
+        private readonly List<RectTransform> pageSlots = new List<RectTransform>();
+        /// <summary>条带当前平移量（像素）。0 = 第一页，-width = 第二页……</summary>
+        private float stripOffset;
+        /// <summary>条带正在滑向的目标。</summary>
+        private float stripTargetOffset;
+        /// <summary>当前停在第几页。</summary>
+        private int stripPageIndex;
+
         private RectTransform decoPage;
         private RectTransform mediaPage;
         private float width;
@@ -153,22 +180,87 @@ namespace ADOFAIEditorStudio
             {
                 tabHost.gameObject.SetActive(true);
             }
-            if (decoPage != null)
+            if (pageStrip == null || overlay == null)
             {
-                bool wanted = overlay != null && overlay.IsDecorationPane;
-                if (decoPage.gameObject.activeSelf != wanted)
-                {
-                    decoPage.gameObject.SetActive(wanted);
-                }
+                return;
             }
-            if (mediaPage != null)
+            // **传送带：整条按页号平移，不再逐页显隐。**
+            //
+            // 所有页面一直活着、一直并排；切换只是把带子滑到目标页。
+            // 这才是"传送带"—— 逐页 SetActive 永远做不到两页同时可见。
+            int target = overlay.CurrentBrowserTabIndex();
+            if (target < 0)
             {
-                bool wanted = overlay != null && overlay.IsMediaPane;
-                if (mediaPage.gameObject.activeSelf != wanted)
-                {
-                    mediaPage.gameObject.SetActive(wanted);
-                }
+                return;
             }
+            EnsurePageSlotsExist();
+
+            // **所有页都保持激活。** 传送带的前提是它们一直活着、一直并排 ——
+            // 关掉的话 `SyncMedia` / `SyncDecorations` 这些每帧同步就不跑了，
+            // 滑过去只看到空白。
+            if (decoPage != null && !decoPage.gameObject.activeSelf)
+            {
+                decoPage.gameObject.SetActive(true);
+            }
+            if (mediaPage != null && !mediaPage.gameObject.activeSelf)
+            {
+                mediaPage.gameObject.SetActive(true);
+            }
+
+            stripPageIndex = target;
+            stripTargetOffset = -target * width;
+        }
+
+        /// <summary>
+        /// 确保条带上的槽位够用 —— 8 个标签就要 8 个槽。
+        ///
+        /// 前两个（装饰物 / 媒体）在 `Build*Page` 里已经建好了，
+        /// 后面 6 个设置页的槽位由这里补齐（内容由 Overlay 挂进去）。
+        /// </summary>
+        private void EnsurePageSlotsExist()
+        {
+            for (int i = 0; i < overlay.BrowserTabCount; i++)
+            {
+                EnsurePageSlot(i);
+            }
+        }
+
+        /// <summary>
+        /// 每帧推进条带。**加速曲线**：越接近目标越慢，落定时不突兀。
+        ///
+        /// 用临界阻尼（critically damped）而不是固定时长 —— 连续点几个标签时，
+        /// 它会从当前速度接着走，不会每次都急停再启动。
+        /// </summary>
+        private void TickStrip()
+        {
+            if (pageStrip == null)
+            {
+                return;
+            }
+            float dt = Time.unscaledDeltaTime;
+            if (dt <= 0f)
+            {
+                return;
+            }
+            // 指数收敛：每帧走剩余距离的一部分，越近越慢。
+            // 0.22 对应约 150ms 收敛到 95%，滑起来是"加速-减速"的观感。
+            float t = 1f - Mathf.Exp(-14f * dt);
+            stripOffset = Mathf.Lerp(stripOffset, stripTargetOffset, t);
+            if (Mathf.Abs(stripTargetOffset - stripOffset) < 0.5f)
+            {
+                stripOffset = stripTargetOffset;
+            }
+            ApplyStripOffset();
+        }
+
+        /// <summary>把条带平移到当前 `stripOffset`。</summary>
+        private void ApplyStripOffset()
+        {
+            if (pageStrip == null)
+            {
+                return;
+            }
+            pageStrip.anchoredPosition = new Vector2(stripOffset, pageStrip.anchoredPosition.y);
         }
 
         // ── 建立 ──────────────────────────────────────────────────────────
@@ -195,11 +287,63 @@ namespace ADOFAIEditorStudio
             root = GetComponent<RectTransform>();
 
             BuildTabStrip();
+            BuildPageStrip();
             BuildDecorationPage();
             BuildMediaPage();
 
             ApplyPageVisibility();
             RefreshTabColors();
+        }
+
+        /// <summary>
+        /// 建传送带容器。**所有页面都挂在它下面、横向并排。**
+        ///
+        /// **遮罩和条带必须是两个节点。** 遮罩挂在固定的外层，条带在它里面平移 ——
+        /// 挂在条带自己身上的话，遮罩会跟着一起移，等于没遮，而且整条内容
+        /// 会被裁到屏幕外（滑过去只看到空白）。
+        /// </summary>
+        private void BuildPageStrip()
+        {
+            // 外层：固定不动、负责裁剪，尺寸永远是一屏。
+            pageViewport = CreateRect("PageViewport", root, 0f, 0f, width, height);
+            pageViewport.gameObject.AddComponent<RectMask2D>();
+
+            // 内层：真正被平移的那条带子。
+            pageStrip = CreateRect("PageStrip", pageViewport, 0f, 0f, width, height);
+            stripOffset = 0f;
+            stripTargetOffset = 0f;
+            stripPageIndex = 0;
+        }
+
+        /// <summary>取第 `index` 页的槽位（不够就补齐）。给 Overlay 挂设置页用。</summary>
+        internal RectTransform GetPageSlot(int index)
+        {
+            return EnsurePageSlot(index);
+        }
+
+        /// <summary>
+        /// 给第 `index` 页准备一个槽位（横向排好），返回它的容器。
+        ///
+        /// 槽位宽度 = 一屏宽，`x` 按序号往右排 —— 于是整条带子就是
+        /// "第 0 页 | 第 1 页 | …"，平移量直接等于 `-index * width`。
+        /// </summary>
+        private RectTransform EnsurePageSlot(int index)
+        {
+            while (pageSlots.Count <= index)
+            {
+                int slotIndex = pageSlots.Count;
+                RectTransform slot = CreateRect("Page" + slotIndex, pageStrip,
+                    0f, 0f, width, height);
+                pageSlots.Add(slot);
+            }
+            // **按序号横向排开。** 第 n 页的 x = n * 一屏宽 ——
+            // 这样整条带子就是"第 0 页 | 第 1 页 | …"，平移量直接是 `-index * width`。
+            RectTransform result = pageSlots[index];
+            if (result != null)
+            {
+                SetTopLeft(result, index * width, 0f, width, height);
+            }
+            return result;
         }
 
         /// <summary>按当前宽高把所有子件重摆一遍。建库和拖时间轴后都走这里。</summary>
@@ -215,6 +359,30 @@ namespace ADOFAIEditorStudio
             {
                 SetTopLeft(tabHost, 0f, TabRowOffsetY, width, TabRowHeight);
                 tabLayoutWidth = -1f;
+            }
+
+            // **条带和所有槽位跟着新宽度重摆。** 面板变宽/变窄之后，
+            // 每页的横向步进也要跟着变，否则带子会错位。
+            if (pageStrip != null)
+            {
+                if (pageViewport != null)
+                {
+                    SetTopLeft(pageViewport, 0f, 0f, width, height);
+                }
+                // **条带宽度 = 页数 × 一屏。** 只给一屏的话，后面的页会被
+                // 父节点的尺寸约束住、排到外面去（虽然槽位坐标是对的）。
+                int pageCount = Mathf.Max(1, pageSlots.Count);
+                SetTopLeft(pageStrip, 0f, 0f, width * pageCount, height);
+                for (int i = 0; i < pageSlots.Count; i++)
+                {
+                    if (pageSlots[i] != null)
+                    {
+                        SetTopLeft(pageSlots[i], i * width, 0f, width, height);
+                    }
+                }
+                stripTargetOffset = -stripPageIndex * width;
+                stripOffset = stripTargetOffset;
+                ApplyStripOffset();
             }
 
             if (decoPage != null)
@@ -462,7 +630,7 @@ namespace ADOFAIEditorStudio
 
         private void BuildDecorationPage()
         {
-            decoPage = CreateRect("Decorations", root, 0f, 0f, width, height);
+            decoPage = CreateRect("Decorations", EnsurePageSlot(0), 0f, 0f, width, height);
 
             // 第一行：四个新建方块 + 计数。方块画事件类型图标，名字不出文字
             // （32 见方放不下两个汉字，和 ImGui 版同样处理）。
@@ -884,7 +1052,7 @@ namespace ADOFAIEditorStudio
 
         private void BuildMediaPage()
         {
-            mediaPage = CreateRect("Media", root, 0f, 0f, width, height);
+            mediaPage = CreateRect("Media", EnsurePageSlot(1), 0f, 0f, width, height);
 
             mediaSearch = CreateSearchField(mediaPage, "MediaSearch",
                 MediaSearchInset, 0f, 100f, MediaHeaderHeight,
@@ -1204,6 +1372,9 @@ namespace ADOFAIEditorStudio
 
         private void Update()
         {
+            // 传送带推进：条带按页号平移，加速曲线在 `TickStrip` 里。
+            TickStrip();
+
             // 【临时探针】见 EditorPropertyPanel.Update 里的说明。
             long __watch = System.Diagnostics.Stopwatch.GetTimestamp();
             UpdateMeasured();

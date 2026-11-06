@@ -32,6 +32,9 @@ namespace ADOFAIEditorStudio
             Mod = modEntry;
             Logger = modEntry.Logger;
             Settings = ModSettings.Load<Settings>(modEntry);
+            // **主题必须在建任何 UI 之前定下来。** 颜色是建控件那一刻读进去的，
+            // 之后改 `UiTheme.Current` 不会让已经建好的控件变色。
+            Ui.UiTheme.Select(Ui.UiTheme.ById(Settings.UiThemeId) ?? Ui.UiTheme.Mono);
             modEntry.OnToggle = OnToggle;
             modEntry.OnUnload = OnUnload;
             EditorPlaybackBridge.InstallInputPatch();
@@ -307,6 +310,14 @@ namespace ADOFAIEditorStudio
         public float TimelineHeight = 292f;
         public float TimelineRowHeight = 30f;
 
+        /// <summary>
+        /// 界面主题 Id。空 = 默认（黑白）。
+        ///
+        /// 现有两套（见 `UiTheme.Mono` / `UiTheme.Ember`）：`"mono"` 黑白、
+        /// `"ember"` 暖色。**存 Id 不存枚举**，以后加主题不用改存档格式。
+        /// </summary>
+        public string UiThemeId = string.Empty;
+
         // ---------------------------------------------------------------- 联机
         //
         // 这三项只是「下次打开联机面板时预填什么」，不是联机状态本身——
@@ -329,15 +340,40 @@ namespace ADOFAIEditorStudio
         private static PropertyInfo cameraProperty;
         private static bool searched;
 
+        /// <summary>ADOFAI 编辑器场景的名字（反编译确认：`scnEditor`）。</summary>
+        private const string EditorSceneName = "scnEditor";
+
+        /// <summary>
+        /// 现在是不是真的在编辑器里。
+        ///
+        /// **严格版**：活动场景必须是 `scnEditor`，**并且** `scnEditor.instance` 非空。
+        ///
+        /// 原来只判「instance 非空」就返回 true，再补一条「场景名里含 editor」
+        /// 的兜底 —— 两条都不够严：
+        ///   · `scnEditor.instance` 是静态单例，场景切走后字段可能还指着
+        ///     已销毁的对象，`GetEditorInstance()` 照样返回非 null；
+        ///   · 场景名兜底是 `IndexOf("editor")`，主菜单里任何带这个词的
+        ///     场景都会命中。
+        ///
+        /// 后果是「AES 入口按钮在主菜单也显示」。调用方（入口按钮、快捷键
+        /// 拦截）都要求**只在编辑器里生效**，所以按最严的判。
+        /// </summary>
         public static bool IsEditorActive()
         {
-            if (GetEditorInstance() != null)
+            UnityEngine.SceneManagement.Scene active =
+                UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+            if (!active.IsValid() || !active.isLoaded)
             {
-                return true;
+                return false;
             }
-
-            string sceneName = SceneManager.GetActiveScene().name;
-            return sceneName.IndexOf("editor", StringComparison.OrdinalIgnoreCase) >= 0;
+            // 场景必须就是编辑器场景。
+            if (!string.Equals(active.name, EditorSceneName,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+            // 场景对了还要实例活着 —— 加载过程中场景名先到位、实例后建。
+            return GetEditorInstance() != null;
         }
 
         public static object GetEditorInstance()

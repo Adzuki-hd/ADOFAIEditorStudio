@@ -3,7 +3,8 @@ using UnityEngine.EventSystems;
 
 namespace ADOFAIEditorStudio
 {
-    internal sealed class TimelineResizeHandle : MonoBehaviour, IPointerDownHandler, IBeginDragHandler, IDragHandler, IEndDragHandler
+    internal sealed class TimelineResizeHandle : MonoBehaviour, IPointerDownHandler, IBeginDragHandler, IDragHandler, IEndDragHandler,
+        IPointerEnterHandler, IPointerExitHandler
     {
         private EditorStudioOverlay owner;
         private RectTransform timelinePanel;
@@ -11,12 +12,67 @@ namespace ADOFAIEditorStudio
         private float dragStartPointerY;
         private float dragStartPanelHeight;
         private bool dragging;
+        private bool hovered;
 
         internal void Initialize(EditorStudioOverlay overlay, RectTransform panel)
         {
             owner = overlay;
             timelinePanel = panel;
             designRoot = panel == null ? null : panel.parent as RectTransform;
+        }
+
+        // ── 光标 ─────────────────────────────────────────────────────────
+        //
+        // **悬停在整条顶边上就换成「上下双向箭头」。**
+        //
+        // 这条热区现在横贯整个时间轴宽度（见 `EditorTimelineView` 里
+        // `ResizeHandle` 的建法），所以光标一进来就该告诉用户"这里能拖高度"。
+        //
+        // 指针纹理由 `EditorTimelineView.GetResizeCursorTexture` 生成并缓存
+        // —— 那里踩过的坑（纹理必须 CPU 可读）写在该方法的注释里。
+
+        public void OnPointerEnter(PointerEventData eventData)
+        {
+            hovered = true;
+            ApplyCursor(true);
+        }
+
+        public void OnPointerExit(PointerEventData eventData)
+        {
+            hovered = false;
+            if (!dragging)
+            {
+                ApplyCursor(false);
+            }
+        }
+
+        private void OnDisable()
+        {
+            hovered = false;
+            if (!dragging)
+            {
+                ApplyCursor(false);
+            }
+        }
+
+        /// <summary>换 / 还指针。拖动中保持箭头，松手后按悬停状态还原。</summary>
+        private static void ApplyCursor(bool resize)
+        {
+            if (resize)
+            {
+                Texture2D texture = EditorTimelineView.GetResizeCursorTexture();
+                if (texture != null)
+                {
+                    // 热点取正中心 —— 箭头上下对称，中心正好落在横杠上。
+                    Cursor.SetCursor(texture,
+                        new Vector2(texture.width * 0.5f, texture.height * 0.5f),
+                        CursorMode.Auto);
+                }
+            }
+            else
+            {
+                Cursor.SetCursor(null, Vector2.zero, CursorMode.Auto);
+            }
         }
 
         public void OnPointerDown(PointerEventData eventData)
@@ -51,6 +107,7 @@ namespace ADOFAIEditorStudio
             dragStartPointerY = local.y;
             dragStartPanelHeight = timelinePanel.rect.height;
             dragging = true;
+            ApplyCursor(true);
             eventData.Use();
         }
 
@@ -84,6 +141,11 @@ namespace ADOFAIEditorStudio
             if (owner != null)
             {
                 owner.SetTimelinePanelHeight(owner.CurrentTimelinePanelHeight, true);
+            }
+            // 松手时鼠标可能已经移出热区，按悬停状态还原指针。
+            if (!hovered)
+            {
+                ApplyCursor(false);
             }
             eventData.Use();
         }

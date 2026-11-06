@@ -445,6 +445,32 @@ namespace ADOFAIEditorStudio.Preview.Domains
         /// <summary>是否剔除不透明度为 0 的装饰物（遮罩与粒子除外）。</summary>
         private bool cullTransparent;
 
+        /// <summary>
+        /// 这件装饰物的事件里有没有可能把它写成遮罩。
+        ///
+        /// 用来决定它要不要进 `maskCandidateStates`。判据取**保守**的一侧：
+        /// 只要有一条事件带 `maskingType` 键（哪怕值是 None），就登记。
+        /// 多登记几件只是多几次遍历，漏登记则会让整类谱面的遮罩失效
+        /// （见 `p5c` 那段说明）。
+        /// </summary>
+        private static bool MayBecomeMask(DecorationState state)
+        {
+            if (state == null || state.Events == null)
+            {
+                return false;
+            }
+            for (int i = 0; i < state.Events.Count; i++)
+            {
+                MoveEvent value = state.Events[i];
+                if (value != null && value.HasMasking
+                    && value.Masking == MaskingType.Mask)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         /// <summary>`maskingType` 是私有字段，反射结果缓存一次。</summary>
         private static System.Reflection.FieldInfo maskingTypeField;
 
@@ -628,8 +654,23 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     return byStart != 0 ? byStart : left.Order.CompareTo(right.Order);
                 });
                 states.Add(state);
-                // 只把真正带遮罩的那几十件登记成候选，主循环不再逐件判断。
-                if (state.Masking != MaskingType.None && decoration is scrVisualDecoration)
+                // 只把可能变成遮罩的那几十件登记成候选，主循环不再逐件判断。
+                //
+                // **判据不能只看 `state.Masking`（作者初始值）。** 它只在
+                // Analyze 时按作者写的 `maskingType` 播种一次，而遮罩类型
+                // 是**可以被后续 MoveDecorations 改的**。Factory 谱面的 `p5c`
+                // 就是这一种：作者初始写 `None`，722 格才设成 `Mask`。
+                // 只看初始值的话它永远进不了这个列表，722 格之后即使模型
+                // 算出了 `Mask`，那个写类型的循环也不会遍历到它 ——
+                // 遮罩从来不存在，被它裁的 `pp4 / p4.3.1 / p4.3.2`
+                // 就整片显示出来了。
+                //
+                // 所以再加一条：**只要它的事件里有任何一条可能写
+                // `maskingType`，就得算候选。** 这个判据是保守的（多登记几件
+                // 只多一点遍历，不会有副作用），但能覆盖"初始不是遮罩、
+                // 后来变成遮罩"的整类谱面。
+                if (decoration is scrVisualDecoration
+                    && (state.Masking != MaskingType.None || MayBecomeMask(state)))
                 {
                     maskCandidateStates.Add(state);
                 }
@@ -1270,6 +1311,15 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     && Mathf.Abs(opacity - state.AppliedOpacity) <= 0.0005f
                     && depth == state.AppliedDepth
                     && visible == state.AppliedVisible
+                    // **`masking` 必须比。** 漏了这一项时，一件「作者初始写
+                    // None、后来某条 MoveDecorations 才改成 Mask」的遮罩件
+                    // 永远过不了这道门：它前面的所有属性都没变，于是每帧都
+                    // `continue`，`WriteMaskingTypeFast` 一次都执行不到。
+                    //
+                    // Factory 谱面的 `p5c` 正是这一种 —— 初始 `maskingType: None`，
+                    // 722 格才设成 `Mask`。遮罩从来没被创建，被它裁的
+                    // `pp4 / p4.3.1 / p4.3.2` 就整片显示出来了。
+                    && masking == state.AppliedMasking
                     && Mathf.Abs(color.r - state.AppliedColor.r) <= 0.002f
                     && Mathf.Abs(color.g - state.AppliedColor.g) <= 0.002f
                     && Mathf.Abs(color.b - state.AppliedColor.b) <= 0.002f
@@ -2036,7 +2086,11 @@ namespace ADOFAIEditorStudio.Preview.Domains
                             + state.AppliedScale.x.ToString("0.##") + ","
                             + (summaryRenderer == null ? "无" : (summaryRenderer.isVisible ? "1" : "0"))
                             + "," + world.x.ToString("0") + "," + world.y.ToString("0")
-                            + ",L" + summaryVisual.gameObject.layer
+                            // **`summaryVisual` 可能是 null。** 不是 scrVisualDecoration
+                            // 的装饰物也能走到这里，原来直接 `.gameObject.layer` 解引用，
+                            // 探针跑到中途就抛 NullReferenceException 并自动关闭 ——
+                            // 那正是"探针只跑到 t≈75 就没了"的原因。
+                            + ",L" + (summaryVisual == null ? "?" : summaryVisual.gameObject.layer.ToString())
                             + ":" + (summaryRenderer == null ? "?" : summaryRenderer.sortingLayerName)
                             + ":" + (summaryRenderer == null ? "?" : summaryRenderer.sortingOrder.ToString())
                             + ") ";

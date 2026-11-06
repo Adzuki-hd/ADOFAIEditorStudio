@@ -716,7 +716,28 @@ namespace ADOFAIEditorStudio
         /// <summary>新的左栏（标签条 + 装饰物页 + 媒体页），见 UiBrowserPane。</summary>
         private UiBrowserPane browserPaneView;
         /// <summary>左栏设置页正文（和右栏共用一个写入层）。</summary>
-        private UiInspectorPane settingsPaneView;
+        /// <summary>
+        /// 6 个设置页实例，下标对应 `SettingsPages`。
+        ///
+        /// **每页一个实例**（不是一个实例切内容）—— 传送带要把 6 页并排铺开，
+        /// 一个实例做不到。
+        /// </summary>
+        private readonly List<UiInspectorPane> settingsPaneViews =
+            new List<UiInspectorPane>();
+
+        /// <summary>
+        /// 这一轮切标签的方向：+1 从右边来，-1 从左边来。
+        ///
+        /// 由 `SetBrowserTab` 按"页号变大还是变小"算好，
+        /// 各页面容器显示时直接用它播滑入动画。
+        /// </summary>
+        private float browserSwitchDirection = 1f;
+
+        /// <summary>这一轮切标签的方向，给各页面容器播滑入动画用。</summary>
+        internal float BrowserSwitchDirection { get { return browserSwitchDirection; } }
+
+        /// <summary>左栏一共几个标签（装饰物 + 媒体 + 6 个设置页）。</summary>
+        internal int BrowserTabCount { get { return 2 + SettingsPages.Length; } }
         /// <summary>右栏新的 uGUI 参数栏。</summary>
         private UiInspectorPane inspectorPane;
         /// <summary>右栏模块底色。</summary>
@@ -1004,9 +1025,29 @@ namespace ADOFAIEditorStudio
             }
         }
 
-        /// <summary>当前设置页的显示名（和那排标签上写的是同一个词）。</summary>
-        internal string SelectedSettingsTitle
+        /// <summary>
+        /// 取某一页设置的显示名。传送带式左栏里，各实例钉死自己那一页时用。
+        /// </summary>
+        internal string SettingsTitleOf(LevelEventType page)
         {
+            for (int i = 0; i < SettingsPages.Length; i++)
+            {
+                if (SettingsPages[i] == page)
+                {
+                    return SettingsPageNames[i];
+                }
+            }
+            return "设置";
+        }
+
+        /// <summary>取某一页设置的事件对象（不管当前选中在哪一页）。</summary>
+        internal LevelEvent FindSettingsPageOf(LevelEventType page)
+        {
+            return FindSettingsPage(page);
+        }
+
+        /// <summary>当前设置页的显示名（和那排标签上写的是同一个词）。</summary>
+        internal string SelectedSettingsTitle        {
             get
             {
                 for (int i = 0; i < SettingsPages.Length; i++)
@@ -1422,6 +1463,14 @@ namespace ADOFAIEditorStudio
             if (!visible)
             {
                 return false;
+            }
+
+            // **有模态弹窗盖着时，滚轮不缩放预览。**
+            // 判据同 `IsModalWindowOpen` 的说明：弹窗是全屏层，
+            // 它盖住的区域滚轮就该归它（或干脆不动），不该漏到预览上。
+            if (IsModalWindowOpen)
+            {
+                return true;
             }
 
             return !IsScreenPointInsidePreview(screenPosition) || IsPreviewZoomLocked;
@@ -2459,6 +2508,10 @@ namespace ADOFAIEditorStudio
             CreateBrandMark(header.rectTransform);
             TextMeshProUGUI brandTitle = CreateText("Title", header.rectTransform, BrandMarkRight, 9f, 360f, 36f,
                 "ADOFAI  EDITOR STUDIO", 20f, TextPrimary, TextAlignmentOptions.MidlineLeft, true);
+            // **品牌字走三色渐变**（用户指定 E60013 → BF442E → 78141B）。
+            // TMP 的顶点渐变只有四个角色、表达不了三色，所以逐字符上色。
+            UiTextGradient.Apply(brandTitle, "ADOFAI  EDITOR STUDIO",
+                UiTheme.Current.BrandGradient);
 
             // 品牌字后面跟一小串**蓝色带下划线**的版本号。
             //
@@ -2581,14 +2634,46 @@ namespace ADOFAIEditorStudio
             button.targetGraphic = face;
             button.transition = Selectable.Transition.None;
             button.navigation = new Navigation { mode = Navigation.Mode.None };
-            button.onClick.AddListener(delegate { SetEditMode(!IsEditMode); });
+            // **点开的是弹窗，不是直接切换。**
+            //
+            // 原来点一下直接翻模式。可「切回只读」会顺带问「布局存了没有」，
+            // 那个确认框和模式切换是两件事，混在一次点击里读不出因果关系。
+            // 现在先开一个模式选择窗，用户明确点了哪一档才生效。
+            button.onClick.AddListener(OpenModeSwitchWindow);
             modeSwitchButton = button;
 
-            TextMeshProUGUI label = CreateText("Label", rect, 0f, 0f, width, height,
-                "编辑模式", UiType.Body, TextPrimary, TextAlignmentOptions.Center, false);
+            // 文字 + 后面跟一枚「双向切换」图标。两者都是蓝色（用户指定），
+            // 所以文字不再靠 `TextPrimary` 上色 —— 那个现在是暖橙。
+            TextMeshProUGUI label = CreateText("Label", rect, 0f, 0f, width - 26f, height,
+                "编辑模式", UiType.Body, ModeSwitchColor, TextAlignmentOptions.Center, false);
             modeSwitchLabel = label;
             modeSwitchState = null;
+
+            // 图标贴右边缘，垂直居中。**白色贴图 + `Image.color` 上蓝**，
+            // 和项目里其它自绘图标同一套。
+            Sprite arrows = UiModeSwitchIcon.Get();
+            if (arrows != null)
+            {
+                Image icon = CreateImage("ModeSwitchIcon", rect,
+                    width - 26f, (height - 16f) * 0.5f, 16f, 16f, ModeSwitchColor);
+                icon.sprite = arrows;
+                icon.preserveAspect = true;
+                icon.raycastTarget = false;
+            }
+
             RefreshModeSwitch();
+        }
+
+        /// <summary>
+        /// 模式切换按钮的文字与图标颜色。
+        ///
+        /// 用户 2026-11-07 指定：顶栏那颗切换按钮的字和图都改成蓝色。
+        /// 取 `UiTheme.Sky.C400` —— 它在深色底上的对比度够读，又不至于
+        /// 和正文的暖橙抢注意力。
+        /// </summary>
+        private static Color ModeSwitchColor
+        {
+            get { return UiPrimitives.Hex("38BDF8"); }
         }
 
         /// <summary>倒梯形贴图（填充 + 一圈描边），按参数缓存，只生成一次。</summary>
@@ -2651,6 +2736,8 @@ namespace ADOFAIEditorStudio
         private Button modeSwitchButton;
         private TextMeshProUGUI modeSwitchLabel;
         private string modeSwitchState;
+        /// <summary>模式选择弹窗那一层。null = 没开。</summary>
+        private RectTransform modeSwitchLayer;
 
         /// <summary>模式按钮的显示：文字写「当前模式」，编辑态用强调色底。</summary>
         private void RefreshModeSwitch()
@@ -2667,8 +2754,136 @@ namespace ADOFAIEditorStudio
             }
             modeSwitchState = state;
             modeSwitchLabel.text = state;
-            // **编辑模式也不给黑字。** 只读态用灰字区分，编辑态用白字。
-            modeSwitchLabel.color = edit ? TextPrimary : TextMuted;
+            // 文字与图标统一蓝色（见 `ModeSwitchColor` 的说明）。
+            modeSwitchLabel.color = ModeSwitchColor;
+        }
+
+        // ── 模式切换弹窗 ────────────────────────────────────────────────────
+
+        /// <summary>
+        /// 顶栏那颗梯形按钮点开的模式选择窗。**占屏幕 70%。**
+        ///
+        /// 为什么不再「点一下直接切」：切回只读会顺带弹「布局存了没有」，
+        /// 两个对话框叠在一起读不出因果关系。现在先让用户明确选一档。
+        ///
+        /// 点某一档 = 立刻切换并关窗（用户 2026-11-07 定的交互）。
+        /// 当前那一档也照常可点 —— 点了就是"保持不变"，关窗即可。
+        /// </summary>
+        private void OpenModeSwitchWindow()
+        {
+            if (!built || designRoot == null)
+            {
+                return;
+            }
+            CloseModeSwitchWindow();
+
+            const float widthRatio = 0.7f;
+            float cardWidth = DesignWidth * widthRatio;
+            float cardHeight = DesignHeight * widthRatio;
+
+            RectTransform layer = CreateTopLeftRect("ModeSwitchLayer", designRoot,
+                0f, 0f, DesignWidth, DesignHeight);
+            modeSwitchLayer = layer;
+
+            Image shade = CreateTopLeftRect("ModeSwitchShade", layer,
+                0f, 0f, DesignWidth, DesignHeight).gameObject.AddComponent<Image>();
+            shade.color = new Color(0f, 0f, 0f, 0.55f);
+            shade.raycastTarget = true;
+            // 点遮罩空白处关窗 —— 和设置窗口同一套。
+            Button shadeButton = shade.gameObject.AddComponent<Button>();
+            shadeButton.targetGraphic = shade;
+            shadeButton.transition = Selectable.Transition.None;
+            shadeButton.onClick.AddListener(CloseModeSwitchWindow);
+
+            RectTransform card;
+            CreateDialogCard("ModeSwitchCard", layer, cardWidth, cardHeight, out card);
+
+            TextMeshProUGUI title = CreateText("ModeSwitchTitle", card, 32f, 24f,
+                cardWidth - 120f, 34f, "模式",
+                UiType.Title, AccentSecondary, TextAlignmentOptions.MidlineLeft, true);
+            title.color = UiTheme.Current.HeadingColor;
+
+            TextMeshProUGUI closeLabel;
+            CreateButton("ModeSwitchClose", card, cardWidth - 60f, 22f, 32f, 32f,
+                "×", false, CloseModeSwitchWindow, out closeLabel);
+            closeLabel.fontSize = UiType.Body;
+
+            CreateHeadingRule("ModeSwitchRule", card, PanelHeadingRule);
+
+            // 两行选项：只读 / 编辑。**横贯整张卡片**，点击区够大。
+            bool edit = IsEditMode;
+            float rowTop = PanelHeadingRule + 28f;
+            float rowHeight = 64f;
+            float rowGap = 12f;
+            float rowWidth = cardWidth - 64f;
+
+            BuildModeRow(card, "ReadOnly", 32f, rowTop, rowWidth, rowHeight,
+                "只读模式", "只看不改，块拖不动、参数改不了",
+                !edit, delegate { ApplyModeFromWindow(false); });
+
+            BuildModeRow(card, "EditMode", 32f, rowTop + rowHeight + rowGap,
+                rowWidth, rowHeight,
+                "编辑模式", "可以拖块、改参数、存工程",
+                edit, delegate { ApplyModeFromWindow(true); });
+
+            layer.SetAsLastSibling();
+        }
+
+        /// <summary>弹窗里的一档。当前选中的那档描边高亮。</summary>
+        private void BuildModeRow(RectTransform card, string name,
+            float x, float y, float width, float height,
+            string title, string subtitle, bool current, Action onClick)
+        {
+            RectTransform row = CreateTopLeftRect(name + "Row", card, x, y, width, height);
+
+            Image background = row.gameObject.AddComponent<Image>();
+            background.color = current
+                ? new Color(1f, 1f, 1f, 0.10f)
+                : new Color(1f, 1f, 1f, 0.03f);
+            background.raycastTarget = true;
+
+            // 当前那一档左边一条蓝色竖条 —— 不用颜色也能读出来是哪一个。
+            if (current)
+            {
+                CreateImage(name + "Mark", row, 0f, 0f, 4f, height, ModeSwitchColor);
+            }
+
+            TextMeshProUGUI titleLabel = CreateText(name + "Title", row,
+                24f, 10f, width - 48f, 26f, title,
+                UiType.BodyLg, current ? ModeSwitchColor : TextPrimary,
+                TextAlignmentOptions.MidlineLeft, true);
+            titleLabel.raycastTarget = false;
+
+            TextMeshProUGUI subtitleLabel = CreateText(name + "Sub", row,
+                24f, 34f, width - 48f, 22f, subtitle,
+                UiType.Body, TextMuted, TextAlignmentOptions.MidlineLeft, false);
+            subtitleLabel.raycastTarget = false;
+
+            Button button = row.gameObject.AddComponent<Button>();
+            button.targetGraphic = background;
+            button.transition = Selectable.Transition.None;
+            button.navigation = new Navigation { mode = Navigation.Mode.None };
+            button.onClick.AddListener(delegate { onClick(); });
+        }
+
+        /// <summary>弹窗里点了某一档：先关窗，再切模式。</summary>
+        ///
+        /// **顺序很重要**：`SetEditMode(false)` 可能弹出「布局还没存」的确认框，
+        /// 那个框要压在空的画面上，不能和模式窗叠在一起。
+        private void ApplyModeFromWindow(bool edit)
+        {
+            CloseModeSwitchWindow();
+            SetEditMode(edit);
+        }
+
+        private void CloseModeSwitchWindow()
+        {
+            if (modeSwitchLayer == null)
+            {
+                return;
+            }
+            Destroy(modeSwitchLayer.gameObject);
+            modeSwitchLayer = null;
         }
 
         // 顶栏品牌标记的度量。金线 + 缝隙，然后才是标题。
@@ -2885,25 +3100,27 @@ namespace ADOFAIEditorStudio
             "<size=20><b>v" + ModVersion + " 更新内容</b></size>",
             "",
             "<b>新增</b>",
-            "<b>· 时间轴模块（分组）</b>：时间轴工具栏多了一支铅笔。在时间轴上点出几笔圈住一批块，回车闭合，这批块就成了一个模块。",
-            "<b>· 画圈</b>：横向吸 1/4 格、纵向吸 1/4 行；Esc 取消这一圈；落在起点附近会自动闭合。",
-            "<b>· 整组拖动</b>：拖模块里的任何一块就是在拖整个模块，横向吸格线。按住 Shift 再拖只动那一块，方便单独微调。",
-            "<b>· 折叠</b>：双击模块或右键「折叠」，收成一条两行高的横条，只留名字。展开时框内不属于这个模块的块会自动往下让位，不再被压在底下。",
-            "<b>· 右键菜单</b>：右键分模块 / 事件块 / 空白三种目标，各自给出复制、剪切、粘贴、删除、折叠、重命名。左键或中键点任何地方都会收起菜单。",
-            "<b>· 多选与合并</b>：Ctrl / Shift 点相邻的模块可以同时选中几个；多选后右键有「合并为 1 个模块」。",
-            "<b>· 删除只删框</b>：删模块不会删里面的块，块会保留并自动选中。",
-            "<b>· 撤销</b>：画圈、拖动、删除、重命名、折叠、合并都能撤销 / 重做，一次操作记一步。",
-            "<b>· 自动保存</b>：模块随工程一起保存，改动后停手两秒自动写盘，不怕直接关游戏。",
+            "<b>· 主题系统</b>：设置 → 常规设置里多了一个「界面主题」下拉，可选「默认」（纯灰阶）和「烈炎」（橙红正文 + 红色标题 + 朱红 logo 渐变）。默认是灰阶那套，切换后整个工作台会重建一次。",
+            "<b>· 过渡动画</b>：左栏 8 个页改成传送带式，切换时整条横向滑动；设置窗口开合有淡入淡出；参数栏换事件时有一次淡入。",
+            "<b>· 删除粒子</b>：删事件块时按块的颜色炸出一簇粒子再消失。",
+            "<b>· 拖动拖尾</b>：拖动事件块时块跟手但带一点滞后，松手不会影响最终落点。",
+            "<b>· 滚动惯性</b>：滚轮改成速度叠加模型，连续滚会越滚越快，松手后自然衰减。Ctrl+滚轮缩放、Shift+滚轮横滚、Alt+滚轮调行高都是同一套。",
+            "<b>· 模式切换弹窗</b>：顶栏那颗模式按钮点开的是一个占屏 70% 的选择窗，里面列出「只读模式 / 编辑模式」并说明各自能做什么，点哪一档就切到哪一档。",
+            "<b>· 时间轴高度可拖</b>：顶边整条都是热区，鼠标移上去会变成上下双向箭头，顶上有一条淡灰细线标出位置。",
             "",
             "<b>修复</b>",
-            "<b>· 批量改参数漏项</b>：参数栏多选时，原来只显示每个选中事件都有的属性，混选不同类型的事件时一大批参数会被筛掉。现在会全部显示，某个事件没有的属性跳过不写。",
-            "<b>· 批量行顺序乱跳</b>：批量参数行的排列顺序不再每次刷新都换一种。",
-            "<b>· 工程路径为空时崩溃</b>：还没打开谱面时的中间态不再抛异常。",
-            "<b>· Esc 先取消画圈</b>：正在画模块时按 Esc 只取消这一圈，不会直接关掉整个工作台。",
-            "<b>· 删模块不再连块一起删</b>：删模块现在只去分组，里面的块保留并保持选中。",
+            "<b>· 遮罩装饰物该消失却显示</b>：一件装饰物如果作者初始写成「不是遮罩」、后来某条移动事件才改成遮罩，原来它永远不会被当成遮罩处理 —— 被它裁的装饰物就整片显示出来。现在会正确识别。",
+            "<b>· 切主题后预览卡住</b>：重建工作台时会顺手关掉预览求值会话，导致画面冻在最后一帧。已修。",
+            "<b>· 多选删除后撤回不全 / 位置乱飞</b>：行号恢复的顺序错了，撤回回来的块会领到别人的行号，真正的主人反被挤到最下面。已修。",
+            "<b>· 弹窗点穿到预览</b>：开着设置窗口等弹窗时点预览区域，会选中最底下的装饰物。六扇窗口都补上了拦截。",
+            "<b>· 入口按钮在主菜单也显示</b>：现在要求活动场景就是编辑器场景才会出现。",
+            "<b>· 框选锚点钉在屏幕上</b>：拉框时滚动时间轴，锚点不跟着内容走，永远选不到滚过去之后的块。已修。",
+            "<b>· 参数栏、图标颜色</b>：视图锁、点事件跟随、定位到播放头、车道筛选这几颗图标在「开启」时误用了正文色，看着像一直处于激活态。已改用强调色 / 次要色。",
             "",
             "<b>调整</b>",
-            "<b>· 铅笔按钮图标</b>：改由程序在运行时画出并缓存，不额外带图片文件。",
+            "<b>· 配色</b>：背景 #111111、面板 #151515，正文默认 #F48862（烈炎主题）或 #F2F2F2（默认主题）。",
+            "<b>· 面板标题</b>：统一成纯色 #FB1F07（烈炎主题）或近白（默认主题），时间轴标题也一并覆盖。",
+            "<b>· 铅笔画模块暂时隐藏</b>：入口按钮不显示，功能代码保留。",
             "",
             "<b>另外</b>",
             "<b>· 独立测试工程</b>：工程文件读写加了一套自动检查，改坏保存逻辑会被当场发现。",
@@ -3093,6 +3310,8 @@ namespace ADOFAIEditorStudio
         private const string DeveloperSectionNote = "排查用开关，平时不用动。";
 
         private RectTransform settingsWindowLayer;
+        /// <summary>设置窗口那张卡片（不是全屏遮罩层）。过渡动画挂在它上面。</summary>
+        private GameObject settingsCard;
         private TextMeshProUGUI settingsPageTitle;
         private TextMeshProUGUI settingsPageBody;
         private RectTransform settingsGeneralPage;
@@ -3115,6 +3334,13 @@ namespace ADOFAIEditorStudio
         /// </summary>
         private void BuildSettingsWindow(RectTransform parent)
         {
+            // **重建时清空行表。** 这两个列表存的是行对象，uiRoot 销毁后它们
+            // 全是死引用；不清的话下一次 BuildSettingsGeneralPage 会往后面
+            // 追加，`RefreshSettingsSwitches` 里就会摸到已销毁的对象。
+            settingsSwitches.Clear();
+            settingsDropdowns.Clear();
+            CloseSettingsDropdown();
+
             RectTransform layer = CreateTopLeftRect("SettingsLayer", parent,
                 0f, 0f, DesignWidth, DesignHeight);
             layer.gameObject.SetActive(false);
@@ -3129,9 +3355,11 @@ namespace ADOFAIEditorStudio
             RectTransform card;
             CreateDialogCard("SettingsCard", layer, SettingsCardWidth, SettingsCardHeight,
                 out card);
+            settingsCard = card.gameObject;
 
-            CreateText("SettingsTitle", card, 28f, 16f, 260f, 30f, "设置",
+            TextMeshProUGUI settingsTitle = CreateText("SettingsTitle", card, 28f, 16f, 260f, 30f, "设置",
                 UiType.Title, AccentSecondary, TextAlignmentOptions.MidlineLeft, true);
+            settingsTitle.color = UiTheme.Current.HeadingColor;
 
             TextMeshProUGUI closeLabel;
             CreateButton("SettingsClose", card, SettingsCardWidth - 52f, 16f, 30f, 30f,
@@ -3214,9 +3442,20 @@ namespace ADOFAIEditorStudio
                 delegate { return Main.Settings != null && Main.Settings.FixedTimelineLayout; },
                 ApplyLayoutMode);
 
+            // 主题：**下拉菜单**，不是开关 —— 以后加第三套主题时开关就装不下了。
+            AddSettingsDropdown(settingsGeneralPage, "界面主题", 44f,
+                new[] { UiTheme.Mono.DisplayName, UiTheme.Ember.DisplayName },
+                delegate
+                {
+                    return UiTheme.Current != null
+                        && UiTheme.Current.Id == UiTheme.Ember.Id ? 1 : 0;
+                },
+                delegate (int index) { ApplyUiTheme(index == 1); });
+
             TextMeshProUGUI hint = CreateText("LayoutHint", settingsGeneralPage,
-                0f, 46f, width - 8f, 80f,
+                0f, 90f, width - 8f, 96f,
                 "固定：按事件类型自动分层，自由：行号完全由你拖。\n"
+                + "主题：烈炎会把正文、面板标题和顶栏 logo 换成橙红；默认是纯灰阶。\n"
                 + "排查用的开关（装饰物探针 / 简化遮罩 / 旧版遮罩）在「开发者」页。",
                 UiType.Body, TextMuted, TextAlignmentOptions.TopLeft, false);
             hint.overflowMode = TextOverflowModes.Overflow;
@@ -3343,6 +3582,23 @@ namespace ADOFAIEditorStudio
         private readonly System.Collections.Generic.List<SettingsSwitch> settingsSwitches
             = new System.Collections.Generic.List<SettingsSwitch>();
 
+        /// <summary>设置页里的下拉行。目前只有「界面主题」用。</summary>
+        private sealed class SettingsDropdown
+        {
+            internal string[] Options;
+            internal Func<int> ReadIndex;
+            internal Action<int> WriteIndex;
+            internal TextMeshProUGUI Label;
+            internal int Height { get { return Options == null ? 0 : Options.Length * 26; } }
+        }
+
+        private readonly System.Collections.Generic.List<SettingsDropdown> settingsDropdowns
+            = new System.Collections.Generic.List<SettingsDropdown>();
+
+        /// <summary>下拉展开时的那块面板 / 挡板。同一时刻只允许一个。</summary>
+        private RectTransform settingsDropdownPanel;
+        private RectTransform settingsDropdownBlocker;
+
         /// <summary>
         /// 加一行「标签 + 状态字 + 开关」。`page` 是这一行挂在哪一页的容器上，
         /// y 是这一行在容器里的顶边距。
@@ -3393,6 +3649,177 @@ namespace ADOFAIEditorStudio
             settingsSwitches.Add(row);
         }
 
+        /// <summary>
+        /// 设置页里的**下拉选择**行（现在只有「界面主题」用它）。
+        ///
+        /// 为什么不用开关：开关只能表达两个状态，而主题是要往后加的。
+        /// 用下拉之后加第三套主题只是多一项，不用再改布局。
+        ///
+        /// 位置和开关那一行对齐（标签 0 起、值从 100 起），这样同一页里
+        /// 两种行的文字左缘是一条线。
+        /// </summary>
+        private void AddSettingsDropdown(RectTransform page, string label, float y,
+            string[] options, Func<int> readIndex, Action<int> writeIndex)
+        {
+            if (page == null || options == null || options.Length == 0)
+            {
+                return;
+            }
+            int index = settingsDropdowns.Count;
+            CreateText("DropLabel" + index, page, 0f, y, 96f, 34f,
+                label, UiType.BodyLg, TextPrimary, TextAlignmentOptions.MidlineLeft, false);
+
+            SettingsDropdown row = new SettingsDropdown
+            {
+                Options = options,
+                ReadIndex = readIndex,
+                WriteIndex = writeIndex
+            };
+
+            // 值那一格：和枚举控件同一种长相 —— 文字 + 右侧小三角 + 整块可点。
+            RectTransform field = CreateTopLeftRect("DropField" + index,
+                page, 100f, y + 5f, 150f, 24f);
+            Image hit = field.gameObject.AddComponent<Image>();
+            hit.color = Color.clear;
+            hit.raycastTarget = true;
+
+            row.Label = CreateText("DropValue" + index, field, 6f, 0f, 126f, 24f,
+                string.Empty, UiType.Body, TextSecondary,
+                TextAlignmentOptions.MidlineLeft, false);
+            row.Label.overflowMode = TextOverflowModes.Ellipsis;
+            row.Label.raycastTarget = false;
+            CreateText("DropCaret" + index, field, 130f, 0f, 14f, 24f,
+                "▾", 11f, TextMuted, TextAlignmentOptions.Center, false).raycastTarget = false;
+
+            Button button = field.gameObject.AddComponent<Button>();
+            button.targetGraphic = hit;
+            button.transition = Selectable.Transition.None;
+            button.navigation = new Navigation { mode = Navigation.Mode.None };
+            SettingsDropdown captured = row;
+            button.onClick.AddListener(delegate { OpenSettingsDropdown(field, captured); });
+
+            settingsDropdowns.Add(row);
+        }
+
+        /// <summary>点开设置页的下拉：列出所有选项，选中就写回并关掉。</summary>
+        private void OpenSettingsDropdown(RectTransform anchor, SettingsDropdown row)
+        {
+            CloseSettingsDropdown();
+
+            // 全屏挡板：点外面收起（和参数栏的弹层同一套做法）。
+            RectTransform blocker = CreateTopLeftRect("SettingsDropBlocker",
+                PopupLayer, 0f, 0f, DesignWidth, DesignHeight);
+            Image blockerImage = blocker.gameObject.AddComponent<Image>();
+            blockerImage.color = new Color(0f, 0f, 0f, 0.001f);
+            blockerImage.raycastTarget = true;
+            Button blockerButton = blocker.gameObject.AddComponent<Button>();
+            blockerButton.targetGraphic = blockerImage;
+            blockerButton.transition = Selectable.Transition.None;
+            blockerButton.onClick.AddListener(CloseSettingsDropdown);
+            settingsDropdownBlocker = blocker;
+
+            float rowHeight = 26f;
+            float width = Mathf.Max(150f, anchor.rect.width);
+            float height = row.Height + 8f;
+
+            Vector2 screen = RectTransformUtility.WorldToScreenPoint(null, anchor.position);
+            Vector2 local;
+            RectTransformUtility.ScreenPointToLocalPointInRectangle(
+                PopupLayer, screen, null, out local);
+            // 锚点在触发器的**左上角**，弹层也从左上角往下铺。
+            float left = local.x + PopupLayer.rect.width * 0.5f;
+            float top = PopupLayer.rect.height * 0.5f - local.y;
+
+            Image panel = CreateImage("SettingsDrop", PopupLayer, left, top, width, height,
+                UiTheme.Current.SurfaceTopBand);
+            panel.raycastTarget = true;
+            panel.sprite = GetRoundedSprite(20, 8f, false, 0f);
+            panel.type = Image.Type.Sliced;
+            RectTransform rect = panel.rectTransform;
+            rect.SetAsLastSibling();
+            settingsDropdownPanel = rect;
+
+            int current = row.ReadIndex();
+            for (int i = 0; i < row.Options.Length; i++)
+            {
+                float rowY = 4f + i * rowHeight;
+                int captured = i;
+                bool selected = i == current;
+
+                Image hover = CreateImage("DropRow" + i, rect, 0f, rowY, width, rowHeight,
+                    selected ? new Color(1f, 1f, 1f, 0.12f) : Color.clear);
+                hover.raycastTarget = true;
+                Button rowButton = hover.gameObject.AddComponent<Button>();
+                rowButton.targetGraphic = hover;
+                rowButton.transition = Selectable.Transition.None;
+                rowButton.navigation = new Navigation { mode = Navigation.Mode.None };
+                rowButton.onClick.AddListener(delegate
+                {
+                    row.WriteIndex(captured);
+                    RefreshSettingsSwitches();
+                    CloseSettingsDropdown();
+                });
+                AttachSettingsHover(hover.gameObject, hover, new Color(1f, 1f, 1f, 0.16f));
+
+                TextMeshProUGUI optionLabel = CreateText("DropRowLabel" + i, rect,
+                    12f, rowY, width - 24f, rowHeight, row.Options[i],
+                    UiType.Body, selected ? TextPrimary : TextSecondary,
+                    TextAlignmentOptions.MidlineLeft, false);
+                optionLabel.raycastTarget = false;
+            }
+        }
+
+        private void CloseSettingsDropdown()
+        {
+            if (settingsDropdownPanel != null)
+            {
+                Destroy(settingsDropdownPanel.gameObject);
+                settingsDropdownPanel = null;
+            }
+            if (settingsDropdownBlocker != null)
+            {
+                Destroy(settingsDropdownBlocker.gameObject);
+                settingsDropdownBlocker = null;
+            }
+        }
+
+        /// <summary>
+        /// 设置页下拉项的悬停反馈。**不做常驻底色** —— 悬停时浮一层极淡白，
+        /// 和界面其它地方的"控件靠 hover 证明自己能点"保持一致。
+        ///
+        /// `UiBrowserPane.HoverFill` 是私有的，跨类用不了，这里补一个同形的。
+        /// </summary>
+        private static void AttachSettingsHover(GameObject target, Image fill, Color hoverColor)
+        {
+            SettingsHover hover = target.AddComponent<SettingsHover>();
+            hover.Fill = fill;
+            hover.HoverColor = hoverColor;
+        }
+
+        private sealed class SettingsHover : MonoBehaviour,
+            UnityEngine.EventSystems.IPointerEnterHandler,
+            UnityEngine.EventSystems.IPointerExitHandler
+        {
+            internal Image Fill;
+            internal Color HoverColor = new Color(1f, 1f, 1f, 0.08f);
+
+            public void OnPointerEnter(UnityEngine.EventSystems.PointerEventData eventData)
+            {
+                if (Fill != null)
+                {
+                    Fill.color = HoverColor;
+                }
+            }
+
+            public void OnPointerExit(UnityEngine.EventSystems.PointerEventData eventData)
+            {
+                if (Fill != null)
+                {
+                    Fill.color = Color.clear;
+                }
+            }
+        }
+
         /// <summary>设置窗口里点「固定 / 自由」。</summary>
         private void ApplyLayoutMode(bool fixedLayout)
         {
@@ -3401,6 +3828,41 @@ namespace ADOFAIEditorStudio
                 TimelineView.SetFixedTimelineLayout(fixedLayout);
             }
             RefreshSettingsSwitches();
+        }
+
+        /// <summary>
+        /// 设置窗口里切主题。
+        ///
+        /// **必须重建整个工作台**：颜色是在建控件那一刻从 `UiTheme.Current`
+        /// 读进去的，改主题对象不会让已经建好的控件变色。`RebuildWorkbench`
+        /// 会销毁 uiRoot 再重新建一遍，主题就整套生效了。
+        ///
+        /// 重建会丢掉一些瞬时状态（选中、滚动位置、打开的子窗口），所以只在
+        /// 用户主动切换时做 —— 这也是它没做成"每帧检查"的原因。
+        /// </summary>
+        private void ApplyUiTheme(bool ember)
+        {
+            if (Main.Settings == null)
+            {
+                return;
+            }
+            string id = ember ? UiTheme.Ember.Id : UiTheme.Mono.Id;
+            if (string.Equals(Main.Settings.UiThemeId, id, System.StringComparison.Ordinal))
+            {
+                return;
+            }
+            Main.Settings.UiThemeId = id;
+            Main.SaveSettings();
+            UiTheme.Select(ember ? UiTheme.Ember : UiTheme.Mono);
+            // 工作台没建起来时不用重建 —— 下次建的时候自然会读到新主题。
+            if (built)
+            {
+                RebuildWorkbench();
+            }
+            else
+            {
+                RefreshSettingsSwitches();
+            }
         }
 
         /// <summary>
@@ -3427,6 +3889,18 @@ namespace ADOFAIEditorStudio
                     SetTopLeftRect(row.Knob.rectTransform, on ? 24f : 3f, 3f, 16f, 16f);
                 }
             }
+
+            // 下拉的显示文字也要跟着刷：主题可能被别的入口改过。
+            for (int i = 0; i < settingsDropdowns.Count; i++)
+            {
+                SettingsDropdown dropdown = settingsDropdowns[i];
+                if (dropdown.Label == null || dropdown.Options == null)
+                {
+                    continue;
+                }
+                int index = Mathf.Clamp(dropdown.ReadIndex(), 0, dropdown.Options.Length - 1);
+                dropdown.Label.text = dropdown.Options[index];
+            }
         }
 
         /// <summary>切左列的页。现在每页只有标题和一句说明，功能接进来时在这里分发。</summary>
@@ -3436,6 +3910,8 @@ namespace ADOFAIEditorStudio
             {
                 return;
             }
+            // **记下从哪一页切过来的** —— 横向滑动的方向由它决定。
+            int previousPage = settingsPageIndex;
             settingsPageIndex = index;
             for (int i = 0; i < settingsNavFills.Count; i++)
             {
@@ -3464,6 +3940,30 @@ namespace ADOFAIEditorStudio
             {
                 settingsDeveloperPage.gameObject.SetActive(index == 2);
             }
+
+            // **切页横向滑动。**
+            //
+            // 往右切页（页号变大）时，新页从右边滑进来 —— 读起来是"内容往左翻"，
+            // 和翻书/翻标签一个方向感。往左切反之。
+            //
+            // 不做"旧页滑出"：两页叠在同一位置，同时动会互相穿透。
+            // 新页滑入已经把方向表达清楚了。
+            RectTransform activePage = index == 0
+                ? settingsGeneralPage
+                : (index == 2 ? settingsDeveloperPage : null);
+            if (activePage != null)
+            {
+                UiTransition pageTransition =
+                    UiTransition.Attach(activePage.gameObject);
+                if (pageTransition != null)
+                {
+                    // 方向：新页比旧页大 → 从右边来（+1）；否则从左边来（-1）。
+                    // 首次打开（previousPage == index）不滑动，只淡入。
+                    float direction = index >= previousPage ? 1f : -1f;
+                    pageTransition.PlaySlide(UiMotion.Fast, direction);
+                }
+            }
+
             // 两页都有开关，切页都刷一遍：探针/遮罩可能被别处（旧配置、
             // 导出流程）改过，进来时按 Settings 的真实值显示。
             RefreshSettingsSwitches();
@@ -3472,6 +3972,45 @@ namespace ADOFAIEditorStudio
         private bool SettingsWindowVisible
         {
             get { return settingsWindowLayer != null && settingsWindowLayer.gameObject.activeSelf; }
+        }
+
+        /// <summary>
+        /// 当前有没有**模态弹窗**盖在整个工作台上（设置 / 说明 / 版本 / 创建工程 /
+        /// 保存提示 / 模式选择）。
+        ///
+        /// **用途只有一个：拦住"点穿"到预览的指针。**
+        ///
+        /// 那些窗口的遮罩在 uGUI 上是 `raycastTarget = true` 的，所以 uGUI
+        /// 的按钮点不到底下的东西。但 `EditorSceneInteraction` 走的是
+        /// `Input.GetMouseButtonDown` **直读**，绕开了事件系统 —— 它只知道
+        /// "鼠标在预览视口矩形里"，不知道上面盖着东西。于是开着设置窗口点
+        /// 预览区域，会选中最底下的装饰物。
+        ///
+        /// 判据取「任一窗口层是激活的」。它们都是全屏层，没有"局部弹窗"，
+        /// 所以激活就等于"盖住了整个工作台"。
+        /// </summary>
+        internal bool IsModalWindowOpen
+        {
+            get
+            {
+                if (!visible || !built)
+                {
+                    return false;
+                }
+                if (SettingsWindowVisible || modeSwitchLayer != null)
+                {
+                    return true;
+                }
+                if (projectCreateWindow != null && projectCreateWindow.IsOpen)
+                {
+                    return true;
+                }
+                if (confirmSaveWindow != null && confirmSaveWindow.IsOpen)
+                {
+                    return true;
+                }
+                return OpenWindow() != null;
+            }
         }
 
         /// <summary>顶栏「设置」点一下就走这里 —— 不展开下拉，直接开窗。</summary>
@@ -3486,6 +4025,17 @@ namespace ADOFAIEditorStudio
             SelectSettingsPage(settingsPageIndex);
             settingsWindowLayer.SetAsLastSibling();
             settingsWindowLayer.gameObject.SetActive(true);
+            // **过渡挂在卡片上，不挂整层。**
+            //
+            // `SettingsLayer` 是全屏遮罩（1920×1080，pivot 在左上），
+            // 缩放它会让整个遮罩从左上角缩 —— 用户看到的就是"窗口位置在动"。
+            // 卡片才是那个"弹出来"的东西，只缩它。
+            UiTransition settingsTransition =
+                UiTransition.Attach(settingsCard);
+            if (settingsTransition != null)
+            {
+                settingsTransition.PlayShow(UiMotion.Base);
+            }
             if (EventSystem.current != null)
             {
                 EventSystem.current.SetSelectedGameObject(null);
@@ -3494,12 +4044,35 @@ namespace ADOFAIEditorStudio
 
         private void CloseSettingsWindow()
         {
-            if (!SettingsWindowVisible)
+            if (!SettingsWindowVisible || settingsWindowClosing)
             {
+                return;
+            }
+            // 淡出播完再真正隐藏 —— 直接 SetActive(false) 会"啪"一下消失。
+            // **动画挂在卡片上**（和显示时同一处），不是整层遮罩。
+            UiTransition transition = settingsCard == null
+                ? null
+                : settingsCard.GetComponent<UiTransition>();
+            GameObject layerObject = settingsWindowLayer.gameObject;
+            if (transition != null)
+            {
+                // 淡出期间再按 Esc 不能重复触发，否则回调叠好几层。
+                settingsWindowClosing = true;
+                transition.PlayHide(UiMotion.Fast, delegate
+                {
+                    settingsWindowClosing = false;
+                    if (layerObject != null)
+                    {
+                        layerObject.SetActive(false);
+                    }
+                });
                 return;
             }
             settingsWindowLayer.gameObject.SetActive(false);
         }
+
+        /// <summary>设置窗口正在播淡出。防止淡出期间重复触发关闭。</summary>
+        private bool settingsWindowClosing;
 
         // ---------------------------------------------------------- 两个要答复的弹窗
 
@@ -3560,8 +4133,9 @@ namespace ADOFAIEditorStudio
             projectCreateWindow.Layer = BuildDialogShell("ProjectCreate", parent,
                 cardWidth, cardHeight, out card);
 
-            CreateText("Title", card, 28f, 18f, cardWidth - 90f, 30f, "创建工程",
+            TextMeshProUGUI createTitle = CreateText("Title", card, 28f, 18f, cardWidth - 90f, 30f, "创建工程",
                 UiType.Title, AccentSecondary, TextAlignmentOptions.MidlineLeft, true);
+            createTitle.color = UiTheme.Current.HeadingColor;
             CreateHeadingRule("Rule", card, PanelHeadingRule);
 
             CreateButton("Close", card, cardWidth - 52f, 18f, 30f, 30f, "×", false,
@@ -3626,9 +4200,10 @@ namespace ADOFAIEditorStudio
             confirmSaveWindow.Layer = BuildDialogShell("ConfirmSave", parent,
                 cardWidth, cardHeight, out card);
 
-            CreateText("Title", card, 28f, 18f, cardWidth - 90f, 30f,
+            TextMeshProUGUI confirmTitle = CreateText("Title", card, 28f, 18f, cardWidth - 90f, 30f,
                 "布局还没保存", UiType.Title, AccentSecondary,
                 TextAlignmentOptions.MidlineLeft, true);
+            confirmTitle.color = UiTheme.Current.HeadingColor;
             CreateHeadingRule("Rule", card, PanelHeadingRule);
 
             CreateText("Body", card, 28f, 68f, cardWidth - 56f, 60f,
@@ -3798,8 +4373,9 @@ namespace ADOFAIEditorStudio
             RectTransform card;
             CreateDialogCard(name + "Card", window.Layer, cardWidth, cardHeight, out card);
 
-            CreateText(name + "Title", card, 28f, 16f, cardWidth - 100f, 30f, titleText,
+            TextMeshProUGUI dialogTitle = CreateText(name + "Title", card, 28f, 16f, cardWidth - 100f, 30f, titleText,
                 UiType.Title, AccentSecondary, TextAlignmentOptions.MidlineLeft, true);
+            dialogTitle.color = UiTheme.Current.HeadingColor;
 
             if (onTitleClick != null)
             {
@@ -4184,6 +4760,14 @@ namespace ADOFAIEditorStudio
 
         private void SetBrowserTab(BrowserPane pane, LevelEventType page)
         {
+            // **算切页方向** —— 标签是横排的，页号变大就是"往右翻"。
+            // 同一页重刷时保持上次方向，别抖。
+            if (pane != browserPane || page != selectedSettingsPage)
+            {
+                browserSwitchDirection =
+                    (int)pane * 100 + (int)page >= (int)browserPane * 100 + (int)selectedSettingsPage
+                        ? 1f : -1f;
+            }
             browserPane = pane;
             if (pane == BrowserPane.Settings)
             {
@@ -4201,24 +4785,11 @@ namespace ADOFAIEditorStudio
                 browserPaneView.ShowPage(pane);
             }
 
-            // 设置页正文：和右栏共用同一个 uGUI 渲染器（单独的实例），
-            // 只在停在这一页时显示。
+            // 设置页正文：**6 个实例常驻在传送带上**，不再逐页显隐。
+            // 切页只靠 `browserPaneView` 平移条带，这里只管把它们建出来。
             if (showSettings)
             {
                 EnsureSettingsPaneView();
-                if (settingsPaneView != null)
-                {
-                    settingsPaneView.gameObject.SetActive(true);
-                    settingsPaneView.SetSettingsMode(true);
-                    settingsPaneView.SetPaneRect(BrowserContentX, BrowserViewY,
-                        previewLayout.LeftPanelWidth - BrowserContentX - PanelHeadingInset,
-                        Mathf.Max(64f, browserPanel.rect.height - BrowserViewY - PanelInnerInset));
-                }
-            }
-            else if (settingsPaneView != null)
-            {
-                settingsPaneView.SetSettingsMode(false);
-                settingsPaneView.gameObject.SetActive(false);
             }
 
             // 媒体页刚从隐藏里回来：它在隐藏期间不推进缩略图队列，卡片位置也
@@ -4233,18 +4804,37 @@ namespace ADOFAIEditorStudio
         /// 左栏设置页的渲染器。**懒建**：它要和右栏共用同一个写入层
         /// （`propertyPanel`），而右栏是在 `BuildInspector` 里才建出来的。
         /// </summary>
+        /// <summary>
+        /// 建 6 个设置页实例，**每个钉死一页、挂在传送带的对应槽位上**。
+        ///
+        /// 原来是**一个**实例、跟着全局选中切换内容 —— 那样永远做不到
+        /// "6 页并排、传送带滑动"。现在每页一个实例，各自渲染各自的。
+        ///
+        /// 代价是 6 个实例常驻、各自轮询。如果卡顿明显，只能退回
+        /// "只渲染当前页 ±1"（见 `UiBrowserPane` 那边的注释）。
+        /// </summary>
         private void EnsureSettingsPaneView()
         {
-            if (settingsPaneView != null || browserPanel == null || propertyPanel == null)
+            if (settingsPaneViews.Count > 0
+                || browserPaneView == null || propertyPanel == null)
             {
                 return;
             }
-            settingsPaneView = UiInspectorPane.Build(browserPanel, this, propertyPanel,
-                uiFont, BrowserContentX, BrowserViewY,
-                previewLayout.LeftPanelWidth - BrowserContentX - PanelHeadingInset,
-                Mathf.Max(64f, browserPanel.rect.height - BrowserViewY - PanelInnerInset),
-                true);
-            settingsPaneView.gameObject.SetActive(false);
+            float innerWidth = previewLayout.LeftPanelWidth - BrowserContentX - PanelHeadingInset;
+            float viewHeight = Mathf.Max(64f,
+                browserPanel.rect.height - BrowserViewY - PanelInnerInset);
+
+            for (int i = 0; i < SettingsPages.Length; i++)
+            {
+                // 槽位下标 = 2 + i（前两个是装饰物页和媒体页）。
+                RectTransform slot = browserPaneView.GetPageSlot(2 + i);
+                UiInspectorPane pane = UiInspectorPane.Build(slot, this, propertyPanel,
+                    uiFont, 0f, 0f, innerWidth, viewHeight, true);
+                pane.PinSettingsPage(SettingsPages[i]);
+                // **保持激活**：传送带要求所有页常驻，滑过去就能看见内容。
+                pane.gameObject.SetActive(true);
+                settingsPaneViews.Add(pane);
+            }
         }
 
         /// <summary>
@@ -5586,9 +6176,11 @@ namespace ADOFAIEditorStudio
             AddPanelBorder(panel, CornerLarge);
             CreateHeadingBand("HeadingBand", panel.rectTransform, PanelHeadingHeight);
             CreateHeadingBar("HeadingBar", panel.rectTransform, PanelHeadingInset);
-            inspectorHeading = CreateText("Heading", panel.rectTransform, HeadingTextInset, HeadingRowY,
+            TextMeshProUGUI inspectorHeadingLabel = CreateText("Heading", panel.rectTransform, HeadingTextInset, HeadingRowY,
                 previewLayout.RightPanelWidth - HeadingTextInset - PanelHeadingInset, HeadingRowBoxHeight,
-                "参数", UiType.Title, AccentSecondary, TextAlignmentOptions.MidlineLeft, true).rectTransform;
+                "参数", UiType.Title, AccentSecondary, TextAlignmentOptions.MidlineLeft, true);
+            inspectorHeadingLabel.color = UiTheme.Current.HeadingColor;
+            inspectorHeading = inspectorHeadingLabel.rectTransform;
             CreateHeadingRule("InspectorRule", panel.rectTransform, PanelHeadingRule);
 
             // 数据/写入层：只接数据，不建旧 UI（见 InitializeModel）。
@@ -6864,10 +7456,14 @@ namespace ADOFAIEditorStudio
             {
                 browserPaneView.SetPaneRect(BrowserContentX, BrowserViewY, innerWidth, viewHeight);
             }
-            if (settingsPaneView != null)
+            // 6 个设置页实例跟着条带一起重排（它们挂在槽位里，坐标是相对的，
+            // 这里只更新自身尺寸）。
+            for (int i = 0; i < settingsPaneViews.Count; i++)
             {
-                settingsPaneView.SetPaneRect(BrowserContentX, BrowserViewY,
-                    innerWidth, viewHeight);
+                if (settingsPaneViews[i] != null)
+                {
+                    settingsPaneViews[i].SetPaneRect(0f, 0f, innerWidth, viewHeight);
+                }
             }
 
             RebuildVisibleMedia(false);
@@ -6876,6 +7472,10 @@ namespace ADOFAIEditorStudio
         private void RebuildRuntimeUiForResolution()
         {
             bool wasVisible = visible;
+            // **重建期间不许取消拖动会话** —— 见 `SuppressScrubCancel` 的说明。
+            // 不加这一层的话，销毁 EditorTimelineView 会顺带把预览求值器关掉，
+            // 切主题 / 改分辨率之后画面就冻住。
+            EditorPlaybackBridge.SuppressScrubCancel = true;
             HidePreviewHandoffImmediate();
             EditorCommandHistory.Clear();
             RestorePreviewViewport();
@@ -6917,6 +7517,12 @@ namespace ADOFAIEditorStudio
                 buildFailed = true;
                 Main.Logger.Log("Failed to rebuild the runtime uGUI after a resolution change: " + exception);
             }
+            finally
+            {
+                // **一定要清掉。** 异常路径漏掉的话，之后所有取消拖动都会被吞，
+                // 表现是"拖完播放头预览不回来"。
+                EditorPlaybackBridge.SuppressScrubCancel = false;
+            }
         }
 
         private void ClearRuntimeUiReferences()
@@ -6928,7 +7534,7 @@ namespace ADOFAIEditorStudio
             browserPanel = null;
             browserBlockFill = null;
             browserPaneView = null;
-            settingsPaneView = null;
+            settingsPaneViews.Clear();
             decoList = null;
             helpWindow = null;
             versionWindow = null;
@@ -6963,6 +7569,9 @@ namespace ADOFAIEditorStudio
             timelineView = null;
             multiplayerPanel = null;
             multiplayerButton = null;
+            // 模式选择弹窗挂在 designRoot 上，重建时整棵树一起销毁 ——
+            // 引用不清的话下次 `CloseModeSwitchWindow` 会摸到已销毁对象。
+            modeSwitchLayer = null;
         }
 
         private void RestorePreviewViewport()

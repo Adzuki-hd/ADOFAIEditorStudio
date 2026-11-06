@@ -58,8 +58,8 @@ namespace ADOFAIEditorStudio
 
             TextMeshProUGUI title = NewText("Heading", toolbar, font,
                 TextX, 0f, 80f, HeadingHeight, "预览", 15f);
-            // 白色：它和「装饰物 / 参数」一样是面板标题，不再是可点的链接。
-            title.color = UiTheme.Current.TextPrimary;
+            // 面板标题走双色渐变，和右栏 / 弹窗标题同一套。
+            title.color = UiTheme.Current.HeadingColor;
             title.alignment = TextAlignmentOptions.MidlineLeft;
             parts.Title = title.rectTransform;
 
