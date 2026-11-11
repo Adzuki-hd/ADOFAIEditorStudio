@@ -13015,7 +13015,11 @@ private static float MinimumPixelsPerSecond
 
         // ---------------------------------------------------------- 拖动指针
 
+        /// <summary>时间轴顶边拖高度用的上下箭头。</summary>
         private static Texture2D resizeCursorTexture;
+
+        /// <summary>事件块左右边缘拖宽用的左右箭头。</summary>
+        private static Texture2D blockResizeCursorTexture;
 
         /// <summary>
         /// 「上下双向箭头」指针 —— 时间轴顶边可拖高度时用。
@@ -13024,8 +13028,11 @@ private static float MinimumPixelsPerSecond
         /// `Texture2D`，所以按用户给的 SVG 描出来（1024 视框，上下两个箭头
         /// 夹一根横杠）。和项目里其它自绘图标同一套做法：把路径展平成多边形，
         /// 再用扫描线填充成贴图。
+        ///
+        /// **和事件块边缘那个左右箭头是两回事**（见 `GetBlockResizeCursorTexture`）。
+        /// 两者都叫"拖大小"，但方向不同，共用一个纹理会让其中一边指错方向。
         /// </summary>
-        internal static Texture2D GetResizeCursorTexture()
+        internal static Texture2D GetTimelineResizeCursorTexture()
         {
             if (resizeCursorTexture != null)
             {
@@ -13166,7 +13173,75 @@ private static float MinimumPixelsPerSecond
 
         private bool cursorIsResize;
 
-        /// <summary>鼠标悬停在块的左/右边缘时切换成左右箭头。</summary>
+        /// <summary>
+        /// 「左右双向箭头」指针 —— 事件块左右边缘拖宽时用。
+        ///
+        /// 画成左右两个三角 + 中间一根横杠，边缘做一像素羽化 ——
+        /// 硬边的斜线在大屏上锯齿很明显。
+        ///
+        /// **别和 `GetTimelineResizeCursorTexture`（上下箭头）混用。**
+        /// 两者都叫"拖大小"，但一个改宽度、一个改高度，共用一个纹理
+        /// 会让其中一边指错方向。
+        /// </summary>
+        internal static Texture2D GetBlockResizeCursorTexture()
+        {
+            if (blockResizeCursorTexture != null)
+            {
+                return blockResizeCursorTexture;
+            }
+
+            const int size = 24;
+            const float halfStroke = 1.6f;
+            var pixels = new Color32[size * size];
+            var clear = new Color32(0, 0, 0, 0);
+
+            float mid = size * 0.5f;
+            for (int y = 0; y < size; y++)
+            {
+                for (int x = 0; x < size; x++)
+                {
+                    float px = x + 0.5f;
+                    float py = y + 0.5f;
+
+                    // 中间那根横杠。
+                    float bar = Mathf.Max(
+                        Mathf.Abs(py - mid) - 1.1f,
+                        Mathf.Abs(px - mid) - (size * 0.22f));
+                    float barAlpha = Mathf.Clamp01(0.5f - bar);
+
+                    // 左右两个箭头（三角形），用「点到三段线段的距离」描边，
+                    // 这样和项目里其它自绘图标是同一套画法。
+                    float left = DistanceToSegment(px, py, 2.5f, mid, 8f, mid - 5.5f);
+                    left = Mathf.Min(left, DistanceToSegment(px, py, 2.5f, mid, 8f, mid + 5.5f));
+                    left = Mathf.Min(left, DistanceToSegment(px, py, 2.5f, mid, 8f, mid));
+
+                    float right = DistanceToSegment(px, py, size - 2.5f, mid, size - 8f, mid - 5.5f);
+                    right = Mathf.Min(right, DistanceToSegment(px, py, size - 2.5f, mid, size - 8f, mid + 5.5f));
+                    right = Mathf.Min(right, DistanceToSegment(px, py, size - 2.5f, mid, size - 8f, mid));
+
+                    float alpha = Mathf.Max(barAlpha, Mathf.Clamp01(halfStroke - Mathf.Min(left, right) + 0.5f));
+                    if (alpha <= 0f)
+                    {
+                        pixels[y * size + x] = clear;
+                        continue;
+                    }
+
+                    pixels[y * size + x] = new Color32(255, 255, 255, (byte)Mathf.RoundToInt(alpha * 255f));
+                }
+            }
+
+            blockResizeCursorTexture = new Texture2D(size, size, TextureFormat.RGBA32, false)
+            {
+                filterMode = FilterMode.Bilinear,
+                wrapMode = TextureWrapMode.Clamp,
+                hideFlags = HideFlags.HideAndDontSave
+            };
+            blockResizeCursorTexture.SetPixels32(pixels);
+            // 第二个参数必须是 false —— 见 `GetTimelineResizeCursorTexture` 里的说明。
+            blockResizeCursorTexture.Apply(false, false);
+            return blockResizeCursorTexture;
+        }
+
         /// <summary>
         /// 悬停在块的左/右边缘时切换成左右箭头。**ImGui 那边也调这个** ——
         /// 换指针这件事只有一份实现（连"纹理必须 CPU 可读"那个坑都在里面）。
@@ -13180,7 +13255,7 @@ private static float MinimumPixelsPerSecond
             }
             if (wantResize)
             {
-                Texture2D texture = GetResizeCursorTexture();
+                Texture2D texture = GetBlockResizeCursorTexture();
                 if (texture != null)
                 {
                     Cursor.SetCursor(texture, new Vector2(texture.width * 0.5f, texture.height * 0.5f),

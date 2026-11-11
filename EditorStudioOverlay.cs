@@ -1483,6 +1483,34 @@ namespace ADOFAIEditorStudio
                 && RectTransformUtility.RectangleContainsScreenPoint(previewViewport, screenPosition, null);
         }
 
+        /// <summary>
+        /// 【临时探针】把指针落点与几个关键矩形的关系拼成一行。
+        ///
+        /// 用途：拖时间轴顶边时点穿选中了装饰物，先量出按下那一刻
+        /// 鼠标到底落在哪几个矩形里 —— 是视口矩形算错了，还是
+        /// 时间轴手柄根本不在任何 uGUI 射线上。取到数就拆。
+        /// </summary>
+        internal string DescribePointerRects(Vector2 screenPosition)
+        {
+            string text = "design=" + DesignWidth + "x" + DesignHeight;
+            text += " screen=" + Screen.width + "x" + Screen.height;
+            if (previewViewport != null)
+            {
+                Vector3[] corners = new Vector3[4];
+                previewViewport.GetWorldCorners(corners);
+                text += " vp=[" + corners[0].x.ToString("0") + "," + corners[0].y.ToString("0")
+                    + " -> " + corners[2].x.ToString("0") + "," + corners[2].y.ToString("0") + "]";
+            }
+            if (timelinePanel != null)
+            {
+                Vector3[] corners = new Vector3[4];
+                timelinePanel.GetWorldCorners(corners);
+                text += " tl=[" + corners[0].x.ToString("0") + "," + corners[0].y.ToString("0")
+                    + " -> " + corners[2].x.ToString("0") + "," + corners[2].y.ToString("0") + "]";
+            }
+            return text;
+        }
+
         private void UpdateNonPreviewPointerCapture()
         {
             bool pointerHeld = Input.GetMouseButton(0) || Input.GetMouseButton(1) || Input.GetMouseButton(2);
@@ -3091,6 +3119,9 @@ namespace ADOFAIEditorStudio
         /// <summary>
         /// 当前版本的更新内容。窗口标题是 `v<版本号> 更新内容`。
         ///
+        /// **这里是「整个 0.39 系列」的合并说明**，0.39.2 之外的历史段落
+        /// 也要留着 —— 从 0.38 跳上来的人只看得到这一份。
+        ///
         /// 一行一条、用 Environment.NewLine 拼起来，**不写反斜杠转义** ——
         /// 换行符用转义写在这个文件里出过事（落进去成了真换行，把字符串
         /// 字面量截断）。这样写也不怕以后谁来编辑器里改文案。
@@ -3098,6 +3129,24 @@ namespace ADOFAIEditorStudio
         private static readonly string VersionNotes = string.Join(Environment.NewLine, new[]
         {
             "<size=20><b>v" + ModVersion + " 更新内容</b></size>",
+            "",
+            "<b>0.39.5 修复</b>",
+            "<b>· 装饰物停在默认贴图上</b>：预览记录的「已应用图片」初值是谱面里写的文件名，于是每帧的「不一样才换图」永远不成立，换图一次都没跑过。现在从哨兵值起步。",
+            "<b>· 缺图 / 图还没加载</b>：以前两种情况走同一条路，一并清空贴图。现在先看磁盘 —— 文件真不存在才清，文件在但还没进图库就等下一帧。",
+            "<b>· 空装饰物显示成占位方块</b>：原生进播放时才隐藏那个占位图，预览不走那条路。现在预览期间主动隐藏，退出时还原。",
+            "<b>· 装饰物没有尾焰</b>：原生在编辑器里会主动隐藏尾焰，预览需要它出现。现在预览期间打开。",
+            "<b>· LastPosition 被当成放置方式</b>：它只是「这次位移相对当前落点」，不是 placement 的取值。以前当放置方式处理，相对定位的装饰物位置会算错。",
+            "<b>· 钉在屏幕上的装饰物位置抖动</b>：位置恒定的（Camera / CameraAspect 相对）走 SetTrans，有位置动画的才走 SetPosition。",
+            "",
+            "<b>0.39.3 修复</b>",
+            "<b>· 数字参数清空后变回 0</b>：把数字框清空提交，值会回落成 0，没法表示「这一项没设过」。现在单值 Float、Vector2 的 X/Y、FloatPair、Vector2Range 清空都写 NaN，框里保持空着；Int 没有 NaN，清空就恢复原值不写数据。",
+            "<b>· 重复清空多记一步撤销</b>：NaN 与 NaN 现在算相等，对已经空着的框再清空不会当成改过。",
+            "",
+            "<b>0.39.2 修复</b>",
+            "<b>· 事件块边缘光标指错方向</b>：拖事件块左右边缘改宽度时，指针显示成了上下箭头。现在分成两枚独立指针 —— 块边缘是左右箭头，时间轴顶边拖高度才是上下箭头。",
+            "",
+            "<b>0.39.1 修复</b>",
+            "<b>· 自动更新装上却还是旧版</b>：0.39.0 的安装包里带的版本号仍是 0.38.0，装完 UMM 里显示的还是旧版本，更新还会卡在「需手动重装」。这一版已重新打过包。",
             "",
             "<b>新增</b>",
             "<b>· 主题系统</b>：设置 → 常规设置里多了一个「界面主题」下拉，可选「默认」（纯灰阶）和「烈炎」（橙红正文 + 红色标题 + 朱红 logo 渐变）。默认是灰阶那套，切换后整个工作台会重建一次。",
@@ -3116,7 +3165,6 @@ namespace ADOFAIEditorStudio
             "<b>· 入口按钮在主菜单也显示</b>：现在要求活动场景就是编辑器场景才会出现。",
             "<b>· 框选锚点钉在屏幕上</b>：拉框时滚动时间轴，锚点不跟着内容走，永远选不到滚过去之后的块。已修。",
             "<b>· 参数栏、图标颜色</b>：视图锁、点事件跟随、定位到播放头、车道筛选这几颗图标在「开启」时误用了正文色，看着像一直处于激活态。已改用强调色 / 次要色。",
-            "<b>· 自动更新装上却还是旧版</b>：0.39.0 的安装包里带的版本号仍是 0.38.0，装完 UMM 里显示的还是旧版本，更新还会卡在「需手动重装」。这一版的包已重新打过。",
             "",
             "<b>调整</b>",
             "<b>· 配色</b>：背景 #111111、面板 #151515，正文默认 #F48862（烈炎主题）或 #F2F2F2（默认主题）。",
@@ -3529,6 +3577,18 @@ namespace ADOFAIEditorStudio
                         return;
                     }
                     Main.Settings.TrackCoverageProbe = on;
+                    Main.SaveSettings();
+                });
+            // 指针探针：左键按下的那一帧打一行，回答「点穿」时 uGUI 到底怎么判的。
+            AddSettingsSwitch(settingsDeveloperPage, "指针探针", 204f, "开", "关",
+                delegate { return Main.Settings != null && Main.Settings.PointerProbe; },
+                delegate (bool on)
+                {
+                    if (Main.Settings == null)
+                    {
+                        return;
+                    }
+                    Main.Settings.PointerProbe = on;
                     Main.SaveSettings();
                 });
             // 帧率跳动日志：每秒三行，专门看「画面一顿一顿、平均帧率却好看」。
@@ -7914,8 +7974,12 @@ namespace ADOFAIEditorStudio
         /// <paramref name="size"/> 是纹理边长；可见的圆角半径是
         /// 纹理像素里的 <paramref name="radius"/>，并且在任何绘制尺寸下都保持这个形状，
         /// 因为贴图是按该半径作边框切九宫的。
+        ///
+        /// `internal` 是给参数栏下拉用的（缓速 / 滤镜的卡片底）。两边必须用
+        /// 同一套切图规则 —— 各自实现一份，圆角迟早对不齐，而且九宫格的
+        /// border 一旦算错就会出现拉伸变形。
         /// </summary>
-        private static Sprite GetRoundedSprite(int size, float radius, bool frame, float frameWidth)
+        internal static Sprite GetRoundedSprite(int size, float radius, bool frame, float frameWidth)
         {
             string key = size + "/" + radius + "/" + (frame ? "f" + frameWidth : "s");
             Sprite cached;

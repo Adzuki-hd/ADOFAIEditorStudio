@@ -4,6 +4,7 @@ using System.Linq;
 using ADOFAI;
 using DG.Tweening;
 using UnityEngine;
+using UnityEngine.EventSystems;
 
 namespace ADOFAIEditorStudio
 {
@@ -678,6 +679,27 @@ namespace ADOFAIEditorStudio
                 CancelMediaDrop();
                 Reset();
                 return;
+            }
+
+            // 指针探针（设置 → 开发者，默认关）：左键按下的那一帧记一行。
+            //
+            // 查的是「拖时间轴顶边时点穿选中装饰物」。原生 `scnEditor.HandleMouseActions`
+            // 用 `EventSystem.current.IsPointerOverGameObject()` 决定要不要走选中
+            // （反编译 44294 / 44501 行），所以这里必须把**那个值**一起打出来 ——
+            // 只看我们自己的矩形判定推不出结论。
+            if (Main.Settings != null && Main.Settings.PointerProbe
+                && Input.GetMouseButtonDown(0) && Main.Overlay != null)
+            {
+                Vector2 down = Input.mousePosition;
+                EventSystem events = EventSystem.current;
+                Main.Logger.Log("[PointerProbe] down=" + down
+                    + " overUI=" + (events != null && events.IsPointerOverGameObject())
+                    + " inViewport=" + RectTransformUtility.RectangleContainsScreenPoint(
+                        viewport, down, null)
+                    + " inTimeline=" + Main.Overlay.IsPointerInsideTimeline(down)
+                    + " timelineCapture=" + EditorTimelineView.IsAnyPointerCapture
+                    + " sceneCapture=" + IsCapturingPointer
+                    + " " + Main.Overlay.DescribePointerRects(down));
             }
 
             // **有模态弹窗盖着时，指针一概不归预览。**

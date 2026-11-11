@@ -213,6 +213,16 @@ namespace ADOFAIEditorStudio
         //
         // **默认关**：正常使用纯属噪声；只在排查「某段轨道/装饰物不对」时打开。
         public bool TrackCoverageProbe = false;
+        // 指针探针（默认关）：左键按下的那一帧，把「指针落在哪、uGUI 是否认为
+        // 指针在 UI 上、时间轴/视口矩形各在哪」写成一行日志。
+        //
+        // 用途：拖时间轴顶边时点穿选中了装饰物。原生 `scnEditor.HandleMouseActions`
+        // 用 `EventSystem.current.IsPointerOverGameObject()` 决定要不要走选中那条路
+        // （反编译 44294 / 44501 行），所以真正要量的是**那一帧该值为真还是假**，
+        // 只看我们自己的矩形判定推不出来。
+        //
+        // **默认关**：它挂在每帧的按下上，正常使用每次点击都会打一行。
+        public bool PointerProbe = false;
         // 时间轴定位以原生引擎优先。旧的静态求值器
         // 只作为兼容回退保留，不是默认路径。
         public bool UseStaticTimelineEvaluation = false;
@@ -329,6 +339,20 @@ namespace ADOFAIEditorStudio
         public int MultiplayerPort = 0;
         /// <summary>上次连的地址。主机换了地址时要记得改。</summary>
         public string MultiplayerAddress = string.Empty;
+
+        // ------------------------------------------------------ 参数栏下拉收藏
+        //
+        // 存的是**写入值** —— 缓速是枚举名（`OutExpo`）、高级滤镜是类名
+        // （`Gameplay.AdvancedFilter`），不是下拉里显示的那串中文。显示名
+        // 会随语言和主题变，写入值才是稳定的身份；存了显示名的话，换一套
+        // 语言之后收藏就全点不亮了。
+        //
+        // 用换行分隔的字符串而不是 `List<string>` 或 `Dictionary`：
+        // `XmlSerializer` 对这个类的集合字段一向只认字符串（见联机那几项），
+        // 而且 `Dictionary` 会直接抛「There was an error reflecting type」。
+        // 换行而不是逗号 —— 滤镜类名里将来冒出一个 `,` 也不会把一条拆成两条。
+        public string FavoriteEases = string.Empty;
+        public string FavoriteFilters = string.Empty;
     }
 
     internal static class EditorBridge

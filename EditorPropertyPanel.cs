@@ -4557,6 +4557,43 @@ namespace ADOFAIEditorStudio
             }
         }
 
+        /// <summary>
+        /// 两个属性值算不算"同一个"，用于跳过没有实际变化的提交。
+        ///
+        /// 和 `Equals` 的差别只在 NaN 上：参数栏清空输入框存的就是 NaN，
+        /// 而 `Equals(NaN, NaN)` 是 false。当成相等，重复清空才不会多写一遍、
+        /// 多记一步撤销。
+        ///
+        /// `Vector2` / `Tuple` 里含 NaN 的情况也要照顾到 —— 留空的是 X 或 Y
+        /// 中的一个时，整个值就不是"纯 NaN"了，得逐项比。
+        /// </summary>
+        private static bool SameValue(object a, object b)
+        {
+            if (a is float fa && b is float fb)
+            {
+                return (float.IsNaN(fa) && float.IsNaN(fb)) || fa.Equals(fb);
+            }
+            if (a is Vector2 va && b is Vector2 vb)
+            {
+                return SameComponent(va.x, vb.x) && SameComponent(va.y, vb.y);
+            }
+            if (a is Tuple<float, float> ta && b is Tuple<float, float> tb)
+            {
+                return SameComponent(ta.Item1, tb.Item1) && SameComponent(ta.Item2, tb.Item2);
+            }
+            if (a is Tuple<Vector2, Vector2> ra && b is Tuple<Vector2, Vector2> rb)
+            {
+                return SameValue(ra.Item1, rb.Item1) && SameValue(ra.Item2, rb.Item2);
+            }
+            return Equals(a, b);
+        }
+
+        /// <summary>`SameValue` 的单分量版：NaN 与 NaN 算相等。</summary>
+        private static bool SameComponent(float a, float b)
+        {
+            return (float.IsNaN(a) && float.IsNaN(b)) || a.Equals(b);
+        }
+
         /// <summary>把一次改值写进**一个**事件，并按需记一步撤销。</summary>
         private void CommitOne(LevelEvent levelEvent, string key, object value)
         {
@@ -4591,7 +4628,11 @@ namespace ADOFAIEditorStudio
             //
             // 唯独「本来被禁用」不能走这条路 —— 那种情况写同一个值是有
             // 意义的，它顺带把属性解禁（见下面）。
-            if (Equals(previousValue, value) && !previousDisabled)
+            //
+            // **NaN 要单独判。** 清空输入框存的是 NaN，而 `Equals(NaN, NaN)`
+            // 是 false —— 直接用 `Equals` 的话，对已经空着的框再清空一次
+            // 也会当成"改了"，写一遍数据再占掉一步撤销。
+            if (SameValue(previousValue, value) && !previousDisabled)
             {
                 return;
             }

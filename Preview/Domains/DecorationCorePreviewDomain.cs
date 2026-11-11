@@ -284,6 +284,16 @@ namespace ADOFAIEditorStudio.Preview.Domains
         private readonly List<DecorationState> states = new List<DecorationState>();
 
         /// <summary>
+        /// `DecorationState.AppliedImage` 的初始哨兵：**还没有任何图被推过**。
+        ///
+        /// 必须不等于任何真实文件名，否则首帧的去重
+        /// （`AppliedImage != imageFilename`）会把那次推送整个跳过 ——
+        /// 装饰物就停在游戏初始化的默认贴图上，看起来就是「原版图标」。
+        /// 文件名里不可能出现 NUL，拿它当哨兵最省事。
+        /// </summary>
+        private const string AppliedImageUnknown = "\0__none__";
+
+        /// <summary>
         /// 「下一帧必须重算」。参数栏改勾选状态时置位 —— 求值器平时在播放头
         /// 不动的时候整帧早退，不置这一位就看不到改动。
         /// </summary>
@@ -377,8 +387,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     screenRect = minimum.x.ToString("0") + "," + minimum.y.ToString("0")
                         + "~" + maximum.x.ToString("0") + "," + maximum.y.ToString("0");
                 }
-                Main.Logger.Log("[DecoProbe] #" + i
-                    + " tag=" + tag
+
+                Main.Logger.Log("[DecoProbe] #" + i                    + " tag=" + tag
                     + " image=" + (state.AppliedImage ?? "")
                     + " floor=" + state.CreationFloor
                     + " 模型(visible=" + state.FrameVisible
@@ -493,6 +503,20 @@ namespace ADOFAIEditorStudio.Preview.Domains
             ApplyLegacyMaskPipeline(Main.Settings == null || Main.Settings.UseLegacySpriteMask);
             lastLegacyMaskSetting = Main.Settings == null || Main.Settings.UseLegacySpriteMask;
 
+            // **缺图装饰物的占位图，预览里不显示。**
+            //
+            // 原版对「名字写了但文件不存在」的处理是赋 `manager.defaultSprite`
+            // （资源名 `DefaultNullDecoration`，一张占位图），专门用在编辑器里
+            // 提醒作者"这件缺图"。它的显隐由 `ShowEmptyDecorations(bool)` 控制：
+            // `scnEditor.Update` 进编辑器时 `show: true`，进播放时 `show: false`。
+            //
+            // 预览是"看着像播放"，该走后者那一档 —— 否则画面上会冒出一堆
+            // 原版占位图标，看起来像渲染失败。用户报的就是这个。
+            //
+            // 只在第一次分析时切一次：它是全局开关，逐帧写会让管理器
+            // 反复重建。
+            ApplyEmptyDecorationVisibility(false);
+
             // **分析过就一定要重画一次。**
             //
             // 这两条早退状态（`hasEvaluated` / `lastEvaluatedTime`）属于实例，
@@ -542,6 +566,16 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     // 禁用的那个坐标上。谱面存盘时这个键不会写出去，重开后装饰物
                     // 回到落点；预览得跟上这一点，否则勾选框看起来毫无作用。
                     Position = AuthorPosition(decoration),
+                    // **`Baseline` 就是 `startPos`，不要乘 `tileSize`。**
+                    //
+                    // 我一度在这里乘过 `tileSize`（想把 Camera 模式下的归一化
+                    // 坐标"还原"成世界坐标），结果 `pivotPosVec` 被写成 `-2.247`
+                    // 而不是原版的 `-1.500`：`screenRelativePos` 跟着偏，
+                    // 两球间距从 13.333 变成 19.987。
+                    //
+                    // `startPos` 在 Camera 模式下就是 `screenRelativePos` 的
+                    // 输入（`UpdateScreenClamp` 里 `/20 + 0.5`），原版全程用它，
+                    // 不需要换算。
                     Baseline = decoration.startPos,
                     Pivot = decoration.pivotOffsetVec,
                     Rotation = decoration.rotAngle,
@@ -620,7 +654,22 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
                 // 作者写的图是每次求值重放的起点，所以
                 // 向后拖动和向前拖动落在同一个 sprite 上。
-                state.DefaultImage = state.AppliedImage = AuthorString(decoration.sourceLevelEvent, "decorationImage", string.Empty);
+                state.DefaultImage = AuthorString(decoration.sourceLevelEvent, "decorationImage", string.Empty);
+
+                // **`AppliedImage` 不能跟着初始化成作者图名。**
+                //
+                // 它记的是「上一次真的推给装饰物的图」，更新循环用
+                //     if (AppliedImage != imageFilename) ApplyImage(...)
+                // 做去重。初始值等于作者图名，首帧两者就相等 —— 那次
+                // `ApplyImage` **永远不会被调用**，装饰物保持游戏初始化时
+                // 的默认贴图。
+                //
+                // 这正是用户报的「装饰物显示成原版图标」：谱面引用了
+                // `BG.png` / `Vignette_Black.png`，文件不在谱面目录里，
+                // 本该被清空贴图，却因为这条去重一次都没走到。
+                //
+                // 用一个不可能等于任何文件名的哨兵，保证首帧必然推一次。
+                state.AppliedImage = AppliedImageUnknown;
 
                 string tag = AuthorString(decoration.sourceLevelEvent, "tag", string.Empty);
                 string[] tags = string.IsNullOrEmpty(tag)
@@ -838,6 +887,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     && frame.Time >= state.SettledAt
                     && frame.Time < state.NextEventStart)
                 {
+                    // 【临时探针】186 格之后那批小物件（o1~o4 / b1~b4）的动画
                     continue;
                 }
 
@@ -1003,13 +1053,16 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     // 会在每次拖动时污染装饰物位置。
                     if (value.HasPosition)
                     {
-                        // 原生按模式挑起点：
-                        //   startPos = (placement == LastPosition) ? dec.pivotPosVec : dec.startPos
-                        // 然后 tween 到 startPos + targetPos。dec.startPos 和
-                        // dec.pivotPosVec 是两个不同的量（游戏调
-                        // SetPosition(startPos, pivotOffset) 时两个都传），所以两种模式都用
-                        // pivot 快照的话，只要两者不同，就会把每个位置事件
-                        // 偏移一个常量。
+                        // 原生 `lastPosition` 的基准就是「上一条事件完成后装饰物停在哪」。
+                        //
+                        // **插值写成 `LerpUnclamped(position, target, eased)`，
+                        // 和其它属性（rotation / scale / color …）保持同一种写法。**
+                        //
+                        // 别改成「事件入口抓一次快照当起点」：那样每条事件都是
+                        // 从快照走完整条缓动曲线，而 `folding` 会在 `ratio >= 1`
+                        // 时把结果折进前缀 —— 折进去的是**快照 + 偏移**，下一条又从
+                        // 新快照起算，位置就一路累积。这一族属性里只有位置是
+                        // 「相对增量」，必须沿用原生 `Lerp(当前值, …)` 的写法。
                         Vector2 origin = value.Placement == DecPlacementType.LastPosition
                             ? position
                             : state.Baseline;
@@ -1176,7 +1229,23 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 // 此外 SetVisible 还是按类型分支的（renderer 标志、text 标志、
                 // activeObject、particle 的 GameObject，或者干脆什么都不做），所以
                 // 没有一个缓存值能预测它。
-                if (placement != decoration.placementType)
+                // **`LastPosition` 不能真的改放置类型。**
+                //
+                // 原生 `ffxMoveDecorationsPlus.StartEffect` 里那句是有条件的：
+                //     if (ADOBase.customLevel && movementTypeUsed
+                //         && movementType != DecPlacementType.LastPosition)
+                //         dec.SetPlacementType(movementType);
+                // 特意把 `LastPosition` 排除了 —— 它的语义只是「用当前落点当基准」，
+                // 不是「换成 LastPosition 模式」。
+                //
+                // 这里原来无条件调，于是写了 `relativeTo: LastPosition` 的
+                // `MoveDecorations` 会把一颗 `relativeTo: Camera` 的装饰物
+                // 从 Camera 改成 LastPosition：`parallax.clampToScreen` 掉成 false，
+                // `screenRelativePos` 不再生效，位置改由 `startPos + 偏移` 算 ——
+                // 换了一整套坐标系。实测原版间距 2.625、AES 4.475，且 AES
+                // 还会先卡在 ±10 再跳回来。
+                if (placement != decoration.placementType
+                    && placement != DecPlacementType.LastPosition)
                 {
                     decoration.SetPlacementType(placement);
                 }
@@ -1302,7 +1371,22 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 // 的变化位，全部没变就返回 `DecorationRefreshStatus.Invisible`，
                 // 整段刷新直接跳过。我们原来是逐 setter 去重 —— 每个 setter 都还在跑，
                 // 而 Unity 对"被碰过的对象"要付一次延迟处理成本，跟改了几个属性无关。
-                if (state.HasTransformApplied
+                // **Camera 相对的装饰物不能进这道脏值门。**
+                //
+                // 它的屏幕位置由 `scrParallax` 的 clampToScreen 分支决定，而自定义
+                // 谱面里那个组件被 `scrDecoration.Awake` 主动禁用（没有 LateUpdate），
+                // 只能靠 `SetPosition → UpdatePosition → SetTrans` 手动刷。
+                //
+                // 它的 `anchored` 是 `startPos - offset`，**不含相机** —— 相机移动时
+                // 下面比较的每一个值都不变，正好命中脏值门被 `continue` 跳过。
+                // 表现就是「球不跟相机、一直往左跑」。
+                //
+                // 判据用 `placementType` 而不是 `parallax.enabled`：后者在自定义
+                // 谱面恒为 false，不能拿来判断需不需要刷。
+                bool cameraRelative = placement == DecPlacementType.Camera
+                    || placement == DecPlacementType.CameraAspect;
+                if (!cameraRelative
+                    && state.HasTransformApplied
                     && state.MaskingApplied
                     && state.MaskingDepthApplied
                     && (anchored - state.AppliedPosition).sqrMagnitude <= 1e-7f
@@ -1342,9 +1426,33 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     // 拖动结束后这里会照常补写一次，位置不会丢。
                     bool holdParticle = ParticleWatch.ScrubbingActive
                         && decoration is scrParticleDecoration;
-                    if (positionChanged && !holdParticle)
+                    if ((positionChanged || cameraRelative) && !holdParticle)
                     {
-                        decoration.SetPosition(anchored, pivot);
+                        // **`pivotPosVec` 只在位置真的变了时才写。**
+                        //
+                        // Camera / CameraAspect 相对的装饰物，屏幕位置由
+                        // `parallax.SetTrans()` 的 clampToScreen 分支按
+                        // `screenRelativePos` 现算，而 `screenRelativePos` 是
+                        // `UpdateScreenClamp` 从 `pivotPosVec` 推出来的 ——
+                        // 所以**不写 `pivotPosVec` 就等于冻住它的位置动画**。
+                        //
+                        // 但也不能无条件写：位置恒定的那种（比如作者画的两颗
+                        // 钉在屏幕上的装饰球）每帧写会把 `screenRel` 一点点
+                        // 推走，间距从原版的 13.333 漂到 20.010。
+                        //
+                        // 判据就是 `positionChanged` —— 和其它装饰物同一条。
+                        if (cameraRelative && !positionChanged)
+                        {
+                            // 位置没变：只让视差按当前 `screenRelativePos` 重算一次。
+                            if (decoration.parallax != null)
+                            {
+                                decoration.parallax.SetTrans();
+                            }
+                        }
+                        else
+                        {
+                            decoration.SetPosition(anchored, pivot);
+                        }
                         state.AppliedPosition = anchored;
                         state.AppliedPivot = pivot;
                     }
@@ -1368,10 +1476,26 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     }
                     bool parallaxChanged = !state.HasTransformApplied
                         || !Approximately(state.AppliedParallax, parallax)
-                        || placement != state.AppliedPlacement;
+                        // **`placement` 不参与这个判断。**
+                        //
+                        // `SetParallax` 的第二个参数会直接写 `this.placementType`
+                        // （反编译 56834），而 `LastPosition` 不是一种放置方式 ——
+                        // 它只是「这次位移相对当前落点」。把模型里的 `placement`
+                        // 原样传进去，回放到 `relativeTo: LastPosition` 的事件时
+                        // 就会把一颗 `Camera` 装饰物改成 `LastPosition`：
+                        // `parallax.clampToScreen` 掉成 false、`screenRelativePos`
+                        // 失效，位置换了一整套坐标系。实测原版两球间距 2.667、
+                        // AES 变成 4.5 甚至 0.5。
+                        //
+                        // 所以只在视差数值真的变了才重写，且改写时只传作者写的
+                        // 那一档（`LastPosition` 一律换成装饰物当前类型，等于不动）。
+                        ;
                     if (parallaxChanged)
                     {
-                        decoration.SetParallax(parallax, placement);
+                        DecPlacementType appliedType = placement == DecPlacementType.LastPosition
+                            ? decoration.placementType
+                            : placement;
+                        decoration.SetParallax(parallax, appliedType);
                         state.AppliedParallax = parallax;
                         state.AppliedPlacement = placement;
                     }
@@ -1540,7 +1664,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 if (!string.Equals(state.AppliedImage, imageFilename, StringComparison.Ordinal))
                 {
                     long imgStart = System.Diagnostics.Stopwatch.GetTimestamp();
-                    if (ApplyImage(decoration, imageFilename))
+                    bool applied = ApplyImage(decoration, imageFilename);
+                    if (applied)
                     {
                         state.AppliedImage = imageFilename;
                         state.LastImageLogTime = -1000f;
@@ -1655,6 +1780,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 (System.Diagnostics.Stopwatch.GetTimestamp() - maskStart)
                 * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
             PreviewDiagnostics.RecordFlag("Deco.MaskCandidates", maskCandidateStates.Count);
+            ShowObjectDecorationTails();
             // **探针绝不能让求值器停摆。** 它抛一次异常，引擎就会把整个
             // DecorationCore 域停用，画面直接少一大片 —— 比它要查的 bug 更糟。
             try
@@ -1697,7 +1823,18 @@ namespace ADOFAIEditorStudio.Preview.Domains
             holder.customSprites.TryGetValue(filename, out sprite);
             if (sprite == null)
             {
-                return false;
+                // **文件名有、图库里没有 —— 保持原版的行为，别自己清空。**
+                //
+                // 我一开始判断错了：原版 `scrDecoration.Setup` 的 Image 分支是
+                //     if (名字非空 && customSprites.TryGetValue(...)) { … }
+                //     else if (dictionary == null) { sprite = manager.defaultSprite; }
+                // 也就是**名字写了但文件不存在 → 赋 `manager.defaultSprite`**
+                // （资源名 `DefaultNullDecoration`，一张占位图），再到
+                // `SetSprite(sprite)`。所以清空是错的，画面会更空 ——
+                // 正确做法是让占位图不显示（见 `SuppressEmptyDecorations`）。
+                //
+                // 「文件在、只是还没进图库」仍然要 `return false` 等下一帧。
+                return FileMissingFromLevelDirectory(filename) ? true : false;
             }
 
             scrParticleDecoration particle = decoration as scrParticleDecoration;
@@ -1718,6 +1855,39 @@ namespace ADOFAIEditorStudio.Preview.Domains
             }
 
             return false;
+        }
+
+        /// <summary>
+        /// 这张图在不在谱面目录里。
+        ///
+        /// 用来区分「作者引用了不存在的文件」和「文件在、只是还没进图库」——
+        /// 前者要清空贴图（原生语义），后者要等下一帧重试。判据只可能是磁盘。
+        ///
+        /// 谱面路径读不到时返回 **false**（当成"可能在加载"）：
+        /// 那种情况宁可多等几帧，也不要把一件本来有图的装饰物清掉。
+        /// </summary>
+        private static bool FileMissingFromLevelDirectory(string filename)
+        {
+            scnGame game = scnGame.instance;
+            string levelPath = game == null ? null : game.levelPath;
+            if (string.IsNullOrEmpty(levelPath))
+            {
+                return false;
+            }
+
+            try
+            {
+                string directory = System.IO.Path.GetDirectoryName(levelPath);
+                if (string.IsNullOrEmpty(directory))
+                {
+                    return false;
+                }
+                return !System.IO.File.Exists(System.IO.Path.Combine(directory, filename));
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
 
         /// <summary>
@@ -1747,6 +1917,10 @@ namespace ADOFAIEditorStudio.Preview.Domains
         public void EndSession()
         {
             ApplyLegacyMaskPipeline(false);
+            // 还原占位图显隐：退出预览要回到编辑器那一档（显示），
+            // 否则关掉工作台后那批缺图装饰物会一直看不见，
+            // 作者就不知道它们缺图了。
+            ApplyEmptyDecorationVisibility(true);
             // 行星相对的装饰物被预加过行星坐标（见 Evaluate），退出预览得把
             // 干净的 pivotPosVec 还给原生：原生播放时 paused=false，它自己还会
             // 再加一次行星位置，旧偏移留着就是加两遍——退出工作台后这两个
@@ -1984,6 +2158,54 @@ namespace ADOFAIEditorStudio.Preview.Domains
         /// mesh 路径有没有在画），不读 `GetVisible()` —— 后者把 alpha 折进去了，
         /// 正好会把「不透明度 0」误报成「组件坏了」。
         /// </summary>
+        /// <summary>
+        /// 预览里把 `AddObject` 装饰球的尾焰打开。
+        ///
+        /// 原生 `UpdateTailVisibility()`：
+        ///     tailParticles.gameObject.SetActive(!ADOBase.isEditingLevel);
+        ///     sparks.gameObject.SetActive(!ADOBase.isEditingLevel &amp;&amp; GetAlpha() != 0f);
+        /// —— **编辑器里主动隐藏尾焰**（省得挡住轨道）。工作台预览挂在编辑器
+        /// 场景上，`isEditingLevel` 恒为真，于是那颗球的尾焰一直是关的：
+        /// 用户看到的就是「球在、尾焰没了」。
+        ///
+        /// 放在这个域而不是 `SetObjectPreviewDomain`：那个域的 `Evaluate`
+        /// 第一句是 `if (keyframes.Count == 0) return;`，而这份谱面一条
+        /// `SetObject` 都没有 —— 挂在那里一次都跑不到（实测日志 0 条）。
+        /// 这个域无条件遍历所有装饰物，才是对的落点。
+        /// </summary>
+        private static void ShowObjectDecorationTails()
+        {
+            scrDecorationManager manager = scrDecorationManager.instance;
+            if (manager == null || manager.allDecorations == null)
+            {
+                return;
+            }
+            for (int i = 0; i < manager.allDecorations.Count; i++)
+            {
+                scrObjectDecoration obj = manager.allDecorations[i] as scrObjectDecoration;
+                if (obj == null || obj.objectType != ObjectDecorationType.Planet)
+                {
+                    continue;
+                }
+                PlanetRenderer renderer = obj.planetRenderer;
+                if (renderer == null)
+                {
+                    continue;
+                }
+                if (renderer.tailParticles != null
+                    && !renderer.tailParticles.gameObject.activeSelf)
+                {
+                    renderer.tailParticles.gameObject.SetActive(true);
+                }
+                if (renderer.sparks != null
+                    && !renderer.sparks.gameObject.activeSelf
+                    && obj.GetAlpha() != 0f)
+                {
+                    renderer.sparks.gameObject.SetActive(true);
+                }
+            }
+        }
+
         private void ProbeDecorations(PreviewEvaluationFrame frame)
         {
             if (Main.Settings == null || !Main.Settings.DecorationProbe)
@@ -2281,6 +2503,34 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 + " mesh=" + (meshDrawing ? "画" : "关")
                 + " spriteMask=" + (mask == null ? "无" : (mask.enabled ? "开" : "关"))
                 + ").");
+        }
+
+        /// <summary>
+        /// 缺图装饰物的占位图（`DefaultNullDecoration`）显示 / 隐藏。
+        ///
+        /// 走游戏自己的 `scrDecorationManager.ShowEmptyDecorations` —— 那正是
+        /// 原版在「进编辑器」和「开始播放」两处分别调 `true` / `false` 的方法。
+        /// 自己遍历装饰物去改 sprite 是错的：管理器内部还有缓存的判断
+        /// （`spriteRenderer.sprite == defaultSprite`），绕过它就再也切不回来。
+        ///
+        /// 预览期间调 `false`（隐藏），退出时调 `true` 还原成编辑器那一档。
+        /// </summary>
+        private static void ApplyEmptyDecorationVisibility(bool show)
+        {
+            scrDecorationManager manager = scrDecorationManager.instance;
+            if (manager == null)
+            {
+                return;
+            }
+            try
+            {
+                manager.ShowEmptyDecorations(show);
+            }
+            catch (Exception exception)
+            {
+                Main.Logger.Warning("[Deco] ShowEmptyDecorations(" + show + ") 失败："
+                    + exception.Message);
+            }
         }
 
         private static void ApplyLegacyMaskPipeline(bool legacy)
@@ -2751,18 +3001,34 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // 起点，就成了「勾回来还是停在落点上」——必须等原生再跑一次 Setup
             // 才能纠正（用户看到的就是「动一下播放头才瞬间归位」）。
             //
-            // `startPos` 是 `SetPlacementType` 按作者数据算出来的初始位置
-            // （落点 + 位置偏移），只有 Setup 会改它，我们这套求值不碰。
+            // **`startPos` 也不能直接用 —— 它的坐标系取决于当前的 `placementType`。**
+            //
+            // `SetPlacementType` 里先算 `vector = position * tileSize`，然后
+            // `Camera` / `CameraAspect` 那两支要 `vector /= tileSize` 除回去。
+            // 所以同一个 `position: [-1.5, 0]`：
+            //     Camera 模式      → startPos = -1.5   （归一化屏幕坐标）
+            //     LastPosition 模式 → startPos = -2.25  （世界坐标）
+            //
+            // 本谱面的球是 `AddObject` 写的 `relativeTo: Camera`，建出来 `startPos = -1.5`；
+            // 回放第一条 `MoveDecorations`（`relativeTo: LastPosition`）时
+            // `SetPlacementType` 才把它改成 `-2.25`。而播种发生在回放之前 ——
+            // 抓到的是 `-1.5`，比真实锚点小了半个格宽，两球各向内缩 0.75，
+            // 间距从 4.5 变成 3.0（用户报的「太近」）。
+            //
+            // 所以按**作者写的 `position`** 直接算世界坐标，绕开 `startPos`。
             ADOFAI.LevelEvent levelEvent = decoration.sourceLevelEvent;
-            if (AuthorEnabled(levelEvent, "position"))
-            {
-                return decoration.startPos;
-            }
             Vector2 offset = ReadListVector2(levelEvent, "position", Vector2.zero);
+            float tile = ADOBase.controller == null ? 1f : ADOBase.controller.tileSize;
             bool camera = decoration.placementType == DecPlacementType.Camera
                 || decoration.placementType == DecPlacementType.CameraAspect;
-            float tile = ADOBase.controller == null ? 1f : ADOBase.controller.tileSize;
-            return camera ? decoration.startPos - offset : decoration.startPos - offset * tile;
+            Vector2 anchor = decoration.startPos;
+            if (!AuthorEnabled(levelEvent, "position"))
+            {
+                // 位置勾掉了：锚点就是「落点」，把这层偏移减回去。
+                return camera ? anchor - offset : anchor - offset * tile;
+            }
+            // 位置启用：锚点本身就是作者写的落点（已统一成世界坐标）。
+            return anchor;
         }
 
         /// <summary>按 `[x, y]` 形态读一个二维值（谱面里存的是列表）。</summary>

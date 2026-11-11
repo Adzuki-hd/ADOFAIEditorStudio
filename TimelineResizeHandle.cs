@@ -28,7 +28,7 @@ namespace ADOFAIEditorStudio
         // 这条热区现在横贯整个时间轴宽度（见 `EditorTimelineView` 里
         // `ResizeHandle` 的建法），所以光标一进来就该告诉用户"这里能拖高度"。
         //
-        // 指针纹理由 `EditorTimelineView.GetResizeCursorTexture` 生成并缓存
+        // 指针纹理由 `EditorTimelineView.GetTimelineResizeCursorTexture` 生成并缓存
         // —— 那里踩过的坑（纹理必须 CPU 可读）写在该方法的注释里。
 
         public void OnPointerEnter(PointerEventData eventData)
@@ -60,7 +60,7 @@ namespace ADOFAIEditorStudio
         {
             if (resize)
             {
-                Texture2D texture = EditorTimelineView.GetResizeCursorTexture();
+                Texture2D texture = EditorTimelineView.GetTimelineResizeCursorTexture();
                 if (texture != null)
                 {
                     // 热点取正中心 —— 箭头上下对称，中心正好落在横杠上。
@@ -108,6 +108,13 @@ namespace ADOFAIEditorStudio
             dragStartPanelHeight = timelinePanel.rect.height;
             dragging = true;
             ApplyCursor(true);
+            // 指针探针（设置 → 开发者，默认关）：记录拖顶边开始/结束时选中了几个
+            // 装饰物。点穿如果发生在**按下那一刻**，这里的 before/after 会不一样。
+            if (Main.Settings != null && Main.Settings.PointerProbe)
+            {
+                Main.Logger.Log("[HandleProbe] BeginDrag at " + eventData.position
+                    + " selectedDecorations(before)=" + CountSelectedDecorations());
+            }
             eventData.Use();
         }
 
@@ -142,12 +149,37 @@ namespace ADOFAIEditorStudio
             {
                 owner.SetTimelinePanelHeight(owner.CurrentTimelinePanelHeight, true);
             }
+            // 指针探针：见 `OnBeginDrag`。两边都有才看得出「拖这一下有没有动到选中」。
+            if (Main.Settings != null && Main.Settings.PointerProbe)
+            {
+                Main.Logger.Log("[HandleProbe] EndDrag at " + eventData.position
+                    + " selectedDecorations(after)=" + CountSelectedDecorations());
+            }
             // 松手时鼠标可能已经移出热区，按悬停状态还原指针。
             if (!hovered)
             {
                 ApplyCursor(false);
             }
             eventData.Use();
+        }
+
+        /// <summary>【临时探针】当前选中了几个装饰物。</summary>
+        private static string CountSelectedDecorations()
+        {
+            scnEditor editor = scnEditor.instance;
+            if (editor == null || editor.selectedDecorations == null)
+            {
+                return "?";
+            }
+            int count = 0;
+            for (int i = 0; i < editor.selectedDecorations.Count; i++)
+            {
+                if (editor.selectedDecorations[i] != null)
+                {
+                    count++;
+                }
+            }
+            return count.ToString();
         }
     }
 }

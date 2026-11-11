@@ -101,6 +101,15 @@ namespace ADOFAIEditorStudio
         private RectTransform popupBlocker;
         private EditorColorPicker colorPicker;
 
+        /// <summary>
+        /// 当前打开着的弹层是由哪个下拉按钮触发的。
+        ///
+        /// 收起时要把它的箭头转回朝下。**关闭路径不止一条**（点外面、
+        /// 选中一项、重复打开另一个下拉），全部都会走到 `ClosePopup`，
+        /// 所以收口放在那里，不用在每个调用点各写一遍。
+        /// </summary>
+        private UiArrowSpin openArrow;
+
         private sealed class Row
         {
             internal RectTransform Rect;
@@ -121,6 +130,15 @@ namespace ADOFAIEditorStudio
             internal TMP_InputField Field1;
             internal TMP_InputField Field2;
             internal TextMeshProUGUI EnumLabel;
+            /// <summary>
+            /// `EnumLabel` 是不是一个**真正由枚举/滤镜驱动的**标签。
+            ///
+            /// `RefreshValues` 末尾有一段无条件回填 `EnumLabel` 的逻辑，走的是
+            /// `ReadEnumName` / `DisplayEnumName`。Tile 那一行也借 `EnumLabel`
+            /// 存它的模式标签（「本格/起点/终点」），但 Tile 不是枚举 ——
+            /// 让它进那段逻辑会被写成错误的值。这个标记就是为了把两类分开。
+            /// </summary>
+            internal bool EnumLabelIsEnum;
             internal Image Swatch;
             /// <summary>上一帧画出来的评分数（`PropertyType.Rating`）。值变了才重建。</summary>
             internal int RatingValue = -1;
@@ -1181,6 +1199,15 @@ namespace ADOFAIEditorStudio
                                 EditorPropertyPanel.SafeGet(target, info, 0f)),
                             delegate(string text)
                             {
+                                // **空值。** Int 没有 NaN 这一说，空只能理解成
+                                // "这次什么都没改"：把框设回原值，不写事件数据。
+                                if (string.IsNullOrEmpty(text))
+                                {
+                                    row.Field1.SetTextWithoutNotify(
+                                        EditorPropertyPanel.FormatInt(
+                                            EditorPropertyPanel.SafeGet(target, info, 0f)));
+                                    return;
+                                }
                                 float parsed;
                                 if (float.TryParse(text, NumberStyles.Float,
                                     CultureInfo.InvariantCulture, out parsed))
@@ -1195,6 +1222,22 @@ namespace ADOFAIEditorStudio
                                 EditorPropertyPanel.SafeGet(target, info, 0f)),
                             delegate(string text)
                             {
+                                // **清空 = 允许留空。**
+                                //
+                                // 原版用 `NaN` 表达"这一项没设过"：空字符串
+                                // 存成 NaN，读回来显示成空字符串 —— 界面上
+                                // 一个字符都不显示，不是 0。`FormatFloat(NaN)`
+                                // 已经做了同样的转换（见它的说明），这里补上
+                                // 写入侧。
+                                //
+                                // 原来清空落进「解析失败」那一支，什么都不写，
+                                // 重画时读到回落值 `0f`，看起来就像被强制
+                                // 改成了 0 —— 用户报的就是这个。
+                                if (string.IsNullOrEmpty(text))
+                                {
+                                    CommitValue(target, key, float.NaN);
+                                    return;
+                                }
                                 float parsed;
                                 if (float.TryParse(text, NumberStyles.Float,
                                     CultureInfo.InvariantCulture, out parsed))
@@ -1411,15 +1454,14 @@ namespace ADOFAIEditorStudio
                 display, 12f, TextPrimary, TextAlignmentOptions.MidlineLeft);
             row.EnumLabel.overflowMode = TextOverflowModes.Ellipsis;
             row.EnumLabel.raycastTarget = false;
-            CreateText("Caret", rect, width - 16f, 0f, 12f, ControlHeight,
-                "▾", 11f, TextMuted, TextAlignmentOptions.Center).raycastTarget = false;
-
+            // 这是真正的枚举标签，交给 `RefreshValues` 末尾那段按枚举规则回填。
+            row.EnumLabelIsEnum = true;
+            UiArrowSpin enumArrow = CreateDropArrow(rect, width - 24f, 0f, 22f, ControlHeight);
             Button button = rect.gameObject.AddComponent<Button>();
             button.targetGraphic = hit;
-            button.transition = Selectable.Transition.None;
-            button.onClick.AddListener(delegate
+            button.transition = Selectable.Transition.None;            button.onClick.AddListener(delegate
             {
-                OpenEnumPopup(rect, info, key);
+                OpenEnumPopup(rect, info, key, enumArrow);
             });
 
             if (info.browsable)
@@ -1487,6 +1529,14 @@ namespace ADOFAIEditorStudio
                 FieldNumber(value.x),
                 delegate(string text)
                 {
+                    // 空 = 留空（存 NaN，`FieldNumber` 里会显示成空）。
+                    if (string.IsNullOrEmpty(text))
+                    {
+                        Vector2 current = EditorPropertyPanel.SafeGet(
+                            target, info, Vector2.zero);
+                        CommitValue(target, key, new Vector2(float.NaN, current.y));
+                        return;
+                    }
                     float parsed;
                     if (float.TryParse(text, NumberStyles.Float,
                         CultureInfo.InvariantCulture, out parsed))
@@ -1500,6 +1550,13 @@ namespace ADOFAIEditorStudio
                 FieldNumber(value.y),
                 delegate(string text)
                 {
+                    if (string.IsNullOrEmpty(text))
+                    {
+                        Vector2 current = EditorPropertyPanel.SafeGet(
+                            target, info, Vector2.zero);
+                        CommitValue(target, key, new Vector2(current.x, float.NaN));
+                        return;
+                    }
                     float parsed;
                     if (float.TryParse(text, NumberStyles.Float,
                         CultureInfo.InvariantCulture, out parsed))
@@ -1529,14 +1586,21 @@ namespace ADOFAIEditorStudio
                 FieldNumber(low),
                 delegate(string text)
                 {
+                    // 空 = 留空（存 NaN，显示仍是空）。见 `BuildValue` 的说明。
+                    Tuple<float, float> current =
+                        EditorPropertyPanel.SafeGet<Tuple<float, float>>(
+                            target, info, null)
+                        ?? new Tuple<float, float>(0f, 0f);
+                    if (string.IsNullOrEmpty(text))
+                    {
+                        CommitValue(target, key,
+                            new Tuple<float, float>(float.NaN, current.Item2));
+                        return;
+                    }
                     float parsed;
                     if (float.TryParse(text, NumberStyles.Float,
                         CultureInfo.InvariantCulture, out parsed))
                     {
-                        Tuple<float, float> current =
-                            EditorPropertyPanel.SafeGet<Tuple<float, float>>(
-                                target, info, null)
-                            ?? new Tuple<float, float>(0f, 0f);
                         CommitValue(target, key,
                             new Tuple<float, float>(parsed, current.Item2));
                     }
@@ -1545,14 +1609,20 @@ namespace ADOFAIEditorStudio
                 FieldNumber(high),
                 delegate(string text)
                 {
+                    Tuple<float, float> current =
+                        EditorPropertyPanel.SafeGet<Tuple<float, float>>(
+                            target, info, null)
+                        ?? new Tuple<float, float>(0f, 0f);
+                    if (string.IsNullOrEmpty(text))
+                    {
+                        CommitValue(target, key,
+                            new Tuple<float, float>(current.Item1, float.NaN));
+                        return;
+                    }
                     float parsed;
                     if (float.TryParse(text, NumberStyles.Float,
                         CultureInfo.InvariantCulture, out parsed))
                     {
-                        Tuple<float, float> current =
-                            EditorPropertyPanel.SafeGet<Tuple<float, float>>(
-                                target, info, null)
-                            ?? new Tuple<float, float>(0f, 0f);
                         CommitValue(target, key,
                             new Tuple<float, float>(current.Item1, parsed));
                     }
@@ -1584,18 +1654,25 @@ namespace ADOFAIEditorStudio
                 EditorPropertyPanel.FormatFloat(a.x),
                 delegate(string text)
                 {
+                    // 另三格现读：`a`/`b` 是建行时的快照，连续改两格时
+                    // 后面的会把前面刚写进去的值覆写回旧值。
+                    Tuple<Vector2, Vector2> current =
+                        EditorPropertyPanel.SafeGet<Tuple<Vector2, Vector2>>(
+                            target, info, null)
+                        ?? new Tuple<Vector2, Vector2>(Vector2.zero, Vector2.zero);
+                    a = current.Item1;
+                    b = current.Item2;
+                    // 空 = 留空（存 NaN，显示仍是空）。见 `BuildValue` 的说明。
+                    if (string.IsNullOrEmpty(text))
+                    {
+                        CommitValue(target, key, new Tuple<Vector2, Vector2>(
+                            new Vector2(float.NaN, a.y), b));
+                        return;
+                    }
                     float parsed;
                     if (float.TryParse(text, NumberStyles.Float,
                         CultureInfo.InvariantCulture, out parsed))
                     {
-                        // 另三格现读：`a`/`b` 是建行时的快照，连续改两格时
-                        // 后面的会把前面刚写进去的值覆写回旧值。
-                        Tuple<Vector2, Vector2> current =
-                            EditorPropertyPanel.SafeGet<Tuple<Vector2, Vector2>>(
-                                target, info, null)
-                            ?? new Tuple<Vector2, Vector2>(Vector2.zero, Vector2.zero);
-                        a = current.Item1;
-                        b = current.Item2;
                         CommitValue(target, key, new Tuple<Vector2, Vector2>(
                             new Vector2(parsed, a.y), b));
                     }
@@ -1606,16 +1683,22 @@ namespace ADOFAIEditorStudio
                 EditorPropertyPanel.FormatFloat(b.x),
                 delegate(string text)
                 {
+                    Tuple<Vector2, Vector2> current =
+                        EditorPropertyPanel.SafeGet<Tuple<Vector2, Vector2>>(
+                            target, info, null)
+                        ?? new Tuple<Vector2, Vector2>(Vector2.zero, Vector2.zero);
+                    a = current.Item1;
+                    b = current.Item2;
+                    if (string.IsNullOrEmpty(text))
+                    {
+                        CommitValue(target, key, new Tuple<Vector2, Vector2>(
+                            a, new Vector2(float.NaN, b.y)));
+                        return;
+                    }
                     float parsed;
                     if (float.TryParse(text, NumberStyles.Float,
                         CultureInfo.InvariantCulture, out parsed))
                     {
-                        Tuple<Vector2, Vector2> current =
-                            EditorPropertyPanel.SafeGet<Tuple<Vector2, Vector2>>(
-                                target, info, null)
-                            ?? new Tuple<Vector2, Vector2>(Vector2.zero, Vector2.zero);
-                        a = current.Item1;
-                        b = current.Item2;
                         CommitValue(target, key, new Tuple<Vector2, Vector2>(
                             a, new Vector2(parsed, b.y)));
                     }
@@ -1627,16 +1710,22 @@ namespace ADOFAIEditorStudio
             CreateField(host, 18f, fieldWidth, EditorPropertyPanel.FormatFloat(a.y),
                 delegate(string text)
                 {
+                    Tuple<Vector2, Vector2> current =
+                        EditorPropertyPanel.SafeGet<Tuple<Vector2, Vector2>>(
+                            target, info, null)
+                        ?? new Tuple<Vector2, Vector2>(Vector2.zero, Vector2.zero);
+                    a = current.Item1;
+                    b = current.Item2;
+                    if (string.IsNullOrEmpty(text))
+                    {
+                        CommitValue(target, key, new Tuple<Vector2, Vector2>(
+                            new Vector2(a.x, float.NaN), b));
+                        return;
+                    }
                     float parsed;
                     if (float.TryParse(text, NumberStyles.Float,
                         CultureInfo.InvariantCulture, out parsed))
                     {
-                        Tuple<Vector2, Vector2> current =
-                            EditorPropertyPanel.SafeGet<Tuple<Vector2, Vector2>>(
-                                target, info, null)
-                            ?? new Tuple<Vector2, Vector2>(Vector2.zero, Vector2.zero);
-                        a = current.Item1;
-                        b = current.Item2;
                         CommitValue(target, key, new Tuple<Vector2, Vector2>(
                             new Vector2(a.x, parsed), b));
                     }
@@ -1646,16 +1735,22 @@ namespace ADOFAIEditorStudio
             CreateField(host, secondX, fieldWidth, EditorPropertyPanel.FormatFloat(b.y),
                 delegate(string text)
                 {
+                    Tuple<Vector2, Vector2> current =
+                        EditorPropertyPanel.SafeGet<Tuple<Vector2, Vector2>>(
+                            target, info, null)
+                        ?? new Tuple<Vector2, Vector2>(Vector2.zero, Vector2.zero);
+                    a = current.Item1;
+                    b = current.Item2;
+                    if (string.IsNullOrEmpty(text))
+                    {
+                        CommitValue(target, key, new Tuple<Vector2, Vector2>(
+                            a, new Vector2(b.x, float.NaN)));
+                        return;
+                    }
                     float parsed;
                     if (float.TryParse(text, NumberStyles.Float,
                         CultureInfo.InvariantCulture, out parsed))
                     {
-                        Tuple<Vector2, Vector2> current =
-                            EditorPropertyPanel.SafeGet<Tuple<Vector2, Vector2>>(
-                                target, info, null)
-                            ?? new Tuple<Vector2, Vector2>(Vector2.zero, Vector2.zero);
-                        a = current.Item1;
-                        b = current.Item2;
                         CommitValue(target, key, new Tuple<Vector2, Vector2>(
                             a, new Vector2(b.x, parsed)));
                     }
@@ -1748,17 +1843,25 @@ namespace ADOFAIEditorStudio
             Image hit = modeRect.gameObject.AddComponent<Image>();
             hit.color = Color.clear;
             hit.raycastTarget = true;
-            CreateText("Label", modeRect, 6f, 0f, modeWidth - 18f, ControlHeight,
-                TileRelativeLabel(current.Item2), 12f, TextPrimary,
-                TextAlignmentOptions.MidlineLeft).raycastTarget = false;
-            CreateText("Caret", modeRect, modeWidth - 16f, 0f, 12f, ControlHeight,
-                "▾", 11f, TextMuted, TextAlignmentOptions.Center).raycastTarget = false;
+            // **标签要存进 row，`RefreshValues` 才刷得到它。**
+            //
+            // 原来这里是直接 `CreateText(...)` 丢掉返回值，于是「本格 / 起点 / 终点」
+            // 只在建行那一刻写死一次 —— 之后不管选哪个，标签都不动。值确实写进
+            // 谱面了（行为是对的），只有显示没跟上，看起来就是「选了不生效」。
+            TextMeshProUGUI modeLabel = CreateText("Label", modeRect, 6f, 0f,
+                modeWidth - 18f, ControlHeight, TileRelativeLabel(current.Item2),
+                12f, TextPrimary, TextAlignmentOptions.MidlineLeft);
+            modeLabel.raycastTarget = false;
+            // 复用 `EnumLabel`：它本来就是「下拉/切换类控件显示当前值的那个标签」，
+            // Tile 的模式框正是这一类。再加一个新字段只会多一处要记得同步的地方。
+            row.EnumLabel = modeLabel;
+            UiArrowSpin tileArrow = CreateDropArrow(modeRect, modeWidth - 24f, 0f, 22f, ControlHeight);
             Button modeButton = modeRect.gameObject.AddComponent<Button>();
             modeButton.targetGraphic = hit;
             modeButton.transition = Selectable.Transition.None;
             modeButton.onClick.AddListener(delegate
             {
-                OpenChoicePopup(modeRect, new[] { "本格", "起点", "终点" },
+                OpenChoicePopup(modeRect, new[] { "本格", "起点", "终点" }, tileArrow,
                     delegate(int choice)
                     {
                         TileRelativeTo mode = choice == 1
@@ -1993,6 +2096,13 @@ namespace ADOFAIEditorStudio
                         Tuple<int, TileRelativeTo> tile = ReadTile(info);
                         SetFieldText(row.Field1,
                             tile.Item1.ToString(CultureInfo.InvariantCulture));
+                        // **模式标签也要回填。** 少了这一句，从下拉里选了「起点 / 终点」
+                        // 之后标签一直停在建行时的那个值 —— 值写进谱面了，行为是对的，
+                        // 只有显示不动，看起来像「选了没反应」。
+                        if (row.EnumLabel != null)
+                        {
+                            row.EnumLabel.text = TileRelativeLabel(tile.Item2);
+                        }
                         break;
                     }
                     case PropertyType.Rating:
@@ -2011,7 +2121,7 @@ namespace ADOFAIEditorStudio
                     }
                 }
 
-                if (row.EnumLabel != null)
+                if (row.EnumLabel != null && row.EnumLabelIsEnum)
                 {
                     // **高级滤镜那一行单独走。**
                     //
@@ -2043,17 +2153,16 @@ namespace ADOFAIEditorStudio
         /// <summary>
         /// 成对数值框里显示的数字。
         ///
-        /// 谱面里没写过的分量读出来是 NaN（`[null, null]`），`FormatFloat` 的约定
-        /// 是把 NaN 写成空串。但在这个场景里空着会被读成“坏了/没加载出来”——
-        /// 用户明确要求默认写 0，所以这里对 NaN 显示 0。
-        /// **只是显示**：不编辑就不写回，数据仍然是 NaN。
+        /// 谱面里没写过的分量读出来是 NaN（`[null, null]`）。**NaN 显示成空串**，
+        /// 和单值框的 `FormatFloat` 一致 —— 那正是「这一项没设过」的诚实表达，
+        /// 也是原版 `PropertyControl_Vector2` 的做法（`ConvertNaNToEmpty`）。
+        ///
+        /// 这里原来对 NaN 显示 `"0"`，理由是"空着会被读成坏了/没加载出来"。
+        /// 但那样作者就永远分不清「值是 0」和「没设过」，而且清空框之后
+        /// 立刻又弹回 0，看起来像退格不起作用 —— 用户后来报的就是这个。
         /// </summary>
         private static string FieldNumber(float value)
         {
-            if (float.IsNaN(value) || float.IsInfinity(value))
-            {
-                return "0";
-            }
             return EditorPropertyPanel.FormatFloat(value);
         }
 
@@ -2091,8 +2200,29 @@ namespace ADOFAIEditorStudio
         private void OpenPopupShell(RectTransform anchor, float popupWidth, float popupHeight,
             Action<RectTransform> buildContent)
         {
+            OpenPopupShell(anchor, popupWidth, popupHeight, null, buildContent);
+        }
+
+        /// <summary>
+        /// <paramref name="triggerArrow"/> 是触发这次弹层的下拉按钮上的箭头。
+        ///
+        /// **必须在这里转，不能在调用方 OpenPopupShell 之前转** —— 这个方法
+        /// 开头就会 `ClosePopup()`（重复开弹层时先关旧的），那一句会把箭头
+        /// 转回 0°。先转再进来的话，动画刚起步就被反向覆盖，看着就是
+        /// 「箭头闪了一下不动」。
+        /// </summary>
+        private void OpenPopupShell(RectTransform anchor, float popupWidth, float popupHeight,
+            UiArrowSpin triggerArrow, Action<RectTransform> buildContent)
+        {
             EnsurePopupLayer();
             ClosePopup();
+
+            // `ClosePopup` 已经跑完了，现在把箭头转到「展开」位。
+            if (triggerArrow != null)
+            {
+                openArrow = triggerArrow;
+                triggerArrow.SpinTo(-90f, ArrowSpinSeconds);
+            }
 
             // 全屏挡板：点外面收起。
             RectTransform blocker = CreateRect("Blocker", popupLayer, 0f, 0f, 0f, 0f);
@@ -2141,10 +2271,16 @@ namespace ADOFAIEditorStudio
 
         private void OpenChoicePopup(RectTransform anchor, string[] options, Action<int> pick)
         {
+            OpenChoicePopup(anchor, options, null, pick);
+        }
+
+        private void OpenChoicePopup(RectTransform anchor, string[] options,
+            UiArrowSpin arrow, Action<int> pick)
+        {
             float width = 140f;
             float rowHeight = 24f;
             float height = options.Length * rowHeight + 8f;
-            OpenPopupShell(anchor, width, height, delegate(RectTransform host)
+            OpenPopupShell(anchor, width, height, arrow, delegate(RectTransform host)
             {
                 for (int i = 0; i < options.Length; i++)
                 {
@@ -2362,11 +2498,12 @@ namespace ADOFAIEditorStudio
             // 显示旧名字 —— 用户看到的就是「点了，没反应」。
             // 存的这一位让 RefreshValues 能刷到它（选中的高亮也靠它）。
             row.EnumLabel = label;
+            // 高级滤镜也是「枚举类」标签：`RefreshValues` 那段按 `FilterDisplayFor`
+            // 回填显示名，正是这里需要的。
+            row.EnumLabelIsEnum = true;
 
-            TextMeshProUGUI arrow = CreateText("Arrow", rect,
-                Mathf.Max(0f, valueWidth - 16f), 0f, 14f, ControlHeight, "▾", 11f,
-                TextMuted, TextAlignmentOptions.Center);
-            arrow.raycastTarget = false;
+            UiArrowSpin filterArrow = CreateDropArrow(rect,
+                Mathf.Max(0f, valueWidth - 24f), 0f, 22f, ControlHeight);
 
             Button button = rect.gameObject.AddComponent<Button>();
             button.targetGraphic = background;
@@ -2374,7 +2511,7 @@ namespace ADOFAIEditorStudio
             button.onClick.AddListener(delegate
             {
                 EnsureFilterOptions();
-                OpenStringListPopup(rect, info, key, filterDisplays, filterValues);
+                OpenStringListPopup(rect, info, key, filterDisplays, filterValues, filterArrow);
             });
 
             // 和值控件一样受"禁用"闸控制：属性被勾掉时点不开。
@@ -2386,9 +2523,11 @@ namespace ADOFAIEditorStudio
             }
         }
 
-        private void OpenEnumPopup(RectTransform anchor, ADOFAI.PropertyInfo info, string key)
+        private void OpenEnumPopup(RectTransform anchor, ADOFAI.PropertyInfo info, string key,
+            UiArrowSpin arrow)
         {
-            OpenOptionListPopup(anchor, info, key, Enum.GetNames(info.enumType), false);
+            OpenOptionListPopup(anchor, info, key, Enum.GetNames(info.enumType), false,
+                null, arrow);
         }
 
         /// <summary>
@@ -2396,23 +2535,36 @@ namespace ADOFAIEditorStudio
         /// 和枚举下拉共用一个实现，差别只在"当前值怎么读、选中怎么提交"。
         /// </summary>
         private void OpenStringListPopup(RectTransform anchor, ADOFAI.PropertyInfo info,
-            string key, string[] names, string[] values)
+            string key, string[] names, string[] values, UiArrowSpin arrow)
         {
-            OpenOptionListPopup(anchor, info, key, names, true, values);
-        }
-
-        private void OpenOptionListPopup(RectTransform anchor, ADOFAI.PropertyInfo info,
-            string key, string[] names, bool stringValue)
-        {
-            OpenOptionListPopup(anchor, info, key, names, stringValue, null);
+            OpenOptionListPopup(anchor, info, key, names, true, values, arrow);
         }
 
         private void OpenOptionListPopup(RectTransform anchor, ADOFAI.PropertyInfo info,
             string key, string[] names, bool stringValue, string[] values)
         {
+            OpenOptionListPopup(anchor, info, key, names, stringValue, values, null);
+        }
+
+        private void OpenOptionListPopup(RectTransform anchor, ADOFAI.PropertyInfo info,
+            string key, string[] names, bool stringValue, string[] values, UiArrowSpin arrow)
+        {
             // 缓速枚举每个选项前面有一段缩略曲线，宽度要把它算进去。
             bool easeEnum = !stringValue && EditorPropertyPanel.IsEaseEnum(info);
             float graphWidth = easeEnum ? EditorPropertyPanel.OptionGraphWidth : 0f;
+
+            // **只有缓速和高级滤镜带搜索与收藏。**
+            //
+            // 别的枚举（TrackStyle 那种两三项的）加上这两样只会更难点：
+            // 搜索框占掉一行高度，收藏只有一个「收藏了唯一一项」的用处。
+            // 判据和下面「收藏存哪份」用的是同一个，别写两遍。
+            bool richList = easeEnum || IsAdvancedFilterProperty(info, key);
+            // 收藏种类的判据：缓速走 FavoriteEases，其余 richList（也就是滤镜）走 FavoriteFilters。
+            bool favoriteKind = !easeEnum;
+
+            float starColumn = richList ? StarColumnWidth : 0f;
+            float searchArea = richList ? SearchAreaHeight : 0f;
+
             // 宽度按**最长选项**量：缓速那类名字（"OutExpo" 等）比枚举名长得多，
             // 按枚举名算宽度会把选项截成半截。
             float longest = 0f;
@@ -2421,15 +2573,20 @@ namespace ADOFAIEditorStudio
                 longest = Mathf.Max(longest, EditorPropertyPanel.DisplayEnumName(
                     target, info, names[i]).Length * 12f);
             }
-            float width = Mathf.Max(160f, graphWidth + longest + 32f);
-            float rowHeight = 26f;
-            float height = Mathf.Min(320f, names.Length * rowHeight + 8f);
-            OpenPopupShell(anchor, width, height, delegate(RectTransform host)
+            float width = Mathf.Max(160f + starColumn, graphWidth + longest + 32f + starColumn);
+            // **卡片之间留 2px 缝。** 紧贴的圆角块读起来像一整块被切开的格子，
+            // 留一道细缝才看得出是一张张独立的卡片。缝隙随卡片一起算进
+            // 行高（见 `OptionCardGap`），列表总高也按它算。
+            float rowHeight = OptionCardHeight + OptionCardGap;
+            float height = Mathf.Min(richList ? 400f : 320f,
+                names.Length * rowHeight + searchArea + 8f);
+            OpenPopupShell(anchor, width, height, arrow, delegate(RectTransform host)
             {
-                // 枚举动辄三四十项（缓速），必须能滚 —— 只画放得下的那几项
-                // 等于把后面的选项藏死。
-                RectTransform viewportHost = CreateRect("View", host, 4f, 4f,
-                    width - 8f, height - 8f);
+                float listTop = 4f + searchArea;
+                float listHeight = height - listTop - 4f;
+
+                RectTransform viewportHost = CreateRect("View", host, 4f, listTop,
+                    width - 8f, listHeight);
                 Image viewBackground = viewportHost.gameObject.AddComponent<Image>();
                 viewBackground.color = Color.clear;
                 viewBackground.raycastTarget = true;
@@ -2456,54 +2613,267 @@ namespace ADOFAIEditorStudio
                 string current = stringValue
                     ? EditorPropertyPanel.SafeGet<string>(target, info, null)
                     : EditorPropertyPanel.ReadEnumName(target, info);
-                for (int i = 0; i < names.Length; i++)
+
+                // **列表要能整段重建**（搜索时边打字边过滤、点星标后要换图标
+                // 并调顺序）。做成局部函数，第一次调用时建出全部行，之后每次
+                // 清空重来 —— 行数是几十到几百，重建一次的开销远小于维护
+                // 「哪一行该显示、该在第几位」这套增量逻辑的出错成本。
+                Action<string> rebuild = null;
+                rebuild = delegate(string filter)
                 {
-                    string name = names[i];
-                    // 显示名与写入值分开：滤镜下拉显示中文，但谱面里要写类名。
-                    string rawValue = values != null && i < values.Length ? values[i] : name;
-                    // **比的是写入值，不是显示名。**
-                    //
-                    // 滤镜那一路 `name` 是中文显示名、`current` 是谱面里的类名，
-                    // 直接比永远不等 —— 于是下拉里一项都不会高亮，用户分不清
-                    // 当前选的是哪个。
-                    bool selected = string.Equals(rawValue, current, StringComparison.Ordinal);
-                    Button button = CreateButton(listContent, 0f, i * rowHeight,
-                        width - 8f, rowHeight,
-                        EditorPropertyPanel.DisplayEnumName(target, info, name),
-                        delegate
-                        {
-                            ClosePopup();
-                            if (stringValue)
-                            {
-                                // 显示名可能是中文，写回谱面的必须是原始值。
-                                CommitValue(target, key, rawValue);
-                                return;
-                            }
-                            object parsed = EditorPropertyPanel.ParseEnumValue(info, name);
-                            if (parsed != null)
-                            {
-                                CommitValue(target, key, parsed);
-                            }
-                        });
-                    TextMeshProUGUI label = button.GetComponentInChildren<TextMeshProUGUI>();
-                    if (label != null)
+                    for (int i = listContent.childCount - 1; i >= 0; i--)
                     {
-                        label.color = selected ? Accent : TextPrimary;
-                        label.alignment = TextAlignmentOptions.MidlineLeft;
-                        float labelX = easeEnum
-                            ? EditorPropertyPanel.OptionGraphX + graphWidth + 8f : 8f;
-                        SetTopLeft(label.rectTransform, labelX, 0f,
-                            Mathf.Max(20f, width - labelX - 12f), rowHeight);
+                        Destroy(listContent.GetChild(i).gameObject);
                     }
 
-                    if (easeEnum)
+                    string trimmed = filter == null ? string.Empty : filter.Trim();
+                    bool searching = trimmed.Length > 0;
+
+                    // 过滤结果：先攒成条目，再决定顺序。
+                    // 结构是 (显示名, 写入值, 是否收藏)。
+                    List<OptionEntry> visible = new List<OptionEntry>();
+                    for (int i = 0; i < names.Length; i++)
                     {
-                        DG.Tweening.Ease ease;
-                        if (EditorPropertyPanel.TryParseEase(name, out ease))
+                        string name = names[i];
+                        string display = EditorPropertyPanel.DisplayEnumName(target, info, name);
+                        string rawValue = values != null && i < values.Length ? values[i] : name;
+                        if (searching
+                            && display.IndexOf(trimmed, StringComparison.OrdinalIgnoreCase) < 0
+                            && rawValue.IndexOf(trimmed, StringComparison.OrdinalIgnoreCase) < 0)
                         {
-                            AddEaseGraph(button.GetComponent<RectTransform>(), ease);
+                            continue;
+                        }
+                        visible.Add(new OptionEntry
+                        {
+                            Display = display,
+                            Value = rawValue,
+                            EnumName = name,
+                            Favorite = richList && EditorFavoriteStore.Contains(favoriteKind, rawValue)
+                        });
+                    }
+
+                    // **搜索时不留收藏分组。** 搜「out」的时候把收藏项继续压在最上面，
+                    // 会让人以为搜索没生效。不搜索时才把收藏提到前面。
+                    if (!searching)
+                    {
+                        visible.Sort(delegate(OptionEntry a, OptionEntry b)
+                        {
+                            if (a.Favorite == b.Favorite)
+                            {
+                                return 0;
+                            }
+                            return a.Favorite ? -1 : 1;
+                        });
+                    }
+
+                    float contentHeight = visible.Count * rowHeight;
+                    listContent.sizeDelta = new Vector2(0f, contentHeight);
+
+                    for (int i = 0; i < visible.Count; i++)
+                    {
+                        OptionEntry entry = visible[i];
+                        // 显示名与写入值分开：滤镜下拉显示中文，但谱面里要写类名。
+                        //
+                        // **比的是写入值，不是显示名。**
+                        //
+                        // 滤镜那一路 `name` 是中文显示名、`current` 是谱面里的类名，
+                        // 直接比永远不等 —— 于是下拉里一项都不会高亮，用户分不清
+                        // 当前选的是哪个。
+                        bool selected = string.Equals(entry.Value, current, StringComparison.Ordinal);
+                        float cardWidth = width - 8f;
+                        float buttonWidth = cardWidth - starColumn;
+                        float cardY = i * rowHeight;
+
+                        // **卡片先建、横跨整行。**
+                        //
+                        // 卡片和按钮是两个独立的兄弟节点，不是父子 —— 卡片要包住
+                        // 右边的星标，而按钮的可点区域只到星标左边（星标自己是个
+                        // 按钮，压在一起会抢事件）。做成父子的话，卡片只能是按钮
+                        // 的宽度，永远包不住星标；把星标塞进按钮里又会变成
+                        // 「点星也顺带选中这一项」。
+                        PaintOptionCard(listContent, 0f, cardY, cardWidth, selected);
+
+                        Button button = CreateButton(listContent, 0f, cardY,
+                            buttonWidth, OptionCardHeight, entry.Display, delegate
+                            {
+                                ClosePopup();
+                                if (stringValue)
+                                {
+                                    // 显示名可能是中文，写回谱面的必须是原始值。
+                                    CommitValue(target, key, entry.Value);
+                                    return;
+                                }
+                                object parsed = EditorPropertyPanel.ParseEnumValue(info, entry.EnumName);
+                                if (parsed != null)
+                                {
+                                    CommitValue(target, key, parsed);
+                                }
+                            });
+                        TextMeshProUGUI label = button.GetComponentInChildren<TextMeshProUGUI>();
+                        if (label != null)
+                        {
+                            label.color = selected ? Accent : TextPrimary;
+                            label.alignment = TextAlignmentOptions.MidlineLeft;
+                            float labelX = easeEnum
+                                ? EditorPropertyPanel.OptionGraphX + graphWidth + 8f : 8f;
+                            SetTopLeft(label.rectTransform, labelX, 0f,
+                                Mathf.Max(20f, buttonWidth - labelX - 12f), OptionCardHeight);
+                        }
+
+                        if (easeEnum)
+                        {
+                            DG.Tweening.Ease ease;
+                            if (EditorPropertyPanel.TryParseEase(entry.EnumName, out ease))
+                            {
+                                AddEaseGraph(button.GetComponent<RectTransform>(), ease);
+                            }
+                        }
+
+                        if (richList)
+                        {
+                            BuildStarButton(listContent, width - 4f - StarColumnWidth,
+                                cardY, entry.Value, favoriteKind, rebuild);
                         }
                     }
+                };
+
+                if (richList)
+                {
+                    // **「搜索」两个字固定在左边，输入区只有一条下划线。**
+                    //
+                    // 原来是整行一个带底线的输入框，读起来像参数栏里的数字框；
+                    // 这里要的是「一个能检索的框」，把标签和输入区分开之后，
+                    // 一眼就知道这行是干什么的，也不用靠占位符（那个一打字就没了）。
+                    CreateText("SearchLabel", host, 6f, 4f, SearchLabelWidth,
+                        SearchFieldHeight, "搜索", 12f, TextMuted,
+                        TextAlignmentOptions.MidlineLeft).raycastTarget = false;
+
+                    // **不用 `onEndEdit`。** 那是回车或失焦才触发的，
+                    // 而搜索要边打字边过滤。`onValueChanged` 每敲一个字符都来一次。
+                    float fieldX = 6f + SearchLabelWidth;
+                    TMP_InputField search = CreateField(host, fieldX,
+                        width - fieldX - 8f, string.Empty, null);
+                    RectTransform fieldRect = search.GetComponent<RectTransform>();
+                    SetTopLeft(fieldRect, fieldX, 4f, width - fieldX - 8f, SearchFieldHeight);
+                    // `CreateField` 自带的底线是贴在**它自己那个 rect 的底部**的，
+                    // 而那个 rect 已经被我们挪过位置 —— 挪完之后底线还跟着走，
+                    // 正好落在「搜索」两个字的基线上，所以不用另外画一条。
+                    search.onValueChanged.AddListener(delegate(string text) { rebuild(text); });
+                }
+
+                rebuild(string.Empty);
+            });
+        }
+
+        /// <summary>搜索区总高：输入行 + 上下留白。</summary>
+        private const float SearchAreaHeight = 34f;
+        /// <summary>搜索输入行的行高（「搜索」两个字和下划线都在这一行里）。</summary>
+        private const float SearchFieldHeight = 24f;
+        /// <summary>「搜索」两个字占的宽度，输入区从它右边起。</summary>
+        private const float SearchLabelWidth = 40f;
+        /// <summary>收藏星标那一列的宽度（含左右留白）。</summary>
+        private const float StarColumnWidth = 26f;
+        /// <summary>卡片高度（不含间隙）。</summary>
+        private const float OptionCardHeight = 26f;
+        /// <summary>卡片之间的缝。取 2 是有意的：再大列表会散，再小圆角挤在一起看不清。</summary>
+        private const float OptionCardGap = 2f;
+        /// <summary>卡片圆角半径。</summary>
+        private const float OptionCardRadius = 5f;
+        /// <summary>
+        /// 箭头旋转的时长。
+        ///
+        /// 0.22 秒 —— 比 UI 过渡的常规 0.3 略快一点：箭头是个小零件的状态提示，
+        /// 拖得太久会显得迟钝。再快（< 0.15）就看不出弹的劲了。
+        /// </summary>
+        private const float ArrowSpinSeconds = 0.22f;
+
+        /// <summary>
+        /// 给一行选项画卡片底：圆角矩形 + 极淡填充，选中项再加描边。
+        ///
+        /// **卡片是列表内容的独立子节点，不是行按钮的子节点。** 它要横跨整行、
+        /// 把右边的收藏星标一起包住；而行按钮的可点区只到星标左边（星标自己
+        /// 是个按钮）。做成父子的话卡片只能是按钮的宽度，永远包不住星标。
+        ///
+        /// 描边用 `Outline` 而不是再叠一张 `frame` 圆角图：`GetRoundedSprite`
+        /// 的描边版本是按固定像素宽画在纹理里的，缩放到 26 高时会糊；
+        /// `Outline` 是 uGUI 自带的描边效果，跟缩放无关。
+        /// </summary>
+        private static void PaintOptionCard(RectTransform parent, float x, float y,
+            float width, bool selected)
+        {
+            Image card = CreateImage("Card", parent, x, y, width, OptionCardHeight,
+                selected ? UiTheme.Current.SurfaceBand : OptionCardFill);
+            card.sprite = EditorStudioOverlay.GetRoundedSprite(
+                20, OptionCardRadius, false, 0f);
+            card.type = Image.Type.Sliced;
+            card.raycastTarget = false;
+            // **不用 `SetAsFirstSibling`。** 每行都把自己的卡片挤到最前面的话，
+            // 后建的卡片会压住先建的那些行 —— 列表看上去就是一叠错位的纸。
+            // 同一行的相对顺序由建节点的先后决定：卡片先建、按钮其次、星标最后，
+            // 而 `SetAsFirstSibling` 在这里没有「本行内」的概念。
+
+            if (!selected)
+            {
+                // 未选中的卡片不描边：几十张都描边的话，列表会变成一片格子。
+                return;
+            }
+
+            Outline outline = card.gameObject.AddComponent<Outline>();
+            outline.effectColor = new Color(1f, 1f, 1f, 0.22f);
+            outline.effectDistance = new Vector2(1f, 1f);
+        }
+
+        /// <summary>下拉里一张普通卡片的填充。比弹层底色亮一档，才看得出是卡片。</summary>
+        private static Color OptionCardFill
+        {
+            get { return new Color(1f, 1f, 1f, 0.05f); }
+        }
+
+        private struct OptionEntry
+        {
+            internal string Display;
+            internal string Value;
+            internal string EnumName;
+            internal bool Favorite;
+        }
+
+        /// <summary>
+        /// 一行右侧的收藏星标。点它**只切收藏**，不关弹窗、不改谱面。
+        ///
+        /// 它是叠在行按钮上的独立 `Button`：uGUI 的 `onClick` 不会从子控件
+        /// 冒泡到父控件，所以点星不会顺带触发那一行的「选中并提交」。
+        /// </summary>
+        private void BuildStarButton(RectTransform parent, float x, float y,
+            string value, bool favoriteKind, Action<string> rebuild)
+        {
+            RectTransform rect = CreateRect("Star", parent, x, y,
+                StarColumnWidth, OptionCardHeight);
+            Image hit = rect.gameObject.AddComponent<Image>();
+            hit.color = Color.clear;
+            hit.raycastTarget = true;
+
+            bool filled = EditorFavoriteStore.Contains(favoriteKind, value);
+            Image icon = CreateImage("Icon", rect, 0f, 0f, 0f, 0f,
+                filled ? Accent : TextMuted);
+            icon.sprite = UiStarIcon.Get(filled);
+            icon.type = Image.Type.Simple;
+            icon.preserveAspect = true;
+            icon.raycastTarget = false;
+            const float iconSize = 16f;
+            SetTopLeft(icon.rectTransform, (StarColumnWidth - iconSize) * 0.5f,
+                (OptionCardHeight - iconSize) * 0.5f, iconSize, iconSize);
+
+            Button button = rect.gameObject.AddComponent<Button>();
+            button.targetGraphic = hit;
+            button.transition = Selectable.Transition.None;
+            string captured = value;
+            button.onClick.AddListener(delegate
+            {
+                EditorFavoriteStore.Toggle(favoriteKind, captured);
+                // 重建整个列表而不是只换这一行的图标：收藏项要挪位置。
+                if (rebuild != null)
+                {
+                    rebuild(null);
                 }
             });
         }
@@ -2590,8 +2960,62 @@ namespace ADOFAIEditorStudio
                 EditorPropertyPanel.OptionGraphWidth, height);
         }
 
+        /// <summary>
+        /// 下拉按钮上那枚三角箭头。
+        ///
+        /// 以前是三处各自 `CreateText(..., "▾", ...)`。工作台用的字体里没有
+        /// 这个字形，打出来是个豆腐块；而且它没法做旋转 —— 字符只能整串换掉，
+        /// 中间没有过渡。现在统一走这张程序化纹理，配合 `UiArrowSpin` 转。
+        ///
+        /// **pivot 必须是 (0.5, 0.5)。** 这里的节点是用 `SetTopLeft` 摆的，
+        /// 那个函数会把 pivot 设成左上角；绕左上角转，视觉上是绕着角甩出去，
+        /// 不是绕中心转。所以摆完位置之后要把 pivot 改回中心，再把
+        /// `anchoredPosition` 补回去（pivot 变了，同一个左上角对应的
+        /// anchoredPosition 就不一样了）。
+        /// </summary>
+        private static UiArrowSpin CreateDropArrow(Transform parent, float x, float y,
+            float width, float height)
+        {
+            // **22px，不是字符时代的 11。**
+            //
+            // `▾` 那个字符在 11 号字里是满高的；换成图之后，纹理里只有中间
+            // 一段是三角（上下要留白给旋转），所以同样写 11 实际可见的
+            // 只有 ~6.8px —— 比原来还小。
+            //
+            // 22px × 纹理里 55% 的三角高度 ≈ 12px 可见高度。行高是 26，
+            // 上下各留 2px，再大就要顶出去了。
+            const float size = 22f;
+            float left = x + (width - size) * 0.5f;
+            float top = y + (height - size) * 0.5f;
+
+            Image arrow = CreateImage("Arrow", parent, left, top, size, size, TextMuted);
+            arrow.sprite = UiTriangleIcon.Get();
+            arrow.type = Image.Type.Simple;
+            arrow.preserveAspect = true;
+            arrow.raycastTarget = false;
+
+            // 把 pivot 从左上角挪到中心，并补偿位置 ——
+            // pivot=(0,1) 时 anchoredPosition 指的是左上角；
+            // 换成 (0.5,0.5) 之后同一个 anchoredPosition 指的是中心，
+            // 所以要把中心点算出来再填进去。
+            RectTransform rect = arrow.rectTransform;
+            rect.pivot = new Vector2(0.5f, 0.5f);
+            rect.anchoredPosition = new Vector2(left + size * 0.5f, -(top + size * 0.5f));
+            // **直接把旋转组件带回去，不靠节点名回查。**
+            // `rect.Find("Arrow")` 那种写法看着能用，但它把节点名变成了
+            // 隐式契约 —— 谁改个名，动画就静默没了，而且没有任何报错。
+            return UiArrowSpin.Attach(rect);
+        }
+
         private void ClosePopup()
         {
+            // **箭头先转回去。** 关闭路径有三条（点外面 / 选中一项 / 再开一个），
+            // 全都会走到这里，所以收口放在这一处。
+            if (openArrow != null)
+            {
+                openArrow.SpinTo(0f, ArrowSpinSeconds);
+                openArrow = null;
+            }
             if (popupHost != null)
             {
                 Destroy(popupHost.gameObject);
