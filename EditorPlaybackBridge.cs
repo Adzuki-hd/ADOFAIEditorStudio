@@ -1715,6 +1715,23 @@ namespace ADOFAIEditorStudio
                 previewClockTime = targetTime;
                 previewClockLastUnscaledTime = Time.unscaledTime;
 
+                // 【探针】拖动时间确定性。
+                //
+                // 查的是「同一个位置拖几次，求值用的时间是不是同一个数」。
+                // 拖动的目标时间由时间轴按「像素 ÷ 每秒像素」算出来
+                // （EditorTimelineView.QueueScrubAtX），理论上只由位置决定；
+                // 但这条路径上还有别的地方会改 previewClockTime，
+                // 所以必须实测，不能靠读代码推定。
+                //
+                // 打开方式：设置 → 开发者 → 指针探针（和其他探针共用开关）。
+                if (Main.Settings != null && Main.Settings.PointerProbe)
+                {
+                    Main.Logger.Log("[ClockProbe] scrub requested="
+                        + requestedTime.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture)
+                        + " target=" + targetTime.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture)
+                        + " clock=" + previewClockTime.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture));
+                }
+
                 // 这些记录之后一次恢复必须把原生运行时放到哪里，上面
                 // 两条分支出于同样理由设置它们。这里漏掉它们
                 // 意味着拖动只移动了求值器的时钟：画面跟着走，
@@ -6332,6 +6349,22 @@ namespace ADOFAIEditorStudio
                 * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
         }
 
+        /// <summary>
+        /// 按游戏在指定 transport 状态下的方式烘焙格，
+        /// 并重新锚定装饰物以匹配。
+        ///
+        /// 谱面的仅限编辑器 PositionTrack 偏移只在
+        /// scrController.paused 置位时累积：
+        ///
+        ///     if ((!editorOnly || !paused) &amp;&amp; editorOnly) break;
+        ///
+        /// 原版在两端用同样方式解决：scnEditor.Play 走
+        /// scnGame.Play，后者清掉 paused，并在编辑器里运行
+        /// FinishCustomLevelLoading，因此它的 ApplyEventsToFloors 在播放期间
+        /// 丢掉这些偏移；停止时又装回编辑器的烘焙。
+        /// 预览通过在 transport 上重新烘焙来重现这一点，而不是试图
+        /// 同时持有两个答案。
+        ///
         /// <summary>
         /// 按游戏在指定 transport 状态下的方式烘焙格，
         /// 并重新锚定装饰物以匹配。

@@ -55,6 +55,9 @@ namespace ADOFAIEditorStudio.Tests
                 TestMalformedModulesAreDropped(root);
                 TestEmptyProject(root);
                 TestSaveCreatesDirectory(root);
+                ChannelTimelineTests.Run();
+                FloorTrackStateTests.Run();
+                AnimateTrackTranslatorTests.Run();
             }
             finally
             {
@@ -75,7 +78,7 @@ namespace ADOFAIEditorStudio.Tests
 
         // ------------------------------------------------------------ 断言
 
-        private static void Check(bool condition, string what)
+        internal static void Check(bool condition, string what)
         {
             checks++;
             if (condition)
@@ -86,7 +89,7 @@ namespace ADOFAIEditorStudio.Tests
             Console.WriteLine("[FAIL] " + what);
         }
 
-        private static void CheckEqual<T>(T expected, T actual, string what)
+        internal static void CheckEqual<T>(T expected, T actual, string what)
         {
             checks++;
             if (EqualityComparer<T>.Default.Equals(expected, actual))
@@ -98,7 +101,7 @@ namespace ADOFAIEditorStudio.Tests
                 + "  期望=" + expected + "  实际=" + actual);
         }
 
-        private static void CheckNear(float expected, float actual, float tolerance,
+        internal static void CheckNear(float expected, float actual, float tolerance,
             string what)
         {
             checks++;

@@ -109,6 +109,13 @@ namespace ADOFAIEditorStudio
                 {
                     PlanetAngleRecorder.Ensure();
                     CameraPathRecorder.Ensure();
+                    // 轨道逐帧记录器：把每一格的实际位置/旋转/缩放/透明度写 CSV，
+                    // 原版和 AES 各跑一遍同一段就能逐帧对比。查「散开之后回不来」
+                    // 这类动画问题时用它取证。热键 Ctrl+Shift+T。
+                    TrackFrameRecorder.Ensure();
+                    TrackFrameRecorder.WatchRange(
+                        Settings.TrackRecordFirstFloor,
+                        Settings.TrackRecordLastFloor);
                     // 球轨迹记录器：逐帧写下每颗球**各自**的位置，用来查长按里
                     // 那颗球的轨迹和双球角度差。它 patch 的是 scrPlanet.LateUpdate，
                     // 输出 CSV 会长到几百 MB，所以和上面两个一样只在诊断开关
@@ -223,6 +230,22 @@ namespace ADOFAIEditorStudio
         //
         // **默认关**：它挂在每帧的按下上，正常使用每次点击都会打一行。
         public bool PointerProbe = false;
+        // 轨道求值走哪套实现。
+        //
+        // true（默认）：新实现——MoveTrack 事件和出现/消失动画进同一张
+        //   时间表，每格六个通道独立求值，没有跨帧状态。
+        // false：旧的 MoveTrack + AnimateTrack 两域实现，靠让位规则协调。
+        //
+        // 留着这个开关是为了出问题时能一键切回去对照。新实现跑通几个版本
+        // 之后可以删掉。
+        public bool UseNativeTrackDomain = true;
+        // 轨道逐帧记录的观察窗口（设置 → 开发者）。
+        //
+        // 记录器把每格的位置/旋转/缩放/透明度写进 track-frames.csv，
+        // 原版和 AES 各跑一遍同一段就能逐帧比对。大谱面全记会把文件撑到
+        // 几个 GB，所以给一个格号区间；两个都填 -1 表示全记录。
+        public int TrackRecordFirstFloor = -1;
+        public int TrackRecordLastFloor = -1;
         // 时间轴定位以原生引擎优先。旧的静态求值器
         // 只作为兼容回退保留，不是默认路径。
         public bool UseStaticTimelineEvaluation = false;

@@ -43,18 +43,34 @@ namespace ADOFAIEditorStudio.Preview.Domains
             get { return "FreeRoam"; }
         }
 
+        /// <summary>
+        /// 本帧的输出，别的域从这里读。
+        ///
+        /// **以前是 static 的**，靠「FreeRoam 先跑、Camera 后跑」这个注册顺序
+        /// 传递。那是一条隐形的时序依赖：换顺序、或者同帧算两趟，值就对不上。
+        /// 改成实例字段之后，读取方拿到的永远是「这个域最近一次求值的结果」，
+        /// 顺序错了也只是读到旧值，不会读到别人的值。
+        ///
+        /// 用一个整体而不是四个散字段：它们要么一起有效、要么一起无效，
+        /// 分开暴露的话调用方还得自己判断「这三个是不是同一帧的」。
+        /// </summary>
+        internal struct ExitCameraOutput
+        {
+            internal bool Active;
+            internal Vector2 From;
+            internal Vector2 To;
+            /// <summary>已经过 Ease 的 0..1 值。</summary>
+            internal float Progress;
+        }
+
         /// <summary>球所在那格此刻的位置，行星域在 freeroam 段用它当圆心。</summary>
-        internal static Vector3 BallTilePosition;
+        internal Vector3 BallTilePosition;
 
         /// <summary>上面那个值这一帧有没有准备好。</summary>
-        internal static bool BallTileValid;
+        internal bool BallTileValid;
 
-        /// <summary>出场运镜。相机域读它，active 为假时走平常的跟随。
-        /// Progress 是已经过 Ease 的 0..1 值。</summary>
-        internal static bool ExitCameraActive;
-        internal static Vector2 ExitCameraFrom;
-        internal static Vector2 ExitCameraTo;
-        internal static float ExitCameraProgress;
+        /// <summary>出场运镜。相机域读它，Active 为假时走平常的跟随。</summary>
+        internal ExitCameraOutput ExitCamera;
 
         /// <summary>每段的"球那格"出场前的位置。必须在任何人动它之前抓好，
         /// 否则下一帧读到的就是自己上一帧写进去的中间值。</summary>
@@ -63,7 +79,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
         public void Analyze(PreviewTimelineContext context)
         {
             BallTileValid = false;
-            ExitCameraActive = false;
+            ExitCamera = default(ExitCameraOutput);
 
             scrLevelMaker maker = scrLevelMaker.instance;
             if (maker == null || maker.listFreeroamStartTiles == null
@@ -92,7 +108,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
         public void Evaluate(PreviewEvaluationFrame frame)
         {
             BallTileValid = false;
-            ExitCameraActive = false;
+            ExitCamera = default(ExitCameraOutput);
 
             scrLevelMaker maker = scrLevelMaker.instance;
             scrConductor conductor = scrConductor.instance;
@@ -157,10 +173,10 @@ namespace ADOFAIEditorStudio.Preview.Domains
             }
 
             BallTileValid = false;
-            ExitCameraActive = false;
+            ExitCamera = default(ExitCameraOutput);
         }
 
-        private static void DriveSection(
+        private void DriveSection(
             scrFloor entry, FreeroamArea tiles, Vector3 origin, float time,
             scrConductor conductor, float pitch, float tileSize)
         {
@@ -203,7 +219,13 @@ namespace ADOFAIEditorStudio.Preview.Domains
             }
 
             float edge = tileSize * entry.nextfloor.radiusScale;
-            Vector3 endValue = entry.nextfloor.transform.position
+            // **读本帧算好的位置，不读 transform。**
+            //
+            // 轨道的写入排在 LateUpdate（原生组件跑在求值器之后会覆盖），
+            // 而 freeroam 在求值阶段跑。直接读 transform 拿到的是上一帧，
+            // 轨道在动的时候差的就是「运镜偏一格」。
+            Vector3 nextFloorPosition = PreviewEvaluationEngine.FloorPositionThisFrame(entry.nextfloor);
+            Vector3 endValue = nextFloorPosition
                 - new Vector3(
                     (float)Math.Sin(entry.exitangle) * edge,
                     (float)Math.Cos(entry.exitangle) * edge,
@@ -248,12 +270,12 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // 原生 MoveCameraToTile 是 Tile 模式：相机贴着那格平移，终点是下一格。
             if (entry.moveCamAtFreeroamEnd)
             {
-                ExitCameraActive = true;
-                ExitCameraFrom = new Vector2(origin.x, origin.y);
-                ExitCameraTo = new Vector2(
-                    entry.nextfloor.transform.position.x,
-                    entry.nextfloor.transform.position.y);
-                ExitCameraProgress = moveEased;
+                ExitCamera.Active = true;
+                ExitCamera.From = new Vector2(origin.x, origin.y);
+                ExitCamera.To = new Vector2(
+                    nextFloorPosition.x,
+                    nextFloorPosition.y);
+                ExitCamera.Progress = moveEased;
             }
         }
     }

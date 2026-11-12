@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using ADOFAI;
 using DG.Tweening;
@@ -583,12 +583,13 @@ namespace ADOFAIEditorStudio.Preview.Domains
             //
             // 起点/终点/进度由 FreeRoamPreviewDomain 算好（它先跑），用的是原生
             // 那条 `duration = crotchet/speed * outTime * 0.5 / pitch` 加 outEase。
-            if (FreeRoamPreviewDomain.ExitCameraActive)
+            FreeRoamPreviewDomain roam = PreviewEvaluationEngine.FreeRoam;
+            if (roam != null && roam.ExitCamera.Active)
             {
                 follow = Vector2.LerpUnclamped(
-                    FreeRoamPreviewDomain.ExitCameraFrom,
-                    FreeRoamPreviewDomain.ExitCameraTo,
-                    FreeRoamPreviewDomain.ExitCameraProgress);
+                    roam.ExitCamera.From,
+                    roam.ExitCamera.To,
+                    roam.ExitCamera.Progress);
             }
 
             Vector2 resolved = follow;
@@ -616,9 +617,9 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
             // freeroam 出场期间 zoom 从基准平滑到 1（原生的 ffxCameraPlus 带
             // zoom 目标，用的同一条 duration 和 outEase）。
-            if (FreeRoamPreviewDomain.ExitCameraActive)
+            if (roam != null && roam.ExitCamera.Active)
             {
-                zoom = Mathf.LerpUnclamped(baseZoom, 1f, FreeRoamPreviewDomain.ExitCameraProgress);
+                zoom = Mathf.LerpUnclamped(baseZoom, 1f, roam.ExitCamera.Progress);
             }
 
             if (float.IsNaN(resolved.x) || float.IsNaN(resolved.y)
@@ -746,12 +747,13 @@ namespace ADOFAIEditorStudio.Preview.Domains
         {
             int floorIndex = Mathf.Clamp(context.FindFloorAtOrBefore(time), 0, floorCount - 1);
             Vector2 follow = EvaluateFollow(floorIndex, time);
-            if (FreeRoamPreviewDomain.ExitCameraActive)
+            FreeRoamPreviewDomain roam = PreviewEvaluationEngine.FreeRoam;
+            if (roam != null && roam.ExitCamera.Active)
             {
                 follow = Vector2.LerpUnclamped(
-                    FreeRoamPreviewDomain.ExitCameraFrom,
-                    FreeRoamPreviewDomain.ExitCameraTo,
-                    FreeRoamPreviewDomain.ExitCameraProgress);
+                    roam.ExitCamera.From,
+                    roam.ExitCamera.To,
+                    roam.ExitCamera.Progress);
             }
 
             Vector2 position = follow;
@@ -1642,7 +1644,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
         private void EvaluateChannelsForReuse(int floorIndex, float time,
             Vector2 follow, ref Vector2 position, ref float rotation, ref float zoom)
         {
-            bool freeRoam = FreeRoamPreviewDomain.ExitCameraActive;
+            FreeRoamPreviewDomain roamNow = PreviewEvaluationEngine.FreeRoam;
+            bool freeRoam = roamNow != null && roamNow.ExitCamera.Active;
             if (reuseFrame == Time.frameCount
                 && reuseFloorIndex == floorIndex
                 && reuseTime.Equals(time)

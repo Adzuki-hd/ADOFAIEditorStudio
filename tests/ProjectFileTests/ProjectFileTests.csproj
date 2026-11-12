@@ -26,6 +26,10 @@
   <ItemGroup>
     <!-- 被测文件。只这一个 —— EditorProjectFile 不碰 Unity，也不碰游戏类型。 -->
     <Compile Include="..\\..\\EditorProjectFile.cs" Link="EditorProjectFile.cs" />
+    <Compile Include="..\\..\\Preview\\Timeline\\ChannelTimeline.cs" Link="ChannelTimeline.cs" />
+    <Compile Include="..\\..\\Preview\\Timeline\\FloorTrackState.cs" Link="FloorTrackState.cs" />
+    <Compile Include="..\\..\\Preview\\Timeline\\MoveTrackFragment.cs" Link="MoveTrackFragment.cs" />
+    <Compile Include="..\\..\\Preview\\Timeline\\AnimateTrackTranslator.cs" Link="AnimateTrackTranslator.cs" />
   </ItemGroup>
 
   <ItemGroup>

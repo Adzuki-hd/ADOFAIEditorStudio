@@ -12,6 +12,30 @@ namespace ADOFAIEditorStudio.Preview.Domains
             BindingFlags.Instance | BindingFlags.NonPublic);
         private int lastFloor = -1;
 
+        /// <summary>
+        /// 本帧球的位置，供相机域读。
+        ///
+        /// 以前相机读 <see cref="PreviewFloorSnapshot.BallPosition"/>——那是
+        /// 「球落脚那一格的中心」，不是球在那一刻的实际位置。球在格内是绕圈
+        /// 走的，所以相机的跟随起点和终点都偏了一截。
+        ///
+        /// 这里暴露的是球域每帧真正算出来、写进 transform 的那个位置。
+        /// 相机读它，就和球看到的是同一个数。
+        ///
+        /// <see cref="BallFrameValid"/> 是这个值有没有在**本帧**算过。
+        /// 球域必须排在相机之前，否则拿到的是上一帧的位置；这个标记
+        /// 让顺序错误可以直接被查出来，而不是悄悄读出旧值。
+        /// </summary>
+        internal Vector3 FrameChosenPlanetPosition;
+
+        /// <summary>这个值是**本帧**算出来的吗。读它之前先问一句，能查出顺序错误。</summary>
+        internal bool BallFrameValid
+        {
+            get { return ballFrameStamp == Time.frameCount; }
+        }
+
+        private int ballFrameStamp = -1;
+
         // 每格的球数（2 或 3）、活动列表的顺序、以及"这一格轮到列表里第几位"。
         // 由 Analyze 预计算，见 BuildMultiPlanetTrack。
         //
@@ -29,6 +53,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
         public void Analyze(PreviewTimelineContext context)
         {
             lastFloor = -1;
+            ballFrameStamp = -1;
             BuildMultiPlanetTrack(context);
             Main.Logger.Log("[StaticPreview/Planet] ready for " + context.Floors.Count + " floors.");
         }
@@ -414,7 +439,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
             }
         }
 
-        private static void EvaluateTwoPlanetFloor(
+        private void EvaluateTwoPlanetFloor(
             PreviewEvaluationFrame frame,
             scrPlayer player,
             int floorIndex,
@@ -800,9 +825,10 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // currfloor.position 上的。那颗格平时就摆在入口格的位置，所以两者
             // 一开始是一样的；但出场动画会把它挪到下一格的入口边缘，球要跟着走
             // （原生 stickToFloors 时不给球单独起 tween，就是靠这个）。
-            if (floor.FreeRoam && FreeRoamPreviewDomain.BallTileValid)
+            FreeRoamPreviewDomain roam = PreviewEvaluationEngine.FreeRoam;
+            if (floor.FreeRoam && roam != null && roam.BallTileValid)
             {
-                centre = FreeRoamPreviewDomain.BallTilePosition;
+                centre = roam.BallTilePosition;
             }
 
             // 长按格的圆心还会**顺着轨道滑向下一格的入口边缘**，绕转是绕着
@@ -888,6 +914,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // 于是还剩一颗差半圈。现在是只写停着那颗。
             chosen.cosmeticRadius = (float)radius;
             chosen.transform.position = position;
+            FrameChosenPlanetPosition = position;
+            ballFrameStamp = Time.frameCount;
             // **这里刻意不调 NoteTransformWritten。**
             //
             // 球的位置本来就是**游戏自己每帧在写**（scrPlanet.LateUpdate 按它自己的

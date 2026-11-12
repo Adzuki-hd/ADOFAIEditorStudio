@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Reflection;
 using ADOFAIEditorStudio.Preview.Domains;
@@ -9,7 +9,26 @@ namespace ADOFAIEditorStudio.Preview
     internal static class PreviewEvaluationEngine
     {
         private static readonly MoveTrackPreviewDomain MoveTrack = new MoveTrackPreviewDomain();
-        private static readonly List<IPreviewDomain> Domains = BuildDomains();
+
+        /// <summary>
+        /// 当前这一套域。**不是 readonly 的**：`UseNativeTrack` 可以在
+        /// 会话之间切换，切换后要重建这张表。见 <see cref="RefreshDomains"/>。
+        /// </summary>
+        /// <summary>
+        /// 当前这一套域。**不能在这里写 `= BuildDomains()`。**
+        ///
+        /// C# 的静态字段按**文本顺序**初始化，而这个字段声明在
+        /// `UseNativeTrack` 之前；初始化器跑的那一刻 `UseNativeTrack`
+        /// 还没被赋成 true，于是 `BuildDomains` 永远走旧实现分支。
+        ///
+        /// 实测后果：设置里开着新实现，日志里一条 `[NativeTrack]` 都没有，
+        /// 旧域的 `MoveTrack analyzed 5354 events` 照常打印。
+        ///
+        /// 所以留 null，由 <see cref="RefreshDomains"/> 在会话开始时按
+        /// 当前设置建。
+        /// </summary>
+        private static List<IPreviewDomain> Domains;
+
 
         /// <summary>
         /// 【临时探针·重建耗时】上一次重建时每个域 Analyze 花了多少毫秒，
@@ -110,53 +129,123 @@ namespace ADOFAIEditorStudio.Preview
         /// </summary>
         private const float HistoryJumpSeconds = 0.25f;
 
+        /// <summary>
+        /// 轨道求值走哪一套实现。
+        ///
+        /// **Native**（默认）：<see cref="NativeBackedTrackDomain"/>。
+        /// MoveTrack 事件和翻译出来的出现/消失片段进同一张时间表，
+        /// 每格六个通道各自求值。没有跨帧状态，给定时间就是给定画面。
+        ///
+        /// **Legacy**：旧的 <see cref="MoveTrackPreviewDomain"/> +
+        /// <see cref="AnimateTrackPreviewDomain"/>。两个域写同一批通道，
+        /// 靠让位规则协调。保留它是为了出问题时能一键切回去对照。
+        ///
+        /// 开关在 `Main.Settings.PreviewEngineMode`，改动后要重开预览会话。
+        /// </summary>
+        internal static bool UseNativeTrack { get; set; } = true;
+
+        /// <summary>
+        /// 按当前设置重建域表。会话开始时调一次——设置在会话之间可以改，
+        /// 但会话中途换实现会让状态对不上，所以只在会话边界重建。
+        /// </summary>
+        private static void RefreshDomains()
+        {
+            bool wanted = Main.Settings == null || Main.Settings.UseNativeTrackDomain;
+            if (wanted == UseNativeTrack && Domains != null && Domains.Count > 0)
+            {
+                return;
+            }
+            UseNativeTrack = wanted;
+            Domains = BuildDomains();
+            DomainEnabled = new bool[Domains.Count];
+
+            // 找出 freeroam 域（相机、行星都从它身上读输出）。
+            FreeRoamDomain = null;
+            for (int i = 0; i < Domains.Count; i++)
+            {
+                FreeRoamPreviewDomain roam = Domains[i] as FreeRoamPreviewDomain;
+                if (roam != null)
+                {
+                    FreeRoamDomain = roam;
+                    break;
+                }
+            }
+
+            // 找出球域（相机从它身上读本帧的球位置）。
+            PlanetDomain = null;
+            for (int i = 0; i < Domains.Count; i++)
+            {
+                PlanetPreviewDomain planet = Domains[i] as PlanetPreviewDomain;
+                if (planet != null)
+                {
+                    PlanetDomain = planet;
+                    break;
+                }
+            }
+
+            // 找出负责轨道写入的那个域（新实现才有，旧实现走自己的队列）。
+            NativeTrackDomainWriter = null;
+            for (int i = 0; i < Domains.Count; i++)
+            {
+                NativeBackedTrackDomain native = Domains[i] as NativeBackedTrackDomain;
+                if (native != null)
+                {
+                    NativeTrackDomainWriter = native;
+                    break;
+                }
+            }
+
+            Main.Logger.Log("[PreviewDomains] rebuilt, nativeTrack=" + UseNativeTrack
+                + " domains=" + Domains.Count + ".");
+        }
+
         private static List<IPreviewDomain> BuildDomains()
         {
-            // AnimateTrack 与 MoveTrack 共用格的 transform/opacity 通道，
-            // 所以它由 MoveTrack 的 evaluate 内部驱动，而不是
-            // 单独注册：两个独立写入者都从起始基线复位，
-            // 每个采样都会互相覆盖。
-            MoveTrack.AttachAnimateTrack(new AnimateTrackPreviewDomain());
+            List<IPreviewDomain> domains = new List<IPreviewDomain>();
 
-            return new List<IPreviewDomain>
+            if (UseNativeTrack)
             {
-                // Camera 和 Planet 以前在这里被排除。Planet 仍然排除：球
-                // 位置与跟随相机走原生确定性路径
-                // （ScrubToFloorNumber + Update_RefreshAngles）。Camera 已回归，
-                // 因为现在 ball follow 和 MoveCamera 都由同一个写入者负责，
-                // 不再是 SyncResidentNativeCameraFocus 旁边的第二个写入者。
-                MoveTrack,
-                // **必须排在最前**：freeroam 出场时它会挪网格格子和球所在那格，
-                // 而 Camera 和 Planet 都读它算出来的位置（运镜起点、球的圆心）。
-                new FreeRoamPreviewDomain(),
-                // 点亮球已踩过的格。辉度的显隐由 hasLit 决定，而格子建出来时
-                // 它是 false——预览里没有球踩过，不补这一步辉度永远看不见。
-                new LightedTrackPreviewDomain(),
-                new CameraPreviewDomain(),
-                new RecolorTrackPreviewDomain(),
-                new DecorationCorePreviewDomain(),
-                new FlashPreviewDomain(),
-                new BloomPreviewDomain(),
-                new CustomBackgroundPreviewDomain(),
-                new ScreenTilePreviewDomain(),
-                new ScreenScrollPreviewDomain(),
-                new HallOfMirrorsPreviewDomain(),
-                new ShakeScreenPreviewDomain(),
-                new FilterPreviewDomain(),
-                new FilterAdvancedPreviewDomain(),
-                new ParticlePreviewDomain(),
-                // 对象装饰物的外观（球颜色 / 轨道颜色样式图标）。
-                // 排在 DecorationCore 之后：那个域负责位置缩放那些通用属性，
-                // 这个只管 SetObject 特有的外观。
-                new SetObjectPreviewDomain(),
-                // PlaySound：只在**播放中**跨过事件时响一声，
-                // 拖播放头不响（理由见该域类注释）。
-                new PlaySoundPreviewDomain(),
-                // 必须排在 Planet 之前：它写 planet.transform.localScale，
-                // 而 Planet 域的圆环要靠那个缩放把自己除回去。
-                new ScalePlanetsPreviewDomain(),
-                new PlanetPreviewDomain()
-            };
+                domains.Add(new NativeBackedTrackDomain());
+            }
+            else
+            {
+                // AnimateTrack 与 MoveTrack 共用格的 transform/opacity 通道，
+                // 所以它由 MoveTrack 的 evaluate 内部驱动，而不是
+                // 单独注册：两个独立写入者都从起始基线复位，
+                // 每个采样都会互相覆盖。
+                MoveTrack.AttachAnimateTrack(new AnimateTrackPreviewDomain());
+                domains.Add(MoveTrack);
+            }
+
+            // **必须排在最前**：freeroam 出场时它会挪网格格子和球所在那格，
+            // 而 Camera 和 Planet 都读它算出来的位置（运镜起点、球的圆心）。
+            domains.Add(new FreeRoamPreviewDomain());
+            domains.Add(new LightedTrackPreviewDomain());
+            domains.Add(new CameraPreviewDomain());
+            domains.Add(new RecolorTrackPreviewDomain());
+            domains.Add(new DecorationCorePreviewDomain());
+            domains.Add(new FlashPreviewDomain());
+            domains.Add(new BloomPreviewDomain());
+            domains.Add(new CustomBackgroundPreviewDomain());
+            domains.Add(new ScreenTilePreviewDomain());
+            domains.Add(new ScreenScrollPreviewDomain());
+            domains.Add(new HallOfMirrorsPreviewDomain());
+            domains.Add(new ShakeScreenPreviewDomain());
+            domains.Add(new FilterPreviewDomain());
+            domains.Add(new FilterAdvancedPreviewDomain());
+            domains.Add(new ParticlePreviewDomain());
+            // 对象装饰物的外观（球颜色 / 轨道颜色样式图标）。
+            // 排在 DecorationCore 之后：那个域负责位置缩放那些通用属性，
+            // 这个只管 SetObject 特有的外观。
+            domains.Add(new SetObjectPreviewDomain());
+            // PlaySound：只在**播放中**跨过事件时响一声，
+            // 拖播放头不响（理由见该域类注释）。
+            domains.Add(new PlaySoundPreviewDomain());
+            // 必须排在 Planet 之前：它写 planet.transform.localScale，
+            // 而 Planet 域的圆环要靠那个缩放把自己除回去。
+            domains.Add(new ScalePlanetsPreviewDomain());
+            domains.Add(new PlanetPreviewDomain());
+            return domains;
         }
 
         private static PreviewTimelineContext context;
@@ -167,7 +256,40 @@ namespace ADOFAIEditorStudio.Preview
 
         private static float lastEngineMs;
         private static float lastValidateMs;        private static bool active;
-        private static readonly bool[] DomainEnabled = new bool[Domains.Count];
+        /// <summary>
+        /// 每个域开没开。长度跟 `Domains` 对齐，所以同样要等域表建好才能建——
+        /// 在 `RefreshDomains` 里一起初始化。
+        /// </summary>
+        private static bool[] DomainEnabled = new bool[0];
+
+        /// <summary>
+        /// 当前这套域里负责写轨道姿态的那个（新实现才有）。
+        ///
+        /// 它不能在 Evaluate 里直接写 transform——原生组件跑在求值器之后，
+        /// 会把值覆盖回去，画面慢一拍。所以 Evaluate 只算，落笔排到
+        /// LateUpdate（见 <see cref="TickEditorScaffoldingLate"/>）。
+        ///
+        /// 用具体类型而不是接口，因为只有这一个域有这种「延迟写入」需求；
+        /// 为了它给所有域加一个接口不划算。
+        /// </summary>
+        private static NativeBackedTrackDomain NativeTrackDomainWriter;
+
+        /// <summary>
+        /// 当前的 freeroam 域实例。相机域和行星域从它身上读出场运镜/球那格的位置。
+        ///
+        /// 以前这些值是 `FreeRoamPreviewDomain` 的静态字段，靠注册顺序传递——
+        /// 那是一条隐形的时序依赖。改成实例之后，读取方拿到的是「这个域最近
+        /// 一次求值的结果」，顺序错了只会读到旧值，不会读到别人的值。
+        /// </summary>
+        private static FreeRoamPreviewDomain FreeRoamDomain;
+
+        /// <summary>
+        /// 当前的球域实例。相机读它本帧算出来的球位置。
+        ///
+        /// 以前相机用快照里的 `BallPosition`——那是「球落脚的格心」，
+        /// 不是球在那一刻的真实位置。球在格内绕圈走，两者差一截。
+        /// </summary>
+        private static PlanetPreviewDomain PlanetDomain;
 
         // ------------------------------------------------------------ 编辑器专属引导线
 
@@ -309,6 +431,9 @@ namespace ADOFAIEditorStudio.Preview
             // MoveTrack 的格 transform 必须在这里写，不能放在求值里：
             // 游戏的原生组件跑在求值器之后，会把它们重置回烘焙值。
             // 和上面那两条引导线是同一个道理。
+            //
+            // 新的轨道域同理——它在 Evaluate 里只算不写，姿态排到这里统一落笔。
+            NativeTrackDomainWriter?.ApplyPending();
             MoveTrack.ApplyPendingWrites();
             if (probe)
             {
@@ -327,6 +452,21 @@ namespace ADOFAIEditorStudio.Preview
         /// 而球和相机都在求值阶段跑，比写入早——直接读会拿到**上一帧**的位置。
         /// 轨道正在动的时候，那一帧的差就是「球没粘在轨道上」的样子。
         /// </summary>
+        /// <summary>
+        /// 当前的 freeroam 域。没注册（或还没重建域表）时返回 null，
+        /// 调用方要自己判空。
+        /// </summary>
+        internal static FreeRoamPreviewDomain FreeRoam
+        {
+            get { return FreeRoamDomain; }
+        }
+
+        /// <summary>当前的球域。没注册时返回 null，调用方要判空。</summary>
+        internal static PlanetPreviewDomain Planet
+        {
+            get { return PlanetDomain; }
+        }
+
         internal static Vector3 FloorPositionThisFrame(scrFloor floor)
         {
             if (floor == null)
@@ -334,7 +474,17 @@ namespace ADOFAIEditorStudio.Preview
                 return Vector3.zero;
             }
 
+            // 先问当前在用的那个轨道域。新实现和旧实现各自持有待写结果，
+            // 谁在跑就问谁——问错了那一侧永远没有值，会退回读 transform，
+            // 也就是拿到上一帧的位置。
             Vector3 pending;
+            if (NativeTrackDomainWriter != null)
+            {
+                return NativeTrackDomainWriter.TryGetPendingPosition(floor, out pending)
+                    ? pending
+                    : floor.transform.position;
+            }
+
             return MoveTrack.TryGetPendingPosition(floor, out pending)
                 ? pending
                 : floor.transform.position;
@@ -432,6 +582,9 @@ namespace ADOFAIEditorStudio.Preview
                 // 砍哪一半。只在重建时写，平时零成本。
                 long totalStart = System.Diagnostics.Stopwatch.GetTimestamp();
                 End();
+
+                // 会话边界重建域表：设置里换了实现，下一段会话就用新的。
+                RefreshDomains();
 
                 long contextStart = System.Diagnostics.Stopwatch.GetTimestamp();
                 context = new PreviewTimelineContext(editor);
@@ -535,6 +688,19 @@ namespace ADOFAIEditorStudio.Preview
 
                 long engineStart = profile ? System.Diagnostics.Stopwatch.GetTimestamp() : 0L;
                 float frameTime = Mathf.Max(0f, time);
+
+                // 【探针】求值入口实际用到的绝对时间。
+                //
+                // 和 EditorPlaybackBridge 里那条 [ClockProbe] 配对：
+                // 那边记「拖动时把时钟设成了什么」，这边记「求值器拿到的是什么」。
+                // 两个数必须一致——不一致说明中间有人改写了时间。
+                // 同一个位置拖多次，这几个数应当完全相同。
+                if (Main.Settings != null && Main.Settings.PointerProbe)
+                {
+                    Main.Logger.Log("[ClockProbe] eval in="
+                        + time.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture)
+                        + " frame=" + frameTime.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture));
+                }
 
                 // **B1 暂时关闭（回归调查中）。**
                 //
@@ -785,6 +951,19 @@ namespace ADOFAIEditorStudio.Preview
 
         internal static void End()
         {
+            // 域表可能还没建过：`Domains` 改成延迟初始化之后，
+            // 「开工作台 → 建表前就关掉」这条路径会走到这里。
+            // 直接读 Domains.Count 会空引用，而 End() 是关工作台必经的一步——
+            // 崩在这里的表现就是播放头消失、播放不了。
+            if (Domains == null)
+            {
+                ReleaseEditorScaffolding();
+                particleGizmos = null;
+                particleGizmoCacheCount = -1;
+                active = false;
+                return;
+            }
+
             for (int i = 0; i < Domains.Count; i++)
             {
                 // 某个域在这里抛异常，不能阻止其余域被拆除。
