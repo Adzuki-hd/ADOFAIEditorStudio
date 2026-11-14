@@ -101,7 +101,7 @@ namespace ADOFAIEditorStudio
                     FloorOffset = levelEvent.floor - baseFloor,
                     Data = data == null
                         ? new Dictionary<string, object>()
-                        : new Dictionary<string, object>(data),
+                        : CloneData(data),
                     Disabled = levelEvent.disabled == null
                         ? new Dictionary<string, bool>()
                         : new Dictionary<string, bool>(levelEvent.disabled)
@@ -109,6 +109,33 @@ namespace ADOFAIEditorStudio
             }
 
             return entries.Count;
+        }
+
+        /// <summary>
+        /// 复制一份数据字典，**里面的列表也要复制**。
+        ///
+        /// `new Dictionary&lt;string, object&gt;(data)` 只是新建了字典本身：
+        /// 键值对里那个 `List&lt;object&gt;` 还是同一个对象。粘贴时再把它塞进
+        /// 新事件，原事件和粘出来的事件就共享同一个列表——改任何一个，
+        /// 另一个跟着变。
+        ///
+        /// 实测后果：粘一次之后谱面里出现「两份位置轨道事件」，看着像粘了两遍；
+        /// 而且原生编辑器会因为这个状态用不了。
+        ///
+        /// 只处理 `List&lt;object&gt;`：谱面数据里的容器就这一种（`positionOffset`、
+        /// `startTile` 这些），元素是标量或 null，不需要再往下递归。
+        /// </summary>
+        private static Dictionary<string, object> CloneData(Dictionary<string, object> source)
+        {
+            Dictionary<string, object> clone = new Dictionary<string, object>(source.Count);
+            foreach (KeyValuePair<string, object> pair in source)
+            {
+                List<object> list = pair.Value as List<object>;
+                clone[pair.Key] = list == null
+                    ? pair.Value
+                    : new List<object>(list);
+            }
+            return clone;
         }
 
         /// <summary>

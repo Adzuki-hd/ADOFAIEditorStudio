@@ -985,10 +985,13 @@ namespace ADOFAIEditorStudio
         /// 设置页要**单独放行**：原生那套存活判断认的是 `editor.events` /
         /// `editor.decorations`，而设置页两边都不在（它挂在 `levelData` 上）——
         /// 照那个判，设置页会被当成死引用，读不出、也写不进。
+        ///
+        /// 判据用 <see cref="IsSettingsEvent"/> 而不是 `settingsPage` 字段：
+        /// 那个字段会被传送带上的多页争抢（详见该方法的注释）。
         /// </summary>
         private bool IsLive(LevelEvent levelEvent)
         {
-            if (levelEvent != null && ReferenceEquals(levelEvent, settingsPage))
+            if (IsSettingsEvent(levelEvent))
             {
                 return true;
             }
@@ -1122,7 +1125,7 @@ namespace ADOFAIEditorStudio
 
             // 设置页那一份顶部不留预留：`PreviewHostTop` 那一截存在的理由是
             // 「顶部可能有装饰物图片」，设置页没有图片，留着就是一条无来由的空带。
-            float scrollTop = settingsPage != null
+            float scrollTop = IsSettingsEvent(currentEvent)
                 ? Padding
                 : (previewVisible ? ScrollTopWithPreview : ScrollTopWithoutPreview);
             float scrollHeight = Mathf.Max(60f, height - scrollTop - 16f);
@@ -1714,6 +1717,41 @@ namespace ADOFAIEditorStudio
                         batchUniformKeys.Add(pair.Key);
                     }
                 }
+            }
+        }
+
+        /// <summary>
+        /// 这一项是不是 `levelData` 上挂的那八页设置之一。
+        ///
+        /// **不能只靠 <see cref="settingsPage"/> 判断。** 那个字段是单个引用，
+        /// 而传送带上六页设置各是一个 `UiInspectorPane`、共用这一个面板，
+        /// 每帧都往里写一次自己那页 —— 后写的覆盖先写的，最后只剩一页被认成
+        /// 设置页。其余几页在 <see cref="IsLive"/> 里被判成死引用，
+        /// `CommitOne` 第一行就返回：参数能输入、值弹回，而且不报错。
+        ///
+        /// 设置页的类型是独占的（`TrackSettings` 这类只作为设置页存在，
+        /// 不会作为时间轴事件出现），所以按类型认就够，不必去遍历
+        /// `levelData.settings` —— 那个属性每次读都新分配一个八元数组。
+        /// </summary>
+        private static bool IsSettingsEvent(LevelEvent levelEvent)
+        {
+            if (levelEvent == null)
+            {
+                return false;
+            }
+            switch (levelEvent.eventType)
+            {
+                case LevelEventType.LevelSettings:
+                case LevelEventType.SongSettings:
+                case LevelEventType.TrackSettings:
+                case LevelEventType.BackgroundSettings:
+                case LevelEventType.CameraSettings:
+                case LevelEventType.MiscSettings:
+                case LevelEventType.EventSettings:
+                case LevelEventType.DecorationSettings:
+                    return true;
+                default:
+                    return false;
             }
         }
 
@@ -4037,7 +4075,7 @@ namespace ADOFAIEditorStudio
                 }
             }
 
-            if (ReferenceEquals(colorTarget, settingsPage))
+            if (IsSettingsEvent(colorTarget))
             {
                 ApplySettingsSideEffects(FindInfo(colorTarget, colorKey));
 
@@ -4697,7 +4735,7 @@ namespace ADOFAIEditorStudio
 
             // 设置页写回之后要补上原生的那两步副作用，否则值是变了、画面不跟。
             // 事件那条路不需要它 —— 事件的 `UpdateDecorationObject` 已经覆盖了。
-            if (ReferenceEquals(levelEvent, settingsPage))
+            if (IsSettingsEvent(levelEvent))
             {
                 ADOFAI.PropertyInfo settingsInfo = FindInfo(levelEvent, key);
                 ApplySettingsSideEffects(settingsInfo);
@@ -4810,7 +4848,7 @@ namespace ADOFAIEditorStudio
 
             // 设置页一律不算装饰物：它的元数据未必把 `isDecoration` 标成 false
             // （那一位本来是给事件用的）。理由见 ShowPreview。
-            if (settingsPage != null || levelEvent == null
+            if (IsSettingsEvent(levelEvent) || levelEvent == null
                 || levelEvent.info == null || !levelEvent.info.isDecoration)
             {
                 return false;
@@ -4848,7 +4886,7 @@ namespace ADOFAIEditorStudio
             // **设置页一律不算装饰物。** 它的元数据未必把 `isDecoration`
             // 标成 false（那一位本来是给事件用的），照它走会给设置页在顶上
             // 留出一条 146px 的空带 —— 正是"顶上总空着一块、不知道干嘛用"。
-            bool isDecoration = settingsPage == null
+            bool isDecoration = !IsSettingsEvent(levelEvent)
                 && levelEvent != null
                 && levelEvent.info != null
                 && levelEvent.info.isDecoration;

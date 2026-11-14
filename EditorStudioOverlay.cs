@@ -1695,6 +1695,10 @@ namespace ADOFAIEditorStudio
             // 尖峰帧上 Overlay.U 会冲到 5~19ms 而域只有 2~4ms —— 说明钱花在
             // 下面这些"界面刷新"上，但看不出是哪一段。这里把 UpdateCore 切成
             // 五段，尖峰帧一眼就能点名。收口时整段删掉。
+            // 【临时探针·A 之前那段】原来 `__mark` 取了之后到 `OU.A` 才第一次
+            // 记录，中间这一整段是盲区 —— 实测 `Overlay.U` 4.78ms 而 A~E
+            // 加起来只有 0.2ms，差的那 4.5ms 就藏在这里。逐段记上，尖峰帧
+            // 才能点名是谁。
             long __mark = System.Diagnostics.Stopwatch.GetTimestamp();
 
             // **物理抑制放在最前面，早于 `settings == null` 的提前返回。**
@@ -1702,15 +1706,18 @@ namespace ADOFAIEditorStudio
             // 状态机；把它挂在设置对象后面，等于让"设置没配好"这种与物理
             // 无关的情况也能把还原逻辑一起跳过。
             PhysicsStepSuppressor.Tick();
+            __mark = MarkSpan("OU.P0", __mark);
             if (settings == null)
             {
                 return;
             }
             // 帧耗时诊断：开关关着时它内部第一行就返回。
             PreviewDiagnostics.Tick();
+            __mark = MarkSpan("OU.P1", __mark);
             // 【临时探针·游戏自身每帧回调】把「没人认领的那 1.3~1.5ms」拆到
             // 具体行为上。同样只在 VerboseDiagnostics 打开时工作。
             BehaviourProbe.Tick();
+            __mark = MarkSpan("OU.P2", __mark);
             // 工作台是否可见 —— 和 St.Play 一起，日志里的每个样本才归得了类。
             PreviewDiagnostics.NoteVisible(visible);
             // 帧率跳动日志：自己一个开关，和上面那份诊断报表互不影响。
@@ -1724,6 +1731,7 @@ namespace ADOFAIEditorStudio
             {
                 LogLargeSurfacesOnce();
             }
+            __mark = MarkSpan("OU.P3", __mark);
 
             // 临时状态到期就撤掉。见 SetTransientStatus。
             if (statusTransient && Time.unscaledTime >= statusClearAt)
@@ -1740,6 +1748,7 @@ namespace ADOFAIEditorStudio
                 }
                 return;
             }
+            __mark = MarkSpan("OU.P4", __mark);
 
             // **快捷键已经取消**：工作台改由编辑器里那颗悬浮球打开
             // （见 `EditorImGuiBridge.DrawFloatingBall`）。
@@ -3469,7 +3478,7 @@ namespace ADOFAIEditorStudio
 
             // 「开发者」页：探针 / 简化遮罩 / 旧版遮罩 / 帧率日志 / 导出。
             settingsDeveloperPage = CreateTopLeftRect("SettingsDeveloperPage", card,
-                contentX, navTop + 44f, contentWidth, 380f);
+                contentX, navTop + 44f, contentWidth, 440f);
             BuildSettingsDeveloperPage(contentWidth);
 
             SelectSettingsPage(0);
@@ -3606,7 +3615,7 @@ namespace ADOFAIEditorStudio
                 });
 
             TextMeshProUGUI hint = CreateText("DeveloperHint", settingsDeveloperPage,
-                0f, 208f, width - 8f, 110f,
+                0f, 242f, width - 8f, 140f,
                 DeveloperSectionNote + "\n"
                 + "探针：把「该显示却没画出来」的装饰物写进日志（默认关）。\n"
                 + "轨道探针：每 0.5 秒记录一遍轨道格的渲染器与屏幕坐标，用来查「轨道不见了」。\n"
@@ -3619,7 +3628,7 @@ namespace ADOFAIEditorStudio
             // 导出是给「整片不见了」用的：拖到出问题的格子点一次，
             // 日志里就有全部装饰物的模型/组件对照。探针关着也能用。
             TextMeshProUGUI dumpLabel;
-            CreateButton("DumpDecorations", settingsDeveloperPage, 0f, 326f, 180f, 32f,
+            CreateButton("DumpDecorations", settingsDeveloperPage, 0f, 390f, 180f, 32f,
                 "导出装饰物状态", false,
                 delegate { Preview.Domains.DecorationCorePreviewDomain.DumpAll(); },
                 out dumpLabel);

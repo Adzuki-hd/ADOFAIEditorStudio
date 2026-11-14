@@ -67,6 +67,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
         // 预计算好的跟随状态，每个格边界一条。
         private Vector2[] cameraAtFloorEntry = new Vector2[0];
+
         // 每一格起步时的 zoom 基准。平时等于谱面的 zoom；freeroam 出场会把
         // 它设成 1（原生 MoveCameraToTile 明确传了 zoom: 1f），之后一直沿用。
         private float[] zoomBaseAtFloor = new float[0];
@@ -443,10 +444,11 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 Vector2 tileAnchor = floor == null
                     ? Vector2.zero
                     : new Vector2(floor.StartPosition.x, floor.StartPosition.y);
+                float entryTime = floor == null ? 0f : Convert.ToSingle(floor.EntryTime);
+
                 Vector2 ballAnchor = floor == null
                     ? Vector2.zero
                     : new Vector2(floor.BallPosition.x, floor.BallPosition.y);
-                float entryTime = floor == null ? 0f : Convert.ToSingle(floor.EntryTime);
 
                 ballAtFloorEntry[i] = ballAnchor;
                 floorPosition[i] = tileAnchor;
@@ -477,14 +479,29 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 else if (followModeAtFloor[i] && !followModeAtFloor[i - 1])
                 {
                     // 自由段之后的一个 Player 事件会调 UpdateFollowCam(force: true)，
-                    // 它会用相机那一刻所处的位置重新播种 frompos。自由段
-                    // 把相机停在格位置上了（Tile 把 camParent 设为
-                    // floorPos，Global 设为原点），所以轨道采纳的是那个位置，
-                    // 而不是继续漂移。在 NYA 谱面上量到：162-163 格是
-                    // Tile，把相机留在 126.26，而 164 格上的 Player 事件报的
-                    // frompos 是 126.26——而一条直穿过去的轨道只到
-                    // 124.76，差一格，让之后每一格都短暂落后。
-                    camera = floorPosition[i - 1];
+                    // 它会用相机那一刻所处的位置重新播种 frompos。
+                    // 在 NYA 谱面上量到：162-163 格是 Tile，把相机留在
+                    // 126.26，而 164 格上的 Player 事件报的 frompos 是 126.26
+                    // —— 而一条直穿过去的轨道只到 124.76，差一格，
+                    // 让之后每一格都短暂落后。
+                    //
+                    // **但不能拿格位置当那个「相机那一刻的位置」。**
+                    //
+                    // 原来这里写死 `camera = floorPosition[i - 1]`，
+                    // 前提是「上一格不跟随时相机停在格位置上」——
+                    // 那只对 freeroam 自由段成立（Tile 把 camParent 设为
+                    // floorPos）。对**被 MoveCamera 事件驱动的格**不成立：
+                    // 那些事件会把相机推走，最后停在「格位置 + 事件偏移」。
+                    //
+                    // 本谱第 128 格正是后者：三条 MoveCamera 把相机推高
+                    // 到 Y=59.228，而格位只有 56.228。拿格位播种让 129 格
+                    // 从低 3 格的地方开始追，实测相机目标 130 格就偏 +2.4、
+                    // 132 格到 +5.9，之后缓慢回落 —— 就是
+                    // 「镜头缓慢上移再慢慢恢复」。
+                    //
+                    // 改成用事件链算出的真实终值；算不出来（没有位置事件）
+                    // 才退回格位置。
+                    camera = ResolveStaticCameraAt(i - 1);
                 }
                 else
                 {
@@ -1679,6 +1696,77 @@ namespace ADOFAIEditorStudio.Preview.Domains
         /// 也在这里折进去，会在事件一触发的瞬间把相机按到某个静态格锚点上，
         /// 丢掉平滑后的跟随，视图就瞬移了。
         /// </summary>
+        /// <summary>
+        /// 某一格**不跟随时**，相机最终停在哪。
+        ///
+        /// 递推遇到「上一格不跟随、这一格开始跟随」的交接点，要用相机
+        /// 那一刻的实际位置播种。而那个位置由该格的 `MoveCamera` 事件决定，
+        /// 不是格位置。
+        ///
+        /// 只按 Tile / Global / LastPosition 三种静态模式算：
+        ///   · Tile        —— 格位置 + offset * tileSize
+        ///   · Global      —— offset * tileSize（不叠格位置）
+        ///   · LastPosition—— 上一条的位置 + offset * tileSize
+        ///
+        /// 同一格有多条位置事件时**后面的覆盖前面的**（原生每条事件都重新
+        /// 赋 targetPos，不是累加），所以这里也取最后一条。
+        ///
+        /// 算不出来（该格没有位置事件）就退回格位置 —— 那是改动前的行为，
+        /// 不会更差。
+        /// </summary>
+        private Vector2 ResolveStaticCameraAt(int index)
+        {
+            if (index < 0 || index >= floorCount)
+            {
+                return index >= 0 && index < floorPosition.Length
+                    ? floorPosition[Mathf.Clamp(index, 0, floorPosition.Length - 1)]
+                    : Vector2.zero;
+            }
+
+            Vector2 result = floorPosition[index];
+            CamMovementType current = CamMovementType.Tile;
+            bool any = false;
+
+            for (int k = 0; k < keyframes.Count; k++)
+            {
+                CameraKeyframe keyframe = keyframes[k];
+                if (keyframe.Floor != index)
+                {
+                    continue;
+                }
+                if (keyframe.ModeUsed)
+                {
+                    current = keyframe.Mode;
+                }
+                if (!keyframe.HasPosition
+                    || (float.IsNaN(keyframe.Position.x) && float.IsNaN(keyframe.Position.y)))
+                {
+                    continue;
+                }
+
+                any = true;
+                switch (current)
+                {
+                    case CamMovementType.Tile:
+                        result = AddPerAxis(floorPosition[index], keyframe.Position * tileSize);
+                        break;
+                    case CamMovementType.Global:
+                        result = keyframe.Position * tileSize;
+                        break;
+                    case CamMovementType.LastPosition:
+                    case CamMovementType.LastPositionNoRotation:
+                        // 没有上一格的静态值可用，按「格位置 + 偏移」近似。
+                        result = AddPerAxis(result, keyframe.Position * tileSize);
+                        break;
+                    default:
+                        // Player 模式不改 camParent，交给跟随，不算静态值。
+                        break;
+                }
+            }
+
+            return any ? result : floorPosition[index];
+        }
+
         private Vector2 ResolveWorld(CamMovementType mode, Vector2 offset, int floorIndex,
             Vector2 ballPosition, Vector2 previousWorld)
         {

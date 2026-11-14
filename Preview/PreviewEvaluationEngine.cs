@@ -491,6 +491,24 @@ namespace ADOFAIEditorStudio.Preview
         }
 
         /// <summary>
+        /// 某一格在**任意时刻**的位置（不依赖当前帧）。
+        ///
+        /// 相机建跟随表时要问「第 i 格入场那一刻，球粘着的轨道在哪」——
+        /// 快照里的 `BallPosition` 是静态值，装不下被 `MoveTrack` 推走的轨道。
+        /// 新轨道域是纯函数，能直接按时间点求；旧实现没有这个能力，
+        /// 返回 false 让调用方退回快照值。
+        /// </summary>
+        internal static bool FloorPositionAt(int index, double time, out Vector3 position)
+        {
+            if (NativeTrackDomainWriter != null)
+            {
+                return NativeTrackDomainWriter.TryGetFloorPositionAt(index, time, out position);
+            }
+            position = Vector3.zero;
+            return false;
+        }
+
+        /// <summary>
         /// 关工作台时把编辑器引导线还回去。
         ///
         /// 它属于原生编辑器：用户在编辑器里改位置轨道时，那几条虚线
@@ -546,6 +564,17 @@ namespace ADOFAIEditorStudio.Preview
         /// </summary>
         private static void PrepareEditorScenery()
         {
+            // **收起上一次游玩留下的结算面板。**
+            //
+            // 游戏通关时 `DetailedResults.Show()` 会把面板
+            // `SetActive(true)` 并把成绩写进去，但**没有对应的 Hide**：
+            // 面板只随场景销毁才消失。从游玩回到编辑器、再打开工作台时，
+            // 那块成绩还挂在屏幕上，遮住预览。
+            //
+            // 这里主动关一次。只关对象、不清文字——下次游玩时
+            // `Show()` 会重新写，内容不用我们管。
+            HideStaleResultsPanel();
+
             scrLevelMaker maker = scrLevelMaker.instance;
             if (maker == null)
             {
@@ -559,6 +588,50 @@ namespace ADOFAIEditorStudio.Preview
             catch (Exception exception)
             {
                 Main.Logger.Error("[StaticPreview] ColorFreeroam failed: " + exception);
+            }
+        }
+
+
+
+        /// <summary>
+        /// 把上一次游玩留下的结算面板收起来。没有面板、或者本来就没开着时什么都不做。
+        /// </summary>
+        private static void HideStaleResultsPanel()
+        {
+            scrController controller = scrController.instance;
+            if (controller == null || controller.detailedResults == null)
+            {
+                return;
+            }
+
+            GameObject panel = controller.detailedResults.gameObject;
+            if (panel == null || !panel.activeSelf)
+            {
+                return;
+            }
+
+            try
+            {
+                // **四个一起关，和游戏自己在 Play() 里做的一样。**
+                //
+                // 反编译 `scrController.Play` 那段：
+                //
+                //     txtAllStrictClear.SetActive(false);
+                //     txtCongrats.SetActive(false);
+                //     detailedResults.SetActive(false);
+                //     txtPercent.SetActive(false);
+                //
+                // 只在**每次开始游玩**时才跑。通关之后回编辑器、再开工作台，
+                // 没人走那条路，于是成绩面板和「恭喜」都留在屏幕上。
+                controller.txtAllStrictClear.gameObject.SetActive(false);
+                controller.txtCongrats.gameObject.SetActive(false);
+                controller.detailedResults.gameObject.SetActive(false);
+                controller.txtPercent.gameObject.SetActive(false);
+                Main.Logger.Log("[StaticPreview] 收起了残留的结算面板。");
+            }
+            catch (Exception exception)
+            {
+                Main.Logger.Error("[StaticPreview] hide results panel failed: " + exception);
             }
         }
 

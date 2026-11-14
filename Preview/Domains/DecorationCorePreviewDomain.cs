@@ -456,12 +456,28 @@ namespace ADOFAIEditorStudio.Preview.Domains
         private bool cullTransparent;
 
         /// <summary>
-        /// 这件装饰物的事件里有没有可能把它写成遮罩。
+        /// 这件装饰物的事件里有没有可能让它参与遮罩。
         ///
         /// 用来决定它要不要进 `maskCandidateStates`。判据取**保守**的一侧：
-        /// 只要有一条事件带 `maskingType` 键（哪怕值是 None），就登记。
-        /// 多登记几件只是多几次遍历，漏登记则会让整类谱面的遮罩失效
-        /// （见 `p5c` 那段说明）。
+        /// 只要有一条事件可能写 `maskingType`，就登记。
+        /// 多登记几件只是多几次遍历，漏登记则会让整类谱面的遮罩失效。
+        ///
+        /// **三种类型都算，不能只认 `Mask`。**
+        ///
+        /// `Mask` 是"当遮罩"，另外两种是"被遮"。写类型的那个循环
+        /// （`ApplyMaskPass`）对三者一视同仁 —— 它写的是
+        /// `spriteRenderer.maskInteraction`，`Mask` 走的是另一条
+        /// `spriteMask.enabled` 分支。所以被遮的件同样必须进这张表。
+        ///
+        /// 只认 `Mask` 时，一件"作者初始 None、后来被设成
+        /// VisibleOutsideMask"的装饰物永远进不了候选，`maskInteraction`
+        /// 一直停在 `None` —— 它就不再被任何遮罩裁剪，整片压在画面上。
+        ///
+        /// 实测（`ViLLAGE OF CHRYSANTHEMUM`，309 格）：
+        /// `Y_mg_st1_5` 被设成 `Mask`（深度 -30006），
+        /// 同格 `Y_mg_st2_5` 被设成 `VisibleOutsideMask`。
+        /// 前者进得了候选，后者进不了 —— 于是那几圈本该被挖空的地方
+        /// 一直显示着 222 倍大的圆环，直到 336 格才被 opacity=0 收掉。
         /// </summary>
         private static bool MayBecomeMask(DecorationState state)
         {
@@ -473,7 +489,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
             {
                 MoveEvent value = state.Events[i];
                 if (value != null && value.HasMasking
-                    && value.Masking == MaskingType.Mask)
+                    && value.Masking != MaskingType.None)
                 {
                     return true;
                 }
@@ -1754,6 +1770,11 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // 这里按原生 UpdatePosition 的同一组输入补一次 SetTrans：
             // startPosition / posCamAtStart 都是「这件装饰物的落点」，
             // 不是相机位置（原生那行就是这么写的，别被名字骗了）。
+            // 【临时探针】这一整轮视差写入原来不在任何子项里，
+            // 而它遍历全部 `states` 并逐件调 `SetTrans()` —— 那是会碰
+            // material / transform 的调用，几十上百件加起来可能就是
+            // 主循环之外那 1.1ms。
+            long parallaxStart = System.Diagnostics.Stopwatch.GetTimestamp();
             for (int i = 0; i < states.Count; i++)
             {
                 DecorationState state = states[i];
@@ -1767,10 +1788,25 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     continue;
                 }
                 Vector2 anchor = state.HasTransformApplied ? state.AppliedPosition : state.Position;
+
+                // **这里试过跳过静止件，不成立。**
+                //
+                // 试过两种判据：
+                //   · `(anchor, 相机位置)` 没变 → 跳过。命中 0 次。
+                //   · 按式子算出落点、和上一帧比 → 跳过。也是 0 次。
+                //
+                // 原因都一样：跟拍类谱面里相机每帧都在跟随球移动，
+                // 落点每帧都真的在变 —— 这个写 transform 不是浪费，是必需。
+                //
+                // 保留计时（`Deco.Parallax`），因为它原来没被算进任何子项，
+                // 光看 `DecorationCore` 总数会以为主循环里在烧钱。
                 decoration.parallax.SetNewStartPosition(anchor);
                 decoration.parallax.posCamAtStart = anchor;
                 decoration.parallax.SetTrans();
             }
+            PreviewDiagnostics.RecordDomain("Deco.Parallax",
+                (System.Diagnostics.Stopwatch.GetTimestamp() - parallaxStart)
+                * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
 
             // 遮罩通道单独计时（Deco.Mask 子项）：它只遍历真正带遮罩的那几十件，
             // 与主循环互不相干，混在 DecorationCore 总耗时里会互相掩盖。

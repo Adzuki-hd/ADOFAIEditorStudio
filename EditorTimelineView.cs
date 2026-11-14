@@ -718,6 +718,24 @@ namespace ADOFAIEditorStudio
             }
         }
 
+        /// <summary>
+        /// 时间轴能走到的最大时刻（秒）。
+        ///
+        /// **时间轴是自由坐标，不是「内容 + 边上一点余量」。**
+        ///
+        /// 以前所有边界都拿 `navigationDuration`（内容终点）当上限，于是
+        /// 谱面末尾之后的空白既滚不过去、也预览不了 —— 特效师要在那里
+        /// 摆一串收尾动画时没处下手。
+        ///
+        /// PACL2 的做法是给一个很大的固定上界（它自己写的
+        /// `MaxPlayTimeSec = 86400`，24 小时），视图和播放头都在这个范围里
+        /// 自由走。这里照同样的思路。
+        ///
+        /// 用 24 小时而不是 `float.MaxValue`：够大（没人会写 24 小时的谱），
+        /// 又不会让 `time * pixelsPerSecond` 溢出、或让画布算出天文数字的宽度。
+        /// </summary>
+        private const float MaximumTimelineSeconds = 86400f;
+
         /// <summary>打开谱面时的默认缩放，也是缩放读数里「100%」的基准。</summary>
         private static float DefaultPixelsPerSecond
         {
@@ -2556,8 +2574,17 @@ private static float MinimumPixelsPerSecond
             float now = Time.unscaledTime;
             // 供预览层判断"现在是拖动定位"：那期间不写粒子装饰物的位置，
             // 否则原生 SetPosition 每帧清一次粒子，看着就是冻住。
-            ParticleWatch.ScrubbingActive = scrubbing || centerBrowseScrubbing
-                || centeredScrubActive;
+            //
+            // **`ResumeAll` 的语义是「恢复」不是「启动」**：它只重新播放
+            // 拖动开始那一刻正在播的发射器，判据是 `BeginScrub` 拍的那张快照。
+            // 快照在每次 `BeginScrub` 里整体重建，所以拖动结束不用清 ——
+            // 下一个拖动开始时会覆盖掉。
+            bool scrubbingNow = scrubbing || centerBrowseScrubbing || centeredScrubActive;
+            if (scrubbingNow && !ParticleWatch.ScrubbingActive)
+            {
+                ParticleWatch.BeginScrub();
+            }
+            ParticleWatch.ScrubbingActive = scrubbingNow;
 
             // **下面这些以前没有单独计时。** 实测 Timeline.U 能到 7.15ms，
             // 而 Collect / UpdateBlocks / Ruler 三项加起来只有 0.02ms ——
@@ -2705,27 +2732,85 @@ private static float MinimumPixelsPerSecond
                 if (Mathf.Abs(centeredScrubVelocity) > 0.0002f)
                 {
                     float scrubNow = snapshot.CurrentTime;
+                    // **上界仍然钉在 `navigationDuration`（内容终点）。**
+                    //
+                    // 试过放宽到「末尾再往后一屏」，结果滚过末尾之后整个
+                    // Shift+滚轮彻底失灵，退回自由模式也不恢复
+                    // （用户实测：「刚刚滚到后面后不知道怎么了，
+                    // Shift+滚轮完全滚不动了，刚刚还能滚的」）。
+                    //
+                    // 根因未查明，只知症状：播放头越过谱面时长之后这个
+                    // 滚动路径就死了。在查清楚之前不放宽 —— 固定播放头的
+                    // 本职是「播放头居中、内容从中间滑过」，
+                    // 把播放头推到谱面外面本来也不是它该做的事。
+                    //
+                    // 末尾之后的空白要靠**自由模式**去摆（那边视图独立于
+                    // 播放头，不受这个限制）。
                     float scrubNext = Mathf.Clamp(
                         scrubNow + centeredScrubVelocity * Time.unscaledDeltaTime,
-                        0f, Mathf.Max(0f, navigationDuration));
-                    if (Mathf.Abs(scrubNext
-                            - (scrubNow + centeredScrubVelocity * Time.unscaledDeltaTime)) > 0.00001f)
+                        0f, MaximumTimelineSeconds);
+                    bool hitBoundary = Mathf.Abs(scrubNext
+                        - (scrubNow + centeredScrubVelocity * Time.unscaledDeltaTime)) > 0.00001f;
+                    if (hitBoundary)
                     {
-                        // 撞到谱面头/尾：速度作废，别继续"想"走。
+                        // 撞到时间轴头/尾：速度作废，**并且这一帧不提交时间**。
+                        //
+                        // 「不提交」是关键。`scrubNext` 已经被 Clamp 顶到边界值，
+                        // 而上界现在是 86400 秒 —— 照旧提交就等于把播放头一把
+                        // 推到 24 小时处，视图跟着飞过去；再想滚回来得滚过一整天
+                        // 的距离，表现就是「卡住十几秒动不了」。
+                        //
+                        // 上界改成固定值之前没这个问题：那时上界是
+                        // `navigationDuration`，撞上去最多也就跑到谱面末尾，
+                        // 距离不远，用户感觉不出来。
                         centeredScrubVelocity = 0f;
+                        centeredScrubActive = false;
+                        scrubPending = false;
+                        EditorPlaybackBridge.EndTimelineScrub();
+                        ParticleWatch.ResumeAll();
+                        // **不 return。** 这段在 `Update` 里，后面还有视图摆正、
+                        // 数据刷新等每帧该做的事；提前返回会让它们整帧跳过，
+                        // 留下不一致的状态（实测表现就是「滚不动，要等十几秒」）。
+                        // 靠下面的 `hitBoundary` 让这一帧不提交 `scrubNext` 即可。
                     }
                     else
                     {
                         centeredScrubVelocity *=
                             Mathf.Exp(-Time.unscaledDeltaTime * HorizontalScrollDecay);
-                        if (Mathf.Abs(centeredScrubVelocity) < 0.0002f)
+                        // **退出阈值必须高于提交阈值（0.001 秒/帧）。**
+                        //
+                        // 原来写的 0.0002（每秒移动 0.0002 秒）意味着一帧只走
+                        // 3 微秒 —— 而 `SubmitPendingScrub` 里有个「时间差小于
+                        // 0.001 秒就当没变、跳过」的判据，于是每帧都被跳过：
+                        // 提交不上去，`centeredScrubActive` 又一直为真，
+                        // 速度只能慢慢衰减到最后才退出去。
+                        // 表现就是「滚不动，要等十几秒才恢复」——日志实测
+                        // `vel` 从 0.00025 一路磨到 0.00020，就在这条死路上。
+                        //
+                        // 抬到 0.01（每秒 0.01 秒，一帧约 0.16 毫秒的移动量）
+                        // 之后，越过它的那一帧一定够得着提交阈值，滚动立刻收尾。
+                        // 这个量级的移动肉眼看不出来，砍掉不影响手感。
+                        bool finishing = Mathf.Abs(centeredScrubVelocity) < 0.01f;
+                        if (finishing)
                         {
                             centeredScrubVelocity = 0f;
                         }
+                        // **只在没撞边界时提交。** 撞边界那一帧的 `scrubNext`
+                        // 已经被 Clamp 顶到 86400 秒，提交它等于把播放头推到
+                        // 24 小时处（见上面那段说明）。
+                        pendingScrubTime = scrubNext;
+                        scrubPending = true;
+                        nextScrubSubmitTime = 0f;
+                        if (finishing)
+                        {
+                            // 提交完最后这一帧再退出 scrub 会话。
+                            // **先提交后结束**：反过来的话最后那段位移会丢。
+                            SubmitPendingScrub(true);
+                            centeredScrubActive = false;
+                            EditorPlaybackBridge.EndTimelineScrub();
+                            ParticleWatch.ResumeAll();
+                        }
                     }
-                    pendingScrubTime = scrubNext;
-                    scrubPending = true;
-                    nextScrubSubmitTime = 0f;
                 }
                 else
                 {
@@ -3238,6 +3323,25 @@ private static float MinimumPixelsPerSecond
 
         public void OnPointerDown(PointerEventData eventData)
         {
+            // **中键按下立刻截断惯性，而且优先级最高。**
+            //
+            // 滚轮滚出来的惯性会持续好几百毫秒。用户想用中键平移/扫时间时，
+            // 那是逆着还在跑的惯性在拖 —— 手感上像"拖不动"，松手后
+            // 惯性又把人拽回去。
+            //
+            // 放在最前面，连右键菜单都不让它抢：中键的语义就是
+            //「我现在要直接控制位置」，任何还在自动跑的位移都该当场停下。
+            if (eventData.button == PointerEventData.InputButton.Middle)
+            {
+                horizontalScrollVelocity = 0f;
+                verticalScrollVelocity = 0f;
+                // 清扫时间那边的速度和「回位延迟」：否则松手后视图
+                // 还会按旧速度继续滑一下，或者被延迟的回位拽走。
+                centeredScrubVelocity = 0f;
+                centeredHoldUntil = 0f;
+                eventData.Use();
+            }
+
             // **右键点模块 = 弹出操作菜单。**
             //
             // 原来右键直接进重命名。现在模块能做的事多了（复制 / 剪切 / 粘贴 /
@@ -3571,7 +3675,7 @@ private static float MinimumPixelsPerSecond
                 float browseTime = Mathf.Clamp(
                     centerBrowseStartTime + centerBrowseAccum,
                     0f,
-                    Mathf.Max(0f, navigationDuration));
+                    MaximumTimelineSeconds);
                 pendingScrubTime = browseTime;
                 scrubPending = true;
                 nextScrubSubmitTime = 0f;
@@ -3725,7 +3829,185 @@ private static float MinimumPixelsPerSecond
             {
                 AdjustRowHeight(-1f);
             }
+            else if (control && (Input.GetKeyDown(KeyCode.LeftArrow)
+                || Input.GetKeyDown(KeyCode.RightArrow)))
+            {
+                // 左减右加，一格一步。
+                MoveSelectionByFloor(Input.GetKeyDown(KeyCode.RightArrow) ? 1 : -1);
+            }
+            else if (control && (Input.GetKeyDown(KeyCode.UpArrow)
+                || Input.GetKeyDown(KeyCode.DownArrow)))
+            {
+                MoveSelectionByRow(Input.GetKeyDown(KeyCode.DownArrow) ? 1 : -1);
+            }
         }
+
+        /// <summary>
+        /// 把选中的块整体上下挪一行。
+        ///
+        /// **只改显示行，不动谱面数据。** 事件还是那些事件、时间还是那些时间，
+        /// 变的只是「块画在第几行」。所以这一步不碰 `floor` / `angleOffset`，
+        /// 也就不需要重建求值器。
+        ///
+        /// 行号有两条载体（`BlockPlacement.Row` 和 `TimelineItem.DisplayRow`），
+        /// 必须一起写 —— 只改一边的话下一次重绑会被另一条拽回去。
+        /// 撤销走 `RecordBlockRows`，和模块推挤那套共用。
+        /// </summary>
+        private void MoveSelectionByRow(int delta)
+        {
+            // 只读模式：虽然只改显示行、不动谱面数据，但它会写排版文件，
+            // 和"不能改"的语义一致，一并拦住。
+            if (delta == 0 || multiSelection.Count == 0 || blockPlacements.Count == 0
+                || !CanEditChart())
+            {
+                return;
+            }
+
+            // 先收集要动的块，并确认它们都能往下/往上走。
+            List<BlockPlacement> targets = new List<BlockPlacement>();
+            int minRow = int.MaxValue;
+            int maxRow = int.MinValue;
+            for (int i = 0; i < blockPlacements.Count; i++)
+            {
+                BlockPlacement placement = blockPlacements[i];
+                if (placement.Item == null || placement.Item.Event == null)
+                {
+                    continue;
+                }
+                if (!multiSelection.Contains(placement.Item.Event))
+                {
+                    continue;
+                }
+                targets.Add(placement);
+                if (placement.Row < minRow) { minRow = placement.Row; }
+                if (placement.Row > maxRow) { maxRow = placement.Row; }
+            }
+
+            if (targets.Count == 0)
+            {
+                return;
+            }
+
+            // 夹住：最上一行不许再往上，最下一行不许再往下。
+            // 下界用 0；上界不设死数——和拖到空白处一样，行多出去就是多出去。
+            if (delta < 0 && minRow + delta < 0)
+            {
+                return;
+            }
+
+            LevelEvent[] events = new LevelEvent[targets.Count];
+            int[] oldRows = new int[targets.Count];
+            int[] newRows = new int[targets.Count];
+            for (int i = 0; i < targets.Count; i++)
+            {
+                BlockPlacement placement = targets[i];
+                events[i] = placement.Item.Event;
+                oldRows[i] = placement.Row;
+                newRows[i] = placement.Row + delta;
+                placement.Row = newRows[i];
+                placement.Item.DisplayRow = newRows[i];
+            }
+
+            EditorCommandHistory.RecordBlockRows(this, events, oldRows, newRows);
+            blocksDirtyVersion++;
+            visualsDirty = true;
+        }
+
+        /// <summary>
+        /// 把选中的事件整体前后挪一格。
+        ///
+        /// **和拖动落点是同一套语义**：目标时间取「目标格的 entryTime」，
+        /// 再走 <see cref="CommitBlockDrag"/> 反解出 floor 和 angleOffset。
+        /// 所以键盘挪和鼠标拖出来的结果一样，不会出现两种操作产生不同数据。
+        ///
+        /// 多选时整体平移：全部按同一个格数位移，相互之间的间距不变。
+        /// 边界处夹住——最左那个已经到第 0 格就不动，避免挤出谱面。
+        /// </summary>
+        private void MoveSelectionByFloor(int delta)
+        {
+            // 只读模式下不能改谱面 —— 和拖动、删除、粘贴共用同一条判据，
+            // 免得这里绕开那道闸。
+            if (!CanEditChart())
+            {
+                return;
+            }
+
+            scnEditor editor = scnEditor.instance;
+            if (editor == null || editor.floors == null || editor.floors.Count == 0
+                || multiSelection.Count == 0)
+            {
+                return;
+            }
+
+            // 先算出每个事件当前落在哪一格，再整体平移。
+            // 用格号做基准而不是时间：键盘移动的语义就是「换一格」。
+            List<scrFloor> floors = editor.floors;
+            List<LevelEvent> targets = new List<LevelEvent>(multiSelection);
+            List<int> currentFloors = new List<int>(targets.Count);
+            int minFloor = int.MaxValue;
+            int maxFloor = int.MinValue;
+            for (int i = 0; i < targets.Count; i++)
+            {
+                int index = Mathf.Clamp(targets[i].floor, 0, floors.Count - 1);
+                currentFloors.Add(index);
+                if (index < minFloor) { minFloor = index; }
+                if (index > maxFloor) { maxFloor = index; }
+            }
+
+            // 夹住：整批都不许冲出首尾。
+            if (delta < 0 && minFloor + delta < 0)
+            {
+                return;
+            }
+            if (delta > 0 && maxFloor + delta > floors.Count - 1)
+            {
+                return;
+            }
+
+            // CommitBlockDrag 内部自己记撤销；这里包一层批处理，
+            // 让多选的整批移动合成一步，而不是一步一格。
+            bool batched = targets.Count > 1;
+            if (batched)
+            {
+                EditorCommandHistory.BeginBatch("键盘移动");
+            }
+
+            for (int i = 0; i < targets.Count; i++)
+            {
+                LevelEvent target = targets[i];
+                if (target == null || !IsEventStillLive(editor, target))
+                {
+                    continue;
+                }
+
+                int newFloorIndex = Mathf.Clamp(currentFloors[i] + delta, 0, floors.Count - 1);
+                float newTime = Convert.ToSingle(floors[newFloorIndex].entryTime);
+
+                TimelineItem item = FindItemForEvent(target);
+                if (item == null)
+                {
+                    continue;
+                }
+
+                int oldFloor = target.floor;
+                float oldAngleOffset = target.GetFloat("angleOffset");
+                bool hadDuration = target.GetData() != null
+                    && target.GetData().ContainsKey("duration");
+                float oldDuration = target.GetFloat("duration");
+
+                item.StartTime = newTime;
+                CommitBlockDrag(editor, item, newTime, item.Duration,
+                    oldFloor, oldAngleOffset, oldDuration, hadDuration);
+            }
+
+            if (batched)
+            {
+                EditorCommandHistory.EndBatch();
+            }
+            MarkBlocksDirty();
+            visualsDirty = true;
+        }
+
 
         private void AdjustRowHeight(float direction)
         {
@@ -3924,7 +4206,7 @@ private static float MinimumPixelsPerSecond
             pendingScrubTime = Mathf.Clamp(
                 viewStartTime + Mathf.Clamp(x, 0f, bodyWidth) / Mathf.Max(1f, pixelsPerSecond),
                 0f,
-                Mathf.Max(0f, navigationDuration)
+                MaximumTimelineSeconds
             );
             scrubPending = true;
             manualNavigationUntil = float.PositiveInfinity;
@@ -13780,8 +14062,28 @@ private static float MinimumPixelsPerSecond
                 ClampCenteredViewStart();
                 return;
             }
-            float maximumStart = Mathf.Max(0f, navigationDuration - bodyWidth / Mathf.Max(1f, pixelsPerSecond));
-            viewStartTime = Mathf.Clamp(viewStartTime, 0f, maximumStart);
+
+            // 两侧各留**一个视口宽**的余量，而不是死卡在内容边界上。
+            //
+            // 有些特效师习惯在谱面开头之前、结尾之后摆一串事件（提前生效的
+            // 入场动画、拖到很后面的收尾）。旧边界把视图钉在
+            // `[0, 内容长 - 视口宽]` 上：播放头停在 0 秒时**左侧一屏什么都
+            // 看不着**，停在末尾时**右侧同样没地方**，想摆东西没处下手。
+            //
+            // 现在：
+            //   · 最左 = 内容起点再往前一屏（`-visible`）
+            //   · 最右 = 内容终点再往后一屏（`navigationDuration`）
+            //
+            // 两侧都能多出一屏的空白，摆完东西继续滑还能再多滑一点 ——
+            // 因为块被算进 `navigationDuration` 之后上界自己会往后长。
+            //
+            // **不改 `navigationDuration` 本身。** 它必须每帧重算
+            // （原因见它赋值处的注释：只增不减会让松手跳回开头），
+            // 在这里放宽夹取就够，不碰那个不变量。
+            float visible = bodyWidth / Mathf.Max(1f, pixelsPerSecond);
+            float minimumStart = -visible;
+            float maximumStart = Mathf.Max(minimumStart, MaximumTimelineSeconds);
+            viewStartTime = Mathf.Clamp(viewStartTime, minimumStart, maximumStart);
         }
 
         /// <summary>
@@ -13792,9 +14094,12 @@ private static float MinimumPixelsPerSecond
         /// </summary>
         private void ClampCenteredViewStart()
         {
+            // 和自由模式同一套放宽：左侧多留半个视口（播放头在 0 秒时要居中），
+            // 右侧多留整屏。见 `ClampViewStart` 里那段说明。
             float visible = bodyWidth / Mathf.Max(1f, pixelsPerSecond);
-            float maximumStart = Mathf.Max(0f, navigationDuration - visible);
-            viewStartTime = Mathf.Clamp(viewStartTime, -visible * 0.5f, maximumStart);
+            float minimumStart = -visible * 0.5f;
+            float maximumStart = Mathf.Max(minimumStart, MaximumTimelineSeconds);
+            viewStartTime = Mathf.Clamp(viewStartTime, minimumStart, maximumStart);
         }
 
         private float GetMaximumVerticalScroll()

@@ -73,26 +73,44 @@ namespace ADOFAIEditorStudio.Preview.Domains
             internal bool WasHidden;
 
             /// <summary>
-            /// 这个装饰物声明了 autoPlay，且还没有被"自动播放"过。
+            /// 这个装饰物的 `autoPlay` 还没来得及「烧掉」。
             ///
-            /// 原版 scrParticleDecoration.Update 是：
+            /// 原版 `scrParticleDecoration.Update()`：
             ///
             ///     if (atStart) {
             ///         if (autoPlay &amp;&amp; !ADOBase.controller.paused) particleSystem.Play();
-            ///         autoPlay = false;   // 无论播没播，都会被清掉
+            ///         autoPlay = false;   // ← 不管播没播，无条件清掉
             ///     }
             ///
-            /// AES 预览时 controller.paused 恒为 true，Play() 被跳过，
-            /// 而 autoPlay 照样清零——这个发射器就永远不播了。
-            /// 这里把这个职责接过来。它和「ApplyEventsToFloors 的 paused 闸」
-            /// 是同一类问题的第三个实例：原生逻辑只要挂在 paused 后面，
-            /// 在预览里就永远不会发生，而且往往还顺手把状态标记吃掉了。
+            /// **关键在最后那句是无条件的。** 编辑器 / 预览里
+            /// `controller.paused` 恒为 true，`Play()` 被跳过，而 `autoPlay`
+            /// 照样被清 —— 于是这批发射器在原版编辑器里**从来不会自己播**，
+            /// 要等谱面某条 `SetParticle Start` 把它叫起来。
             ///
-            /// 另外，原版那个 Update 只在**自身激活**时才会跑，所以
-            /// 自动播放实际发生在它第一次可见的时候；隐藏期间这个机会
-            /// 不会被消费掉。这里照同样的语义。
+            /// 这里以前理解反了：保留这个闩、等物体第一次露面就补一次
+            /// `Play()`，理由是"原生逻辑挂在 paused 后面，预览里不会发生的
+            /// 事要我来补"。但这一处**恰恰不该补** —— 原版在编辑器里就是
+            /// 不播，补了才是错的。
+            ///
+            /// 实测（`ViLLAGE OF CHRYSANTHEMUM`）：20 件 `autoPlay=True`
+            /// 的发射器（`p4_tjsfud*` / `oe_ccccc`）里有 18 件在预览
+            /// `t=0.000` 就被点着了，而它们要到 2464 格才出场、谱面也
+            /// 从没有显式 `Start`。原版同一段画面干干净净 ——
+            /// 用户报的「315 格附近很多不该出现的粒子」就是它们
+            /// （三角形 / 花瓣 / 字符图三种图全对得上）。
+            ///
+            /// 所以这个标记现在只用于**把闩烧掉**，不再触发任何播放。
             /// </summary>
             internal bool AutoPlayPending;
+
+            /// <summary>
+            /// 已经因为「这一刻没有任何 mode 动作」把它停了。
+            ///
+            /// 只是去重：`ApplyTargetMode` 每帧都会走，没这个标记就会
+            /// 每帧 `Stop()` 一次。真正的判据是"当前没有动作"，
+            /// 见那里的注释。
+            /// </summary>
+            internal bool ParticlesStoppedForNoAction;
 
             /// <summary>
             /// 最近一条已经炸过的 emit 事件。只用来挡"同一条事件重复炸"，
@@ -133,6 +151,9 @@ namespace ADOFAIEditorStudio.Preview.Domains
             {
                 states[i].AppliedTargetMode = null;
                 states[i].EmittedLast = null;
+                // 时间倒回去了：这条发射器可能又回到"还没有任何动作"的状态，
+                // 允许再停一次（见 ApplyTargetMode）。
+                states[i].ParticlesStoppedForNoAction = false;
             }
         }
 
@@ -239,44 +260,15 @@ namespace ADOFAIEditorStudio.Preview.Domains
         }
 
         /// <summary>
-        /// 把声明了 autoPlay 的粒子装饰物登记下来，由求值器替原生补上
-        /// 那一次自动播放。
+        /// 把声明了 `autoPlay` 的粒子装饰物登记下来，好让
+        /// <see cref="ApplyAutoPlay"/> 按原版时机把这个闩**烧掉**。
         ///
-        /// 走 allDecorations 而不是 GetTaggedDecorations：自动播放和 tag
-        /// 无关，每个粒子装饰物都有自己的 autoPlay 标记。
+        /// 走 `allDecorations` 而不是 `GetTaggedDecorations`：自动播放和 tag
+        /// 无关，每个粒子装饰物都有自己的 `autoPlay` 标记。
+        ///
+        /// **这里不播任何东西。** 原版在编辑器里（`paused` 为真）同样不播 ——
+        /// 详见 `AutoPlayPending` 与 `ApplyAutoPlay` 的注释。
         /// </summary>
-        /// <summary>
-        /// 这个发射器有没有被谱面**显式 Start 过**。
-        ///
-        /// 有的话就不能再替原生补那一次 autoPlay：
-        ///
-        /// - 原生那边 `autoPlay` 是在 `Update` 里被消费的 ——
-        ///   `if (atStart) { if (autoPlay && !paused) Play(); autoPlay = false; }`。
-        ///   关卡加载时物体只要激活过一帧，标志就被烧掉了，之后永远不会再自播；
-        ///   而求值器是"等它第一次露面才播"，于是**露面的那一刻**就会喷出来。
-        /// - 本谱 7-6.57 / 7-6.59 就是这种：`AddParticle` 写的是 `visible: false`
-        ///   加 `autoPlay: true`，真正的启动在 1009 格的 `SetParticle Start`。
-        ///   而 1009 格那条 `MoveDecorations` 带 `angleOffset: -360`（提前整整一圈
-        ///   生效），于是在 992-993 一带就把它们掀开 —— 求值器顺手把 autoPlay
-        ///   补播了，原版这里什么都不该有。
-        ///
-        /// 判据只看"有没有 Start 动作"：只有 Stop、没有 Start 的发射器
-        /// 仍然需要 autoPlay 才能起来，不能一起挡掉。
-        /// </summary>
-        private static bool HasExplicitStart(DecoState state)
-        {
-            for (int i = 0; i < state.Actions.Count; i++)
-            {
-                ParticleAction action = state.Actions[i];
-                if (action.Kind == ParticleActionKind.TargetMode
-                    && action.Mode == ParticlePlayMode.Start)
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
-
         private void CollectAutoPlayDecorations(scrDecorationManager manager)
         {
             List<scrDecoration> all = manager.allDecorations;
@@ -303,7 +295,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
 
                 try
                 {
-                    if (source.GetBool("autoPlay") && !HasExplicitStart(state))
+                    if (source.GetBool("autoPlay"))
                     {
                         state.AutoPlayPending = true;
                         autoPlayCount++;
@@ -318,9 +310,9 @@ namespace ADOFAIEditorStudio.Preview.Domains
             if (autoPlayCount > 0)
             {
                 Main.Logger.Log("[StaticPreview/Particle] " + autoPlayCount
-                    + " decorations want autoPlay; the native autoplay sits behind"
-                    + " the paused gate and never runs in preview, so the evaluator"
-                    + " takes it over.");
+                    + " decorations declare autoPlay; per the native editor those"
+                    + " must stay silent (paused blocks Play, and the flag is"
+                    + " cleared anyway), so the evaluator only clears the flag.");
             }
         }
 
@@ -487,11 +479,27 @@ namespace ADOFAIEditorStudio.Preview.Domains
         }
 
         /// <summary>
-        /// 替原版补上那一次 autoPlay。
+        /// 把原版那一次「`autoPlay` 烧掉」补上 —— **只烧，不播**。
         ///
-        /// 只在装饰物**可见**时才消费掉这次机会，照抄原版的语义：
-        /// 原生那段代码在 Update 里，而 Update 只在自身激活时跑，
-        /// 所以隐藏期间这个机会一直留着，等它第一次露面才播。
+        /// 原版 `scrParticleDecoration.Update()`：
+        ///
+        ///     if (atStart) {
+        ///         if (autoPlay &amp;&amp; !ADOBase.controller.paused) particleSystem.Play();
+        ///         autoPlay = false;   // 无条件
+        ///     }
+        ///
+        /// 编辑器 / 预览里 `paused` 恒为 true，所以 `Play()` 永远不会发生，
+        /// 而 `autoPlay` 照样被清。AES 以前把这里当成"原生逻辑被 paused
+        /// 挡住、要我来补"，结果替原版多播了一批本该沉默的发射器
+        /// （见 `AutoPlayPending` 的注释）。
+        ///
+        /// 现在只把它标记清掉，一次 `Play()` 都不补。真正该起来的发射器
+        /// 由谱面的 `SetParticle Start` 负责 —— 那才是原版的路径。
+        ///
+        /// 注意**不能在 Analyze 里直接清**：原版那句写在 `Update` 里，
+        /// 而 `Update` 只在物体激活时才跑；物体一直被藏着的话闩会留到它
+        /// 第一次露面。这里保留同样的时机（`ApplyAutoPlay` 每帧对着
+        /// 已激活的系统调），只是把动作从"播"降级成"清"。
         /// </summary>
         private static void ApplyAutoPlay(DecoState state)
         {
@@ -500,23 +508,19 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 return;
             }
 
-            ParticleSystem system = state.Deco.particleSystem;
+            ParticleSystem system = state.Deco == null ? null : state.Deco.particleSystem;
             if (system == null)
             {
                 return;
             }
 
-            // 还藏着就先不动；等装饰物域把它放出来再播。
+            // 还藏着就先不动 —— 照抄原版「Update 只在激活时跑」的时机。
             if (!system.gameObject.activeSelf)
             {
                 return;
             }
 
             state.AutoPlayPending = false;
-            if (!system.isPlaying)
-            {
-                system.Play();
-            }
         }
 
         /// <summary>
@@ -534,8 +538,35 @@ namespace ADOFAIEditorStudio.Preview.Domains
         {
             if (current == null)
             {
+                // **没有任何 mode 动作作用在这一刻 = 这个发射器必须静默。**
+                //
+                // 原版的粒子只有两条启动路径：`SetParticle Start`，或者
+                // `autoPlay`（编辑器里被 `paused` 挡掉、且标志会被烧掉）。
+                // 两者都没有的发射器，在原版编辑器里就是停着的。
+                //
+                // 以前这里直接 `return`，等于"不管它"——只要别的地方（比如
+                // 拖动收尾的 `ParticleWatch.ResumeAll`）把它点着了，就再也
+                // 没人负责让它停下，画面上于是多出一堆本该 1800 格才登场的
+                // 粒子。在这里收口：没动作就停。
+                //
+                // **不能 `Clear()`**：那会连已发射的粒子一起抹掉，画面突然
+                // 空一块。`StopEmitting` 只停发射，在飞的粒子自然消散，
+                // 这也是原版 `SetParticle Stop` 的做法。
+                if (state.ParticlesStoppedForNoAction)
+                {
+                    return;
+                }
+                ParticleSystem idle = state.Deco.particleSystem;
+                if (idle != null && idle.isPlaying)
+                {
+                    idle.Stop(false, ParticleSystemStopBehavior.StopEmitting);
+                }
+                state.ParticlesStoppedForNoAction = true;
                 return;
             }
+
+            // 之后一旦真有动作作用，允许下一次"无动作"再停一回。
+            state.ParticlesStoppedForNoAction = false;
 
             ParticleSystem system = state.Deco.particleSystem;
             if (system == null)

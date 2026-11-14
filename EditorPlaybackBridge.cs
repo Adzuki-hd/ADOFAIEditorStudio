@@ -1005,6 +1005,25 @@ namespace ADOFAIEditorStudio
                     new HarmonyMethod(applyEventsPostfix),
                     null,
                     new HarmonyMethod(applyEventsFinalizer));
+
+                // 预览期间撤掉「方向变化」判出来的旋转图标。
+                MethodInfo iconMethod = typeof(scrFloor).GetMethod(
+                    "LateUpdate",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                    null,
+                    Type.EmptyTypes,
+                    null);
+                MethodInfo iconPostfix = typeof(EditorSwirlIconPatch).GetMethod("Postfix", StaticFlags);
+                if (iconMethod != null && iconPostfix != null)
+                {
+                    harmony.Patch(iconMethod, null, new HarmonyMethod(iconPostfix));
+                    Main.Logger.Log("[EditorSwirlIconPatch] scrFloor.LateUpdate patched（图标跟随透明度）。");
+                }
+                else
+                {
+                    Main.Logger.Error("[EditorSwirlIconPatch] scrFloor.LateUpdate 没找到，"
+                        + "预览里的格图标不会跟随轨道淡出。");
+                }
                 Main.Logger.Log("Persistent preview input and exit patches installed.");
 
                 // 这个 Harmony 版本里 PatchAll(Type) 不是重载，而这个探针
@@ -1063,6 +1082,34 @@ namespace ADOFAIEditorStudio
                 if (tweenOpacity != null && opacityPrefix != null)
                 {
                     harmony.Patch(tweenOpacity, new HarmonyMethod(opacityPrefix));
+                }
+
+                // 选中装饰物探针：查「选中那一刻画面整体异常」。
+                //
+                // 三个入口（画面点击 / 右侧列表 / 时间轴）都会走到
+                // `scnEditor.SelectDecoration(LevelEvent, ...)`，所以打在它上面
+                // 一次就覆盖全部。
+                //
+                // 要回答的是：选中那一刻相机、球、求值器各自处于什么状态，
+                // 以及 `SaveState`（里面 `levelData.Copy()` 深拷贝整个关卡）
+                // 花了多久 —— 这个谱面 1303 条事件、585 条 MoveTrack。
+                MethodInfo selectDecoration = typeof(scnEditor).GetMethod(
+                    "SelectDecoration", InstanceFlags, null,
+                    new[]
+                    {
+                        typeof(ADOFAI.LevelEvent), typeof(bool), typeof(bool),
+                        typeof(bool), typeof(bool)
+                    }, null);
+                MethodInfo selectDecorationProbe = typeof(SelectDecorationProbe)
+                    .GetMethod("Prefix", StaticFlags);
+                if (selectDecoration != null && selectDecorationProbe != null)
+                {
+                    harmony.Patch(selectDecoration,
+                        new HarmonyMethod(selectDecorationProbe));
+                }
+                else if (Main.VerboseLog)
+                {
+                    Main.Logger.Warning("[SelectDecoProbe] 没找到 SelectDecoration，探针未安装。");
                 }
 
                 // 退出追踪器：每一个都只是针对一个方法的诊断，所以用
@@ -4759,6 +4806,29 @@ namespace ADOFAIEditorStudio
             }
             evaluatorBackend.End();
             RestoreStaticPreviewNativeUpdates();
+
+            // **把 gameworld 还回编辑器该有的值。**
+            //
+            // StartEditorNativePlayback 为了让球能自动打击，把它设成了 true
+            // （scrPlanet.AutoShouldHitNow 要先看这个），但从来没还原过。
+            // 后果是播过一次之后它永久为 true，而游戏画格图标那条路
+            // （scrFloor.UpdateIconSprite）正是靠它区分「真实播放」和「编辑器」：
+            //
+            //     if (!controller.gameworld) break;        // 编辑器里不画
+            //     bool flag = seqID != 0 && isCCW != listFloors[seqID-1].isCCW;
+            //     if (flag) floorIcon = FloorIcon.Swirl;
+            //
+            // gameworld 一直为 true 时，编辑器会被当成播放态，于是每格的
+            // 方向变化都被判成「要画旋转图标」——实测一张 1454 格的谱
+            // 里 311 个 Twirl 格全亮，图标悬在轨道外面。
+            //
+            // 只在这里还原：上面那些交接原生播放的路径需要它是 true，
+            // 而 TryStopPlayback 是真正「离开预览」的唯一出口。
+            scrController stopController = scrController.instance;
+            if (stopController != null)
+            {
+                stopController.gameworld = false;
+            }
             restartTargetTime = 0f;
             restartCommitExactTime = false;
             EditorCommandHistory.Clear();
@@ -7652,6 +7722,34 @@ namespace ADOFAIEditorStudio
             {
                 editor.DeselectFloors();
                 editor.DeselectAllDecorations();
+
+                // **无条件再清一次边框。**
+                //
+                // `DeselectAllDecorations()` 第一句是
+                //     if (SelectionDecorationIsEmpty()) return;
+                // 列表已经空了就直接返回，真正清边框的
+                // `ClearDecorationBorders()` 在它后面 —— 永远跑不到。
+                //
+                // 实测（`[ClearSel] before deco=0 floors=1 borders=1`）：
+                // 存在「selectedDecorations 空、但仍有一件装饰物的框开着」
+                // 这个中间态。一旦进去，按多少次 Shift+C 都清不掉
+                // （每次都被那句早退挡住），关掉工作台框也还在 ——
+                // 框是装饰物对象上的 `selectionBordersObject`，
+                // 和我们的面板无关。
+                //
+                // 只有重新选中一次（让列表非空）再清才有机会，
+                // 正是用户描述的「再次进 AES 选中装饰物，再次 Shift+C 就可以了」。
+                //
+                // `ClearDecorationBorders()` 是原生公开方法、幂等、
+                // 无条件关掉所有装饰物的框。补这一次没有副作用：
+                // 列表本来就空时它是唯一有效的一步；列表非空时
+                // `DeselectAllDecorations` 已经清过，这里等于重复一次空操作。
+                scrDecorationManager decorationManager = scrDecorationManager.instance;
+                if (decorationManager != null)
+                {
+                    decorationManager.ClearDecorationBorders();
+                }
+
             }
 
             EditorStudioOverlay overlay = Main.Overlay;
@@ -8157,6 +8255,70 @@ namespace ADOFAIEditorStudio
     /// 在写的通道。ffxSetHitsound 和 ffxSetHoldsound 没有 Update，也不碰
     /// 渲染，所以不可能和它竞争。
     /// </summary>
+    /// <summary>
+    /// 预览期间，把「方向变化」判出来的旋转图标撤掉。
+    ///
+    /// **背景。** 工作台为了让轨道有入场动画，必须让 `gameworld` 保持 true；
+    /// 而同一个旗标也是游戏区分「真实播放」和「编辑器」的依据。
+    /// 于是 `scrFloor.UpdateIconSprite` 里那条
+    ///
+    ///     if (!controller.gameworld) break;              // 编辑器里不画图标
+    ///     bool flag = seqID != 0 &amp;&amp; isCCW != listFloors[seqID-1].isCCW;
+    ///     if (flag) floorIcon = FloorIcon.Swirl;
+    ///
+    /// 在预览里全部命中——一张 1454 格的谱里有 311 个格子点亮旋转图标，
+    /// 图标还悬在轨道外面。
+    ///
+    /// **不去动 gameworld**：试过在开会话时把它设回 false，轨道入场动画
+    /// 立刻没了。改成在图标真正落到渲染器那一刻把它换掉，两边都不牺牲。
+    ///
+    /// **挂的是 `SetIconSprite` 而不是 `UpdateIconSprite`。** 实测挂后者
+    /// 一条日志都没有——那个方法在预览期间根本没被调，图标是从别的路径
+    /// 设进 `lastIconSprite` 的。`SetIconSprite` 是所有路径的汇合点。
+    /// </summary>
+    internal static class EditorSwirlIconPatch
+    {
+        /// <summary>
+        /// 挂在 `scrFloor.SetIconSprite(Sprite)` 之后。
+        ///
+        /// 只在预览接管期间、且这一格的图标确实是「方向变化」判出来的时撤。
+        /// 没开工作台时不介入——那时候游戏自己的 `gameworld` 是 false，
+        /// 本来就不会画。
+        /// </summary>
+        internal static void Postfix(scrFloor __instance)
+        {
+            // **图标要跟着轨道一起淡。**
+            //
+            // 游戏在 `scrFloor.LateUpdate` 里是这么做的：
+            //
+            //     if (isFading) {
+            //         floorRenderer.material.SetFloat(ShaderProperty_Alpha, opacity);
+            //         if (!controller.paused) {
+            //             SetIconColor(new Color(1f, 1f, 1f, opacity));   // ← 图标
+            //         }
+            //         ...
+            //     }
+            //
+            // 而编辑器里 `paused` 恒为 true，那行永远被跳过——轨道淡到透明，
+            // 图标却一直是全不透明，看上去就是「图标悬在已经看不见的轨道外面」。
+            // 旋转、蜗牛、兔子、所有格图标都是这一个原因。
+            //
+            // 这里补上被跳过的那一句。只补透明度，不动别的：
+            // 颜色恒为白色是游戏自己的写法（图标靠贴图着色，不靠 tint）。
+            if (__instance == null || Main.Overlay == null || !Main.Overlay.IsVisible)
+            {
+                return;
+            }
+
+            float opacity = __instance.opacity;
+            if (Mathf.Approximately(opacity, 1f))
+            {
+                return;
+            }
+            __instance.SetIconColor(new Color(1f, 1f, 1f, opacity));
+        }
+    }
+
     internal static class ApplyEventsToFloorsPatch
     {
         private const BindingFlags Flags =

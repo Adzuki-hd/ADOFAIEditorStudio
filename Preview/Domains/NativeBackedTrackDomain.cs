@@ -49,6 +49,25 @@ namespace ADOFAIEditorStudio.Preview.Domains
         private FloorPose[] pendingPoses = new FloorPose[0];
         private bool pendingValid;
 
+        // 上一帧**写进场景**的姿态。
+        //
+        // 用来跳过「这一帧和上一帧算出来一模一样」的格 —— 那种格不写，
+        // 场景里的值本来就已经是对的。
+        //
+        // **为什么不拿 `transform` 读回来比**（原来就是那么做的）：
+        // 读 `transform.position` / `eulerAngles` / `localScale` 各自都会
+        // 让 Unity 做一次 transform 同步，4446 格 × 3 次读回，比写入本身
+        // 还贵。实测本谱 4446 格里每帧只有 60 格真的在动，其余 4386 格
+        // 的读回全是白花。
+        //
+        // 正确性：某一格判为「没变」时，场景里的值等于上一帧写进去的值，
+        // 也就是 `lastPoses[i]`；而这一帧算出来的 `pendingPoses[i]` 与它
+        // 相等，所以「不写」和「写」的结果完全一致。
+        //
+        // `lastValid` 为假时（刚 Analyze 完）一律写一遍，保证首帧对齐。
+        private FloorPose[] lastPoses = new FloorPose[0];
+        private bool[] lastValid = new bool[0];
+
         public void Analyze(PreviewTimelineContext source)
         {
             context = source;
@@ -56,6 +75,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
             floors = new FloorTrackState[count];
             pendingFloors = new scrFloor[count];
             pendingPoses = new FloorPose[count];
+            lastPoses = new FloorPose[count];
+            lastValid = new bool[count];
             pendingValid = false;
 
             for (int i = 0; i < count; i++)
@@ -283,6 +304,7 @@ namespace ADOFAIEditorStudio.Preview.Domains
             // LateUpdate 里统一写。旧的 MoveTrack 域走的是同一条路
             // （理由见 PreviewEvaluationEngine.TickEditorScaffoldingLate
             // 里那段注释），这也是那个域一直没这个延迟的原因。
+            int animated = 0;
             for (int i = 0; i < count; i++)
             {
                 scrFloor binding = frame.Context.GetFloorBinding(i);
@@ -291,12 +313,53 @@ namespace ADOFAIEditorStudio.Preview.Domains
                     continue;
                 }
 
+                if (floors[i].HasAnyEvent)
+                {
+                    animated++;
+                }
+
                 pendingFloors[i] = binding;
                 pendingPoses[i] = floors[i].Evaluate(frame.Time);
                 evaluatedCount++;
             }
 
+            // 【临时探针】带事件的格占多少。实测 Written=3/4446 说明绝大多数格
+            // 静止，那么「有没有事件」就是最省的分流判据。
+            if (PreviewDiagnostics.Enabled)
+            {
+                PreviewDiagnostics.RecordFlag("Track.Animated", animated);
+            }
+
             pendingValid = true;
+        }
+
+        /// <summary>
+        /// 某一格在**任意时刻**的位置。
+        ///
+        /// 这个域是纯函数（给定时间就是给定画面，没有跨帧状态），所以可以
+        /// 离线问「第 i 格入场那一刻，格在哪」—— 相机建跟随表时需要这个。
+        ///
+        /// **为什么要它**：相机跟随的目标是球，而球粘在轨道上。快照里的
+        /// `BallPosition` 是静态值（`startPos + offsetPos`），能吃下
+        /// `PositionTrack`（它同时写 `offsetPos`），但吃不下 `MoveTrack`
+        /// ——`ffxMoveFloorPlus` 直接对 `transform.position` 起 tween，
+        /// 从不碰 `offsetPos`。于是「轨道被 MoveTrack 推走之后，球在哪」
+        /// 快照里根本没有。
+        ///
+        /// 本谱第 129 格就是这个情形：`PositionTrack positionOffset: [0,8]`
+        /// 上移 8 格，131 格紧接着 `MoveTrack`。相机按静态位置跟随，
+        /// 就从 130 格起累积出 +2.4 → +5.9 格的上移，之后缓慢回落。
+        /// </summary>
+        internal bool TryGetFloorPositionAt(int index, double time, out Vector3 position)
+        {
+            position = Vector3.zero;
+            if (index < 0 || index >= floors.Length || floors[index] == null)
+            {
+                return false;
+            }
+            FloorPose pose = floors[index].Evaluate(time);
+            position = new Vector3(pose.X, pose.Y, 0f);
+            return true;
         }
 
         /// <summary>
@@ -345,6 +408,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
             pendingValid = false;
 
             bool wrote = false;
+            int changed = 0;
+            int skipped = 0;
             for (int i = 0; i < evaluatedCount; i++)
             {
                 scrFloor binding = pendingFloors[i];
@@ -352,8 +417,30 @@ namespace ADOFAIEditorStudio.Preview.Domains
                 {
                     continue;
                 }
-                Apply(binding, pendingPoses[i]);
+
+                FloorPose pose = pendingPoses[i];
+                // 和上一帧写进场景的值比：一样就不碰 transform。
+                // 省掉的是三次读回 + 三次比较，见 `lastPoses` 的注释。
+                if (lastValid[i] && SamePose(lastPoses[i], pose))
+                {
+                    skipped++;
+                    wrote = true;
+                    continue;
+                }
+
+                Apply(binding, pose);
+                lastPoses[i] = pose;
+                lastValid[i] = true;
+                changed++;
                 wrote = true;
+            }
+
+            // 【临时探针】看「全量遍历」和「真的动了」差多少。
+            if (PreviewDiagnostics.Enabled && wrote)
+            {
+                PreviewDiagnostics.RecordFlag("Track.Written", changed);
+                PreviewDiagnostics.RecordFlag("Track.Skipped", skipped);
+                PreviewDiagnostics.RecordFlag("Track.Scanned", evaluatedCount);
             }
 
             if (wrote)
@@ -362,33 +449,45 @@ namespace ADOFAIEditorStudio.Preview.Domains
             }
         }
 
+        /// <summary>
+        /// 把一份姿态写进场景。
+        ///
+        /// **无条件写**：要不要写由调用方用 `SamePose` 判过，这里不再
+        /// 逐个属性读回 transform 比较 —— 那三次读回各自会触发一次 Unity
+        /// 的 transform 同步，4446 格就是一万三千多次，比写入本身还贵。
+        /// </summary>
         private static void Apply(scrFloor floor, FloorPose pose)
         {
             Transform transform = floor.transform;
+            // 位置要保 z：装饰物/轨道可能被别的东西挪过深度，这里只管 XY。
             Vector3 position = transform.position;
-            if (!Approximately(position.x, pose.X) || !Approximately(position.y, pose.Y))
-            {
-                transform.position = new Vector3(pose.X, pose.Y, position.z);
-            }
+            transform.position = new Vector3(pose.X, pose.Y, position.z);
+            transform.rotation = Quaternion.Euler(0f, 0f, pose.Rotation);
 
-            if (!Approximately(transform.eulerAngles.z, pose.Rotation))
-            {
-                transform.rotation = Quaternion.Euler(0f, 0f, pose.Rotation);
-            }
-
+            // 缩放同理，只换 XY。
             Vector3 scale = transform.localScale;
-            float wantedX = pose.ScaleX / 100f;
-            float wantedY = pose.ScaleY / 100f;
-            if (!Approximately(scale.x, wantedX) || !Approximately(scale.y, wantedY))
-            {
-                transform.localScale = new Vector3(wantedX, wantedY, scale.z);
-            }
+            transform.localScale = new Vector3(pose.ScaleX / 100f, pose.ScaleY / 100f, scale.z);
 
-            float opacity = Mathf.Clamp01(pose.Opacity);
-            if (!Approximately(floor.opacity, opacity))
-            {
-                floor.SetOpacity(opacity);
-            }
+            floor.SetOpacity(Mathf.Clamp01(pose.Opacity));
+        }
+
+        /// <summary>
+        /// 两份姿态是不是同一个画面。
+        ///
+        /// 容差和原来读回 transform 时用的 `Approximately` 一致，所以
+        /// 「跳过的格」和「写了但值没变的格」在画面上不可区分。
+        ///
+        /// **只是不读 transform 了**：那三次读回各自会触发一次 Unity 的
+        /// transform 同步，4446 格就是一万三千多次，比写入本身还贵。
+        /// </summary>
+        private static bool SamePose(FloorPose a, FloorPose b)
+        {
+            return Approximately(a.X, b.X)
+                && Approximately(a.Y, b.Y)
+                && Approximately(a.Rotation, b.Rotation)
+                && Approximately(a.ScaleX, b.ScaleX)
+                && Approximately(a.ScaleY, b.ScaleY)
+                && Approximately(a.Opacity, b.Opacity);
         }
 
         private static bool Approximately(float a, float b)
@@ -399,6 +498,8 @@ namespace ADOFAIEditorStudio.Preview.Domains
         public void EndSession()
         {
             floors = new FloorTrackState[0];
+            lastPoses = new FloorPose[0];
+            lastValid = new bool[0];
             context = null;
         }
 

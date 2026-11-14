@@ -60,6 +60,17 @@ namespace ADOFAIEditorStudio.Preview.Timeline
             baselineOpacity = opacity;
         }
 
+        /// <summary>这一格有没有任何通道被事件碰过。</summary>
+        internal bool HasAnyEvent
+        {
+            get
+            {
+                return PositionX.Count > 0 || PositionY.Count > 0
+                    || Rotation.Count > 0 || ScaleX.Count > 0
+                    || ScaleY.Count > 0 || Opacity.Count > 0;
+            }
+        }
+
         /// <summary>所有通道排序。加完事件后调一次。</summary>
         internal void Sort()
         {
